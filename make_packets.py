@@ -68,11 +68,18 @@ EXTRA_FIELDS = [
     "Why This Might Be Wrong",
     "Opener",
     "Evidence Refs",
+    "Safe Outreach Claims",
+    "Unsafe Claims",
     "Place Key",
     "Fit Ceiling",
     "Fit Flags",
     "Review Fit Band",
     "Packet Eligible",
+    "Packet Eligibility Reason",
+    "Sendable",
+    "Minimum Evidence Passed",
+    "Send Blockers",
+    "Sendability Blockers",
 ]
 
 
@@ -143,7 +150,7 @@ def is_eligible(row: Dict[str, str], include_all: bool, priority_filter: Optiona
     if include_all:
         return True
 
-    return row.get("Packet Eligible", "").strip().lower() == "yes"
+    return row.get("Packet Eligible", "").strip().lower() == "yes" and row.get("Sendable", "").strip().lower() == "yes"
 
 
 def core_tsv_draft(row: Dict[str, str]) -> str:
@@ -366,6 +373,10 @@ def packet_markdown(row: Dict[str, str]) -> str:
     lines.append("")
     lines.append(f"- **Priority:** {row.get('Lead Priority', '')}")
     lines.append(f"- **Packet Eligible:** {row.get('Packet Eligible', '') or 'No'}")
+    lines.append(f"- **Packet Eligibility Reason:** {row.get('Packet Eligibility Reason', '') or 'none'}")
+    lines.append(f"- **Sendable:** {row.get('Sendable', '') or 'No'}")
+    lines.append(f"- **Minimum Evidence Passed:** {row.get('Minimum Evidence Passed', '') or 'No'}")
+    lines.append(f"- **Sendability Blockers:** {row.get('Sendability Blockers', '') or row.get('Send Blockers', '') or 'none'}")
     lines.append(f"- **Offer Fit:** {row.get('Offer Fit', '')}")
     lines.append(f"- **Website Quality:** {row.get('Current Website Quality', '')}")
     lines.append(f"- **Site Status:** {row.get('Site Status', '')}")
@@ -434,6 +445,11 @@ def write_index(output_dir: Path, packet_rows: List[Dict[str, str]]) -> None:
         "Desktop Screenshot Path",
         "Mobile Screenshot Path",
         "Score Total",
+        "Sendable",
+        "Minimum Evidence Passed",
+        "Packet Eligibility Reason",
+        "Sendability Blockers",
+        "Send Blockers",
         "Review Fit Band",
         "Fit Flags",
         "Source File",

@@ -49,6 +49,8 @@ Rules:
 - If there is no evidence for a claim, lower evidence confidence instead of inventing.
 - Missing site plus strong reviews can be an A lead.
 - Hard disqualifier or score below 50 means Skip.
+- safe_outreach_claims must be grounded: every claim needs one or more evidence_refs from the packet.
+- unsafe_claims should list clean-sounding claims that should not be used because the evidence does not prove them.
 
 Allowed best_angle values:
 - Website Rebuild
@@ -78,6 +80,13 @@ Output schema:
   "why_this_might_be_wrong": [],
   "opener": "",
   "evidence_refs": [],
+  "safe_outreach_claims": [
+    {{
+      "claim": "",
+      "evidence_refs": []
+    }}
+  ],
+  "unsafe_claims": [],
   "airtable_fields": {{}}
 }}
 
@@ -107,4 +116,3 @@ def write_review_queue(
         paths.append(path)
 
     return paths
-

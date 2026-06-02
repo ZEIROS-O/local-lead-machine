@@ -13,6 +13,9 @@ from lead_machine.lead_card import build_lead_card
 from lead_machine.llm_queue import build_llm_prompt, write_review_queue
 from lead_machine.manual_scores import load_manual_score, merge_manual_score
 from lead_machine.schema import normalize_lead, row_dedupe_keys
+from lead_machine.sendability import flatten_safe_outreach_claims, normalize_evidence_refs
+from make_packets import is_eligible
+from score_leads import score_record
 
 
 class LeadMachineContractsTest(unittest.TestCase):
@@ -154,6 +157,11 @@ class LeadMachineContractsTest(unittest.TestCase):
             "why_this_might_be_wrong": ["Owner may be referral-driven"],
             "opener": "Want me to send a cleaner estimate-page mockup?",
             "evidence_refs": ["ev-google-rating", "ev-third-party-jobber"],
+            "safe_outreach_claims": [
+                {"claim": "Your Google profile shows strong review proof.", "evidence_refs": ["ev-google-rating"]},
+                {"claim": "Your visible web presence routes through Jobber.", "evidence_refs": ["ev-third-party-jobber"]},
+            ],
+            "unsafe_claims": ["Do not claim they are losing jobs."],
             "airtable_fields": {"Status": "New"},
         }
 
@@ -166,6 +174,9 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(card["grade"], "A")
         self.assertEqual(card["best_angle"], "Social/Jobber Escape")
         self.assertEqual(card["airtable_fields"]["Lead Priority"], "A")
+        self.assertTrue(card["sendable"])
+        self.assertTrue(card["minimum_evidence_passed"])
+        self.assertEqual(card["evidence_refs"], ["ev-google-rating", "ev-third-party-jobber"])
 
     def test_manual_score_file_loader_rejects_missing_evidence_refs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -190,6 +201,8 @@ class LeadMachineContractsTest(unittest.TestCase):
                         "why_this_might_be_wrong": [],
                         "opener": "",
                         "evidence_refs": ["missing-id"],
+                        "safe_outreach_claims": [{"claim": "Missing claim.", "evidence_refs": ["missing-id"]}],
+                        "unsafe_claims": ["Do not use unsupported claims."],
                         "airtable_fields": {},
                     }
                 ),
@@ -265,6 +278,191 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertAlmostEqual(metrics["a_lead_human_approval_rate"], 0.5)
         self.assertAlmostEqual(metrics["average_a_review_minutes"], 3.25)
         self.assertAlmostEqual(metrics["sampled_false_skip_rate"], 1.0)
+
+    def test_sendability_normalizes_duplicate_evidence_refs_and_flattens_safe_claims(self) -> None:
+        self.assertEqual(normalize_evidence_refs(["E1", "E2", "E1", "E3"]), ["E1", "E2", "E3"])
+        self.assertEqual(normalize_evidence_refs("E1, E2; E3 E2"), ["E1", "E2", "E3"])
+
+        flattened = flatten_safe_outreach_claims(
+            [
+                {"claim": "Your quote path is hard to find on mobile.", "evidence_refs": ["E3", "E7"]},
+                {"claim": "Your best photos are buried.", "evidence_refs": "E9"},
+            ]
+        )
+
+        self.assertEqual(
+            flattened,
+            "Your quote path is hard to find on mobile. [E3,E7]; Your best photos are buried. [E9]",
+        )
+
+    def test_manual_score_with_invalid_safe_claim_ref_gets_blocked(self) -> None:
+        enriched = {
+            "google": self._google_fixture(),
+            "evidence": self._evidence_fixture(site_status="weak"),
+        }
+        raw_score = self._manual_score(
+            safe_outreach_claims=[
+                {"claim": "Your quote path is hard to find.", "evidence_refs": ["E2", "missing-ref"]}
+            ]
+        )
+
+        row = merge_manual_score(enriched, raw_score, fallback_vertical="hardscaping")
+
+        self.assertEqual(row["Sendable"], "No")
+        self.assertIn("Invalid evidence reference", row["Send Blockers"])
+        self.assertEqual(row["Minimum Evidence Passed"], "No")
+
+    def test_manual_score_with_b_grade_but_no_concrete_issue_gets_blocked(self) -> None:
+        enriched = {
+            "google": self._google_fixture(),
+            "evidence": self._evidence_fixture(
+                site_status="okay",
+                evidence_items=[
+                    {"id": "E1", "field": "google_rating", "value": "4.9 stars / 130 reviews"},
+                    {"id": "E2", "field": "trust_signals", "value": "licensed, insured"},
+                ],
+            ),
+        }
+        raw_score = self._manual_score(
+            safe_outreach_claims=[{"claim": "Your reviews are strong.", "evidence_refs": ["E1"]}]
+        )
+
+        row = merge_manual_score(enriched, raw_score, fallback_vertical="hardscaping")
+
+        self.assertEqual(row["Lead Priority"], "B")
+        self.assertEqual(row["Sendable"], "No")
+        self.assertIn("Missing concrete conversion issue", row["Send Blockers"])
+        self.assertEqual(row["Packet Eligible"], "")
+
+    def test_manual_score_with_high_score_and_low_confidence_gets_blocked_but_evidence_can_pass(self) -> None:
+        enriched = {
+            "google": self._google_fixture(),
+            "evidence": self._evidence_fixture(site_status="weak"),
+        }
+        raw_score = self._manual_score(confidence="low")
+
+        row = merge_manual_score(enriched, raw_score, fallback_vertical="hardscaping")
+
+        self.assertEqual(row["Lead Priority"], "B")
+        self.assertEqual(row["Sendable"], "No")
+        self.assertIn("Low confidence", row["Send Blockers"])
+        self.assertEqual(row["Minimum Evidence Passed"], "Yes")
+
+    def test_no_site_lead_with_strong_reviews_passes_concrete_issue_gate(self) -> None:
+        row = score_record(
+            {
+                "google": {
+                    "business_name": "Ron & Sons Landscaping",
+                    "city": "East Cleveland",
+                    "phone": "(216) 555-1212",
+                    "rating": "4.9",
+                    "reviews": "31",
+                    "website_url": "",
+                    "google_maps_url": "https://maps.google.com/?cid=456",
+                    "place_id": "ChIJ456",
+                },
+                "website": {
+                    "site_status": "No Website",
+                    "site_issue_flags": [],
+                    "pages": {},
+                    "emails_found": [],
+                    "phones_found": [],
+                    "forms_found": False,
+                    "cta_terms": [],
+                    "combined_text": "",
+                },
+                "derived": {},
+                "screenshots": {},
+            },
+            "hardscaping",
+        )
+
+        self.assertEqual(row["Lead Priority"], "A")
+        self.assertEqual(row["Sendable"], "Yes")
+        self.assertEqual(row["Minimum Evidence Passed"], "Yes")
+        self.assertEqual(row["Packet Eligible"], "Yes")
+        self.assertIn("no owned website or conversion asset", row["Safe Outreach Claims"])
+
+    def test_high_scoring_hallucinated_lead_gets_blocked_when_claims_are_ungrounded(self) -> None:
+        enriched = {
+            "google": self._google_fixture(),
+            "evidence": self._evidence_fixture(
+                site_status="okay",
+                evidence_items=[
+                    {"id": "E1", "field": "google_rating", "value": "4.9 stars / 130 reviews"},
+                    {"id": "E2", "field": "trust_signals", "value": "licensed, insured"},
+                ],
+            ),
+        }
+        raw_score = self._manual_score(
+            safe_outreach_claims=[{"claim": "You are losing jobs because your form is broken.", "evidence_refs": []}]
+        )
+
+        row = merge_manual_score(enriched, raw_score, fallback_vertical="hardscaping")
+
+        self.assertEqual(row["Sendable"], "No")
+        self.assertIn("Missing concrete conversion issue", row["Send Blockers"])
+        self.assertIn("Missing evidence-backed opener", row["Send Blockers"])
+        self.assertIn("Safe outreach claim missing evidence reference", row["Send Blockers"])
+        self.assertEqual(row["Minimum Evidence Passed"], "No")
+
+    def test_packet_eligible_cannot_be_yes_when_sendable_is_no(self) -> None:
+        row = {"Lead Priority": "A", "Packet Eligible": "Yes", "Sendable": "No"}
+
+        self.assertFalse(is_eligible(row, include_all=False, priority_filter=None))
+        self.assertTrue(is_eligible(row, include_all=True, priority_filter=None))
+
+    def _google_fixture(self) -> dict:
+        return {
+            "business_name": "A+ Landscaping LLC",
+            "city": "Kirtland",
+            "phone": "(440) 637-5848",
+            "website_url": "https://example.com",
+            "google_maps_url": "https://maps.google.com/?cid=123",
+            "rating": "4.9",
+            "reviews": "130",
+            "place_id": "ChIJ123",
+        }
+
+    def _evidence_fixture(self, *, site_status: str, evidence_items: list | None = None) -> dict:
+        return {
+            "site_status": site_status,
+            "screenshots": {"desktop": "desktop.png", "mobile": "mobile.png"},
+            "evidence_items": evidence_items
+            or [
+                {"id": "E1", "field": "google_rating", "value": "4.9 stars / 130 reviews"},
+                {"id": "E2", "field": "site_issue_flags", "value": "no_clear_cta_detected"},
+            ],
+        }
+
+    def _manual_score(self, **overrides: object) -> dict:
+        score = {
+            "subscores": {
+                "icp_fit": 14,
+                "reputation_demand_proof": 12,
+                "web_conversion_pain": 18,
+                "mockup_leverage": 10,
+                "reachability": 7,
+                "offer_angle_clarity": 9,
+                "evidence_confidence": 5,
+            },
+            "confidence": "medium",
+            "hard_disqualifiers": [],
+            "best_angle": "Estimate Funnel",
+            "recommended_action": "Build mockup then SMS owner",
+            "why_this_lead": ["Strong reviews", "Visible quote-path issue"],
+            "why_this_might_be_wrong": [],
+            "opener": "Your reviews are strong, but the quote path looks hard to find. Want me to send a cleaner version?",
+            "evidence_refs": ["E1", "E2"],
+            "safe_outreach_claims": [
+                {"claim": "Your quote path looks hard to find.", "evidence_refs": ["E2"]},
+                {"claim": "Your Google profile shows strong reviews.", "evidence_refs": ["E1"]},
+            ],
+            "unsafe_claims": ["Do not claim they are losing jobs."],
+            "airtable_fields": {},
+        }
+        score.update(overrides)
+        return score
 
 
 if __name__ == "__main__":

@@ -142,6 +142,7 @@ def build_evidence_profile(enriched: Dict[str, Any]) -> Dict[str, Any]:
         source_url=google.get("google_maps_url", ""),
     )
     _evidence_item(items, field="site_status", value=site_status, source_url=final_url)
+    _evidence_item(items, field="site_issue_flags", value=", ".join(site.get("site_issue_flags") or []), source_url=final_url)
     _evidence_item(items, field="third_party_tools", value=", ".join(tools), source_url=final_url)
     _evidence_item(items, field="contact_form", value=bool(site.get("forms_found")), source_url=final_url)
     _evidence_item(items, field="cta_terms", value=", ".join(ctas), source_url=final_url)
@@ -151,6 +152,7 @@ def build_evidence_profile(enriched: Dict[str, Any]) -> Dict[str, Any]:
     _evidence_item(items, field="service_area_detected", value=", ".join(service_area), source_url=final_url)
     _evidence_item(items, field="trust_signals", value=", ".join(trust_signals), source_url=final_url)
     _evidence_item(items, field="tracking_detected", value=", ".join(tracking), source_url=final_url)
+    _evidence_item(items, field="phone_consistency", value=derived.get("phone_consistency", "unknown"), source_url=final_url)
     if screenshots.get("desktop") or screenshots.get("mobile"):
         _evidence_item(
             items,
@@ -179,4 +181,3 @@ def build_evidence_profile(enriched: Dict[str, Any]) -> Dict[str, Any]:
         "phone_consistency": derived.get("phone_consistency", "unknown"),
         "evidence_items": items,
     }
-

@@ -30,6 +30,7 @@ from lead_machine.lead_card import build_lead_card
 from lead_machine.llm_queue import safe_slug
 from lead_machine.manual_scores import load_manual_score, merge_manual_score
 from lead_machine.schema import normalize_lead
+from lead_machine.sendability import apply_sendability
 
 
 PRIORITY_RANK = {"A": 0, "B": 1, "C": 2, "Skip": 3}
@@ -641,6 +642,96 @@ def packet_eligible(priority: str, offer_fit: str) -> str:
     return ""
 
 
+def packet_eligibility_reason(priority: str, offer_fit: str) -> str:
+    if packet_eligible(priority, offer_fit):
+        return "A/B lead with Website Rebuild or Estimate Funnel"
+    if priority not in {"A", "B"}:
+        return "Lead priority below B threshold"
+    return "Offer fit not Website Rebuild or Estimate Funnel"
+
+
+def evidence_id_by_field(record: Dict[str, Any], field: str) -> str:
+    evidence = record.get("evidence") or {}
+    for item in evidence.get("evidence_items", []) or []:
+        if item.get("field") == field and item.get("id"):
+            return str(item["id"])
+    return ""
+
+
+def first_issue_evidence_id(record: Dict[str, Any]) -> str:
+    evidence = record.get("evidence") or {}
+    issue_fields = {
+        "site_status",
+        "site_issue_flags",
+        "contact_form",
+        "cta_terms",
+        "phone_visible",
+        "third_party_tools",
+    }
+    for item in evidence.get("evidence_items", []) or []:
+        if item.get("field") in issue_fields and item.get("id"):
+            return str(item["id"])
+    return ""
+
+
+def deterministic_safe_claims(record: Dict[str, Any], offer_fit: str) -> List[Dict[str, Any]]:
+    g = record.get("google", {}) or {}
+    w = record.get("website", {}) or {}
+    rating = g.get("rating", "")
+    reviews = g.get("reviews", "")
+    status = w.get("site_status", "")
+
+    claims: List[Dict[str, Any]] = []
+    demand_ref = evidence_id_by_field(record, "google_rating")
+    issue_ref = first_issue_evidence_id(record)
+
+    if demand_ref:
+        claims.append(
+            {
+                "claim": f"Your Google profile shows {rating} stars and {reviews} reviews.",
+                "evidence_refs": [demand_ref],
+            }
+        )
+
+    if issue_ref:
+        if status == "No Website":
+            claim = "There is no owned website or conversion asset visible."
+        elif status == "Broken Website":
+            claim = "The current website appears broken from the collected evidence."
+        elif status == "Social Only":
+            claim = "The visible web presence appears to rely on social pages instead of an owned conversion asset."
+        elif offer_fit == "Estimate Funnel":
+            claim = "The estimate path appears harder to find than it should be."
+        else:
+            claim = "The owned conversion path appears weaker than the business proof."
+        claims.append({"claim": claim, "evidence_refs": [issue_ref]})
+
+    return claims
+
+
+def deterministic_opener(record: Dict[str, Any], offer_fit: str) -> str:
+    g = record.get("google", {}) or {}
+    business = g.get("business_name", "your business")
+    rating = g.get("rating", "")
+    reviews = g.get("reviews", "")
+    status = (record.get("website", {}) or {}).get("site_status", "")
+
+    if status == "No Website":
+        return (
+            f"Your Google profile looks strong ({rating} stars / {reviews} reviews), "
+            "but I couldn't find an owned website or estimate path. Want me to send a cleaner direction?"
+        )
+    if offer_fit == "Estimate Funnel":
+        return (
+            f"{business} looks credible from the outside ({rating} stars / {reviews} reviews), "
+            "but the estimate path looks harder to find than it should be. Want me to send a cleaner version?"
+        )
+    return (
+        f"{business} looks credible from the outside ({rating} stars / {reviews} reviews), "
+        "but the online conversion path looks weaker than the business proof. Want me to send what I noticed?"
+    )
+
+
 def review_fit_band(record: Dict[str, Any], vertical: str) -> str:
     reviews = safe_int(record.get("google", {}).get("reviews"))
     family = vertical_family(vertical)
@@ -666,6 +757,7 @@ def review_fit_band(record: Dict[str, Any], vertical: str) -> str:
 
 
 def score_record(record: Dict[str, Any], fallback_vertical: str) -> Dict[str, Any]:
+    record = ensure_evidence(record)
     vertical = infer_vertical(record, fallback_vertical)
 
     strength, strength_evidence = score_business_strength(record, vertical)
@@ -701,7 +793,14 @@ def score_record(record: Dict[str, Any], fallback_vertical: str) -> Dict[str, An
     w = record.get("website", {})
     screenshots = record.get("screenshots", {})
 
-    return {
+    safe_claims = deterministic_safe_claims(record, offer_fit)
+    evidence_refs: List[str] = []
+    for claim in safe_claims:
+        for ref in claim.get("evidence_refs") or []:
+            if ref not in evidence_refs:
+                evidence_refs.append(ref)
+
+    row = {
         "Business Name": g.get("business_name", ""),
         "Owner Name": "",
         "Vertical": vertical,
@@ -725,7 +824,7 @@ def score_record(record: Dict[str, Any], fallback_vertical: str) -> Dict[str, An
         "Offer Fit": offer_fit,
         "Site Status": w.get("site_status", ""),
         "Evidence Notes": evidence_notes,
-        "AI Confidence": "",
+        "AI Confidence": "medium",
         "Manual Reviewed": "",
         "Skip Reason": skip_reason(record, priority, total, offer_fit, fit_flags),
         "Desktop Screenshot Path": screenshots.get("desktop", ""),
@@ -738,8 +837,20 @@ def score_record(record: Dict[str, Any], fallback_vertical: str) -> Dict[str, An
         "Fit Ceiling": fit_cap,
         "Fit Flags": ", ".join(fit_flags),
         "Review Fit Band": review_fit_band(record, vertical),
+        "Opener": deterministic_opener(record, offer_fit),
+        "Evidence Refs": json.dumps(evidence_refs, ensure_ascii=False),
+        "Safe Outreach Claims": json.dumps(safe_claims, ensure_ascii=False),
+        "Unsafe Claims": json.dumps(
+            [
+                "Do not claim they are losing jobs.",
+                "Do not claim a form is broken unless the evidence verifies it.",
+            ],
+            ensure_ascii=False,
+        ),
         "Packet Eligible": packet_eligible(priority, offer_fit),
+        "Packet Eligibility Reason": packet_eligibility_reason(priority, offer_fit),
     }
+    return apply_sendability(row)
 
 
 def read_jsonl(path: Path) -> List[Dict[str, Any]]:
