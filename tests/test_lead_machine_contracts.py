@@ -339,6 +339,65 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(csv_row["Sendable"], "Yes")
         self.assertEqual(csv_row["Minimum Evidence Passed"], "Yes")
 
+    def test_manual_llm_airtable_fields_override_source_identity_fields(self) -> None:
+        raw_score = self._manual_score(
+            best_angle="No-Site Launch",
+            recommended_action="Build no-site mockup",
+            airtable_fields={
+                "business_name": "Painesville Patio Co",
+                "phone": "(440) 555-0199",
+                "vertical": "hardscaping",
+                "city": "Painesville",
+                "category": "patio contractor",
+                "recommended_action": "Send corrected hardscaping mockup",
+            },
+        )
+        enriched = {
+            "google": {
+                **self._google_fixture(),
+                "Business Name": "Painsville Services",
+                "business_name": "",
+                "Vertical": "service",
+                "vertical": "",
+                "City": "Painsville",
+                "city": "",
+                "Phone": "(440) 555-0100",
+                "phone": "",
+            },
+            "evidence": self._evidence_fixture(site_status="weak"),
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            scores_dir = tmp_path / "scores"
+            scores_dir.mkdir()
+            (scores_dir / "chij123.json").write_text(json.dumps(raw_score), encoding="utf-8")
+            output_path = tmp_path / "scored.csv"
+
+            rows = score_records_manual([enriched], scores_dir=scores_dir, fallback_vertical="service")
+            write_csv(output_path, rows)
+            packet = packet_markdown(rows[0])
+
+            with output_path.open(newline="", encoding="utf-8") as f:
+                [csv_row] = list(csv.DictReader(f))
+
+        self.assertEqual(csv_row["Business Name"], "Painesville Patio Co")
+        self.assertEqual(csv_row["business_name"], "Painesville Patio Co")
+        self.assertEqual(csv_row["Phone"], "(440) 555-0199")
+        self.assertEqual(csv_row["phone"], "(440) 555-0199")
+        self.assertEqual(csv_row["Vertical"], "hardscaping")
+        self.assertEqual(csv_row["vertical"], "hardscaping")
+        self.assertEqual(csv_row["category"], "patio contractor")
+        self.assertEqual(csv_row["City"], "Painesville")
+        self.assertEqual(csv_row["city"], "Painesville")
+        self.assertEqual(csv_row["Best Service Angle"], "No-Site Launch")
+        self.assertEqual(csv_row["best_angle"], "No-Site Launch")
+        self.assertEqual(csv_row["Recommended Action"], "Send corrected hardscaping mockup")
+        self.assertEqual(csv_row["recommended_action"], "Send corrected hardscaping mockup")
+        self.assertIn("- **Business:** Painesville Patio Co", packet)
+        self.assertIn("- **Vertical:** hardscaping", packet)
+        self.assertIn("- **City:** Painesville", packet)
+
     def test_manual_scored_packet_omits_legacy_review_prompt(self) -> None:
         row = merge_manual_score(
             {"google": self._google_fixture(), "evidence": self._evidence_fixture(site_status="weak")},

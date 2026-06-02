@@ -101,6 +101,59 @@ def allowed_evidence_ids(enriched: Dict[str, Any]) -> Set[str]:
     return {str(item.get("id")) for item in evidence.get("evidence_items", []) if item.get("id")}
 
 
+def _clean_manual_field(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _first_non_empty_field(fields: Dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        if key not in fields:
+            continue
+        value = _clean_manual_field(fields.get(key))
+        if value:
+            return value
+    return ""
+
+
+def _sync_manual_airtable_aliases(
+    row: Dict[str, Any],
+    airtable_fields: Dict[str, Any],
+    base_values: Dict[str, Any],
+) -> None:
+    identity_fields = [
+        ("Business Name", "business_name", ("Business Name", "business_name")),
+        ("Phone", "phone", ("Phone", "phone")),
+        ("City", "city", ("City", "city")),
+        ("Vertical", "vertical", ("Vertical", "vertical", "Category", "category")),
+        ("Best Service Angle", "best_angle", ("Best Service Angle", "Offer Fit", "Best Angle", "best_angle")),
+        ("Recommended Action", "recommended_action", ("Recommended Action", "recommended_action")),
+    ]
+
+    for user_key, internal_key, manual_keys in identity_fields:
+        value = (
+            _first_non_empty_field(airtable_fields, *manual_keys)
+            or _clean_manual_field(base_values.get(user_key))
+            or _clean_manual_field(row.get(user_key))
+        )
+        if value:
+            row[user_key] = value
+            row[internal_key] = value
+
+    if row.get("best_angle"):
+        row["Offer Fit"] = row["best_angle"]
+        row["Best Angle"] = row["best_angle"]
+
+    category = (
+        _first_non_empty_field(airtable_fields, "Category", "category")
+        or _clean_manual_field(base_values.get("category"))
+        or _clean_manual_field(row.get("category"))
+    )
+    if category:
+        row["category"] = category
+
+
 def merge_manual_score(
     enriched: Dict[str, Any],
     score: Dict[str, Any],
@@ -175,17 +228,30 @@ def merge_manual_score(
         "Packet Eligible": packet_eligible,
         "Packet Eligibility Reason": "Manual grade A/B" if packet_eligible else "Manual grade below B threshold",
     }
-    row.update(validated.get("airtable_fields") or {})
+    base_alias_values = {
+        "Business Name": row.get("Business Name", ""),
+        "Phone": row.get("Phone", ""),
+        "City": row.get("City", ""),
+        "Vertical": row.get("Vertical", ""),
+        "Best Service Angle": row.get("Best Service Angle", ""),
+        "Recommended Action": row.get("Recommended Action", ""),
+        "category": lead.category,
+    }
+    airtable_fields = validated.get("airtable_fields") or {}
+    if not isinstance(airtable_fields, dict):
+        airtable_fields = {}
+    row.update(airtable_fields)
+    _sync_manual_airtable_aliases(row, airtable_fields, base_alias_values)
     row.update(
         {
             # Keep the manual-LLM schema fields next to the existing Airtable/reporting aliases.
             "total_score": validated["total_score"],
             "grade": validated["grade"],
-            "best_angle": validated.get("best_angle", ""),
+            "best_angle": row.get("best_angle", validated.get("best_angle", "")),
             "confidence": validated["confidence"],
             "Total Score": validated["total_score"],
             "Grade": validated["grade"],
-            "Best Angle": validated.get("best_angle", ""),
+            "Best Angle": row.get("Best Angle", row.get("best_angle", validated.get("best_angle", ""))),
             "Confidence": validated["confidence"],
         }
     )
