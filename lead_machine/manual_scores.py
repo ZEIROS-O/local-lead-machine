@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Set
 
 from .schema import normalize_lead
+from .sendability import apply_sendability, normalize_evidence_refs, normalize_safe_outreach_claims, normalize_unsafe_claims
 
 
 SUBSCORE_LIMITS = {
@@ -39,6 +40,8 @@ def validate_manual_score(data: Dict[str, Any], *, allowed_evidence_ids: Set[str
             "why_this_might_be_wrong",
             "opener",
             "evidence_refs",
+            "safe_outreach_claims",
+            "unsafe_claims",
             "airtable_fields",
         ],
     )
@@ -58,11 +61,11 @@ def validate_manual_score(data: Dict[str, Any], *, allowed_evidence_ids: Set[str
     if confidence not in CONFIDENCE_VALUES:
         raise ValueError("confidence must be low, medium, or high")
 
-    refs = data.get("evidence_refs") or []
-    if not isinstance(refs, list) or not refs:
+    refs = normalize_evidence_refs(data.get("evidence_refs"))
+    if not refs:
         raise ValueError("evidence_refs must be a non-empty list")
 
-    unknown_refs = sorted(set(str(ref) for ref in refs) - allowed_evidence_ids)
+    unknown_refs = sorted(set(refs) - allowed_evidence_ids)
     if unknown_refs:
         raise ValueError(f"Unknown evidence_refs: {', '.join(unknown_refs)}")
 
@@ -80,6 +83,9 @@ def validate_manual_score(data: Dict[str, Any], *, allowed_evidence_ids: Set[str
     validated = dict(data)
     validated["subscores"] = normalized_subscores
     validated["confidence"] = confidence
+    validated["evidence_refs"] = refs
+    validated["safe_outreach_claims"] = normalize_safe_outreach_claims(data.get("safe_outreach_claims"))
+    validated["unsafe_claims"] = normalize_unsafe_claims(data.get("unsafe_claims"))
     validated["total_score"] = total
     validated["grade"] = grade
     return validated
@@ -119,6 +125,7 @@ def merge_manual_score(
     if website.get("emails_found"):
         email = ", ".join(website.get("emails_found") or [])
 
+    packet_eligible = "Yes" if validated["grade"] in {"A", "B"} else ""
     row = {
         "Business Name": lead.business_name,
         "Owner Name": "",
@@ -162,11 +169,14 @@ def merge_manual_score(
         "Why This Might Be Wrong": json.dumps(validated.get("why_this_might_be_wrong") or [], ensure_ascii=False),
         "Opener": validated.get("opener", ""),
         "Evidence Refs": json.dumps(validated.get("evidence_refs") or [], ensure_ascii=False),
+        "Safe Outreach Claims": json.dumps(validated.get("safe_outreach_claims") or [], ensure_ascii=False),
+        "Unsafe Claims": json.dumps(validated.get("unsafe_claims") or [], ensure_ascii=False),
         "Place Key": lead.place_id_or_unique_key,
-        "Packet Eligible": "Yes" if validated["grade"] in {"A", "B"} else "",
+        "Packet Eligible": packet_eligible,
+        "Packet Eligibility Reason": "Manual grade A/B" if packet_eligible else "Manual grade below B threshold",
     }
     row.update(validated.get("airtable_fields") or {})
-    return row
+    return apply_sendability(row)
 
 
 def _website_quality_from_status(status: str) -> str:
@@ -177,4 +187,3 @@ def _website_quality_from_status(status: str) -> str:
     if status == "strong":
         return "Good"
     return "Okay"
-
