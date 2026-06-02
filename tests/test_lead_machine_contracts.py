@@ -214,7 +214,12 @@ class LeadMachineContractsTest(unittest.TestCase):
 
     def test_llm_prompt_and_queue_use_manual_web_workflow(self) -> None:
         enriched = {
-            "google": {"business_name": "A+ Landscaping LLC", "place_id": "ChIJ123"},
+            "google": {
+                "business_name": "A+ Landscaping LLC",
+                "place_id": "ChIJ123",
+                "vertical": "service",
+                "source_query": "hardscaping contractor Cleveland OH",
+            },
             "evidence": {
                 "site_status": "jobber_only",
                 "screenshots": {"desktop": "desktop.png", "mobile": "mobile.png"},
@@ -223,14 +228,70 @@ class LeadMachineContractsTest(unittest.TestCase):
         }
 
         prompt = build_llm_prompt(enriched, fallback_vertical="hardscaping")
-        self.assertIn("Return JSON only", prompt)
+        self.assertIn("Response must be one valid JSON object only.", prompt)
+        self.assertIn("First character must be { and last character must be }.", prompt)
+        self.assertIn("No markdown fences.", prompt)
+        self.assertIn("No commentary.", prompt)
+        self.assertIn("No reasoning outside JSON.", prompt)
+        self.assertIn("No \"Thought for X seconds\" text.", prompt)
         self.assertIn("ICP Fit / 20", prompt)
+        self.assertIn('"total_score": 0', prompt)
+        self.assertIn('"grade": "A|B|C|Skip"', prompt)
+        self.assertIn("total_score must equal the sum of all subscores.", prompt)
+        self.assertIn("A = 80-100", prompt)
+        self.assertIn("confidence must be one of low, medium, high.", prompt)
+        self.assertIn('"safe_outreach_claims"', prompt)
+        self.assertIn('"unsafe_claims"', prompt)
+        self.assertIn("Build/send a no-site launch mockup", prompt)
+        self.assertIn("Must mention at least one specific evidence-backed observation.", prompt)
+        self.assertIn('"vertical": "hardscaping"', prompt)
         self.assertIn("ev-google-rating", prompt)
 
         with tempfile.TemporaryDirectory() as tmp:
             paths = write_review_queue([enriched], Path(tmp), fallback_vertical="hardscaping")
             self.assertEqual(len(paths), 1)
             self.assertTrue(paths[0].read_text(encoding="utf-8").startswith("# Manual LLM Review"))
+
+    def test_llm_prompt_infers_vertical_when_cli_vertical_is_generic(self) -> None:
+        enriched = {
+            "google": {
+                "business_name": "Barski Hardscaping",
+                "place_id": "ChIJ456",
+                "vertical": "service",
+                "category": "landscaper",
+                "source_query": "patio paver contractor Cleveland OH",
+            },
+            "evidence": {"evidence_items": [{"id": "E1", "field": "google_rating", "value": "4.9 / 24"}]},
+        }
+
+        prompt = build_llm_prompt(enriched, fallback_vertical="service")
+
+        self.assertIn('"vertical": "hardscaping"', prompt)
+
+    def test_manual_score_loader_accepts_new_schema_and_normalizes_mismatched_total(self) -> None:
+        raw_score = self._manual_score(total_score=1, grade="Skip")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            score_path = Path(tmp) / "lead.json"
+            score_path.write_text(json.dumps(raw_score), encoding="utf-8")
+            validated = load_manual_score(score_path, allowed_evidence_ids={"E1", "E2"})
+
+        self.assertEqual(validated["total_score"], 75)
+        self.assertEqual(validated["grade"], "B")
+        self.assertEqual(validated["confidence"], "medium")
+
+    def test_manual_score_loader_still_accepts_old_schema_without_total_or_grade(self) -> None:
+        raw_score = self._manual_score()
+        raw_score.pop("total_score", None)
+        raw_score.pop("grade", None)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            score_path = Path(tmp) / "lead.json"
+            score_path.write_text(json.dumps(raw_score), encoding="utf-8")
+            validated = load_manual_score(score_path, allowed_evidence_ids={"E1", "E2"})
+
+        self.assertEqual(validated["total_score"], 75)
+        self.assertEqual(validated["grade"], "B")
 
     def test_airtable_payload_and_feedback_metrics(self) -> None:
         card = {
