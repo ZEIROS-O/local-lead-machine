@@ -3,12 +3,14 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
+import upload_airtable
 from lead_machine.airtable_sync import build_airtable_payload, plan_airtable_sync
 from lead_machine.evidence import build_evidence_profile
 from lead_machine.feedback import compute_feedback_metrics
@@ -24,6 +26,145 @@ from score_leads import score_record, score_records_manual, write_csv
 
 
 class LeadMachineContractsTest(unittest.TestCase):
+    def _airtable_csv_row(self, **overrides: str) -> dict[str, str]:
+        row = {
+            "Business Name": "A+ Landscaping LLC",
+            "Owner Name": "Alex Owner",
+            "Vertical": "hardscaping",
+            "City": "Kirtland",
+            "Phone": "(440) 637-5848",
+            "Email": "owner@example.com",
+            "Website URL": "https://example.com",
+            "Google Maps URL": "https://maps.google.com/?cid=123",
+            "Reviews": "130",
+            "Rating": "4.9",
+            "Current Website Quality": "Weak",
+            "Best Service Angle": "Website Rebuild",
+            "Specific Observation": "The site hides estimate requests.",
+            "Lead Priority": "A",
+            "Score Total": "86",
+            "AI Confidence": "medium",
+            "Recommended Action": "Build mockup then SMS owner",
+            "Opener": "Want me to send a cleaner estimate-page mockup?",
+            "Evidence Refs": "ev-google-rating, ev-site",
+            "Safe Outreach Claims": "Strong Google review proof.",
+            "Unsafe Claims": "Do not claim they are losing jobs.",
+            "Packet Eligible": "Yes",
+            "Packet Eligibility Reason": "A lead with Website Rebuild angle.",
+            "Sendable": "Yes",
+            "Minimum Evidence Passed": "Yes",
+            "Send Blockers": "",
+            "Place Key": "ChIJ123",
+        }
+        row.update(overrides)
+        return row
+
+    def _write_airtable_csv(self, path: Path, rows: list[dict[str, str]]) -> None:
+        fieldnames: list[str] = []
+        for row in rows:
+            for key in row:
+                if key not in fieldnames:
+                    fieldnames.append(key)
+        with path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+
+    def _run_upload(self, argv: list[str]) -> tuple[int, str, str]:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with patch("sys.argv", argv), redirect_stdout(stdout), redirect_stderr(stderr):
+            code = upload_airtable.main()
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def _dry_run_plan(self, stdout: str) -> list[dict[str, object]]:
+        lines = stdout.splitlines()
+        self.assertTrue(lines and lines[0].startswith("[DRY-RUN]"))
+        return json.loads("\n".join(lines[1:]))
+
+    def test_airtable_csv_dry_run_builds_payload_for_sendable_row_without_network(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "scored.csv"
+            self._write_airtable_csv(csv_path, [self._airtable_csv_row(**{"Outreach Channel": ""})])
+
+            with patch("upload_airtable.requests.get") as get:
+                code, stdout, stderr = self._run_upload(["upload_airtable.py", "--input", str(csv_path)])
+
+        self.assertEqual(code, 0, stderr)
+        get.assert_not_called()
+        planned = self._dry_run_plan(stdout)
+        self.assertEqual(len(planned), 1)
+        self.assertEqual(planned[0]["method"], "POST")
+        self.assertEqual(planned[0]["upsert_key"], "place:ChIJ123")
+        fields = planned[0]["payload"]["fields"]  # type: ignore[index]
+        self.assertEqual(fields["Business Name"], "A+ Landscaping LLC")
+        self.assertEqual(fields["Best Service Angle"], "Website Rebuild")
+        self.assertEqual(fields["Status"], "Mockup Needed")
+        self.assertEqual(fields["Next Action"], "Build mockup")
+        self.assertEqual(fields["Outreach Channel"], "Google Maps")
+        self.assertEqual(fields["Packet Eligible"], "Yes")
+        self.assertEqual(fields["Sendable"], "Yes")
+
+    def test_airtable_only_sendable_excludes_non_sendable_csv_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "scored.csv"
+            rows = [
+                self._airtable_csv_row(),
+                self._airtable_csv_row(
+                    **{"Business Name": "Not Sendable LLC", "Sendable": "No", "Place Key": "ChIJ999"}
+                ),
+                self._airtable_csv_row(
+                    **{"Business Name": "No Packet LLC", "Packet Eligible": "No", "Place Key": "ChIJ888"}
+                ),
+            ]
+            self._write_airtable_csv(csv_path, rows)
+
+            code, stdout, stderr = self._run_upload(
+                ["upload_airtable.py", "--input", str(csv_path), "--only-sendable"]
+            )
+
+        self.assertEqual(code, 0, stderr)
+        planned = self._dry_run_plan(stdout)
+        self.assertEqual(len(planned), 1)
+        fields = planned[0]["payload"]["fields"]  # type: ignore[index]
+        self.assertEqual(fields["Business Name"], "A+ Landscaping LLC")
+
+    def test_airtable_csv_upsert_key_prefers_place_key_then_normalized_phone(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "scored.csv"
+            rows = [
+                self._airtable_csv_row(),
+                self._airtable_csv_row(**{"Business Name": "Phone Only LLC", "Place Key": "", "Phone": "+1 440.555.0101"}),
+            ]
+            self._write_airtable_csv(csv_path, rows)
+
+            records = upload_airtable.read_input_records(csv_path, only_sendable=False, packet_dir=Path(tmp))
+            planned = plan_airtable_sync(
+                records,
+                existing_records_by_key={"place:ChIJ123": "rec-place", "phone:4405550101": "rec-phone"},
+            )
+
+        self.assertEqual(planned[0]["method"], "PATCH")
+        self.assertEqual(planned[0]["record_id"], "rec-place")
+        self.assertEqual(planned[0]["upsert_key"], "place:ChIJ123")
+        self.assertEqual(planned[1]["method"], "PATCH")
+        self.assertEqual(planned[1]["record_id"], "rec-phone")
+        self.assertEqual(planned[1]["upsert_key"], "phone:4405550101")
+
+    def test_airtable_live_mode_requires_env_vars_before_network(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "scored.csv"
+            self._write_airtable_csv(csv_path, [self._airtable_csv_row()])
+
+            with patch.dict(os.environ, {}, clear=True), patch("upload_airtable.requests.get") as get:
+                code, _stdout, stderr = self._run_upload(["upload_airtable.py", "--input", str(csv_path), "--live"])
+
+        self.assertEqual(code, 1)
+        get.assert_not_called()
+        self.assertIn("AIRTABLE_BASE_ID", stderr)
+        self.assertIn("AIRTABLE_PROSPECTS_TABLE", stderr)
+        self.assertIn("AIRTABLE_PAT", stderr)
+
     def test_normalizes_google_places_row_and_dedupe_keys_in_precedence_order(self) -> None:
         row = {
             "business_name": "  A+ Landscaping LLC  ",
