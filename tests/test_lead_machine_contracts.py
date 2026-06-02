@@ -19,6 +19,8 @@ from lead_machine.manual_scores import load_manual_score, merge_manual_score
 from lead_machine.schema import normalize_lead, row_dedupe_keys
 from lead_machine.sendability import flatten_safe_outreach_claims, normalize_evidence_refs
 from make_packets import is_eligible, packet_markdown
+from make_llm_batch import write_llm_batches
+from import_llm_score_bundle import import_score_bundle
 from score_leads import main as score_leads_main
 from score_leads import score_record, score_records_manual, write_csv
 
@@ -272,6 +274,145 @@ class LeadMachineContractsTest(unittest.TestCase):
         prompt = build_llm_prompt(enriched, fallback_vertical="service")
 
         self.assertIn('"vertical": "hardscaping"', prompt)
+
+    def test_llm_batch_prompt_contains_multiple_leads_and_score_files(self) -> None:
+        first = {
+            "google": self._google_fixture(),
+            "evidence": self._evidence_fixture(site_status="weak"),
+            "website": {"combined_text": "Homepage text for A+ Landscaping."},
+        }
+        second = {
+            "google": {
+                **self._google_fixture(),
+                "business_name": "Barski Hardscaping",
+                "phone": "(440) 555-0101",
+                "place_id": "ChIJ456",
+            },
+            "evidence": self._evidence_fixture(site_status="jobber_only"),
+            "website": {"combined_text": "Homepage text for Barski Hardscaping."},
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            batch_paths = write_llm_batches(
+                [first, second],
+                Path(tmp),
+                fallback_vertical="hardscaping",
+                batch_size=5,
+            )
+            prompt = batch_paths[0].prompt_path.read_text(encoding="utf-8")
+            expected_files = batch_paths[0].expected_files_path.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(len(batch_paths), 1)
+        self.assertIn("Response must be one valid JSON object only.", prompt)
+        self.assertIn('"batch_id": "batch_001"', prompt)
+        self.assertIn('"scores"', prompt)
+        self.assertIn('"score_file": "chij123.json"', prompt)
+        self.assertIn('"score_file": "chij456.json"', prompt)
+        self.assertIn("A+ Landscaping LLC", prompt)
+        self.assertIn("Barski Hardscaping", prompt)
+        self.assertIn("ICP Fit / 20", prompt)
+        self.assertEqual(expected_files, ["chij123.json", "chij456.json"])
+
+    def test_llm_score_bundle_importer_writes_individual_score_json_files(self) -> None:
+        score_one = self._manual_score(total_score=75, grade="B")
+        score_two = self._manual_score(
+            total_score=86,
+            grade="A",
+            subscores={
+                "icp_fit": 18,
+                "reputation_demand_proof": 14,
+                "web_conversion_pain": 22,
+                "mockup_leverage": 12,
+                "reachability": 8,
+                "offer_angle_clarity": 8,
+                "evidence_confidence": 4,
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bundle_path = tmp_path / "bundle.json"
+            scores_dir = tmp_path / "scores"
+            bundle_path.write_text(
+                json.dumps(
+                    {
+                        "batch_id": "batch_001",
+                        "scores": [
+                            {"score_file": "chij123.json", "score": score_one},
+                            {"score_file": "chij456.json", "score": score_two},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = import_score_bundle(bundle_path, scores_dir)
+
+            first = json.loads((scores_dir / "chij123.json").read_text(encoding="utf-8"))
+            second = json.loads((scores_dir / "chij456.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(result.scores_imported, 2)
+        self.assertEqual(result.files_written, 2)
+        self.assertEqual(result.validation_failures, [])
+        self.assertEqual(first["grade"], "B")
+        self.assertEqual(first["total_score"], 75)
+        self.assertEqual(second["grade"], "A")
+        self.assertEqual(second["total_score"], 86)
+
+    def test_llm_score_bundle_importer_rejects_invalid_json_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bundle_path = tmp_path / "bundle.json"
+            scores_dir = tmp_path / "scores"
+            bundle_path.write_text("{bad json", encoding="utf-8")
+
+            with self.assertRaises(ValueError) as caught:
+                import_score_bundle(bundle_path, scores_dir)
+
+        self.assertIn("Invalid JSON bundle", str(caught.exception))
+        self.assertFalse(scores_dir.exists())
+
+    def test_llm_score_bundle_importer_rejects_score_without_safe_outreach_claims(self) -> None:
+        score = self._manual_score(total_score=75, grade="B")
+        score.pop("safe_outreach_claims")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bundle_path = tmp_path / "bundle.json"
+            scores_dir = tmp_path / "scores"
+            bundle_path.write_text(
+                json.dumps({"batch_id": "batch_001", "scores": [{"score_file": "chij123.json", "score": score}]}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(ValueError) as caught:
+                import_score_bundle(bundle_path, scores_dir)
+
+        self.assertIn("safe_outreach_claims", str(caught.exception))
+        self.assertFalse((scores_dir / "chij123.json").exists())
+
+    def test_llm_score_bundle_importer_rejects_score_file_path_traversal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bundle_path = tmp_path / "bundle.json"
+            scores_dir = tmp_path / "scores"
+            bundle_path.write_text(
+                json.dumps(
+                    {
+                        "batch_id": "batch_001",
+                        "scores": [
+                            {"score_file": "../../bad.json", "score": self._manual_score(total_score=75, grade="B")}
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(ValueError) as caught:
+                import_score_bundle(bundle_path, scores_dir)
+
+        self.assertIn("unsafe score_file", str(caught.exception))
+        self.assertFalse((scores_dir / "bad.json").exists())
 
     def test_manual_score_loader_accepts_new_schema_and_normalizes_mismatched_total(self) -> None:
         raw_score = self._manual_score(total_score=1, grade="Skip")

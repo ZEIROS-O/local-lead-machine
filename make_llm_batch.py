@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, List
+
+from lead_machine.evidence import build_evidence_profile
+from lead_machine.icp import hard_icp_gate
+from lead_machine.llm_queue import safe_slug
+from lead_machine.schema import normalize_lead
+
+
+WEBSITE_TEXT_LIMIT = 12000
+
+MANUAL_SCORE_SCHEMA: Dict[str, Any] = {
+    "subscores": {
+        "icp_fit": 0,
+        "reputation_demand_proof": 0,
+        "web_conversion_pain": 0,
+        "mockup_leverage": 0,
+        "reachability": 0,
+        "offer_angle_clarity": 0,
+        "evidence_confidence": 0,
+    },
+    "total_score": 0,
+    "grade": "A|B|C|Skip",
+    "confidence": "low|medium|high",
+    "hard_disqualifiers": [],
+    "best_angle": "",
+    "recommended_action": "",
+    "why_this_lead": [],
+    "why_this_might_be_wrong": [],
+    "opener": "",
+    "evidence_refs": [],
+    "safe_outreach_claims": [{"claim": "", "evidence_refs": []}],
+    "unsafe_claims": [],
+    "airtable_fields": {},
+}
+
+
+@dataclass(frozen=True)
+class BatchWrite:
+    batch_id: str
+    prompt_path: Path
+    expected_files_path: Path
+    score_files: List[str]
+
+
+def read_jsonl(path: Path) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{path}:{line_number}: invalid JSON: {exc.msg}") from exc
+        if not isinstance(record, dict):
+            raise ValueError(f"{path}:{line_number}: expected a JSON object")
+        records.append(ensure_evidence(record))
+    return records
+
+
+def ensure_evidence(record: Dict[str, Any]) -> Dict[str, Any]:
+    if "evidence" in record:
+        return record
+    updated = dict(record)
+    updated["evidence"] = build_evidence_profile(record)
+    return updated
+
+
+def score_file_for_record(record: Dict[str, Any], *, fallback_vertical: str) -> str:
+    google = record.get("google", {}) or {}
+    lead = normalize_lead(google, fallback_vertical=fallback_vertical, source_batch=google.get("source_query", ""))
+    return f"{safe_slug(lead.place_id_or_unique_key or lead.business_name)}.json"
+
+
+def lead_packet_for_record(record: Dict[str, Any], *, fallback_vertical: str) -> Dict[str, Any]:
+    record = ensure_evidence(record)
+    google = record.get("google", {}) or {}
+    evidence = record.get("evidence", {}) or {}
+    website = record.get("website", {}) or {}
+    lead = normalize_lead(google, fallback_vertical=fallback_vertical, source_batch=google.get("source_query", ""))
+
+    return {
+        "score_file": score_file_for_record(record, fallback_vertical=fallback_vertical),
+        "lead": lead.to_dict(),
+        "screenshots": (evidence.get("screenshots") or website.get("screenshots") or record.get("screenshots") or {}),
+        "evidence": evidence,
+        "website_text": str(website.get("combined_text") or "")[:WEBSITE_TEXT_LIMIT],
+    }
+
+
+def candidate_records(records: Iterable[Dict[str, Any]], *, fallback_vertical: str) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+    for record in records:
+        google = record.get("google", {}) or {}
+        lead = normalize_lead(google, fallback_vertical=fallback_vertical, source_batch=google.get("source_query", ""))
+        if not hard_icp_gate(lead).should_skip:
+            candidates.append(record)
+    return candidates
+
+
+def chunk_records(records: List[Dict[str, Any]], batch_size: int) -> List[List[Dict[str, Any]]]:
+    if batch_size <= 0:
+        raise ValueError("batch_size must be greater than 0")
+    return [records[index : index + batch_size] for index in range(0, len(records), batch_size)]
+
+
+def build_batch_prompt(
+    packets: List[Dict[str, Any]],
+    *,
+    batch_id: str,
+) -> str:
+    response_example = {
+        "batch_id": batch_id,
+        "scores": [
+            {
+                "score_file": packets[0]["score_file"] if packets else "phone-xxxxxxxxxx.json",
+                "score": MANUAL_SCORE_SCHEMA,
+            }
+        ],
+    }
+
+    return f"""# Manual LLM Batch Review - {batch_id}
+
+Use this prompt in Claude or ChatGPT on the web. Attach screenshots when useful.
+
+JSON-only response requirements:
+- Response must be one valid JSON object only.
+- First character must be {{ and last character must be }}.
+- No markdown fences.
+- No commentary.
+- No reasoning outside JSON.
+- No "Thought for X seconds" text.
+- Use one scores item per lead packet.
+- Every score_file must exactly match a score_file listed in lead_packets below.
+- score_file may look like "phone-xxxxxxxxxx.json" when the lead key is phone-derived.
+
+Shared rubric:
+- ICP Fit / 20
+- Reputation + Demand Proof / 15
+- Web Conversion Pain / 25
+- Mockup Leverage / 15
+- Reachability / 10
+- Offer Angle Clarity / 10
+- Evidence Confidence / 5
+
+Rules:
+- Score and confidence are separate.
+- total_score must equal the sum of all subscores.
+- grade rules: A = 80-100, B = 65-79, C = 50-64, Skip = below 50 or hard disqualifier.
+- confidence must be one of low, medium, high.
+- Every scored claim must reference evidence IDs from that lead packet.
+- If there is no evidence for a claim, lower evidence confidence instead of inventing.
+- Missing site plus strong reviews can be an A lead.
+- Hard disqualifier or score below 50 means Skip.
+- safe_outreach_claims must be an array of objects.
+- Each safe_outreach_claims object must have claim as a string and evidence_refs as an array of valid evidence IDs from that lead packet.
+- Every safe_outreach_claims object must have at least one evidence ref.
+- unsafe_claims must be an array of strings.
+- unsafe_claims should list clean-sounding claims that should NOT be used because the packet evidence does not prove them.
+- recommended_action must be operational. Bad: "A lead - pursue." Good: "Build/send a no-site launch mockup focused on an owned homepage with review proof, phone CTA, and estimate request path."
+- opener must be safe to send or lightly edit.
+- opener must mention at least one specific evidence-backed observation.
+- opener must not make fake money claims, guarantee results, or make unsupported competitor claims.
+- opener must not say "you are losing jobs" unless directly proven by packet evidence.
+
+Allowed best_angle values:
+- Website Rebuild
+- Estimate Funnel
+- Website Cleanup
+- Tracking
+- Advanced Optimization
+- No-Site Launch
+- Social/Jobber Escape
+
+Manual score schema for each scores[].score:
+{json.dumps(MANUAL_SCORE_SCHEMA, ensure_ascii=False, indent=2)}
+
+Required response format:
+{json.dumps(response_example, ensure_ascii=False, indent=2)}
+
+lead_packets:
+{json.dumps(packets, ensure_ascii=False, indent=2)}
+"""
+
+
+def write_llm_batches(
+    records: Iterable[Dict[str, Any]],
+    output_dir: Path,
+    *,
+    fallback_vertical: str = "service",
+    batch_size: int = 5,
+    limit: int = 0,
+    only_candidates: bool = False,
+) -> List[BatchWrite]:
+    selected = [ensure_evidence(record) for record in records]
+    if only_candidates:
+        selected = candidate_records(selected, fallback_vertical=fallback_vertical)
+    if limit > 0:
+        selected = selected[:limit]
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    written: List[BatchWrite] = []
+    for batch_index, chunk in enumerate(chunk_records(selected, batch_size), start=1):
+        batch_id = f"batch_{batch_index:03d}"
+        packets = [lead_packet_for_record(record, fallback_vertical=fallback_vertical) for record in chunk]
+        score_files = [packet["score_file"] for packet in packets]
+        prompt_path = output_dir / f"{batch_id}.md"
+        expected_path = output_dir / f"{batch_id}_expected_files.txt"
+        prompt_path.write_text(build_batch_prompt(packets, batch_id=batch_id), encoding="utf-8")
+        expected_path.write_text("\n".join(score_files) + ("\n" if score_files else ""), encoding="utf-8")
+        written.append(
+            BatchWrite(
+                batch_id=batch_id,
+                prompt_path=prompt_path,
+                expected_files_path=expected_path,
+                score_files=score_files,
+            )
+        )
+
+    return written
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", required=True, help="Input enriched JSONL")
+    parser.add_argument("--output-dir", required=True, help="Batch output directory, e.g. review_queue_<batch>/batches")
+    parser.add_argument("--batch-size", type=int, default=5, help="Leads per manual LLM batch")
+    parser.add_argument("--limit", type=int, default=0, help="Optional max lead count after filtering")
+    parser.add_argument("--only-candidates", action="store_true", help="Only include leads that pass the hard ICP gate")
+    parser.add_argument("--vertical", default="service", help="Fallback vertical")
+    args = parser.parse_args()
+
+    input_path = Path(args.input)
+    if not input_path.exists():
+        raise FileNotFoundError(input_path)
+
+    records = read_jsonl(input_path)
+    written = write_llm_batches(
+        records,
+        Path(args.output_dir),
+        fallback_vertical=args.vertical,
+        batch_size=args.batch_size,
+        limit=args.limit,
+        only_candidates=args.only_candidates,
+    )
+
+    print(f"[DONE] Input: {input_path}")
+    print(f"[DONE] Batch dir: {args.output_dir}")
+    print(f"[DONE] Batch files written: {len(written)}")
+    print(f"[DONE] Expected score files: {sum(len(batch.score_files) for batch in written)}")
+    for batch in written[:10]:
+        print(f"[BATCH] {batch.prompt_path}")
+        print(f"[EXPECT] {batch.expected_files_path}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
