@@ -156,7 +156,12 @@ def existing_packet_path(row: Dict[str, str], packet_dir: Path) -> str:
 
 
 def csv_row_to_record(row: Dict[str, str], packet_dir: Path) -> Dict[str, Any]:
+    business_name = clean_cell(row.get("Business Name"))
+    if not business_name:
+        raise ValueError("CSV row missing required Business Name")
+
     fields: Dict[str, Any] = {}
+    defaulted_fields: List[str] = []
     for field in CSV_AIRTABLE_FIELDS:
         value = coerce_airtable_value(field, row.get(field, ""))
         if value != "":
@@ -168,11 +173,16 @@ def csv_row_to_record(row: Dict[str, str], packet_dir: Path) -> Dict[str, Any]:
             fields[field] = value
 
     if is_sendable_record(fields):
-        fields["Status"] = "Mockup Needed"
-        fields["Next Action"] = "Build mockup"
+        if not clean_cell(fields.get("Status")):
+            fields["Status"] = "Mockup Needed"
+            defaulted_fields.append("Status")
+        if not clean_cell(fields.get("Next Action")):
+            fields["Next Action"] = "Build mockup"
+            defaulted_fields.append("Next Action")
 
     if not clean_cell(fields.get("Outreach Channel")):
         fields["Outreach Channel"] = "Google Maps"
+        defaulted_fields.append("Outreach Channel")
 
     packet_path = existing_packet_path(row, packet_dir)
     if packet_path:
@@ -191,9 +201,10 @@ def csv_row_to_record(row: Dict[str, str], packet_dir: Path) -> Dict[str, Any]:
     return {
         "place_id_or_unique_key": place_key,
         "upsert_key": upsert_key,
-        "business_name": clean_cell(row.get("Business Name")),
+        "business_name": business_name,
         "phone": clean_cell(row.get("Phone")),
         "airtable_fields": fields,
+        "defaulted_airtable_fields": defaulted_fields,
     }
 
 
@@ -201,7 +212,7 @@ def read_csv_records(path: Path, *, only_sendable: bool, packet_dir: Path) -> Li
     with path.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         fieldnames = reader.fieldnames or []
-        missing = [field for field in CSV_AIRTABLE_FIELDS if field not in fieldnames]
+        missing = [field for field in ["Business Name"] if field not in fieldnames]
         if missing:
             raise ValueError(f"Input CSV missing required columns: {', '.join(missing)}")
 

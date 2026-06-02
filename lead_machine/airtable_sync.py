@@ -45,17 +45,28 @@ def plan_airtable_sync(
 ) -> List[Dict[str, Any]]:
     existing = existing_records_by_key or {}
     planned: List[Dict[str, Any]] = []
+    seen_input_keys: set[str] = set()
     for card in cards:
         place_key = card_place_key(card)
         upsert_key = card_upsert_key(card)
+        if not upsert_key:
+            raise ValueError("Airtable record missing upsert key")
+        if upsert_key in seen_input_keys:
+            raise ValueError(f"Duplicate Airtable upsert key in input: {upsert_key}")
+        seen_input_keys.add(upsert_key)
         record_id = existing.get(upsert_key) or existing.get(place_key)
+        payload = build_airtable_payload(card)
+        if record_id:
+            fields = payload.get("fields", {})
+            for field in card.get("defaulted_airtable_fields") or []:
+                fields.pop(str(field), None)
         planned.append(
             {
                 "method": "PATCH" if record_id else "POST",
                 "record_id": record_id or "",
                 "place_key": place_key,
                 "upsert_key": upsert_key,
-                "payload": build_airtable_payload(card),
+                "payload": payload,
             }
         )
     return planned

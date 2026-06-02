@@ -68,6 +68,8 @@ def validate_bundle_scores(bundle: Dict[str, Any]) -> List[Tuple[str, Dict[str, 
     scores = bundle.get("scores")
     if not isinstance(scores, list):
         raise ValueError("Bundle must have scores array")
+    if not scores:
+        raise ValueError("scores array must contain at least one score")
 
     failures: List[str] = []
     validated_scores: List[Tuple[str, Dict[str, Any]]] = []

@@ -125,6 +125,78 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(fields["Packet Eligible"], "Yes")
         self.assertEqual(fields["Sendable"], "Yes")
 
+    def test_airtable_csv_dry_run_accepts_sparse_scored_row_and_upserts_by_phone(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "scored.csv"
+            self._write_airtable_csv(
+                csv_path,
+                [
+                    {
+                        "Business Name": "Phone Only Landscaping",
+                        "Phone": "(440) 637-5848",
+                        "Lead Priority": "A",
+                        "Score Total": "86",
+                        "Sendable": "Yes",
+                        "Packet Eligible": "Yes",
+                    }
+                ],
+            )
+
+            code, stdout, stderr = self._run_upload(["upload_airtable.py", "--input", str(csv_path)])
+
+        self.assertEqual(code, 0, stderr)
+        planned = self._dry_run_plan(stdout)
+        self.assertEqual(len(planned), 1)
+        self.assertEqual(planned[0]["method"], "POST")
+        self.assertEqual(planned[0]["upsert_key"], "phone:4406375848")
+        fields = planned[0]["payload"]["fields"]  # type: ignore[index]
+        self.assertEqual(fields["Business Name"], "Phone Only Landscaping")
+        self.assertEqual(fields["Phone"], "(440) 637-5848")
+        self.assertEqual(fields["Lead Priority"], "A")
+        self.assertEqual(fields["Score Total"], 86)
+        self.assertEqual(fields["Sendable"], "Yes")
+        self.assertEqual(fields["Packet Eligible"], "Yes")
+        self.assertNotIn("Recommended Action", fields)
+        self.assertNotIn("Place Key", fields)
+
+    def test_airtable_csv_dry_run_preserves_explicit_sendable_operational_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "scored.csv"
+            self._write_airtable_csv(
+                csv_path,
+                [
+                    self._airtable_csv_row(
+                        **{
+                            "Status": "Contacted",
+                            "Next Action": "Follow up",
+                        }
+                    )
+                ],
+            )
+
+            code, stdout, stderr = self._run_upload(["upload_airtable.py", "--input", str(csv_path)])
+
+        self.assertEqual(code, 0, stderr)
+        planned = self._dry_run_plan(stdout)
+        self.assertEqual(len(planned), 1)
+        fields = planned[0]["payload"]["fields"]  # type: ignore[index]
+        self.assertEqual(fields["Status"], "Contacted")
+        self.assertEqual(fields["Next Action"], "Follow up")
+
+    def test_airtable_patch_does_not_send_defaulted_operational_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "scored.csv"
+            self._write_airtable_csv(csv_path, [self._airtable_csv_row(**{"Outreach Channel": ""})])
+
+            records = upload_airtable.read_input_records(csv_path, only_sendable=False, packet_dir=Path(tmp))
+            planned = plan_airtable_sync(records, existing_records_by_key={"place:ChIJ123": "rec-existing"})
+
+        self.assertEqual(planned[0]["method"], "PATCH")
+        fields = planned[0]["payload"]["fields"]  # type: ignore[index]
+        self.assertNotIn("Status", fields)
+        self.assertNotIn("Next Action", fields)
+        self.assertNotIn("Outreach Channel", fields)
+
     def test_airtable_only_sendable_excludes_non_sendable_csv_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             csv_path = Path(tmp) / "scored.csv"
@@ -170,6 +242,21 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(planned[1]["method"], "PATCH")
         self.assertEqual(planned[1]["record_id"], "rec-phone")
         self.assertEqual(planned[1]["upsert_key"], "phone:4405550101")
+
+    def test_airtable_sync_rejects_duplicate_input_upsert_keys(self) -> None:
+        first = {
+            "upsert_key": "phone:4405550101",
+            "airtable_fields": {"Business Name": "First Patio Co", "Phone": "(440) 555-0101"},
+        }
+        duplicate = {
+            "upsert_key": "phone:4405550101",
+            "airtable_fields": {"Business Name": "Duplicate Patio Co", "Phone": "(440) 555-0101"},
+        }
+
+        with self.assertRaises(ValueError) as caught:
+            plan_airtable_sync([first, duplicate], existing_records_by_key={})
+
+        self.assertIn("Duplicate Airtable upsert key in input: phone:4405550101", str(caught.exception))
 
     def test_airtable_live_mode_requires_env_vars_before_network(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -560,6 +647,19 @@ class LeadMachineContractsTest(unittest.TestCase):
                 import_score_bundle(bundle_path, scores_dir)
 
         self.assertIn("Invalid JSON bundle", str(caught.exception))
+        self.assertFalse(scores_dir.exists())
+
+    def test_llm_score_bundle_importer_rejects_empty_scores_array(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bundle_path = tmp_path / "bundle.json"
+            scores_dir = tmp_path / "scores"
+            bundle_path.write_text(json.dumps({"batch_id": "batch_001", "scores": []}), encoding="utf-8")
+
+            with self.assertRaises(ValueError) as caught:
+                import_score_bundle(bundle_path, scores_dir)
+
+        self.assertIn("scores array must contain at least one score", str(caught.exception))
         self.assertFalse(scores_dir.exists())
 
     def test_llm_score_bundle_importer_rejects_score_without_safe_outreach_claims(self) -> None:
