@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$#" -lt 1 ]; then
+  echo "Usage: ./dedupe_batch <batch_name>"
+  echo "Example: ./dedupe_batch hardscaping_round2"
+  exit 1
+fi
+
+BATCH="$1"
+
+RAW="output/raw_places_${BATCH}.csv"
+CLEAN="output/raw_places_${BATCH}_clean.csv"
+BACKUP="output/raw_places_${BATCH}_before_dedupe.csv"
+
+if [ ! -f "$RAW" ]; then
+  echo "[ERROR] Missing raw file: $RAW"
+  exit 1
+fi
+
+mapfile -t EXCLUDES < <(
+  find output -maxdepth 1 -type f -name 'raw_places*.csv' \
+    ! -name "raw_places_${BATCH}.csv" \
+    ! -name "raw_places_${BATCH}_clean.csv" \
+    ! -name "raw_places_${BATCH}_before_dedupe.csv" \
+    ! -name '*_clean.csv' \
+    ! -name '*before_dedupe.csv' \
+    | sort
+)
+
+echo "[INFO] Batch: $BATCH"
+echo "[INFO] Raw: $RAW"
+echo "[INFO] Clean: $CLEAN"
+echo "[INFO] Backup: $BACKUP"
+echo "[INFO] Excluding against:"
+printf '  %s\n' "${EXCLUDES[@]}"
+
+python dedupe_places.py \
+  --input "$RAW" \
+  --exclude "${EXCLUDES[@]}" \
+  --output "$CLEAN"
+
+cp "$RAW" "$BACKUP"
+cp "$CLEAN" "$RAW"
+
+echo "[DONE] Replaced $RAW with deduped clean file."

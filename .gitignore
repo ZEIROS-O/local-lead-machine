@@ -1,0 +1,50 @@
+# Secrets / local config
+.env
+.env.*
+!.env.example
+
+# Python / virtualenv
+.venv/
+venv/
+__pycache__/
+*/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Generated pipeline outputs
+output/
+cards_*/
+review_queue_*/
+reports/
+tmp/
+temp/
+*.log
+
+# Screenshots / generated artifacts
+screenshots/
+artifacts/
+packets/
+lead_packets/
+packets_*/
+
+# Local lead/prospect data dumps
+data/
+*.csv
+*.jsonl
+*.xlsx
+*.sqlite
+*.db
+
+# Keep intentional test fixtures
+!tests/fixtures/
+!tests/fixtures/**
+!.gitkeep

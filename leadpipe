@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -e
+
+cd ~/local-lead-machine
+source .venv/bin/activate
+
+python run_pipeline.py "$@"

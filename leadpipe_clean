@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BATCH=""
+
+args=("$@")
+for ((i=0; i<${#args[@]}; i++)); do
+  if [[ "${args[$i]}" == "--batch" ]]; then
+    BATCH="${args[$((i+1))]}"
+  fi
+done
+
+if [[ -z "$BATCH" ]]; then
+  echo "Usage: ./leadpipe_clean --batch <batch_name> --vertical <vertical>"
+  echo "Example: ./leadpipe_clean --batch hardscaping_round3 --vertical hardscaping"
+  exit 1
+fi
+
+./leadpipe "$@" --skip-enrich --skip-score --skip-packets
+./dedupe_batch "$BATCH"
+
+rm -rf "packets_${BATCH}"
+rm -f "output/enriched_${BATCH}.jsonl"
+rm -f "output/scored_${BATCH}.csv"
+
+./leadpipe "$@" --skip-search
