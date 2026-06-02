@@ -18,7 +18,7 @@ from lead_machine.llm_queue import build_llm_prompt, write_review_queue
 from lead_machine.manual_scores import load_manual_score, merge_manual_score
 from lead_machine.schema import normalize_lead, row_dedupe_keys
 from lead_machine.sendability import flatten_safe_outreach_claims, normalize_evidence_refs
-from make_packets import is_eligible
+from make_packets import is_eligible, packet_markdown
 from score_leads import main as score_leads_main
 from score_leads import score_record, score_records_manual, write_csv
 
@@ -338,6 +338,20 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(csv_row["Confidence"], "medium")
         self.assertEqual(csv_row["Sendable"], "Yes")
         self.assertEqual(csv_row["Minimum Evidence Passed"], "Yes")
+
+    def test_manual_scored_packet_omits_legacy_review_prompt(self) -> None:
+        row = merge_manual_score(
+            {"google": self._google_fixture(), "evidence": self._evidence_fixture(site_status="weak")},
+            self._manual_score(),
+            fallback_vertical="hardscaping",
+        )
+
+        packet = packet_markdown(row)
+
+        self.assertIn("## Extracted Evidence", packet)
+        self.assertIn("## Suggested Opener", packet)
+        self.assertIn("## Core TSV Draft", packet)
+        self.assertNotIn("ChatGPT/Claude Review Prompt", packet)
 
     def test_manual_llm_strict_mode_raises_when_any_score_missing(self) -> None:
         enriched = {

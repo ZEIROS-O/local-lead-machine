@@ -82,6 +82,34 @@ EXTRA_FIELDS = [
     "Sendability Blockers",
 ]
 
+REVIEW_PROMPT_SUPPRESSING_FIELDS = [
+    "Score ICP Fit",
+    "Score Reputation",
+    "Score Web Pain",
+    "Score Mockup Leverage",
+    "Score Reachability",
+    "Score Offer Clarity",
+    "Score Evidence Confidence",
+    "Recommended Action",
+    "Why This Lead",
+    "Why This Might Be Wrong",
+    "Evidence Refs",
+    "Safe Outreach Claims",
+    "Unsafe Claims",
+    "total_score",
+    "grade",
+    "best_angle",
+    "confidence",
+    "Total Score",
+    "Grade",
+    "Best Angle",
+    "Confidence",
+    "Sendable",
+    "Minimum Evidence Passed",
+    "Send Blockers",
+    "Sendability Blockers",
+]
+
 
 def raise_csv_limit() -> None:
     try:
@@ -173,6 +201,15 @@ def field_table(row: Dict[str, str], fields: List[str]) -> str:
         lines.append(f"| {field} | {value} |")
 
     return "\n".join(lines)
+
+
+def field_populated(value: Any) -> bool:
+    cleaned = str(value or "").strip()
+    return cleaned not in {"", "[]", "{}", "null", "None"}
+
+
+def should_include_review_prompt(row: Dict[str, str]) -> bool:
+    return not any(field_populated(row.get(field, "")) for field in REVIEW_PROMPT_SUPPRESSING_FIELDS)
 
 
 def evidence_summary(row: Dict[str, str], evidence: Dict[str, Any]) -> str:
@@ -402,8 +439,9 @@ def packet_markdown(row: Dict[str, str]) -> str:
     lines.append("```")
     lines.append("")
     lines.append(evidence_summary(row, evidence))
-    lines.append("")
-    lines.append(review_prompt(row))
+    if should_include_review_prompt(row):
+        lines.append("")
+        lines.append(review_prompt(row))
 
     return "\n".join(lines)
 
