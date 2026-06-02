@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import csv
+import io
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 from lead_machine.airtable_sync import build_airtable_payload, plan_airtable_sync
 from lead_machine.evidence import build_evidence_profile
@@ -16,6 +19,7 @@ from lead_machine.manual_scores import load_manual_score, merge_manual_score
 from lead_machine.schema import normalize_lead, row_dedupe_keys
 from lead_machine.sendability import flatten_safe_outreach_claims, normalize_evidence_refs
 from make_packets import is_eligible
+from score_leads import main as score_leads_main
 from score_leads import score_record, score_records_manual, write_csv
 
 
@@ -334,6 +338,103 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(csv_row["Confidence"], "medium")
         self.assertEqual(csv_row["Sendable"], "Yes")
         self.assertEqual(csv_row["Minimum Evidence Passed"], "Yes")
+
+    def test_manual_llm_strict_mode_raises_when_any_score_missing(self) -> None:
+        enriched = {
+            "google": self._google_fixture(),
+            "evidence": self._evidence_fixture(site_status="weak"),
+        }
+        missing_score = {
+            "google": {
+                **self._google_fixture(),
+                "business_name": "Missing Score Landscaping",
+                "place_id": "ChIJ999",
+            },
+            "evidence": self._evidence_fixture(site_status="weak"),
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            scores_dir = tmp_path / "scores"
+            scores_dir.mkdir()
+            (scores_dir / "chij123.json").write_text(json.dumps(self._manual_score()), encoding="utf-8")
+
+            with self.assertRaises(FileNotFoundError) as caught:
+                score_records_manual(
+                    [enriched, missing_score],
+                    scores_dir=scores_dir,
+                    fallback_vertical="hardscaping",
+                )
+
+        self.assertIn("Missing Score Landscaping", str(caught.exception))
+        self.assertIn("chij999.json", str(caught.exception))
+
+    def test_manual_llm_only_scored_writes_outputs_for_available_scores(self) -> None:
+        raw_score = self._manual_score()
+        enriched = {
+            "google": self._google_fixture(),
+            "evidence": self._evidence_fixture(site_status="weak"),
+        }
+        missing_score = {
+            "google": {
+                **self._google_fixture(),
+                "business_name": "Missing Score Landscaping",
+                "place_id": "ChIJ999",
+            },
+            "evidence": self._evidence_fixture(site_status="weak"),
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            scores_dir = tmp_path / "scores"
+            scores_dir.mkdir()
+            (scores_dir / "chij123.json").write_text(json.dumps(raw_score), encoding="utf-8")
+            input_path = tmp_path / "enriched.jsonl"
+            input_path.write_text(
+                f"{json.dumps(enriched)}\n{json.dumps(missing_score)}\n",
+                encoding="utf-8",
+            )
+            output_path = tmp_path / "scored.csv"
+            cards_path = tmp_path / "cards.jsonl"
+            stdout = io.StringIO()
+
+            argv = [
+                "score_leads.py",
+                "--input",
+                str(input_path),
+                "--output",
+                str(output_path),
+                "--vertical",
+                "hardscaping",
+                "--mode",
+                "manual-llm",
+                "--scores-dir",
+                str(scores_dir),
+                "--cards-output",
+                str(cards_path),
+                "--only-scored",
+            ]
+            with patch("sys.argv", argv), redirect_stdout(stdout):
+                score_leads_main()
+
+            with output_path.open(newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+            cards = [json.loads(line) for line in cards_path.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["Business Name"], "A+ Landscaping LLC")
+        self.assertIn("Sendable", rows[0])
+        self.assertIn("Minimum Evidence Passed", rows[0])
+        self.assertEqual(rows[0]["Sendable"], "Yes")
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(cards[0]["business_name"], "A+ Landscaping LLC")
+        self.assertNotIn("Missing Score Landscaping", [row["Business Name"] for row in rows])
+        summary = stdout.getvalue()
+        self.assertIn("[MANUAL] Scored records processed: 1", summary)
+        self.assertIn("[MANUAL] Missing scores skipped: 1", summary)
+        self.assertIn("Missing Score Landscaping", summary)
+        self.assertIn(str(scores_dir / "chij999.json"), summary)
+        self.assertIn(str(scores_dir / "missing-score-landscaping.json"), summary)
 
     def test_airtable_payload_and_feedback_metrics(self) -> None:
         card = {

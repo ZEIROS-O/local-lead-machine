@@ -22,6 +22,7 @@ import argparse
 import csv
 import json
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -125,6 +126,18 @@ HIGH_TICKET_TERMS = [
 
 BAD_REVIEW_THRESHOLD = 4.3
 IDEAL_RATING_THRESHOLD = 4.5
+
+
+@dataclass(frozen=True)
+class MissingManualScore:
+    lead_name: str
+    expected_paths: List[Path]
+
+
+@dataclass(frozen=True)
+class ManualScoreRun:
+    rows: List[Dict[str, Any]]
+    missing_scores: List[MissingManualScore]
 
 
 def safe_float(value: Any, default: float = 0.0) -> float:
@@ -896,21 +909,56 @@ def evidence_ids(record: Dict[str, Any]) -> set[str]:
     return {str(item.get("id")) for item in evidence.get("evidence_items", []) if item.get("id")}
 
 
-def manual_score_path(record: Dict[str, Any], scores_dir: Path, fallback_vertical: str) -> Path:
+def manual_score_candidates(record: Dict[str, Any], scores_dir: Path, fallback_vertical: str) -> Tuple[str, List[Path]]:
     google = record.get("google", {}) or {}
     lead = normalize_lead(google, fallback_vertical=fallback_vertical, source_batch=google.get("source_query", ""))
-    candidates = [
-        safe_slug(lead.place_id_or_unique_key),
-        safe_slug(lead.business_name),
-    ]
-    for candidate in candidates:
-        path = scores_dir / f"{candidate}.json"
+    candidates: List[str] = []
+    for candidate in [safe_slug(lead.place_id_or_unique_key), safe_slug(lead.business_name)]:
+        if candidate not in candidates:
+            candidates.append(candidate)
+
+    lead_name = lead.business_name or lead.place_id_or_unique_key or "lead"
+    return lead_name, [scores_dir / f"{candidate}.json" for candidate in candidates]
+
+
+def missing_manual_score_message(lead_name: str, expected_paths: List[Path]) -> str:
+    return (
+        f"Missing manual score JSON for {lead_name}. "
+        f"Expected one of: {', '.join(str(path) for path in expected_paths)}"
+    )
+
+
+def manual_score_path(record: Dict[str, Any], scores_dir: Path, fallback_vertical: str) -> Path:
+    lead_name, expected_paths = manual_score_candidates(record, scores_dir, fallback_vertical)
+    for path in expected_paths:
         if path.exists():
             return path
-    raise FileNotFoundError(
-        f"Missing manual score JSON for {lead.business_name or lead.place_id_or_unique_key}. "
-        f"Expected one of: {', '.join(str(scores_dir / (candidate + '.json')) for candidate in candidates)}"
-    )
+    raise FileNotFoundError(missing_manual_score_message(lead_name, expected_paths))
+
+
+def score_records_manual_run(
+    records: List[Dict[str, Any]],
+    *,
+    scores_dir: Path,
+    fallback_vertical: str,
+    only_scored: bool = False,
+) -> ManualScoreRun:
+    scored: List[Dict[str, Any]] = []
+    missing_scores: List[MissingManualScore] = []
+    for record in records:
+        record = ensure_evidence(record)
+        lead_name, expected_paths = manual_score_candidates(record, scores_dir, fallback_vertical)
+        score_path = next((path for path in expected_paths if path.exists()), None)
+        if score_path is None:
+            if only_scored:
+                missing_scores.append(MissingManualScore(lead_name=lead_name, expected_paths=expected_paths))
+                continue
+            raise FileNotFoundError(missing_manual_score_message(lead_name, expected_paths))
+
+        score = load_manual_score(score_path, allowed_evidence_ids=evidence_ids(record))
+        scored.append(merge_manual_score(record, score, fallback_vertical=fallback_vertical))
+
+    return ManualScoreRun(rows=scored, missing_scores=missing_scores)
 
 
 def score_records_manual(
@@ -918,14 +966,33 @@ def score_records_manual(
     *,
     scores_dir: Path,
     fallback_vertical: str,
+    only_scored: bool = False,
 ) -> List[Dict[str, Any]]:
-    scored: List[Dict[str, Any]] = []
-    for record in records:
-        record = ensure_evidence(record)
-        score_path = manual_score_path(record, scores_dir, fallback_vertical)
-        score = load_manual_score(score_path, allowed_evidence_ids=evidence_ids(record))
-        scored.append(merge_manual_score(record, score, fallback_vertical=fallback_vertical))
-    return scored
+    return score_records_manual_run(
+        records,
+        scores_dir=scores_dir,
+        fallback_vertical=fallback_vertical,
+        only_scored=only_scored,
+    ).rows
+
+
+def print_manual_only_scored_summary(run: ManualScoreRun) -> None:
+    print(f"[MANUAL] Scored records processed: {len(run.rows)}")
+    print(f"[MANUAL] Missing scores skipped: {len(run.missing_scores)}")
+
+    if not run.missing_scores:
+        print("[MANUAL] Skipped lead names: none")
+        print("[MANUAL] Expected score paths: none")
+        return
+
+    print("[MANUAL] Skipped lead names:")
+    for missing in run.missing_scores:
+        print(f"[MANUAL] - {missing.lead_name}")
+
+    print("[MANUAL] Expected score paths:")
+    for missing in run.missing_scores:
+        paths = ", ".join(str(path) for path in missing.expected_paths)
+        print(f"[MANUAL] - {missing.lead_name}: {paths}")
 
 
 def sort_key(row: Dict[str, Any]) -> Tuple[int, int, int, int, int]:
@@ -949,6 +1016,11 @@ def main() -> int:
     parser.add_argument("--mode", choices=["deterministic", "manual-llm"], default="deterministic")
     parser.add_argument("--scores-dir", default="", help="Manual LLM score JSON directory")
     parser.add_argument("--cards-output", default="", help="Optional lead cards JSONL output")
+    parser.add_argument(
+        "--only-scored",
+        action="store_true",
+        help="Manual LLM mode: skip enriched records without a matching score JSON",
+    )
     parser.add_argument("--limit", type=int, default=0, help="Optional max records to score")
     args = parser.parse_args()
 
@@ -965,7 +1037,15 @@ def main() -> int:
     if args.mode == "manual-llm":
         if not args.scores_dir:
             raise SystemExit("--scores-dir is required when --mode manual-llm")
-        scored = score_records_manual(records, scores_dir=Path(args.scores_dir), fallback_vertical=args.vertical)
+        manual_run = score_records_manual_run(
+            records,
+            scores_dir=Path(args.scores_dir),
+            fallback_vertical=args.vertical,
+            only_scored=args.only_scored,
+        )
+        scored = manual_run.rows
+        if args.only_scored:
+            print_manual_only_scored_summary(manual_run)
     else:
         scored = [score_record(record, args.vertical) for record in records]
 
