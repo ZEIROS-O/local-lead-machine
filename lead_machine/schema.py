@@ -20,6 +20,18 @@ GENERIC_DOMAINS = {
     "sites.google.com",
 }
 
+GENERIC_VERTICALS = {
+    "",
+    "service",
+    "services",
+    "service business",
+    "home service",
+    "home services",
+    "contractor",
+    "general contractor",
+    "general_contractor",
+}
+
 
 @dataclass(frozen=True)
 class CanonicalLead:
@@ -51,6 +63,60 @@ def pick(row: Dict[str, Any], *keys: str) -> str:
         if value not in (None, ""):
             return clean(value)
     return ""
+
+
+def infer_vertical(row: Dict[str, Any]) -> str:
+    parts = [
+        pick(row, "business_name", "Business Name", "name"),
+        pick(row, "category", "Category", "Google category"),
+        pick(row, "source_query", "Source Query"),
+    ]
+    blob = " ".join(parts).lower().replace("_", " ")
+
+    if "roof" in blob:
+        return "roofing"
+    if any(
+        term in blob
+        for term in (
+            "hardscape",
+            "hardscaping",
+            "paver",
+            "patio",
+            "retaining wall",
+            "outdoor living",
+            "masonry",
+            "brick",
+            "concrete",
+            "landscape",
+            "landscaper",
+            "landscaping",
+        )
+    ):
+        return "hardscaping"
+    if any(term in blob for term in ("tree service", "arborist")):
+        return "tree service"
+    if "hvac" in blob or "heating" in blob or "air conditioning" in blob:
+        return "hvac"
+    if "plumb" in blob:
+        return "plumbing"
+    if "electric" in blob:
+        return "electrical"
+
+    return ""
+
+
+def resolve_vertical(row: Dict[str, Any], fallback_vertical: str = "service") -> str:
+    row_vertical = pick(row, "vertical", "Vertical")
+    fallback = clean(fallback_vertical)
+    inferred = infer_vertical(row)
+
+    if row_vertical and row_vertical.lower() not in GENERIC_VERTICALS:
+        return row_vertical
+    if fallback and fallback.lower() not in GENERIC_VERTICALS:
+        return fallback
+    if inferred:
+        return inferred
+    return row_vertical or fallback or "service"
 
 
 def safe_float(value: Any) -> Optional[float]:
@@ -103,7 +169,7 @@ def normalize_lead(
     source_batch: str = "",
 ) -> CanonicalLead:
     business_name = pick(row, "business_name", "Business Name", "name")
-    vertical = pick(row, "vertical", "Vertical") or clean(fallback_vertical)
+    vertical = resolve_vertical(row, fallback_vertical=fallback_vertical)
     address = pick(row, "address", "Address")
     city = pick(row, "city", "City")
     phone = pick(row, "phone", "Phone")
@@ -177,4 +243,3 @@ def row_dedupe_keys(lead: CanonicalLead) -> List[str]:
         keys.append(f"name_city:{name}:{city}")
 
     return keys
-
