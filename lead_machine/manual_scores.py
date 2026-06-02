@@ -176,6 +176,19 @@ def merge_manual_score(
         "Packet Eligibility Reason": "Manual grade A/B" if packet_eligible else "Manual grade below B threshold",
     }
     row.update(validated.get("airtable_fields") or {})
+    row.update(
+        {
+            # Keep the manual-LLM schema fields next to the existing Airtable/reporting aliases.
+            "total_score": validated["total_score"],
+            "grade": validated["grade"],
+            "best_angle": validated.get("best_angle", ""),
+            "confidence": validated["confidence"],
+            "Total Score": validated["total_score"],
+            "Grade": validated["grade"],
+            "Best Angle": validated.get("best_angle", ""),
+            "Confidence": validated["confidence"],
+        }
+    )
     return apply_sendability(row)
 
 

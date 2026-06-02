@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import tempfile
 import unittest
@@ -15,7 +16,7 @@ from lead_machine.manual_scores import load_manual_score, merge_manual_score
 from lead_machine.schema import normalize_lead, row_dedupe_keys
 from lead_machine.sendability import flatten_safe_outreach_claims, normalize_evidence_refs
 from make_packets import is_eligible
-from score_leads import score_record
+from score_leads import score_record, score_records_manual, write_csv
 
 
 class LeadMachineContractsTest(unittest.TestCase):
@@ -292,6 +293,47 @@ class LeadMachineContractsTest(unittest.TestCase):
 
         self.assertEqual(validated["total_score"], 75)
         self.assertEqual(validated["grade"], "B")
+
+    def test_manual_llm_csv_outputs_user_facing_score_columns(self) -> None:
+        raw_score = self._manual_score(
+            subscores={
+                "icp_fit": 18,
+                "reputation_demand_proof": 14,
+                "web_conversion_pain": 22,
+                "mockup_leverage": 12,
+                "reachability": 8,
+                "offer_angle_clarity": 8,
+                "evidence_confidence": 4,
+            },
+            total_score=86,
+            grade="A",
+            best_angle="No-Site Launch",
+            confidence="medium",
+        )
+        enriched = {
+            "google": self._google_fixture(),
+            "evidence": self._evidence_fixture(site_status="weak"),
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            scores_dir = tmp_path / "scores"
+            scores_dir.mkdir()
+            (scores_dir / "chij123.json").write_text(json.dumps(raw_score), encoding="utf-8")
+            output_path = tmp_path / "scored.csv"
+
+            rows = score_records_manual([enriched], scores_dir=scores_dir, fallback_vertical="hardscaping")
+            write_csv(output_path, rows)
+
+            with output_path.open(newline="", encoding="utf-8") as f:
+                [csv_row] = list(csv.DictReader(f))
+
+        self.assertEqual(csv_row["Total Score"], "86")
+        self.assertEqual(csv_row["Grade"], "A")
+        self.assertEqual(csv_row["Best Angle"], "No-Site Launch")
+        self.assertEqual(csv_row["Confidence"], "medium")
+        self.assertEqual(csv_row["Sendable"], "Yes")
+        self.assertEqual(csv_row["Minimum Evidence Passed"], "Yes")
 
     def test_airtable_payload_and_feedback_metrics(self) -> None:
         card = {
