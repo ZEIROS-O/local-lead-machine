@@ -6,7 +6,7 @@ import json
 import os
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -25,6 +25,17 @@ from make_llm_batch import write_llm_batches
 from import_llm_score_bundle import import_score_bundle
 from score_leads import main as score_leads_main
 from score_leads import score_record, score_records_manual, write_csv
+
+
+AIRTABLE_ENV_VARS = (
+    "AIRTABLE_API_KEY",
+    "AIRTABLE_TOKEN",
+    "AIRTABLE_PAT",
+    "AIRTABLE_BASE_ID",
+    "AIRTABLE_TABLE_NAME",
+    "AIRTABLE_TABLE",
+    "AIRTABLE_PROSPECTS_TABLE",
+)
 
 
 class LeadMachineContractsTest(unittest.TestCase):
@@ -83,6 +94,13 @@ class LeadMachineContractsTest(unittest.TestCase):
         lines = stdout.splitlines()
         self.assertTrue(lines and lines[0].startswith("[DRY-RUN]"))
         return json.loads("\n".join(lines[1:]))
+
+    @contextmanager
+    def _without_airtable_env(self):
+        with patch.dict(os.environ, {}, clear=False), patch("upload_airtable.load_dotenv", return_value=False):
+            for key in AIRTABLE_ENV_VARS:
+                os.environ.pop(key, None)
+            yield
 
     def test_airtable_csv_dry_run_builds_payload_for_sendable_row_without_network(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -158,14 +176,45 @@ class LeadMachineContractsTest(unittest.TestCase):
             csv_path = Path(tmp) / "scored.csv"
             self._write_airtable_csv(csv_path, [self._airtable_csv_row()])
 
-            with patch.dict(os.environ, {}, clear=True), patch("upload_airtable.requests.get") as get:
+            with (
+                self._without_airtable_env(),
+                patch("upload_airtable.requests.get") as get,
+                patch("upload_airtable.requests.post") as post,
+                patch("upload_airtable.requests.patch") as patch_request,
+                patch("upload_airtable.validate_airtable_fields") as validate_fields,
+            ):
                 code, _stdout, stderr = self._run_upload(["upload_airtable.py", "--input", str(csv_path), "--live"])
 
         self.assertEqual(code, 1)
         get.assert_not_called()
+        post.assert_not_called()
+        patch_request.assert_not_called()
+        validate_fields.assert_not_called()
         self.assertIn("AIRTABLE_BASE_ID", stderr)
         self.assertIn("AIRTABLE_PROSPECTS_TABLE", stderr)
         self.assertIn("AIRTABLE_PAT", stderr)
+
+    def test_airtable_dry_run_does_not_require_env_vars_or_network(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "scored.csv"
+            self._write_airtable_csv(csv_path, [self._airtable_csv_row()])
+
+            with (
+                self._without_airtable_env(),
+                patch("upload_airtable.requests.get") as get,
+                patch("upload_airtable.requests.post") as post,
+                patch("upload_airtable.requests.patch") as patch_request,
+                patch("upload_airtable.validate_airtable_fields") as validate_fields,
+            ):
+                code, stdout, stderr = self._run_upload(["upload_airtable.py", "--input", str(csv_path)])
+
+        self.assertEqual(code, 0, stderr)
+        get.assert_not_called()
+        post.assert_not_called()
+        patch_request.assert_not_called()
+        validate_fields.assert_not_called()
+        planned = self._dry_run_plan(stdout)
+        self.assertEqual(len(planned), 1)
 
     def test_normalizes_google_places_row_and_dedupe_keys_in_precedence_order(self) -> None:
         row = {
