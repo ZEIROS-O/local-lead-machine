@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import io
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -216,7 +218,7 @@ class SearchWorkflowTest(unittest.TestCase):
 
             with patch("make_search_batch.text_search", return_value=text_results), patch(
                 "make_search_batch.place_details", side_effect=lambda api_key, place_id: details[place_id]
-            ), patch("make_search_batch.enrich_row", side_effect=fake_enrich):
+            ), patch("make_search_batch.enrich_row", side_effect=fake_enrich), redirect_stdout(io.StringIO()):
                 result = make_search_batch.run_search_batch(
                     config_path=config_path,
                     batch="test_hardscaping_001",
@@ -225,22 +227,163 @@ class SearchWorkflowTest(unittest.TestCase):
                     no_screenshots=True,
                 )
 
-            self.assertEqual(result.raw_count, 8)
+            self.assertEqual(result.raw_count, 2)
             self.assertEqual(result.deduped_count, 1)
             self.assertEqual(result.icp_pass_count, 1)
             self.assertEqual(result.enriched_count, 1)
+            self.assertEqual(result.duplicate_reason_counts["duplicate_place_id_early"], 6)
             self.assertTrue(result.raw_path.exists())
             self.assertTrue(result.deduped_path.exists())
             self.assertTrue(result.enriched_path.exists())
+            self.assertTrue(result.report_path.exists())
+
+    def test_runner_skips_early_duplicate_place_ids_before_details(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "search_configs/test_hardscaping_001.json"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(json.dumps(_config(queries=["hardscaping Cleveland OH"], geo_slices=["Cleveland OH"]).to_dict()), encoding="utf-8")
+
+            text_results = [{"id": "same-place"}, {"id": "same-place"}]
+            details = {
+                "id": "same-place",
+                "displayName": {"text": "Patio Pros"},
+                "formattedAddress": "123 Main St, Cleveland, OH 44101, USA",
+                "nationalPhoneNumber": "(216) 555-0100",
+                "websiteUri": "https://patiopros.example",
+                "googleMapsUri": "https://maps.google.com/?cid=1",
+                "rating": 4.8,
+                "userRatingCount": 28,
+                "primaryType": "landscaper",
+            }
+
+            def fake_enrich(row, screenshots_dir, take_shots):
+                return {"google": row, "website": {"site_status": "No Website"}, "derived": {}, "screenshots": {}}
+
+            with patch("make_search_batch.text_search", return_value=text_results), patch(
+                "make_search_batch.place_details", return_value=details
+            ) as details_call, patch("make_search_batch.enrich_row", side_effect=fake_enrich), redirect_stdout(io.StringIO()):
+                result = make_search_batch.run_search_batch(
+                    config_path=config_path,
+                    batch="test_hardscaping_001",
+                    root=root,
+                    api_key="test-key",
+                    no_screenshots=True,
+                    sleep_seconds=0,
+                )
+
+            self.assertEqual(details_call.call_count, 1)
+            self.assertEqual(result.raw_count, 1)
+            self.assertEqual(result.deduped_count, 1)
+            self.assertEqual(result.duplicate_reason_counts["duplicate_place_id_early"], 1)
+
+    def test_runner_applies_max_search_detail_and_enrich_caps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "search_configs/test_hardscaping_001.json"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(json.dumps(_config().to_dict()), encoding="utf-8")
+
+            def fake_text_search(api_key, search_text, max_results):
+                return [{"id": f"{search_text}-1"}, {"id": f"{search_text}-2"}]
+
+            def fake_details(api_key, place_id):
+                suffix = sum(ord(char) for char in place_id) % 10000
+                return {
+                    "id": place_id,
+                    "displayName": {"text": f"Patio Pros {suffix}"},
+                    "formattedAddress": f"{suffix} Main St, Cleveland, OH 44101, USA",
+                    "nationalPhoneNumber": f"(216) 555-{suffix:04d}",
+                    "websiteUri": f"https://patiopros{suffix}.example",
+                    "googleMapsUri": f"https://maps.google.com/?cid={suffix}",
+                    "rating": 4.8,
+                    "userRatingCount": 28,
+                    "primaryType": "patio contractor",
+                }
+
+            def fake_enrich(row, screenshots_dir, take_shots):
+                return {"google": row, "website": {"site_status": "No Website"}, "derived": {}, "screenshots": {}}
+
+            with patch("make_search_batch.text_search", side_effect=fake_text_search) as search_call, patch(
+                "make_search_batch.place_details", side_effect=fake_details
+            ) as details_call, patch("make_search_batch.enrich_row", side_effect=fake_enrich) as enrich_call, redirect_stdout(io.StringIO()):
+                result = make_search_batch.run_search_batch(
+                    config_path=config_path,
+                    batch="test_hardscaping_001",
+                    root=root,
+                    api_key="test-key",
+                    no_screenshots=True,
+                    sleep_seconds=0,
+                    max_searches=2,
+                    max_details=3,
+                    max_enrich=1,
+                )
+
+            self.assertEqual(search_call.call_count, 2)
+            self.assertEqual(details_call.call_count, 3)
+            self.assertEqual(enrich_call.call_count, 1)
+            self.assertEqual(len(result.queries_run), 2)
+            self.assertEqual(result.raw_count, 3)
+            self.assertEqual(result.icp_pass_count, 3)
+            self.assertEqual(result.enriched_count, 1)
+
+    def test_progress_logging_run_still_writes_report(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "search_configs/test_hardscaping_001.json"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(json.dumps(_config(queries=["hardscaping Cleveland OH"], geo_slices=["Cleveland OH"]).to_dict()), encoding="utf-8")
+
+            text_results = [{"id": "place-1"}]
+            details = {
+                "id": "place-1",
+                "displayName": {"text": "Patio Pros"},
+                "formattedAddress": "123 Main St, Cleveland, OH 44101, USA",
+                "nationalPhoneNumber": "(216) 555-0100",
+                "websiteUri": "https://patiopros.example",
+                "googleMapsUri": "https://maps.google.com/?cid=1",
+                "rating": 4.8,
+                "userRatingCount": 28,
+                "primaryType": "patio contractor",
+            }
+
+            def fake_enrich(row, screenshots_dir, take_shots):
+                return {"google": row, "website": {"site_status": "No Website"}, "derived": {}, "screenshots": {}}
+
+            progress = io.StringIO()
+            with patch("make_search_batch.text_search", return_value=text_results), patch(
+                "make_search_batch.place_details", return_value=details
+            ), patch("make_search_batch.enrich_row", side_effect=fake_enrich), redirect_stdout(progress):
+                result = make_search_batch.run_search_batch(
+                    config_path=config_path,
+                    batch="test_hardscaping_001",
+                    root=root,
+                    api_key="test-key",
+                    no_screenshots=True,
+                    sleep_seconds=0,
+                )
+
+            output = progress.getvalue()
+            self.assertIn("Total query×geo searches: 1", output)
+            self.assertIn("[SEARCH 1/1] hardscaping Cleveland OH", output)
+            self.assertIn("Raw count: 1", output)
+            self.assertIn("Report:", output)
+            self.assertIn("Next command: make batch BATCH=test_hardscaping_001 BATCH_SIZE=5 LIMIT=10", output)
             self.assertTrue(result.report_path.exists())
 
     def test_makefile_has_search_targets_and_preserves_manual_batch_default(self) -> None:
         makefile = Path("Makefile").read_text(encoding="utf-8")
 
         self.assertIn("BATCH ?= manual_existing", makefile)
+        self.assertIn("MAX_SEARCHES ?=", makefile)
+        self.assertIn("MAX_DETAILS ?=", makefile)
+        self.assertIn("MAX_ENRICH ?=", makefile)
         self.assertRegex(makefile, r"(?m)^search:")
         self.assertRegex(makefile, r"(?m)^search-summary:")
         self.assertRegex(makefile, r"(?m)^full-from-search:")
+        self.assertIn("$(if $(MAX_SEARCHES),--max-searches $(MAX_SEARCHES),)", makefile)
+        self.assertIn("$(if $(MAX_DETAILS),--max-details $(MAX_DETAILS),)", makefile)
+        self.assertIn("$(if $(MAX_ENRICH),--max-enrich $(MAX_ENRICH),)", makefile)
         self.assertIn("make_llm_batch.py --input $(ENRICHED)", makefile)
 
     def test_airtable_payload_omits_internal_debug_fields(self) -> None:

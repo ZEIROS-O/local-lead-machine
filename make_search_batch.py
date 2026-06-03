@@ -230,6 +230,21 @@ def _int_or_default(value: Any, default: int) -> int:
         return default
 
 
+def _validate_optional_cap(name: str, value: Optional[int]) -> None:
+    if value is not None and value < 0:
+        raise ValueError(f"{name} must be greater than or equal to 0")
+
+
+def _progress(message: str) -> None:
+    print(message, flush=True)
+
+
+def _inline_counts(items: Mapping[str, int]) -> str:
+    if not items:
+        return "none"
+    return ", ".join(f"{key}: {value}" for key, value in sorted(items.items()))
+
+
 def _clean(value: Any) -> str:
     return str(value or "").strip()
 
@@ -529,23 +544,51 @@ def collect_raw_rows(
     sleep_seconds: float,
     warnings: List[str],
     errors: List[str],
-) -> Tuple[List[Dict[str, str]], List[str]]:
+    max_searches: Optional[int] = None,
+    max_details: Optional[int] = None,
+) -> Tuple[List[Dict[str, str]], List[str], Dict[str, int]]:
     raw_rows: List[Dict[str, str]] = []
     queries_run: List[str] = []
+    duplicate_reason_counts: Counter[str] = Counter()
+    seen_place_ids: set[str] = set()
+    details_count = 0
+    details_cap_reported = False
 
-    for search in expand_searches(config):
+    expanded_searches = expand_searches(config)
+    searches = expanded_searches
+    if max_searches is not None:
+        searches = expanded_searches[:max_searches]
+    _progress(f"Total query×geo searches: {len(expanded_searches)}")
+    if len(searches) != len(expanded_searches):
+        _progress(f"Search cap active: running {len(searches)} of {len(expanded_searches)} searches")
+
+    for search_index, search in enumerate(searches, start=1):
         queries_run.append(search.search_text)
+        _progress(f"[SEARCH {search_index}/{len(searches)}] {search.search_text}")
         try:
             places = text_search(api_key, search.search_text, search.max_results)
         except Exception as exc:
             errors.append(f"Text search failed for {search.search_text!r}: {exc}")
+            _progress(f"[SEARCH {search_index}/{len(searches)}] result count: 0")
             continue
+        _progress(f"[SEARCH {search_index}/{len(searches)}] result count: {len(places)}")
 
         for place in places:
             place_id = _pick(place, "id", "place_id")
             if not place_id:
                 warnings.append(f"Search result missing place id for {search.search_text!r}")
                 continue
+            if place_id in seen_place_ids:
+                duplicate_reason_counts["duplicate_place_id_early"] += 1
+                continue
+            seen_place_ids.add(place_id)
+            if max_details is not None and details_count >= max_details:
+                if not details_cap_reported:
+                    warnings.append(f"Hit --max-details={max_details}; skipped remaining Place Details calls")
+                    _progress(f"[DETAILS] hit max-details={max_details}; skipping remaining Place Details calls")
+                    details_cap_reported = True
+                continue
+            details_count += 1
             try:
                 details = place_details(api_key, place_id)
                 lead = normalize_place(details, search.search_text)
@@ -563,13 +606,16 @@ def collect_raw_rows(
             except Exception as exc:
                 errors.append(f"Place details failed for place_id={place_id}: {exc}")
                 continue
+            finally:
+                if details_count and details_count % 10 == 0:
+                    _progress(f"[DETAILS] raw={len(raw_rows)} details={details_count}")
             if sleep_seconds > 0:
                 time.sleep(sleep_seconds)
 
         if sleep_seconds > 0:
             time.sleep(sleep_seconds)
 
-    return raw_rows, queries_run
+    return raw_rows, queries_run, dict(duplicate_reason_counts)
 
 
 def run_search_batch(
@@ -580,10 +626,16 @@ def run_search_batch(
     api_key: Optional[str] = None,
     no_screenshots: bool = True,
     sleep_seconds: float = 0.15,
+    max_searches: Optional[int] = None,
+    max_details: Optional[int] = None,
+    max_enrich: Optional[int] = None,
 ) -> SearchRunResult:
     config = load_search_config(config_path)
     if batch and batch != config.batch:
         raise ValueError(f"BATCH={batch} does not match config batch={config.batch}")
+    _validate_optional_cap("--max-searches", max_searches)
+    _validate_optional_cap("--max-details", max_details)
+    _validate_optional_cap("--max-enrich", max_enrich)
 
     api_key = (api_key or os.getenv("GOOGLE_PLACES_API_KEY", "")).strip()
     if not api_key:
@@ -598,16 +650,28 @@ def run_search_batch(
 
     warnings: List[str] = []
     errors: List[str] = []
-    raw_rows, queries_run = collect_raw_rows(
+    raw_rows, queries_run, early_duplicate_reason_counts = collect_raw_rows(
         config,
         api_key=api_key,
         sleep_seconds=sleep_seconds,
         warnings=warnings,
         errors=errors,
+        max_searches=max_searches,
+        max_details=max_details,
     )
+    _progress(f"Raw count: {len(raw_rows)}")
     write_csv_rows(raw_path, raw_rows)
 
     deduped_rows, duplicate_reason_counts = dedupe_search_rows(raw_rows)
+    duplicate_reason_counts = {
+        **duplicate_reason_counts,
+        **{
+            reason: duplicate_reason_counts.get(reason, 0) + count
+            for reason, count in early_duplicate_reason_counts.items()
+        },
+    }
+    _progress(f"Deduped count: {len(deduped_rows)}")
+    _progress(f"Duplicate reason counts: {_inline_counts(duplicate_reason_counts)}")
     write_csv_rows(deduped_path, deduped_rows)
 
     passed_rows: List[Dict[str, str]] = []
@@ -621,9 +685,18 @@ def run_search_batch(
         if gate.boost_terms:
             row["icp_boost_terms"] = ", ".join(gate.boost_terms)
         passed_rows.append(row)
+    _progress(f"ICP pass count: {len(passed_rows)}; skip count: {sum(skip_reason_counts.values())}")
+    _progress(f"ICP skip reason counts: {_inline_counts(skip_reason_counts)}")
 
     enriched_records: List[Dict[str, Any]] = []
-    for row in passed_rows:
+    rows_to_enrich = passed_rows
+    if max_enrich is not None:
+        rows_to_enrich = passed_rows[:max_enrich]
+        if len(passed_rows) > len(rows_to_enrich):
+            warnings.append(f"Hit --max-enrich={max_enrich}; skipped remaining enrichment rows")
+            _progress(f"Enrichment cap active: {len(rows_to_enrich)} of {len(passed_rows)} rows")
+    for enrich_index, row in enumerate(rows_to_enrich, start=1):
+        _progress(f"[ENRICH {enrich_index}/{len(rows_to_enrich)}] {_pick(row, 'business_name', 'Business Name') or 'unknown'}")
         try:
             enriched_records.append(
                 enrich_row(row, screenshots_dir=screenshots_dir, take_shots=not no_screenshots)
@@ -659,6 +732,8 @@ def run_search_batch(
         errors=errors,
     )
     write_search_report(result)
+    _progress(f"Report: {result.report_path}")
+    _progress(f"Next command: make batch BATCH={result.batch} BATCH_SIZE=5 LIMIT=10")
     return result
 
 
@@ -746,6 +821,9 @@ def main() -> int:
     parser.add_argument("--batch", default="", help="Optional batch guard; must match config batch")
     parser.add_argument("--no-screenshots", action="store_true", help="Skip screenshots during enrichment")
     parser.add_argument("--sleep", type=float, default=0.15, help="Seconds between Google/detail calls")
+    parser.add_argument("--max-searches", type=int, default=None, help="Optional cap on expanded query×geo searches")
+    parser.add_argument("--max-details", type=int, default=None, help="Optional cap on Place Details calls")
+    parser.add_argument("--max-enrich", type=int, default=None, help="Optional cap on enrichment rows")
     args = parser.parse_args()
 
     try:
@@ -755,6 +833,9 @@ def main() -> int:
             api_key=os.getenv("GOOGLE_PLACES_API_KEY", ""),
             no_screenshots=args.no_screenshots,
             sleep_seconds=args.sleep,
+            max_searches=args.max_searches,
+            max_details=args.max_details,
+            max_enrich=args.max_enrich,
         )
     except (FileNotFoundError, RuntimeError, ValueError) as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)

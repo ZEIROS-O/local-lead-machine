@@ -1,0 +1,44 @@
+{
+  "batch": "cleveland_hardscaping_medium_001",
+  "vertical": "hardscaping",
+  "location": "Cleveland OH",
+  "limit_per_query": 10,
+  "queries": [
+    "hardscaping Cleveland OH",
+    "patio contractor Cleveland OH",
+    "retaining wall contractor Cleveland OH",
+    "paver patio contractor Cleveland OH"
+  ],
+  "geo_slices": [
+    "Cleveland OH",
+    "Lakewood OH",
+    "Westlake OH",
+    "Chagrin Falls OH",
+    "Solon OH",
+    "Mentor OH"
+  ],
+  "min_rating": 4.0,
+  "min_reviews": 5,
+  "allow_missing_website": true,
+  "exclude_terms": [
+    "franchise",
+    "national chain",
+    "garden center",
+    "nursery",
+    "tree service",
+    "lawn fertilization",
+    "snow removal only",
+    "commercial maintenance only"
+  ],
+  "boost_terms": [
+    "patio",
+    "pavers",
+    "retaining wall",
+    "masonry",
+    "hardscape",
+    "hardscaping",
+    "outdoor kitchen",
+    "landscape construction",
+    "concrete"
+  ]
+}

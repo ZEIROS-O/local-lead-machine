@@ -7,6 +7,9 @@ LIMIT ?= 12
 BATCH_SIZE ?= 5
 BATCH_ID ?= batch_001
 CONFIG ?= search_configs/$(BATCH).json
+MAX_SEARCHES ?=
+MAX_DETAILS ?=
+MAX_ENRICH ?=
 
 ENRICHED := output/enriched_$(BATCH).jsonl
 SCORED_MANUAL := output/scored_$(BATCH)_manual.csv
@@ -31,7 +34,7 @@ pipeline:
 	$(PY) run_pipeline.py --batch $(BATCH) --vertical $(VERTICAL) --skip-search --limit $(LIMIT) --no-screenshots
 
 search:
-	$(PY) make_search_batch.py --config $(CONFIG) --batch $(BATCH) --no-screenshots
+	$(PY) make_search_batch.py --config $(CONFIG) --batch $(BATCH) --no-screenshots $(if $(MAX_SEARCHES),--max-searches $(MAX_SEARCHES),) $(if $(MAX_DETAILS),--max-details $(MAX_DETAILS),) $(if $(MAX_ENRICH),--max-enrich $(MAX_ENRICH),)
 
 search-summary:
 	@cat $(SEARCH_REPORT)
