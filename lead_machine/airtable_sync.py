@@ -5,6 +5,44 @@ from typing import Any, Dict, Iterable, List, Optional
 from .schema import normalize_phone
 
 
+AIRTABLE_ALLOWED_FIELDS = [
+    "Business Name",
+    "Owner Name",
+    "Vertical",
+    "City",
+    "Phone",
+    "Email",
+    "Website URL",
+    "Google Maps URL",
+    "Reviews",
+    "Rating",
+    "Current Website Quality",
+    "Best Service Angle",
+    "Specific Observation",
+    "Mockup URL",
+    "Video URL",
+    "Outreach Channel",
+    "Status",
+    "Last Contacted",
+    "Next Follow-Up",
+    "Assigned To",
+    "Lead Priority",
+    "Offer Fit",
+    "Site Status",
+    "AI Confidence",
+    "Skip Reason",
+    "Place Key",
+    "Score Total",
+    "Sendable",
+    "Packet Eligible",
+    "Opener",
+    "Recommended Action",
+    "Send Blockers",
+    "Packet Path",
+    "Next Action",
+]
+
+
 def build_airtable_payload(card: Dict[str, Any]) -> Dict[str, Any]:
     fields = dict(card.get("airtable_fields") or {})
     fields["Place Key"] = card.get("place_id_or_unique_key") or fields.get("Place Key", "")
@@ -13,7 +51,14 @@ def build_airtable_payload(card: Dict[str, Any]) -> Dict[str, Any]:
     fields["Offer Fit"] = card.get("best_angle", fields.get("Offer Fit", ""))
     fields["Recommended Action"] = card.get("recommended_action", fields.get("Recommended Action", ""))
     fields["Opener"] = card.get("opener", fields.get("Opener", ""))
-    return {"fields": {key: value for key, value in fields.items() if value not in ("", None, [], {})}}
+    allowed = set(AIRTABLE_ALLOWED_FIELDS)
+    return {
+        "fields": {
+            key: value
+            for key, value in fields.items()
+            if key in allowed and value not in ("", None, [], {})
+        }
+    }
 
 
 def card_place_key(card: Dict[str, Any]) -> str:

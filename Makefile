@@ -6,6 +6,7 @@ VERTICAL ?= hardscaping
 LIMIT ?= 12
 BATCH_SIZE ?= 5
 BATCH_ID ?= batch_001
+CONFIG ?= search_configs/$(BATCH).json
 
 ENRICHED := output/enriched_$(BATCH).jsonl
 SCORED_MANUAL := output/scored_$(BATCH)_manual.csv
@@ -13,8 +14,9 @@ QUEUE_DIR := review_queue_$(BATCH)
 BATCH_DIR := $(QUEUE_DIR)/batches
 SCORES_DIR := $(QUEUE_DIR)/scores
 PACKETS_DIR := packets_$(BATCH)_manual
+SEARCH_REPORT := reports/search_$(BATCH).md
 
-.PHONY: test compile status pipeline batch save-batch validate-batch import-batch score packets inspect airtable-dry airtable-live full-after-llm clean-manual
+.PHONY: test compile status pipeline search search-summary batch save-batch validate-batch import-batch score packets inspect airtable-dry airtable-live full-from-search full-after-llm clean-manual
 
 status:
 	@git status --short
@@ -23,10 +25,16 @@ test:
 	$(PY) -m unittest discover -s tests
 
 compile:
-	$(PY) -m py_compile enrich_leads.py score_leads.py make_llm_queue.py make_llm_batch.py import_llm_score_bundle.py make_packets.py run_pipeline.py upload_airtable.py feedback_report.py
+	$(PY) -m py_compile enrich_leads.py score_leads.py make_llm_queue.py make_llm_batch.py import_llm_score_bundle.py make_packets.py run_pipeline.py upload_airtable.py feedback_report.py make_search_batch.py
 
 pipeline:
 	$(PY) run_pipeline.py --batch $(BATCH) --vertical $(VERTICAL) --skip-search --limit $(LIMIT) --no-screenshots
+
+search:
+	$(PY) make_search_batch.py --config $(CONFIG) --batch $(BATCH) --no-screenshots
+
+search-summary:
+	@cat $(SEARCH_REPORT)
 
 batch:
 	mkdir -p $(BATCH_DIR)
@@ -64,6 +72,8 @@ airtable-dry:
 
 airtable-live:
 	$(PY) upload_airtable.py --input $(SCORED_MANUAL) --only-sendable --live
+
+full-from-search: search batch
 
 full-after-llm: validate-batch import-batch score packets inspect airtable-dry
 
