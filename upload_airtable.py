@@ -19,7 +19,12 @@ except ModuleNotFoundError:
     def load_dotenv() -> bool:
         return False
 
-from lead_machine.airtable_sync import build_airtable_payload, plan_airtable_sync
+from lead_machine.airtable_sync import (
+    TYPED_AIRTABLE_FIELDS,
+    build_airtable_payload,
+    normalize_airtable_value,
+    plan_airtable_sync,
+)
 from lead_machine.schema import normalize_phone
 
 
@@ -59,8 +64,6 @@ CSV_AIRTABLE_FIELDS = [
 OPERATIONAL_FIELDS = ["Status", "Next Action", "Outreach Channel"]
 OPTIONAL_FIELDS = ["Packet Path"]
 DEFAULT_PACKET_DIR = Path("packets_manual_existing_manual")
-INTEGER_FIELDS = {"Reviews", "Score Total"}
-FLOAT_FIELDS = {"Rating"}
 
 
 def read_cards(path: Path) -> List[Dict[str, Any]]:
@@ -96,16 +99,11 @@ def coerce_airtable_value(field: str, value: Any) -> Any:
     cleaned = clean_cell(value)
     if cleaned == "":
         return ""
-    if field in INTEGER_FIELDS:
-        try:
-            return int(float(cleaned))
-        except ValueError:
-            return cleaned
-    if field in FLOAT_FIELDS:
-        try:
-            return float(cleaned)
-        except ValueError:
-            return cleaned
+    if field in TYPED_AIRTABLE_FIELDS:
+        normalized = normalize_airtable_value(field, cleaned)
+        if normalized is None:
+            return ""
+        return normalized
     return cleaned
 
 

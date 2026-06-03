@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, Iterable, List, Optional
 
 from .schema import normalize_phone
@@ -42,22 +43,99 @@ AIRTABLE_ALLOWED_FIELDS = [
     "Next Action",
 ]
 
+INTEGER_FIELDS = {"Reviews", "Score Total"}
+FLOAT_FIELDS = {"Rating"}
+AI_CONFIDENCE_FIELD = "AI Confidence"
+AI_CONFIDENCE_LABELS = {"low", "medium", "high"}
+SITE_STATUS_FIELD = "Site Status"
+SITE_STATUS_LABELS = {
+    "missing": "Missing",
+    "broken": "Broken",
+    "unknown": "Unknown",
+    "no website": "No Website",
+    "loaded": "Loaded",
+    "loads": "Loaded",
+    "redirect issue": "Redirect Issue",
+    "social only": "Social Only",
+    "facebook only": "Social Only",
+}
+TYPED_AIRTABLE_FIELDS = INTEGER_FIELDS | FLOAT_FIELDS | {AI_CONFIDENCE_FIELD, SITE_STATUS_FIELD}
+
+
+def _parse_finite_float(value: Any) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+    else:
+        cleaned = str(value).strip()
+        if cleaned == "":
+            return None
+        try:
+            number = float(cleaned)
+        except ValueError:
+            return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def normalize_airtable_value(field: str, value: Any) -> Any:
+    if field == AI_CONFIDENCE_FIELD:
+        label = str(value or "").strip().casefold()
+        if label in AI_CONFIDENCE_LABELS:
+            return label
+        number = _parse_finite_float(value)
+        if number is None:
+            return None
+        if number >= 0.80:
+            return "high"
+        if number >= 0.55:
+            return "medium"
+        return "low"
+
+    if field == SITE_STATUS_FIELD:
+        label = " ".join(str(value or "").strip().casefold().replace("_", " ").split())
+        return SITE_STATUS_LABELS.get(label)
+
+    if field in INTEGER_FIELDS:
+        number = _parse_finite_float(value)
+        if number is None:
+            return None
+        return int(number)
+
+    if field in FLOAT_FIELDS:
+        return _parse_finite_float(value)
+
+    return value
+
+
+def _first_non_blank(*values: Any) -> Any:
+    for value in values:
+        if value not in ("", None, [], {}):
+            return value
+    return ""
+
 
 def build_airtable_payload(card: Dict[str, Any]) -> Dict[str, Any]:
     fields = dict(card.get("airtable_fields") or {})
     fields["Place Key"] = card.get("place_id_or_unique_key") or fields.get("Place Key", "")
     fields["Lead Priority"] = card.get("grade", fields.get("Lead Priority", ""))
-    fields["AI Confidence"] = card.get("confidence", fields.get("AI Confidence", ""))
+    fields["AI Confidence"] = _first_non_blank(card.get("confidence"), fields.get("AI Confidence", ""))
     fields["Offer Fit"] = card.get("best_angle", fields.get("Offer Fit", ""))
     fields["Recommended Action"] = card.get("recommended_action", fields.get("Recommended Action", ""))
     fields["Opener"] = card.get("opener", fields.get("Opener", ""))
     allowed = set(AIRTABLE_ALLOWED_FIELDS)
+    payload_fields: Dict[str, Any] = {}
+    for key, value in fields.items():
+        if key not in allowed:
+            continue
+        normalized_value = normalize_airtable_value(key, value)
+        if normalized_value in ("", None, [], {}):
+            continue
+        payload_fields[key] = normalized_value
     return {
-        "fields": {
-            key: value
-            for key, value in fields.items()
-            if key in allowed and value not in ("", None, [], {})
-        }
+        "fields": payload_fields
     }
 
 

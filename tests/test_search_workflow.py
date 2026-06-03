@@ -255,6 +255,7 @@ class SearchWorkflowTest(unittest.TestCase):
                 "Minimum Evidence Passed": "Yes",
                 "Packet Eligibility Reason": "debug reason",
                 "Recommended Action": "Build mockup",
+                "Site Status": "broken",
             },
         }
 
@@ -262,8 +263,117 @@ class SearchWorkflowTest(unittest.TestCase):
 
         self.assertEqual(fields["Business Name"], "A+ Landscaping")
         self.assertEqual(fields["Recommended Action"], "Build mockup")
+        self.assertEqual(fields["Site Status"], "Broken")
         for internal_field in make_search_batch.INTERNAL_AIRTABLE_FIELDS:
             self.assertNotIn(internal_field, fields)
+
+    def test_airtable_payload_normalizes_site_status_single_select_values(self) -> None:
+        cases = {
+            "missing": "Missing",
+            "broken": "Broken",
+            "no_website": "No Website",
+            "no website": "No Website",
+            "loaded": "Loaded",
+            "loads": "Loaded",
+            "unknown": "Unknown",
+            "redirect_issue": "Redirect Issue",
+            "redirect issue": "Redirect Issue",
+            "social_only": "Social Only",
+            "social only": "Social Only",
+            "facebook_only": "Social Only",
+            "facebook only": "Social Only",
+        }
+        for site_status, expected in cases.items():
+            with self.subTest(site_status=site_status):
+                card = {
+                    "place_id_or_unique_key": "ChIJ123",
+                    "airtable_fields": {
+                        "Business Name": "A+ Landscaping",
+                        "Site Status": site_status,
+                    },
+                }
+
+                fields = build_airtable_payload(card)["fields"]
+
+                self.assertEqual(fields["Site Status"], expected)
+
+    def test_airtable_payload_omits_unknown_site_status(self) -> None:
+        card = {
+            "place_id_or_unique_key": "ChIJ123",
+            "airtable_fields": {
+                "Business Name": "A+ Landscaping",
+                "Site Status": "parked_or_weird",
+            },
+        }
+
+        fields = build_airtable_payload(card)["fields"]
+
+        self.assertNotIn("Site Status", fields)
+
+    def test_airtable_payload_keeps_ai_confidence_labels_lowercase(self) -> None:
+        for confidence in ("medium", "high", "low"):
+            with self.subTest(confidence=confidence):
+                card = {
+                    "place_id_or_unique_key": "ChIJ123",
+                    "airtable_fields": {
+                        "Business Name": "A+ Landscaping",
+                        "AI Confidence": confidence,
+                    },
+                }
+
+                fields = build_airtable_payload(card)["fields"]
+
+                self.assertEqual(fields["AI Confidence"], confidence)
+
+    def test_airtable_payload_maps_numeric_ai_confidence_to_label(self) -> None:
+        cases = {
+            "0.91": "high",
+            "0.65": "medium",
+            "0.35": "low",
+        }
+        for confidence, expected in cases.items():
+            with self.subTest(confidence=confidence):
+                card = {
+                    "place_id_or_unique_key": "ChIJ123",
+                    "airtable_fields": {
+                        "Business Name": "A+ Landscaping",
+                        "AI Confidence": confidence,
+                    },
+                }
+
+                fields = build_airtable_payload(card)["fields"]
+
+                self.assertEqual(fields["AI Confidence"], expected)
+
+    def test_airtable_payload_omits_unknown_ai_confidence(self) -> None:
+        card = {
+            "place_id_or_unique_key": "ChIJ123",
+            "airtable_fields": {
+                "Business Name": "A+ Landscaping",
+                "AI Confidence": "certain-ish",
+            },
+        }
+
+        fields = build_airtable_payload(card)["fields"]
+
+        self.assertNotIn("AI Confidence", fields)
+
+    def test_airtable_payload_coerces_typed_number_fields(self) -> None:
+        card = {
+            "place_id_or_unique_key": "ChIJ123",
+            "airtable_fields": {
+                "Business Name": "A+ Landscaping",
+                "Reviews": "130",
+                "Rating": "4.9",
+                "Score Total": "86",
+            },
+        }
+
+        fields = build_airtable_payload(card)["fields"]
+
+        self.assertEqual(fields["Reviews"], 130)
+        self.assertEqual(fields["Rating"], 4.9)
+        self.assertEqual(fields["Score Total"], 86)
 
 
 if __name__ == "__main__":
