@@ -6,6 +6,7 @@ VERTICAL ?= hardscaping
 LIMIT ?= 12
 BATCH_SIZE ?= 5
 BATCH_ID ?= batch_001
+LANE ?= all
 CONFIG ?= search_configs/$(BATCH).json
 MAX_SEARCHES ?=
 MAX_DETAILS ?=
@@ -18,8 +19,9 @@ BATCH_DIR := $(QUEUE_DIR)/batches
 SCORES_DIR := $(QUEUE_DIR)/scores
 PACKETS_DIR := packets_$(BATCH)_manual
 SEARCH_REPORT := reports/search_$(BATCH).md
+ICP_REPORT := reports/icp_lanes_$(BATCH).md
 
-.PHONY: test compile status pipeline search search-summary batch save-batch validate-batch import-batch score packets inspect airtable-dry airtable-live full-from-search full-after-llm clean-manual
+.PHONY: test compile status pipeline search search-summary batch batch-lane icp-report save-batch validate-batch import-batch score packets inspect airtable-dry airtable-live full-from-search full-after-llm clean-manual
 
 status:
 	@git status --short
@@ -28,7 +30,7 @@ test:
 	$(PY) -m unittest discover -s tests
 
 compile:
-	$(PY) -m py_compile enrich_leads.py score_leads.py make_llm_queue.py make_llm_batch.py import_llm_score_bundle.py make_packets.py run_pipeline.py upload_airtable.py feedback_report.py make_search_batch.py
+	$(PY) -m py_compile enrich_leads.py score_leads.py make_llm_queue.py make_llm_batch.py import_llm_score_bundle.py make_packets.py run_pipeline.py upload_airtable.py feedback_report.py make_search_batch.py make_icp_lane_report.py lead_machine/icp_lanes.py
 
 pipeline:
 	$(PY) run_pipeline.py --batch $(BATCH) --vertical $(VERTICAL) --skip-search --limit $(LIMIT) --no-screenshots
@@ -48,6 +50,12 @@ batch:
 	@echo
 	@echo "Expected score files:"
 	@cat $(BATCH_DIR)/$(BATCH_ID)_expected_files.txt
+
+batch-lane:
+	$(PY) make_llm_batch.py --input $(ENRICHED) --output-dir review_queue_$(BATCH)_$(LANE)/batches --batch-size $(BATCH_SIZE) --limit $(LIMIT) --only-candidates --lane $(LANE)
+
+icp-report:
+	$(PY) make_icp_lane_report.py --input $(ENRICHED) --output $(ICP_REPORT)
 
 save-batch:
 	mkdir -p $(BATCH_DIR)

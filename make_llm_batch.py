@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterable, List
 
 from lead_machine.evidence import build_evidence_profile
 from lead_machine.icp import hard_icp_gate
+from lead_machine.icp_lanes import SELECTABLE_LANES, classify_icp_lane, lane_sort_key
 from lead_machine.llm_queue import safe_slug
 from lead_machine.schema import normalize_lead
 
@@ -121,9 +122,15 @@ def lead_packet_for_record(record: Dict[str, Any], *, fallback_vertical: str) ->
     evidence = record.get("evidence", {}) or {}
     website = record.get("website", {}) or {}
     lead = normalize_lead(google, fallback_vertical=fallback_vertical, source_batch=google.get("source_query", ""))
+    lane_result = classify_icp_lane(record)
 
     return {
         "score_file": score_file_for_record(record, fallback_vertical=fallback_vertical),
+        "icp_lane": lane_result.lane,
+        "icp_lane_score": lane_result.score,
+        "icp_lane_tier": lane_result.tier,
+        "icp_lane_reasons": lane_result.reasons,
+        "icp_lane_blockers": lane_result.blockers,
         "lead": lead.to_dict(),
         "screenshots": (evidence.get("screenshots") or website.get("screenshots") or record.get("screenshots") or {}),
         "evidence": evidence,
@@ -353,10 +360,18 @@ def write_llm_batches(
     batch_size: int = 5,
     limit: int = 0,
     only_candidates: bool = False,
+    lane: str = "all",
 ) -> List[BatchWrite]:
+    if lane != "all" and lane not in SELECTABLE_LANES:
+        raise ValueError(f"unsupported lane: {lane}")
+
     selected = [ensure_evidence(record) for record in records]
     if only_candidates:
         selected = candidate_records(selected, fallback_vertical=fallback_vertical)
+    if lane != "all":
+        selected = [record for record in selected if classify_icp_lane(record).lane == lane]
+        selected.sort(key=lambda record: lane_sort_key(record, lane))
+    elif only_candidates:
         selected.sort(key=batch_sort_key)
     if limit > 0:
         selected = selected[:limit]
@@ -392,6 +407,13 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=0, help="Optional max lead count after filtering")
     parser.add_argument("--only-candidates", action="store_true", help="Only include leads that pass the hard ICP gate")
     parser.add_argument("--vertical", default="service", help="Fallback vertical")
+    parser.add_argument(
+        "--lane",
+        choices=("all", *SELECTABLE_LANES),
+        default="all",
+        help="Optional ICP lane queue to generate",
+    )
+    parser.add_argument("--lane-report", action="store_true", help="Print lane counts for the input records")
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -399,6 +421,14 @@ def main() -> int:
         raise FileNotFoundError(input_path)
 
     records = read_jsonl(input_path)
+    if args.lane_report:
+        counts = {lane: 0 for lane in ("all", *SELECTABLE_LANES, "skip")}
+        counts["all"] = len(records)
+        for record in records:
+            lane_result = classify_icp_lane(record)
+            counts[lane_result.lane] = counts.get(lane_result.lane, 0) + 1
+        print("[LANES] " + " | ".join(f"{lane}: {count}" for lane, count in counts.items()))
+
     written = write_llm_batches(
         records,
         Path(args.output_dir),
@@ -406,10 +436,12 @@ def main() -> int:
         batch_size=args.batch_size,
         limit=args.limit,
         only_candidates=args.only_candidates,
+        lane=args.lane,
     )
 
     print(f"[DONE] Input: {input_path}")
     print(f"[DONE] Batch dir: {args.output_dir}")
+    print(f"[DONE] Lane: {args.lane}")
     print(f"[DONE] Batch files written: {len(written)}")
     print(f"[DONE] Expected score files: {sum(len(batch.score_files) for batch in written)}")
     for batch in written[:10]:
