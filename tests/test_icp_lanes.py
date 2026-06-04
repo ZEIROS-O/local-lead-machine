@@ -29,11 +29,18 @@ def _record(
     form_strength: str = "Strong",
     cta_strength: str = "Strong",
     has_estimate_cta: bool = True,
+    source_query: str = "hardscaping Cleveland OH",
+    vertical: str = "hardscaping",
+    combined_text: str = "hardscape patio retaining wall request an estimate gallery reviews",
+    high_ticket_terms: list[str] | None = None,
+    emails_found: list[str] | None = None,
     place_id: str = "ChIJLANE",
 ) -> dict[str, object]:
     flags = flags or []
     categories = categories or []
     visible_pain_reasons = visible_pain_reasons or []
+    high_ticket_terms = high_ticket_terms if high_ticket_terms is not None else ["hardscape", "patio"]
+    emails_found = emails_found if emails_found is not None else ["office@example.com"]
     return {
         "google": {
             "business_name": business_name,
@@ -42,21 +49,23 @@ def _record(
             "rating": rating,
             "reviews": reviews,
             "category": category,
-            "source_query": "hardscaping Cleveland OH",
+            "source_query": source_query,
+            "vertical": vertical,
             "place_id": place_id,
         },
         "website": {
             "site_status": site_status,
             "rendered_site_status": rendered_site_status,
             "site_issue_flags": flags,
-            "combined_text": "hardscape patio retaining wall request an estimate gallery reviews",
+            "combined_text": combined_text,
             "estimate_form_detected": estimate_form_detected,
             "contact_form_detected": contact_form_detected,
             "form_strength": form_strength,
             "cta_strength": cta_strength,
             "forms_found": contact_form_detected.lower() == "yes",
+            "emails_found": emails_found,
             "phones_found": [phone] if phone else [],
-            "high_ticket_terms": ["hardscape", "patio"],
+            "high_ticket_terms": high_ticket_terms,
         },
         "evidence": {
             "site_status": site_status,
@@ -133,6 +142,144 @@ class ICPLaneTest(unittest.TestCase):
         )
 
         self.assertEqual(result.lane, "social_jobber_escape")
+
+    def test_microsite_urls_are_social_jobber_escape_not_estimate_funnel(self) -> None:
+        for website_url in (
+            "https://jb-restoration.godaddysites.com",
+            "https://jbrestoration.wordpress.com",
+            "https://jbrestoration.wixsite.com/home",
+        ):
+            with self.subTest(website_url=website_url):
+                result = classify_icp_lane(
+                    _record(
+                        website_url=website_url,
+                        site_status="okay",
+                        flags=["weak_basic_form"],
+                        categories=["estimate_path_pain"],
+                        visible_pain_score=28,
+                        visible_pain_reasons=["Basic estimate form only"],
+                        send_trigger="Basic estimate form only",
+                        form_strength="Basic",
+                    )
+                )
+
+                self.assertEqual(result.lane, "social_jobber_escape")
+                self.assertNotEqual(result.lane, "estimate_funnel")
+
+    def test_hardscaping_estimate_funnel_caps_generic_contractor_without_service_evidence(self) -> None:
+        result = classify_icp_lane(
+            _record(
+                business_name="Fraser Contracting",
+                category="General contractor",
+                reviews="54",
+                flags=["missing_estimate_path"],
+                categories=["estimate_path_pain"],
+                visible_pain_score=32,
+                visible_pain_reasons=["No estimate form detected"],
+                send_trigger="No estimate form detected",
+                estimate_form_detected="No",
+                contact_form_detected="Yes",
+                form_strength="None",
+                cta_strength="Strong",
+                has_estimate_cta=True,
+                combined_text="general construction repair additions home improvement call for a quote",
+                high_ticket_terms=[],
+            )
+        )
+
+        self.assertEqual(result.lane, "estimate_funnel")
+        self.assertNotEqual(result.tier, "A")
+        self.assertLessEqual(result.score, 64)
+
+    def test_no_estimate_form_with_visible_cta_and_contact_path_is_not_automatically_a(self) -> None:
+        result = classify_icp_lane(
+            _record(
+                reviews="54",
+                flags=["missing_estimate_path"],
+                categories=["estimate_path_pain"],
+                visible_pain_score=22,
+                visible_pain_reasons=["No estimate form detected"],
+                send_trigger="No estimate form detected",
+                estimate_form_detected="No",
+                contact_form_detected="Yes",
+                form_strength="None",
+                cta_strength="Strong",
+                has_estimate_cta=True,
+            )
+        )
+
+        self.assertEqual(result.lane, "estimate_funnel")
+        self.assertEqual(result.tier, "B")
+
+    def test_strong_service_fit_basic_estimate_path_can_still_be_b_or_a(self) -> None:
+        result = classify_icp_lane(
+            _record(
+                reviews="42",
+                flags=["weak_basic_form"],
+                categories=["estimate_path_pain"],
+                visible_pain_score=24,
+                visible_pain_reasons=["Basic estimate form only"],
+                send_trigger="Basic estimate form only",
+                form_strength="Basic",
+                combined_text=(
+                    "hardscaping patio pavers retaining wall outdoor living "
+                    "landscape design request an estimate"
+                ),
+                high_ticket_terms=["hardscaping", "patio", "pavers", "retaining wall", "outdoor living"],
+            )
+        )
+
+        self.assertEqual(result.lane, "estimate_funnel")
+        self.assertIn(result.tier, {"A", "B"})
+
+    def test_owned_weak_site_without_visual_status_can_populate_rebuild_lane(self) -> None:
+        result = classify_icp_lane(
+            _record(
+                site_status="weak",
+                rendered_site_status="Unknown",
+                flags=["generic_copy_signals", "weak_services_page"],
+                categories=["service_clarity_pain"],
+                visible_pain_score=24,
+                visible_pain_reasons=["Unclear service presentation"],
+                send_trigger="Unclear service presentation",
+            )
+        )
+
+        self.assertEqual(result.lane, "owned_weak_site_rebuild")
+
+    def test_151_plus_review_basic_form_only_is_optimization_not_a_estimate_funnel(self) -> None:
+        result = classify_icp_lane(
+            _record(
+                reviews="180",
+                site_status="okay",
+                flags=["weak_basic_form"],
+                categories=["estimate_path_pain"],
+                visible_pain_score=35,
+                visible_pain_reasons=["Basic estimate form only"],
+                send_trigger="Basic estimate form only",
+                form_strength="Basic",
+            )
+        )
+
+        self.assertEqual(result.lane, "optimization_only")
+        self.assertNotEqual(result.tier, "A")
+
+    def test_76_plus_review_basic_form_only_requires_clearer_pain(self) -> None:
+        result = classify_icp_lane(
+            _record(
+                reviews="104",
+                site_status="okay",
+                flags=["weak_basic_form"],
+                categories=["estimate_path_pain"],
+                visible_pain_score=28,
+                visible_pain_reasons=["Basic estimate form only"],
+                send_trigger="Basic estimate form only",
+                form_strength="Basic",
+            )
+        )
+
+        self.assertEqual(result.lane, "optimization_only")
+        self.assertNotEqual(result.tier, "A")
 
     def test_owned_weak_loaded_site_with_no_form_is_rebuild_or_estimate_funnel(self) -> None:
         result = classify_icp_lane(

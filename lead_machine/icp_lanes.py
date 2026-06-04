@@ -41,9 +41,14 @@ NON_OWNED_DOMAINS = {
     "yelp.com",
     "nextdoor.com",
     "porch.com",
+    "godaddysites.com",
+    "wordpress.com",
+    "wixsite.com",
+    "square.site",
     "business.site",
     "sites.google.com",
     "linktr.ee",
+    "carrd.co",
 }
 
 NON_OWNED_URL_TERMS = {
@@ -59,9 +64,25 @@ NON_OWNED_URL_TERMS = {
     "yelp.",
     "nextdoor.",
     "porch.",
+    "godaddysites.com",
+    "wordpress.com",
+    "wixsite.com",
+    "square.site",
     "business.site",
     "sites.google.com",
     "linktr.ee",
+    "carrd.co",
+}
+
+MICROSITE_URL_TERMS = {
+    "godaddysites.com",
+    "wordpress.com",
+    "wixsite.com",
+    "sites.google.com",
+    "square.site",
+    "linktr.ee",
+    "carrd.co",
+    "business.site",
 }
 
 PREMIUM_FLAGS = {
@@ -149,6 +170,46 @@ TARGET_SERVICE_TERMS = {
     "renovation",
 }
 
+HARDSCAPE_BATCH_TERMS = {
+    "hardscape",
+    "hardscaping",
+    "paver",
+    "pavers",
+    "patio",
+    "retaining wall",
+    "outdoor living",
+}
+
+HARDSCAPE_SERVICE_TERMS = {
+    "hardscape",
+    "hardscaping",
+    "patio",
+    "paver",
+    "pavers",
+    "retaining wall",
+    "concrete",
+    "stamped concrete",
+    "decorative concrete",
+    "masonry",
+    "outdoor living",
+    "outdoor kitchen",
+    "fire pit",
+    "landscape design",
+    "landscape construction",
+    "design-build",
+}
+
+SITE_WEAKNESS_FLAGS = {
+    "generic_copy_signals",
+    "weak_services_page",
+    "unclear_service_pages",
+    "high_ticket_services_unclear",
+    "service_clarity_pain",
+    "low_visible_trust",
+    "reviews_not_near_cta",
+    "trust_proof_pain",
+}
+
 GENERIC_SERVICE_TERMS = {
     "service",
     "home service",
@@ -187,9 +248,12 @@ class _LaneContext:
     rating: float
     reviews: int
     text: str
+    service_text: str
     has_owned_site: bool
     is_non_owned_url: bool
     strong_estimate_form: bool
+    hardscaping_batch: bool
+    hardscape_service_evidence: bool
 
 
 def classify_icp_lane(record: Dict[str, Any]) -> ICPLaneResult:
@@ -268,6 +332,7 @@ def _context(record: Dict[str, Any]) -> _LaneContext:
         _pick(google, "reviews", "Reviews", "google_review_count") or _pick(record, "reviews", "Reviews")
     )
     text = _searchable_text(record, google, website, evidence)
+    service_text = _service_evidence_text(record, google, website, evidence)
     is_non_owned_url = _is_non_owned_url(primary_url) or status in {"social_only", "jobber_only"}
     has_owned_site = bool(primary_url) and not is_non_owned_url and status not in {
         "",
@@ -310,9 +375,12 @@ def _context(record: Dict[str, Any]) -> _LaneContext:
         rating=rating,
         reviews=reviews,
         text=text,
+        service_text=service_text,
         has_owned_site=has_owned_site,
         is_non_owned_url=is_non_owned_url,
         strong_estimate_form=strong_estimate_form,
+        hardscaping_batch=_is_hardscaping_batch(record, google),
+        hardscape_service_evidence=_has_any_phrase(service_text, HARDSCAPE_SERVICE_TERMS),
     )
 
 
@@ -379,7 +447,12 @@ def _choose_lane(ctx: _LaneContext) -> tuple[str, List[str]]:
             return "optimization_only", reasons + ["151+ reviews requires stronger pain than this estimate signal"]
         if _reviews_require_clear_pain(ctx) and not _clear_concrete_pain(ctx):
             return "optimization_only", reasons + ["76+ reviews requires clear concrete pain"]
-        return "estimate_funnel", reasons + ["concrete estimate-path issue"]
+        estimate_reasons = ["estimate-path issue"]
+        if _hardscaping_service_fit_missing(ctx):
+            estimate_reasons.append("hardscaping service evidence is weak/generic")
+        if _weak_estimate_signal_only(ctx):
+            estimate_reasons.append("quote-path signal is basic or weak-form-only")
+        return "estimate_funnel", reasons + estimate_reasons
 
     if weak_owned:
         if _reviews_require_very_strong_pain(ctx) and not _very_strong_pain(ctx):
@@ -415,6 +488,16 @@ def _score(ctx: _LaneContext, *, lane: str, blockers: List[str]) -> int:
         score = min(score, 79)
         if _has_weak_signal_only(ctx) and ctx.reviews >= 151:
             score = min(score, 64)
+        if _weak_estimate_signal_only(ctx) and ctx.reviews >= 151:
+            score = min(score, 64)
+
+    if lane == "estimate_funnel":
+        if _hardscaping_service_fit_missing(ctx):
+            score = min(score, 64)
+        if _weak_estimate_signal_only(ctx) and not _strong_project_value_fit(ctx):
+            score = min(score, 79)
+        if _no_estimate_with_visible_contact_path(ctx):
+            score = min(score, 79)
 
     if lane == "skip" or blockers:
         score = min(score, 49)
@@ -452,9 +535,15 @@ def _demand_points(ctx: _LaneContext) -> int:
 def _service_fit_points(ctx: _LaneContext) -> int:
     if any(term in ctx.text for term in IRRELEVANT_TERMS):
         return 0
-    if any(term in ctx.text for term in TARGET_SERVICE_TERMS):
+    if ctx.hardscaping_batch:
+        if ctx.hardscape_service_evidence:
+            return 20
+        if any(term in ctx.service_text for term in GENERIC_SERVICE_TERMS):
+            return 10
+        return 8
+    if any(term in ctx.service_text for term in TARGET_SERVICE_TERMS):
         return 20
-    if any(term in ctx.text for term in GENERIC_SERVICE_TERMS):
+    if any(term in ctx.service_text for term in GENERIC_SERVICE_TERMS):
         return 14
     return 10
 
@@ -577,9 +666,10 @@ def _structural_site_reason(ctx: _LaneContext) -> str:
 def _has_owned_weak_site(ctx: _LaneContext) -> bool:
     return (
         ctx.has_owned_site
-        and ctx.rendered_status in {"loaded", "loads", "okay"}
         and ctx.status == "weak"
-        and ctx.visible_pain_score > 0
+        and ctx.visible_pain_score >= 16
+        and _has_site_itself_weak_pain(ctx)
+        and not _estimate_signal_only(ctx)
     )
 
 
@@ -651,11 +741,13 @@ def _has_weak_signal_only(ctx: _LaneContext) -> bool:
 def _clear_concrete_pain(ctx: _LaneContext) -> bool:
     if _is_missing_or_broken_site(ctx) or ctx.is_non_owned_url:
         return True
+    if _weak_estimate_signal_only(ctx):
+        return False
     if ctx.categories & {"premium_perception_gap", "portfolio_presentation_pain", "no_site_or_social_only_pain", "broken_site_pain"}:
         return True
     if ctx.flags & (PREMIUM_FLAGS | PORTFOLIO_FLAGS):
         return True
-    if _has_estimate_issue(ctx) and ctx.visible_pain_score >= 16:
+    if _has_estimate_issue(ctx) and ctx.visible_pain_score >= 16 and not _weak_estimate_signal_only(ctx):
         return True
     return bool(ctx.send_trigger and ctx.visible_pain_score >= 20)
 
@@ -669,9 +761,9 @@ def _very_strong_pain(ctx: _LaneContext) -> bool:
         return True
     if ctx.flags & (PREMIUM_FLAGS | PORTFOLIO_FLAGS) and ctx.visible_pain_score >= 22:
         return True
-    if "estimate_path_pain" in ctx.categories and ctx.visible_pain_score >= 28:
+    if "estimate_path_pain" in ctx.categories and ctx.visible_pain_score >= 28 and not _weak_estimate_signal_only(ctx):
         return True
-    return bool(ctx.send_trigger and ctx.visible_pain_score >= 30)
+    return bool(ctx.send_trigger and ctx.visible_pain_score >= 30 and not _weak_estimate_signal_only(ctx))
 
 
 def _reviews_require_clear_pain(ctx: _LaneContext) -> bool:
@@ -728,6 +820,8 @@ def _non_owned_reason(url: str) -> str:
         return "primary URL is Jobber/clienthub"
     if "facebook" in lowered or "instagram" in lowered:
         return "primary URL is social media"
+    if any(term in lowered for term in MICROSITE_URL_TERMS):
+        return "primary URL is microsite/non-owned site"
     if any(term in lowered for term in ("angi", "homeadvisor", "thumbtack", "houzz", "yelp", "nextdoor", "porch")):
         return "primary URL is third-party directory"
     return "primary URL is non-owned social/booking/directory URL"
@@ -756,6 +850,118 @@ def _searchable_text(
         " ".join(_listish(evidence.get("services_detected"))),
     ]
     return " ".join(part for part in parts if part).lower()
+
+
+def _service_evidence_text(
+    record: Dict[str, Any],
+    google: Dict[str, Any],
+    website: Dict[str, Any],
+    evidence: Dict[str, Any],
+) -> str:
+    parts = [
+        _pick(google, "business_name", "Business Name", "name"),
+        _pick(google, "category", "Category", "Google category"),
+        _pick(record, "business_name", "Business Name", "name"),
+        _pick(record, "category", "Category", "Google category"),
+        _pick(website, "combined_text"),
+        " ".join(_listish(website.get("high_ticket_terms"))),
+        " ".join(_listish(evidence.get("services_detected"))),
+    ]
+    return " ".join(part for part in parts if part).lower()
+
+
+def _is_hardscaping_batch(record: Dict[str, Any], google: Dict[str, Any]) -> bool:
+    text = " ".join(
+        [
+            _pick(google, "source_query", "Source Query"),
+            _pick(google, "vertical", "Vertical"),
+            _pick(record, "source_query", "Source Query"),
+            _pick(record, "vertical", "Vertical"),
+        ]
+    ).lower()
+    return _has_any_phrase(text, HARDSCAPE_BATCH_TERMS)
+
+
+def _hardscaping_service_fit_missing(ctx: _LaneContext) -> bool:
+    return ctx.hardscaping_batch and not ctx.hardscape_service_evidence
+
+
+def _has_site_itself_weak_pain(ctx: _LaneContext) -> bool:
+    if ctx.flags & SITE_WEAKNESS_FLAGS:
+        return True
+    if ctx.categories & {"service_clarity_pain", "trust_proof_pain"}:
+        return True
+    text = " ".join(ctx.visible_pain_reasons + [ctx.send_trigger]).lower()
+    return any(
+        term in text
+        for term in (
+            "outdated",
+            "cheap",
+            "template",
+            "generic",
+            "unclear service",
+            "weak service",
+            "underbuilt",
+            "low visible trust",
+        )
+    )
+
+
+def _estimate_signal_only(ctx: _LaneContext) -> bool:
+    estimate_flags = bool(ctx.flags & ESTIMATE_FLAGS)
+    estimate_categories = bool(ctx.categories & {"estimate_path_pain", "mobile_usability_pain"})
+    non_estimate_flags = ctx.flags - ESTIMATE_FLAGS
+    non_estimate_categories = ctx.categories - {"estimate_path_pain", "mobile_usability_pain"}
+    return (estimate_flags or estimate_categories) and not non_estimate_flags and not non_estimate_categories
+
+
+def _weak_estimate_signal_only(ctx: _LaneContext) -> bool:
+    if ctx.flags & {"broken_form", "form_error", "missing_contact_path", "no_form_detected"}:
+        return False
+    if _normalize_status(_pick(ctx.evidence, "contact_form_detected") or _pick(ctx.website, "contact_form_detected")) == "no":
+        return False
+    if _form_strength(ctx) in {"weak", "basic"} or "weak_basic_form" in ctx.flags:
+        return True
+    return _no_estimate_with_visible_contact_path(ctx)
+
+
+def _no_estimate_with_visible_contact_path(ctx: _LaneContext) -> bool:
+    estimate_form = _normalize_status(
+        _pick(ctx.evidence, "estimate_form_detected") or _pick(ctx.website, "estimate_form_detected")
+    )
+    contact_form = _normalize_status(
+        _pick(ctx.evidence, "contact_form_detected") or _pick(ctx.website, "contact_form_detected")
+    )
+    cta_strength = _normalize_status(_pick(ctx.evidence, "cta_strength") or _pick(ctx.website, "cta_strength"))
+    return (
+        estimate_form == "no"
+        and contact_form != "no"
+        and cta_strength not in {"", "none", "weak"}
+        and bool(ctx.phone or _listish(ctx.website.get("emails_found")))
+    )
+
+
+def _strong_project_value_fit(ctx: _LaneContext) -> bool:
+    if not ctx.hardscaping_batch or not ctx.hardscape_service_evidence:
+        return False
+    return _phrase_match_count(ctx.service_text, HARDSCAPE_SERVICE_TERMS) >= 3 and ctx.visible_pain_score >= 28
+
+
+def _has_any_phrase(text: str, terms: Iterable[str]) -> bool:
+    return any(_has_phrase(text, term) for term in terms)
+
+
+def _phrase_match_count(text: str, terms: Iterable[str]) -> int:
+    return sum(1 for term in terms if _has_phrase(text, term))
+
+
+def _has_phrase(text: str, term: str) -> bool:
+    cleaned_text = str(text or "").lower()
+    cleaned_term = str(term or "").lower().strip()
+    if not cleaned_text or not cleaned_term:
+        return False
+    pattern = rf"(?<![a-z0-9]){re.escape(cleaned_term)}s?(?![a-z0-9])"
+    return re.search(pattern, cleaned_text) is not None
 
 
 def _domain(url: str) -> str:
