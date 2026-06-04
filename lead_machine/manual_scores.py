@@ -20,6 +20,23 @@ SUBSCORE_LIMITS = {
 
 CONFIDENCE_VALUES = {"low", "medium", "high"}
 
+SAFE_AIRTABLE_OVERRIDE_KEYS = {
+    "Business Name",
+    "business_name",
+    "Phone",
+    "phone",
+    "City",
+    "city",
+    "Vertical",
+    "vertical",
+    "Category",
+    "category",
+    "Best Service Angle",
+    "best_angle",
+    "Recommended Action",
+    "recommended_action",
+}
+
 
 def _require_keys(data: Dict[str, Any], keys: Iterable[str]) -> None:
     missing = [key for key in keys if key not in data]
@@ -135,6 +152,10 @@ def _first_non_empty_field(fields: Dict[str, Any], *keys: str) -> str:
     return ""
 
 
+def _safe_airtable_overrides(fields: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: value for key, value in fields.items() if key in SAFE_AIRTABLE_OVERRIDE_KEYS}
+
+
 def _sync_manual_airtable_aliases(
     row: Dict[str, Any],
     airtable_fields: Dict[str, Any],
@@ -145,7 +166,7 @@ def _sync_manual_airtable_aliases(
         ("Phone", "phone", ("Phone", "phone")),
         ("City", "city", ("City", "city")),
         ("Vertical", "vertical", ("Vertical", "vertical", "Category", "category")),
-        ("Best Service Angle", "best_angle", ("Best Service Angle", "Offer Fit", "Best Angle", "best_angle")),
+        ("Best Service Angle", "best_angle", ("Best Service Angle", "best_angle")),
         ("Recommended Action", "recommended_action", ("Recommended Action", "recommended_action")),
     ]
 
@@ -155,9 +176,8 @@ def _sync_manual_airtable_aliases(
             or _clean_manual_field(base_values.get(user_key))
             or _clean_manual_field(row.get(user_key))
         )
-        if value:
-            row[user_key] = value
-            row[internal_key] = value
+        row[user_key] = value
+        row[internal_key] = value
 
     if row.get("best_angle"):
         row["Offer Fit"] = row["best_angle"]
@@ -168,8 +188,7 @@ def _sync_manual_airtable_aliases(
         or _clean_manual_field(base_values.get("category"))
         or _clean_manual_field(row.get("category"))
     )
-    if category:
-        row["category"] = category
+    row["category"] = category
 
 
 def _fallback_visible_pain_from_evidence(evidence: Dict[str, Any]) -> Dict[str, Any]:
@@ -358,8 +377,8 @@ def merge_manual_score(
     airtable_fields = validated.get("airtable_fields") or {}
     if not isinstance(airtable_fields, dict):
         airtable_fields = {}
-    row.update(airtable_fields)
-    _sync_manual_airtable_aliases(row, airtable_fields, base_alias_values)
+    airtable_overrides = _safe_airtable_overrides(airtable_fields)
+    _sync_manual_airtable_aliases(row, airtable_overrides, base_alias_values)
     row.update(
         {
             # Keep the manual-LLM schema fields next to the existing Airtable/reporting aliases.

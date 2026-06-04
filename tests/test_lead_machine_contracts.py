@@ -1594,6 +1594,105 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertIn("- **Vertical:** hardscaping", packet)
         self.assertIn("- **City:** Painesville", packet)
 
+    def test_manual_llm_ignores_bad_airtable_field_keys_and_preserves_canonical_fields(self) -> None:
+        raw_score = self._manual_score(
+            airtable_fields={
+                "Website URL": "https://bad.example",
+                "Reviews": "999",
+                "Rating": "1.0",
+                "[Phone](tel:000)": "(000) 000-0000",
+                "Business Name](https://bad.example)": "Bad Markdown Name",
+            },
+        )
+        enriched = {
+            "google": self._google_fixture(),
+            "evidence": self._evidence_fixture(site_status="weak"),
+        }
+
+        row = merge_manual_score(enriched, raw_score, fallback_vertical="hardscaping")
+
+        self.assertNotIn("[Phone](tel:000)", row)
+        self.assertNotIn("Business Name](https://bad.example)", row)
+        self.assertEqual(row["Website URL"], "https://example.com")
+        self.assertEqual(row["Phone"], "(440) 637-5848")
+        self.assertEqual(row["Reviews"], "130")
+        self.assertEqual(row["Rating"], "4.9")
+
+    def test_score_leads_writes_csv_after_importing_bad_airtable_fields_bundle(self) -> None:
+        first_score = self._manual_score(total_score=75, grade="B")
+        second_score = self._manual_score(
+            total_score=75,
+            grade="B",
+            airtable_fields={
+                "Website URL": "https://bad.example",
+                "Reviews": "999",
+                "Rating": "1.0",
+                "[Phone](tel:000)": "(000) 000-0000",
+            },
+        )
+        first_enriched = {
+            "google": self._google_fixture(),
+            "evidence": self._evidence_fixture(site_status="weak"),
+        }
+        second_enriched = {
+            "google": {
+                **self._google_fixture(),
+                "business_name": "Bad Bundle Landscaping",
+                "place_id": "ChIJ456",
+            },
+            "evidence": self._evidence_fixture(site_status="weak"),
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bundle_path = tmp_path / "bundle.json"
+            scores_dir = tmp_path / "scores"
+            input_path = tmp_path / "enriched.jsonl"
+            output_path = tmp_path / "scored.csv"
+            bundle_path.write_text(
+                json.dumps(
+                    {
+                        "scores": [
+                            {"score_file": "chij123.json", "score": first_score},
+                            {"score_file": "chij456.json", "score": second_score},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            input_path.write_text(
+                f"{json.dumps(first_enriched)}\n{json.dumps(second_enriched)}\n",
+                encoding="utf-8",
+            )
+
+            import_score_bundle(bundle_path, scores_dir)
+            argv = [
+                "score_leads.py",
+                "--input",
+                str(input_path),
+                "--output",
+                str(output_path),
+                "--vertical",
+                "hardscaping",
+                "--mode",
+                "manual-llm",
+                "--scores-dir",
+                str(scores_dir),
+            ]
+            with patch("sys.argv", argv):
+                code = score_leads_main()
+
+            with output_path.open(newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+
+        bad_bundle_row = next(row for row in rows if row["Business Name"] == "Bad Bundle Landscaping")
+        self.assertEqual(code, 0)
+        self.assertNotIn("[Phone](tel:000)", rows[0].keys())
+        self.assertEqual(bad_bundle_row["Website URL"], "https://example.com")
+        self.assertEqual(bad_bundle_row["Phone"], "(440) 637-5848")
+        self.assertEqual(bad_bundle_row["Reviews"], "130")
+        self.assertEqual(bad_bundle_row["Rating"], "4.9")
+
     def test_manual_scored_packet_omits_legacy_review_prompt(self) -> None:
         row = merge_manual_score(
             {"google": self._google_fixture(), "evidence": self._evidence_fixture(site_status="weak")},
