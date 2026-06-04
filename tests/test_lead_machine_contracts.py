@@ -21,7 +21,7 @@ from lead_machine.llm_queue import build_llm_prompt, write_review_queue
 from lead_machine.manual_scores import load_manual_score, merge_manual_score
 from lead_machine.schema import normalize_lead, row_dedupe_keys
 from lead_machine.sendability import flatten_safe_outreach_claims, normalize_evidence_refs
-from make_packets import is_eligible, packet_markdown
+from make_packets import is_eligible, main as make_packets_main, packet_markdown
 from make_llm_batch import write_llm_batches
 from import_llm_score_bundle import import_score_bundle
 from score_leads import main as score_leads_main
@@ -99,10 +99,25 @@ class LeadMachineContractsTest(unittest.TestCase):
             code = upload_airtable.main()
         return code, stdout.getvalue(), stderr.getvalue()
 
+    def _run_make_packets(self, argv: list[str]) -> tuple[int, str, str]:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with patch("sys.argv", argv), redirect_stdout(stdout), redirect_stderr(stderr):
+            code = make_packets_main()
+        return code, stdout.getvalue(), stderr.getvalue()
+
     def _dry_run_plan(self, stdout: str) -> list[dict[str, object]]:
         lines = stdout.splitlines()
         self.assertTrue(lines and lines[0].startswith("[DRY-RUN]"))
         return json.loads("\n".join(lines[1:]))
+
+    def _write_packet_index(self, packet_dir: Path, rows: list[dict[str, str]]) -> None:
+        packet_dir.mkdir(parents=True, exist_ok=True)
+        fieldnames = ["Packet Path", "Business Name", "Place Key", "Phone", "Lead Priority", "Offer Fit"]
+        with (packet_dir / "packet_index.csv").open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
 
     @contextmanager
     def _without_airtable_env(self):
@@ -213,6 +228,131 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertNotIn("Status", fields)
         self.assertNotIn("Next Action", fields)
         self.assertNotIn("Outreach Channel", fields)
+
+    def test_make_packets_updates_scored_csv_with_current_batch_packet_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_cwd = Path.cwd()
+            os.chdir(tmp)
+            try:
+                csv_path = Path("output/scored_current_batch_manual.csv")
+                csv_path.parent.mkdir(parents=True)
+                stale_path = "packets_manual_existing_manual/A_no-site-launch/003-m-m-masonry-and-landscape-llc.md"
+                self._write_airtable_csv(
+                    csv_path,
+                    [
+                        self._airtable_csv_row(
+                            **{
+                                "Business Name": "M & M Masonry and Landscape LLC",
+                                "Phone": "(440) 622-0083",
+                                "Place Key": "ChIJe1e2bAl1MYgRmYxkuR04D40",
+                                "Lead Priority": "A",
+                                "Offer Fit": "No-Site Launch",
+                                "Packet Path": stale_path,
+                            }
+                        )
+                    ],
+                )
+
+                code, _stdout, stderr = self._run_make_packets(
+                    [
+                        "make_packets.py",
+                        "--inputs",
+                        str(csv_path),
+                        "--output-dir",
+                        "packets_current_batch_manual",
+                    ]
+                )
+
+                with csv_path.open(newline="", encoding="utf-8") as f:
+                    rows = list(csv.DictReader(f))
+            finally:
+                os.chdir(old_cwd)
+
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(
+            rows[0]["Packet Path"],
+            "packets_current_batch_manual/A_no-site-launch/001-m-m-masonry-and-landscape-llc.md",
+        )
+        self.assertNotIn("packets_manual_existing_manual", rows[0]["Packet Path"])
+
+    def test_airtable_uses_current_batch_packet_index_instead_of_stale_packet_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_cwd = Path.cwd()
+            os.chdir(tmp)
+            try:
+                csv_path = Path("output/scored_current_batch_manual.csv")
+                csv_path.parent.mkdir(parents=True)
+                current_path = "packets_current_batch_manual/A_no-site-launch/004-m-m-masonry-and-landscape-llc.md"
+                stale_path = "packets_manual_existing_manual/A_no-site-launch/003-m-m-masonry-and-landscape-llc.md"
+                Path(current_path).parent.mkdir(parents=True)
+                Path(current_path).write_text("current", encoding="utf-8")
+                Path(stale_path).parent.mkdir(parents=True)
+                Path(stale_path).write_text("stale", encoding="utf-8")
+                self._write_packet_index(
+                    Path("packets_current_batch_manual"),
+                    [
+                        {
+                            "Packet Path": current_path,
+                            "Business Name": "M & M Masonry and Landscape LLC",
+                            "Place Key": "ChIJe1e2bAl1MYgRmYxkuR04D40",
+                            "Phone": "(440) 622-0083",
+                            "Lead Priority": "A",
+                            "Offer Fit": "No-Site Launch",
+                        }
+                    ],
+                )
+                self._write_airtable_csv(
+                    csv_path,
+                    [
+                        self._airtable_csv_row(
+                            **{
+                                "Business Name": "M & M Masonry and Landscape LLC",
+                                "Phone": "(440) 622-0083",
+                                "Place Key": "ChIJe1e2bAl1MYgRmYxkuR04D40",
+                                "Packet Path": stale_path,
+                            }
+                        )
+                    ],
+                )
+
+                code, stdout, stderr = self._run_upload(
+                    ["upload_airtable.py", "--input", str(csv_path), "--only-sendable"]
+                )
+            finally:
+                os.chdir(old_cwd)
+
+        self.assertEqual(code, 0, stderr)
+        planned = self._dry_run_plan(stdout)
+        fields = planned[0]["payload"]["fields"]  # type: ignore[index]
+        self.assertEqual(fields["Packet Path"], current_path)
+        self.assertNotIn("packets_manual_existing_manual", fields["Packet Path"])
+
+    def test_airtable_payload_uses_current_packet_path_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_cwd = Path.cwd()
+            os.chdir(tmp)
+            try:
+                csv_path = Path("output/scored_current_batch_manual.csv")
+                csv_path.parent.mkdir(parents=True)
+                current_path = "packets_current_batch_manual/A_website-rebuild/001-a-landscaping-llc.md"
+                Path(current_path).parent.mkdir(parents=True)
+                Path(current_path).write_text("current", encoding="utf-8")
+                self._write_airtable_csv(
+                    csv_path,
+                    [self._airtable_csv_row(**{"Offer Fit": "Website Rebuild", "Packet Path": current_path})],
+                )
+
+                records = upload_airtable.read_input_records(
+                    csv_path,
+                    only_sendable=True,
+                    packet_dir=Path("packets_current_batch_manual"),
+                )
+                planned = plan_airtable_sync(records, existing_records_by_key={})
+            finally:
+                os.chdir(old_cwd)
+
+        fields = planned[0]["payload"]["fields"]  # type: ignore[index]
+        self.assertEqual(fields["Packet Path"], current_path)
 
     def test_airtable_only_sendable_excludes_non_sendable_csv_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

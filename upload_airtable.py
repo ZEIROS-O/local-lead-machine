@@ -121,6 +121,38 @@ def safe_slug(text: str) -> str:
     return text.strip("-")
 
 
+def infer_packet_dir(input_path: Path) -> Path:
+    stem = input_path.stem
+    prefix = "scored_"
+    suffix = "_manual"
+    if stem.startswith(prefix) and stem.endswith(suffix):
+        batch = stem[len(prefix) : -len(suffix)]
+        if batch:
+            return Path(f"packets_{batch}_manual")
+    return DEFAULT_PACKET_DIR
+
+
+def path_from_cwd(path_value: str) -> Path:
+    path = Path(path_value)
+    if path.is_absolute():
+        return path
+    return Path.cwd() / path
+
+
+def packet_path_exists(path_value: str) -> bool:
+    return path_from_cwd(path_value).exists()
+
+
+def packet_path_is_inside_dir(path_value: str, packet_dir: Path) -> bool:
+    try:
+        path = path_from_cwd(path_value).resolve()
+        root = path_from_cwd(str(packet_dir)).resolve()
+        path.relative_to(root)
+    except (OSError, ValueError):
+        return False
+    return True
+
+
 def existing_packet_path(row: Dict[str, str], packet_dir: Path) -> str:
     if not packet_dir.exists():
         return ""
@@ -137,21 +169,18 @@ def existing_packet_path(row: Dict[str, str], packet_dir: Path) -> str:
                 indexed_path = clean_cell(index_row.get("Packet Path"))
                 if not indexed_path:
                     continue
-                path = Path(indexed_path)
-                if not path.is_absolute():
-                    path = Path.cwd() / path
-                if not path.exists():
+                if not packet_path_exists(indexed_path):
                     continue
 
                 indexed_place = clean_cell(index_row.get("Place Key"))
                 indexed_phone = normalize_phone(index_row.get("Phone", ""))
                 indexed_business = clean_cell(index_row.get("Business Name")).casefold()
                 if place_key and indexed_place == place_key:
-                    return str(path)
+                    return indexed_path
                 if phone and indexed_phone == phone:
-                    return str(path)
+                    return indexed_path
                 if business_key and indexed_business == business_key:
-                    return str(path)
+                    return indexed_path
 
     business_slug = safe_slug(business)
     if not business_slug:
@@ -162,6 +191,19 @@ def existing_packet_path(row: Dict[str, str], packet_dir: Path) -> str:
             return str(path)
 
     return ""
+
+
+def current_packet_path(row: Dict[str, str], packet_dir: Path) -> str:
+    packet_path = existing_packet_path(row, packet_dir)
+    if packet_path:
+        return packet_path
+
+    explicit_path = clean_cell(row.get("Packet Path"))
+    if not explicit_path or not packet_path_exists(explicit_path):
+        return ""
+    if packet_dir.exists() and not packet_path_is_inside_dir(explicit_path, packet_dir):
+        return ""
+    return explicit_path
 
 
 def csv_row_to_record(row: Dict[str, str], packet_dir: Path) -> Dict[str, Any]:
@@ -193,7 +235,7 @@ def csv_row_to_record(row: Dict[str, str], packet_dir: Path) -> Dict[str, Any]:
         fields["Outreach Channel"] = "Google Maps"
         defaulted_fields.append("Outreach Channel")
 
-    packet_path = existing_packet_path(row, packet_dir)
+    packet_path = current_packet_path(row, packet_dir)
     if packet_path:
         fields["Packet Path"] = packet_path
 
@@ -358,8 +400,8 @@ def main() -> int:
     parser.add_argument("--live", action="store_true", help="Send planned writes to Airtable")
     parser.add_argument(
         "--packet-dir",
-        default=str(DEFAULT_PACKET_DIR),
-        help="Packet directory for optional Packet Path mapping",
+        default="",
+        help="Packet directory for optional Packet Path mapping; defaults to packets_<BATCH>_manual for scored_<BATCH>_manual.csv",
     )
     parser.add_argument("--base-id", default=os.getenv("AIRTABLE_BASE_ID", ""))
     parser.add_argument("--table", default=os.getenv("AIRTABLE_PROSPECTS_TABLE", ""))
@@ -370,7 +412,7 @@ def main() -> int:
         parser.error("--dry-run cannot be combined with --live")
 
     input_path = Path(args.input)
-    packet_dir = Path(args.packet_dir)
+    packet_dir = Path(args.packet_dir) if args.packet_dir else infer_packet_dir(input_path)
 
     try:
         if not input_path.exists():

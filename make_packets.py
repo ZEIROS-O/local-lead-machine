@@ -153,8 +153,9 @@ def read_rows(paths: List[Path]) -> List[Dict[str, str]]:
             raise FileNotFoundError(path)
 
         with path.open(newline="", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
+            for index, row in enumerate(csv.DictReader(f)):
                 row["_source_file"] = str(path)
+                row["_source_index"] = str(index)
                 rows.append(row)
 
     return rows
@@ -509,6 +510,47 @@ def write_index(output_dir: Path, packet_rows: List[Dict[str, str]]) -> None:
             writer.writerow({field: row.get(field, "") for field in fields})
 
 
+def update_input_packet_paths(input_paths: List[Path], packet_rows: List[Dict[str, str]]) -> List[Path]:
+    packet_paths_by_source: Dict[tuple[str, str], str] = {}
+    for row in packet_rows:
+        source_file = row.get("_source_file", "")
+        source_index = row.get("_source_index", "")
+        packet_path = row.get("Packet Path", "")
+        if source_file and source_index:
+            packet_paths_by_source[(source_file, source_index)] = packet_path
+
+    updated: List[Path] = []
+    for path in input_paths:
+        with path.open(newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            fieldnames = list(reader.fieldnames or [])
+            rows = list(reader)
+
+        added_packet_path = False
+        if "Packet Path" not in fieldnames:
+            fieldnames.append("Packet Path")
+            added_packet_path = True
+
+        changed = added_packet_path
+        for index, row in enumerate(rows):
+            packet_path = packet_paths_by_source.get((str(path), str(index)), "")
+            if row.get("Packet Path", "") != packet_path:
+                row["Packet Path"] = packet_path
+                changed = True
+
+        if not changed:
+            continue
+
+        with path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+
+        updated.append(path)
+
+    return updated
+
+
 def main() -> int:
     raise_csv_limit()
 
@@ -570,11 +612,14 @@ def main() -> int:
         print(f"[PACKET] {packet_path}")
 
     write_index(output_dir, packet_rows)
+    updated_inputs = update_input_packet_paths(input_paths, packet_rows)
 
     print(f"[DONE] Inputs: {', '.join(str(p) for p in input_paths)}")
     print(f"[DONE] Output dir: {output_dir}")
     print(f"[DONE] Packets created: {len(packet_rows)}")
     print(f"[DONE] Index: {output_dir / 'packet_index.csv'}")
+    if updated_inputs:
+        print(f"[DONE] Updated packet paths: {', '.join(str(p) for p in updated_inputs)}")
 
     if packet_rows:
         print("\nTop packets:")
