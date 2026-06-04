@@ -58,6 +58,20 @@ Rules:
 - Every scored claim must reference evidence IDs from the packet.
 - If there is no evidence for a claim, lower evidence confidence instead of inventing.
 - Missing site plus strong reviews can be an A lead.
+- Do not score A/sendable just because the business is reputable.
+- Do not score A/sendable just because the business fits hardscaping.
+- The best lead is one where the website is visibly worse than the actual business.
+- No specific observation = no send.
+- More reviews require stronger proof of visible pain.
+- Do not infer missing forms if evidence is uncertain.
+- A strong estimate form does not globally disqualify a lead.
+- It only blocks missing-form, no-contact-path, and no-estimate-path claims.
+- If another concrete issue exists, score based on that issue: premium perception gap, weak portfolio presentation, outdated site, bad mobile path, weak review/trust placement, or unclear service positioning.
+- Estimate Funnel A/sendable requires a concrete estimate-path issue: no contact/estimate form, weak/basic form, phone/email-only path, broken/social-only site, missing or buried CTA, bad mobile status, low visible trust/proof despite demand, or a form that is buried/generic/disconnected from premium services.
+- Do not use Estimate Funnel if the form is strong unless the actual estimate path is still visibly weak.
+- If a strong estimate form exists, do not use missing-form, no-contact-path, or no-estimate-path pain.
+- CTA terms alone are not proof of funnel pain.
+- Advanced Optimization is not enough for sendability unless tied to a concrete visible issue.
 - Hard disqualifier or score below 50 means Skip.
 - safe_outreach_claims must be an array of objects.
 - Each safe_outreach_claims object must have claim as a string and evidence_refs as an array of valid evidence IDs from the packet.
@@ -67,6 +81,7 @@ Rules:
 - recommended_action must be operational. Bad: "A lead - pursue." Good: "Build/send a no-site launch mockup focused on an owned homepage with review proof, phone CTA, and estimate request path."
 - opener: Must be safe to send or lightly edit.
 - opener: Must mention at least one specific evidence-backed observation.
+- opener: Every opener must reference a real observable issue.
 - opener: Must not make fake money claims.
 - opener: Must not guarantee results.
 - opener: Must not make unsupported competitor claims.
@@ -75,6 +90,11 @@ Rules:
 Allowed best_angle values:
 - Website Rebuild
 - Estimate Funnel
+- Premium Perception Gap
+- Portfolio Rebuild
+- Mobile Quote Path Cleanup
+- Service Page Cleanup
+- Review/Trust Proof Upgrade
 - Website Cleanup
 - Tracking
 - Advanced Optimization
@@ -97,6 +117,10 @@ Output schema:
   "confidence": "low|medium|high",
   "hard_disqualifiers": [],
   "best_angle": "",
+  "visible_pain_score": 0,
+  "visible_pain_reasons": [],
+  "visible_pain_categories": [],
+  "send_trigger": "",
   "recommended_action": "",
   "why_this_lead": [],
   "why_this_might_be_wrong": [],

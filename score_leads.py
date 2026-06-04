@@ -9,7 +9,7 @@ Core logic:
 - Priority is driven by visual/conversion delta, then capped by ICP fit.
 - Whales/franchises/commercial/restoration-heavy roofing are downgraded.
 - Missing form/CTA is de-weighted unless corroborated by other weakness.
-- Packet Eligible = only A/B + Website Rebuild or Estimate Funnel.
+- Packet Eligible = only A/B + a concrete rebuild, funnel, portfolio, premium-perception, mobile, service-page, or trust-proof angle.
 
 Examples:
     python score_leads.py --input output/enriched_hardscaping.jsonl --output output/scored_hardscaping.csv --vertical hardscaping
@@ -38,6 +38,11 @@ PRIORITY_RANK = {"A": 0, "B": 1, "C": 2, "Skip": 3}
 DELTA_RANK = {
     "Website Rebuild": 0,
     "Estimate Funnel": 1,
+    "Premium Perception Gap": 1,
+    "Portfolio Rebuild": 1,
+    "Mobile Quote Path Cleanup": 1,
+    "Service Page Cleanup": 2,
+    "Review/Trust Proof Upgrade": 2,
     "Website Cleanup": 2,
     "Tracking / Missed Call": 2,
     "GBP / Reviews": 2,
@@ -124,8 +129,52 @@ HIGH_TICKET_TERMS = [
     "brick",
 ]
 
-BAD_REVIEW_THRESHOLD = 4.3
-IDEAL_RATING_THRESHOLD = 4.5
+BAD_REVIEW_THRESHOLD = 4.0
+IDEAL_RATING_THRESHOLD = 4.4
+
+PREMIUM_PERCEPTION_FLAGS = {
+    "premium_perception_gap",
+    "premium_brand_mismatch",
+    "owned_site_undersells_google_proof",
+    "cheap_website",
+    "site_looks_cheap",
+    "outdated_site",
+    "lawn_maintenance_positioning",
+}
+
+PORTFOLIO_FLAGS = {
+    "weak_project_gallery",
+    "weak_gallery",
+    "buried_project_photos",
+    "project_photos_buried",
+    "portfolio_presentation_pain",
+}
+
+MOBILE_FLAGS = {"weak_mobile_path", "bad_mobile_status", "mobile_usability_pain"}
+TRUST_FLAGS = {"low_visible_trust", "reviews_not_near_cta", "trust_proof_pain"}
+SERVICE_CLARITY_FLAGS = {"weak_services_page", "unclear_service_pages", "high_ticket_services_unclear", "service_clarity_pain"}
+ESTIMATE_PATH_WEAKNESS_FLAGS = {
+    "no_clear_cta_detected",
+    "weak_mobile_path",
+    "bad_mobile_status",
+    "buried_cta",
+    "only_phone_email_path",
+    "broken_form",
+    "form_error",
+    "low_visible_trust",
+    "reviews_not_near_cta",
+    "weak_basic_form",
+}
+
+CONCRETE_PACKET_OFFERS = {
+    "Website Rebuild",
+    "Estimate Funnel",
+    "Premium Perception Gap",
+    "Portfolio Rebuild",
+    "Mobile Quote Path Cleanup",
+    "Service Page Cleanup",
+    "Review/Trust Proof Upgrade",
+}
 
 
 @dataclass(frozen=True)
@@ -182,6 +231,54 @@ def more_restrictive(a: str, b: str) -> str:
 def is_no_or_broken(record: Dict[str, Any]) -> bool:
     status = record.get("website", {}).get("site_status", "Unknown")
     return status in {"No Website", "Broken Website", "Social Only"}
+
+
+def form_status(record: Dict[str, Any], key: str, default: str = "") -> str:
+    website = record.get("website", {}) or {}
+    evidence = record.get("evidence", {}) or {}
+    value = website.get(key)
+    if value in ("", None):
+        value = evidence.get(key)
+    return str(value or default)
+
+
+def has_strong_estimate_form(record: Dict[str, Any]) -> bool:
+    return (
+        form_status(record, "estimate_form_detected").lower() == "yes"
+        and form_status(record, "form_strength").lower() == "strong"
+    )
+
+
+def form_strength(record: Dict[str, Any]) -> str:
+    return form_status(record, "form_strength", "None")
+
+
+def site_issue_flags(record: Dict[str, Any]) -> set[str]:
+    website = record.get("website", {}) or {}
+    evidence = record.get("evidence", {}) or {}
+    flags = website.get("site_issue_flags") or evidence.get("raw_flags") or []
+    return {str(flag).strip().lower() for flag in flags if str(flag).strip()}
+
+
+def visible_pain_categories(record: Dict[str, Any]) -> set[str]:
+    evidence = record.get("evidence", {}) or {}
+    value = evidence.get("visible_pain_categories") or []
+    if isinstance(value, str):
+        value = value.replace(",", ";").split(";")
+    if not isinstance(value, list):
+        value = []
+    return {str(category).strip() for category in value if str(category).strip()}
+
+
+def has_estimate_path_weakness(record: Dict[str, Any]) -> bool:
+    categories = visible_pain_categories(record)
+    flags = site_issue_flags(record)
+    current_form_strength = form_strength(record).lower()
+    if categories & {"estimate_path_pain", "mobile_usability_pain", "trust_proof_pain"}:
+        return True
+    if flags & ESTIMATE_PATH_WEAKNESS_FLAGS:
+        return True
+    return current_form_strength in {"weak", "basic"}
 
 
 def infer_vertical(record: Dict[str, Any], fallback: str) -> str:
@@ -248,7 +345,7 @@ def fit_ceiling(record: Dict[str, Any], vertical: str) -> Tuple[str, List[str]]:
         return "Skip", flags
 
     if rating and rating < IDEAL_RATING_THRESHOLD:
-        flags.append("rating below ideal 4.5")
+        flags.append("rating below preferred 4.4")
         return "C", flags
 
     # Roofing restoration/insurance is not always bad, but it is often a slower/insurance-driven sale.
@@ -259,14 +356,14 @@ def fit_ceiling(record: Dict[str, Any], vertical: str) -> Tuple[str, List[str]]:
         return "C", flags
 
     # Inverted-U review logic.
-    # 15-250/300 reviews = best ICP band. Very high reviews = stronger company but less closeable.
-    if reviews >= 500:
-        flags.append("whale review count 500+")
-        return ("B" if no_site else "C"), flags
+    # 5-20 reviews = best first-wave owner-led band. More reviews need clearer visible pain.
+    if reviews >= 75:
+        flags.append("75+ reviews requires very clear visible pain")
+        return ("A" if no_site else "B"), flags
 
-    if reviews >= 300:
-        flags.append("above ideal owner-led review band")
-        return ("B" if no_site else "C"), flags
+    if reviews >= 21:
+        flags.append("21-75 reviews requires clear visible pain")
+        return "A", flags
 
     if reviews < 5:
         flags.append("very thin review proof")
@@ -274,14 +371,7 @@ def fit_ceiling(record: Dict[str, Any], vertical: str) -> Tuple[str, List[str]]:
             return "C", flags
         return "C", flags
 
-    if reviews < 15:
-        flags.append("thin review proof")
-        if no_site and rating >= 4.8:
-            # In old-school trades this can still be a real business, but do not overtrust it.
-            return "B", flags
-        return "C", flags
-
-    flags.append("inside target review/rating band")
+    flags.append("inside 5-20 sweet spot review/rating band")
     return "A", flags
 
 
@@ -313,34 +403,25 @@ def score_business_strength(record: Dict[str, Any], vertical: str) -> Tuple[int,
 
     # Inverted-U: reward enough proof, not infinite proof.
     if family == "hardscaping":
-        if 15 <= reviews <= 250:
+        if 5 <= reviews <= 20:
             score += 10
-            evidence.append(f"{reviews} reviews inside ideal hardscaping band")
-        elif 5 <= reviews < 15:
-            score += 5
-            evidence.append(f"{reviews} reviews, thin but possible old-school trade proof")
-        elif 251 <= reviews < 500:
+            evidence.append(f"{reviews} reviews inside 5-20 hardscaping sweet spot")
+        elif 21 <= reviews <= 75:
             score += 7
-            evidence.append(f"{reviews} reviews, mature business")
-        elif reviews >= 500:
+            evidence.append(f"{reviews} reviews, workable proof but needs visible pain")
+        elif reviews > 75:
             score += 4
-            evidence.append(f"{reviews} reviews, likely larger/vendorized")
+            evidence.append(f"{reviews} reviews, higher-review business needs stronger visible pain")
     else:
-        if 25 <= reviews <= 250:
+        if 5 <= reviews <= 20:
             score += 10
-            evidence.append(f"{reviews} reviews inside ideal band")
-        elif 15 <= reviews < 25:
+            evidence.append(f"{reviews} reviews inside 5-20 sweet spot")
+        elif 21 <= reviews <= 75:
             score += 7
-            evidence.append(f"{reviews} reviews, enough proof but thin")
-        elif 5 <= reviews < 15:
-            score += 3
-            evidence.append(f"{reviews} reviews, thin proof")
-        elif 251 <= reviews < 500:
-            score += 6
-            evidence.append(f"{reviews} reviews, mature business")
-        elif reviews >= 500:
-            score += 3
-            evidence.append(f"{reviews} reviews, likely whale/vendorized")
+            evidence.append(f"{reviews} reviews, workable proof but needs visible pain")
+        elif reviews > 75:
+            score += 4
+            evidence.append(f"{reviews} reviews, higher-review business needs stronger visible pain")
 
     if has_any(blob, HIGH_TICKET_TERMS) or d.get("has_high_ticket_terms"):
         score += 10
@@ -364,9 +445,11 @@ def score_business_strength(record: Dict[str, Any], vertical: str) -> Tuple[int,
 def score_online_weakness(record: Dict[str, Any]) -> Tuple[int, List[str]]:
     w = record.get("website", {})
     d = record.get("derived", {})
-    flags = set(w.get("site_issue_flags", []))
+    flags = site_issue_flags(record)
+    categories = visible_pain_categories(record)
     status = w.get("site_status", "Unknown")
     blob = text_blob(record)
+    strong_estimate_form = has_strong_estimate_form(record)
 
     score = 0
     evidence: List[str] = []
@@ -385,6 +468,26 @@ def score_online_weakness(record: Dict[str, Any]) -> Tuple[int, List[str]]:
         score += 18
         evidence.append("non-standard website/booking URL")
 
+    if categories & {"premium_perception_gap"} or flags & PREMIUM_PERCEPTION_FLAGS:
+        score += 16
+        evidence.append("premium work is undersold by owned site")
+
+    if categories & {"portfolio_presentation_pain"} or flags & PORTFOLIO_FLAGS:
+        score += 16
+        evidence.append("weak/buried project gallery")
+
+    if categories & {"mobile_usability_pain"} or flags & MOBILE_FLAGS:
+        score += 14
+        evidence.append("mobile quote path weakness")
+
+    if categories & {"trust_proof_pain"} or flags & TRUST_FLAGS:
+        score += 10
+        evidence.append("weak trust proof near conversion point")
+
+    if categories & {"service_clarity_pain"} or flags & SERVICE_CLARITY_FLAGS:
+        score += 10
+        evidence.append("unclear high-ticket service presentation")
+
     if "no_email_detected" in flags:
         score += 5
         evidence.append("no visible email")
@@ -399,12 +502,20 @@ def score_online_weakness(record: Dict[str, Any]) -> Tuple[int, List[str]]:
     weak_services = not services_ok
     corroborated = bool(structural_status or nonstandard or generic or no_email or weak_services)
 
-    if "no_form_detected" in flags:
+    if "no_form_detected" in flags and not strong_estimate_form:
         points = 8 if corroborated else 2
         score += points
         evidence.append("no form detected" + ("" if corroborated else " (low-confidence)"))
 
-    if "no_clear_cta_detected" in flags:
+    current_form_strength = form_strength(record).lower()
+    if current_form_strength == "weak":
+        score += 8
+        evidence.append("weak form detected")
+    elif current_form_strength == "basic":
+        score += 5
+        evidence.append("basic form only")
+
+    if "no_clear_cta_detected" in flags and not strong_estimate_form:
         points = 8 if corroborated else 2
         score += points
         evidence.append("weak/no clear CTA" + ("" if corroborated else " (low-confidence)"))
@@ -436,7 +547,8 @@ def score_online_weakness(record: Dict[str, Any]) -> Tuple[int, List[str]]:
 def choose_offer_fit(record: Dict[str, Any], strength: int, weakness: int) -> Tuple[str, int, List[str]]:
     w = record.get("website", {})
     d = record.get("derived", {})
-    flags = set(w.get("site_issue_flags", []))
+    flags = site_issue_flags(record)
+    categories = visible_pain_categories(record)
     status = w.get("site_status", "Unknown")
 
     evidence: List[str] = []
@@ -449,19 +561,57 @@ def choose_offer_fit(record: Dict[str, Any], strength: int, weakness: int) -> Tu
         evidence.append("uses booking/social URL instead of full owned site")
         return "Website Rebuild", 20, evidence
 
+    strong_estimate_form = has_strong_estimate_form(record)
+    current_form_strength = form_strength(record).lower()
     no_form = "no_form_detected" in flags
     no_cta = "no_clear_cta_detected" in flags
     no_email = "no_email_detected" in flags
     phone_diff = d.get("phone_consistency") == "different"
+    estimate_path_weakness = has_estimate_path_weakness(record)
+
+    if categories & {"portfolio_presentation_pain"} or flags & PORTFOLIO_FLAGS:
+        evidence.append("project gallery/portfolio presentation gap")
+        return "Portfolio Rebuild", 16, evidence
+
+    if categories & {"premium_perception_gap"} or flags & PREMIUM_PERCEPTION_FLAGS:
+        evidence.append("premium work is undersold by owned site")
+        return "Premium Perception Gap", 16, evidence
+
+    if categories & {"mobile_usability_pain"} or flags & MOBILE_FLAGS:
+        evidence.append("mobile quote path needs cleanup")
+        return "Mobile Quote Path Cleanup", 15, evidence
+
+    if categories & {"trust_proof_pain"} or flags & TRUST_FLAGS:
+        evidence.append("review/trust proof is weak near conversion point")
+        return "Review/Trust Proof Upgrade", 12, evidence
+
+    if categories & {"service_clarity_pain"} or flags & SERVICE_CLARITY_FLAGS:
+        evidence.append("high-ticket service pages are unclear")
+        return "Service Page Cleanup", 12, evidence
+
+    if strong_estimate_form and not (estimate_path_weakness or no_email or phone_diff):
+        if weakness >= 18:
+            evidence.append("site has cleanup gaps, but a strong estimate form is already present")
+            return "Website Cleanup", 10, evidence
+        evidence.append("strong estimate form already present")
+        return "Advanced Optimization", 4, evidence
+
+    if current_form_strength in {"weak", "basic"} and weakness >= 12:
+        evidence.append(f"{current_form_strength} estimate/contact form with other weakness")
+        return "Estimate Funnel", 14, evidence
 
     # Only treat form/CTA as funnel issue if there are multiple signals.
-    if no_form and no_cta and (no_email or weakness >= 18):
+    if not strong_estimate_form and no_form and no_cta and (no_email or weakness >= 18):
         evidence.append("no form, weak CTA, and corroborating weakness")
         return "Estimate Funnel", 18, evidence
 
-    if no_form and weakness >= 16:
+    if not strong_estimate_form and no_form and weakness >= 16:
         evidence.append("form/intake gap with other weakness")
         return "Estimate Funnel", 16, evidence
+
+    if strong_estimate_form and estimate_path_weakness and weakness >= 16:
+        evidence.append("estimate path has a specific weakness beyond form existence")
+        return "Mobile Quote Path Cleanup", 14, evidence
 
     if phone_diff:
         evidence.append("phone mismatch")
@@ -523,7 +673,17 @@ def base_priority_from_delta(record: Dict[str, Any], offer_fit: str) -> str:
     if offer_fit == "Estimate Funnel":
         return "B"
 
-    if offer_fit in {"Website Cleanup", "Tracking / Missed Call", "GBP / Reviews", "SEO / Service Pages"}:
+    if offer_fit in {"Premium Perception Gap", "Portfolio Rebuild", "Mobile Quote Path Cleanup"}:
+        return "B"
+
+    if offer_fit in {
+        "Website Cleanup",
+        "Tracking / Missed Call",
+        "GBP / Reviews",
+        "SEO / Service Pages",
+        "Service Page Cleanup",
+        "Review/Trust Proof Upgrade",
+    }:
         return "C"
 
     if offer_fit == "Advanced Optimization":
@@ -621,6 +781,18 @@ def make_observation(
             f"Fit context: {fit}. This is likely a secondary prospect unless screenshots show the site is visibly outdated enough for a strong mockup delta."
         )
 
+    if offer_fit in {
+        "Premium Perception Gap",
+        "Portfolio Rebuild",
+        "Mobile Quote Path Cleanup",
+        "Service Page Cleanup",
+        "Review/Trust Proof Upgrade",
+    }:
+        return (
+            f"{name} has credible local demand/proof ({rating} rating, {reviews} reviews; {strength}), but the visible web presentation undersells the business: {weakness}. "
+            f"Fit context: {fit}. The outreach angle should stay tied to that observable gap, not to a missing-form claim."
+        )
+
     if offer_fit == "Advanced Optimization":
         return (
             f"{name} appears more mature than a basic rebuild prospect: {rating} rating, {reviews} reviews, and {strength}. "
@@ -650,14 +822,14 @@ def skip_reason(record: Dict[str, Any], priority: str, total: int, offer_fit: st
 
 
 def packet_eligible(priority: str, offer_fit: str) -> str:
-    if priority in {"A", "B"} and offer_fit in {"Website Rebuild", "Estimate Funnel"}:
+    if priority in {"A", "B"} and offer_fit in CONCRETE_PACKET_OFFERS:
         return "Yes"
     return ""
 
 
 def packet_eligibility_reason(priority: str, offer_fit: str) -> str:
     if packet_eligible(priority, offer_fit):
-        return "A/B lead with Website Rebuild or Estimate Funnel"
+        return "A/B lead with concrete visible-pain offer fit"
     if priority not in {"A", "B"}:
         return "Lead priority below B threshold"
     return "Offer fit not Website Rebuild or Estimate Funnel"
@@ -690,13 +862,15 @@ def first_issue_evidence_id(record: Dict[str, Any]) -> str:
 def deterministic_safe_claims(record: Dict[str, Any], offer_fit: str) -> List[Dict[str, Any]]:
     g = record.get("google", {}) or {}
     w = record.get("website", {}) or {}
+    evidence = record.get("evidence", {}) or {}
     rating = g.get("rating", "")
     reviews = g.get("reviews", "")
     status = w.get("site_status", "")
+    send_trigger = str(evidence.get("send_trigger") or "").strip()
 
     claims: List[Dict[str, Any]] = []
     demand_ref = evidence_id_by_field(record, "google_rating")
-    issue_ref = first_issue_evidence_id(record)
+    issue_ref = evidence_id_by_field(record, "send_trigger") or first_issue_evidence_id(record)
 
     if demand_ref:
         claims.append(
@@ -707,7 +881,15 @@ def deterministic_safe_claims(record: Dict[str, Any], offer_fit: str) -> List[Di
         )
 
     if issue_ref:
-        if status == "No Website":
+        if send_trigger == "No owned website found":
+            claim = "There is no owned website or conversion asset visible."
+        elif send_trigger == "Website appears broken":
+            claim = "The current website appears broken from the collected evidence."
+        elif send_trigger == "Social-only web presence":
+            claim = "The visible web presence appears to rely on social pages instead of an owned conversion asset."
+        elif send_trigger:
+            claim = send_trigger
+        elif status == "No Website":
             claim = "There is no owned website or conversion asset visible."
         elif status == "Broken Website":
             claim = "The current website appears broken from the collected evidence."
@@ -728,11 +910,17 @@ def deterministic_opener(record: Dict[str, Any], offer_fit: str) -> str:
     rating = g.get("rating", "")
     reviews = g.get("reviews", "")
     status = (record.get("website", {}) or {}).get("site_status", "")
+    send_trigger = str((record.get("evidence", {}) or {}).get("send_trigger") or "").strip()
 
     if status == "No Website":
         return (
             f"Your Google profile looks strong ({rating} stars / {reviews} reviews), "
             "but I couldn't find an owned website or estimate path. Want me to send a cleaner direction?"
+        )
+    if send_trigger:
+        return (
+            f"{business} looks credible from the outside ({rating} stars / {reviews} reviews), "
+            f"but I noticed this specific web issue: {send_trigger.lower()}. Want me to send a cleaner version?"
         )
     if offer_fit == "Estimate Funnel":
         return (
@@ -747,23 +935,13 @@ def deterministic_opener(record: Dict[str, Any], offer_fit: str) -> str:
 
 def review_fit_band(record: Dict[str, Any], vertical: str) -> str:
     reviews = safe_int(record.get("google", {}).get("reviews"))
-    family = vertical_family(vertical)
 
-    if reviews >= 500:
-        return "Whale 500+"
-    if reviews >= 300:
-        return "High 300-499"
-    if family == "hardscaping":
-        if 15 <= reviews <= 250:
-            return "Ideal 15-250"
-        if 5 <= reviews < 15:
-            return "Thin but possible 5-14"
-    else:
-        if 25 <= reviews <= 250:
-            return "Ideal 25-250"
-        if 15 <= reviews < 25:
-            return "Thin but possible 15-24"
-
+    if reviews >= 75:
+        return "High 75+ needs very clear pain"
+    if 21 <= reviews <= 75:
+        return "Allowed 21-75 needs clear pain"
+    if 5 <= reviews <= 20:
+        return "Ideal 5-20"
     if reviews < 5:
         return "Very thin 0-4"
     return "Out of band"
@@ -793,12 +971,19 @@ def score_record(record: Dict[str, Any], fallback_vertical: str) -> Dict[str, An
         vertical,
     )
 
+    evidence_profile = record.get("evidence", {}) or {}
+    visible_pain_reasons = evidence_profile.get("visible_pain_reasons") or []
+    visible_pain_reasons_text = "; ".join(str(reason) for reason in visible_pain_reasons if str(reason).strip())
+    send_trigger = str(evidence_profile.get("send_trigger") or "").strip()
+    visible_pain_score = evidence_profile.get("visible_pain_score", 0)
+
     evidence_notes = "; ".join(
         [
             f"Strength {strength}/40: {', '.join(strength_evidence) or 'none'}",
             f"Weakness {weakness}/40: {', '.join(weakness_evidence) or 'none'}",
             f"Offer {offer_score}/20: {offer_fit} ({', '.join(offer_evidence) or 'none'})",
             f"Fit cap: {fit_cap} ({', '.join(fit_flags) or 'none'})",
+            f"Visible pain {visible_pain_score}: {visible_pain_reasons_text or 'none'}",
         ]
     )
 
@@ -836,6 +1021,17 @@ def score_record(record: Dict[str, Any], fallback_vertical: str) -> Dict[str, An
         "Lead Priority": priority,
         "Offer Fit": offer_fit,
         "Site Status": w.get("site_status", ""),
+        "Contact Form Detected": form_status(record, "contact_form_detected", "Unknown"),
+        "Estimate Form Detected": form_status(record, "estimate_form_detected", "Unknown"),
+        "Form Strength": form_status(record, "form_strength", "None"),
+        "Form Detection Method": form_status(record, "form_detection_method", "none"),
+        "CTA Strength": form_status(record, "cta_strength", "None"),
+        "Visible Pain Score": visible_pain_score,
+        "visible_pain_score": visible_pain_score,
+        "Visible Pain Reasons": visible_pain_reasons_text,
+        "visible_pain_reasons": visible_pain_reasons,
+        "Send Trigger": send_trigger,
+        "send_trigger": send_trigger,
         "Evidence Notes": evidence_notes,
         "AI Confidence": "medium",
         "Manual Reviewed": "",
@@ -898,10 +1094,14 @@ def write_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
 
 
 def ensure_evidence(record: Dict[str, Any]) -> Dict[str, Any]:
-    if "evidence" not in record:
-        record = dict(record)
-        record["evidence"] = build_evidence_profile(record)
-    return record
+    evidence = record.get("evidence")
+    if isinstance(evidence, dict) and all(
+        key in evidence for key in ("visible_pain_score", "visible_pain_reasons", "send_trigger")
+    ):
+        return record
+    updated = dict(record)
+    updated["evidence"] = build_evidence_profile(record)
+    return updated
 
 
 def evidence_ids(record: Dict[str, Any]) -> set[str]:

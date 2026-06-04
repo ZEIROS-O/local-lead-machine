@@ -30,6 +30,10 @@ MANUAL_SCORE_SCHEMA: Dict[str, Any] = {
     "confidence": "low|medium|high",
     "hard_disqualifiers": [],
     "best_angle": "",
+    "visible_pain_score": 0,
+    "visible_pain_reasons": [],
+    "visible_pain_categories": [],
+    "send_trigger": "",
     "recommended_action": "",
     "why_this_lead": [],
     "why_this_might_be_wrong": [],
@@ -65,7 +69,10 @@ def read_jsonl(path: Path) -> List[Dict[str, Any]]:
 
 
 def ensure_evidence(record: Dict[str, Any]) -> Dict[str, Any]:
-    if "evidence" in record:
+    evidence = record.get("evidence")
+    if isinstance(evidence, dict) and all(
+        key in evidence for key in ("visible_pain_score", "visible_pain_reasons", "send_trigger")
+    ):
         return record
     updated = dict(record)
     updated["evidence"] = build_evidence_profile(record)
@@ -102,6 +109,100 @@ def candidate_records(records: Iterable[Dict[str, Any]], *, fallback_vertical: s
         if not hard_icp_gate(lead).should_skip:
             candidates.append(record)
     return candidates
+
+
+def batch_sort_key(record: Dict[str, Any]) -> tuple[int, int, int, int, int, int]:
+    record = ensure_evidence(record)
+    evidence = record.get("evidence", {}) or {}
+    website = record.get("website", {}) or {}
+    google = record.get("google", {}) or {}
+
+    site_status = str(evidence.get("site_status") or website.get("site_status") or "").strip().lower().replace(" ", "_")
+    structural_rank = {
+        "missing": 0,
+        "no_website": 0,
+        "broken": 0,
+        "broken_website": 0,
+        "social_only": 0,
+        "jobber_only": 0,
+        "weak": 1,
+    }.get(site_status, 2)
+
+    trigger_rank = 0 if str(evidence.get("send_trigger") or "").strip() else 1
+    visible_pain_score = int(evidence.get("visible_pain_score") or 0)
+
+    raw_categories = evidence.get("visible_pain_categories") or []
+    if isinstance(raw_categories, str):
+        raw_categories = raw_categories.replace(",", ";").split(";")
+    if not isinstance(raw_categories, list):
+        raw_categories = []
+    categories = {str(category).strip() for category in raw_categories if str(category).strip()}
+    flags = {
+        str(flag).strip().lower()
+        for flag in (website.get("site_issue_flags") or evidence.get("raw_flags") or [])
+        if str(flag).strip()
+    }
+    pain_rank = 8
+    if categories & {"no_site_or_social_only_pain", "broken_site_pain"}:
+        pain_rank = 0
+    elif categories & {"portfolio_presentation_pain"} or flags & {
+        "weak_project_gallery",
+        "weak_gallery",
+        "buried_project_photos",
+        "project_photos_buried",
+        "portfolio_presentation_pain",
+    }:
+        pain_rank = 1
+    elif categories & {"premium_perception_gap"} or flags & {
+        "premium_perception_gap",
+        "premium_brand_mismatch",
+        "owned_site_undersells_google_proof",
+        "cheap_website",
+        "site_looks_cheap",
+        "outdated_site",
+        "lawn_maintenance_positioning",
+    }:
+        pain_rank = 2
+    elif categories & {"mobile_usability_pain"} or flags & {"weak_mobile_path", "bad_mobile_status", "mobile_usability_pain"}:
+        pain_rank = 3
+    elif categories & {"trust_proof_pain", "service_clarity_pain"} or flags & {
+        "low_visible_trust",
+        "reviews_not_near_cta",
+        "trust_proof_pain",
+        "weak_services_page",
+        "unclear_service_pages",
+        "high_ticket_services_unclear",
+        "service_clarity_pain",
+    }:
+        pain_rank = 4
+    elif categories & {"estimate_path_pain"}:
+        pain_rank = 5
+
+    estimate_form = str(evidence.get("estimate_form_detected") or website.get("estimate_form_detected") or "").lower()
+    form_strength = str(evidence.get("form_strength") or website.get("form_strength") or "").lower()
+    strong_form_no_pain_rank = (
+        1
+        if estimate_form == "yes"
+        and form_strength == "strong"
+        and visible_pain_score <= 0
+        and not categories
+        else 0
+    )
+
+    try:
+        reviews = int(float(google.get("reviews") or 0))
+    except (TypeError, ValueError):
+        reviews = 0
+    if 5 <= reviews <= 20:
+        review_rank = 0
+    elif 21 <= reviews <= 75:
+        review_rank = 1
+    elif reviews < 5:
+        review_rank = 2
+    else:
+        review_rank = 3
+
+    return (structural_rank, trigger_rank, pain_rank, -visible_pain_score, review_rank, strong_form_no_pain_rank)
 
 
 def chunk_records(records: List[Dict[str, Any]], batch_size: int) -> List[List[Dict[str, Any]]]:
@@ -157,6 +258,20 @@ Rules:
 - Every scored claim must reference evidence IDs from that lead packet.
 - If there is no evidence for a claim, lower evidence confidence instead of inventing.
 - Missing site plus strong reviews can be an A lead.
+- Do not score A/sendable just because the business is reputable.
+- Do not score A/sendable just because the business fits hardscaping.
+- The best lead is one where the website is visibly worse than the actual business.
+- No specific observation = no send.
+- More reviews require stronger proof of visible pain.
+- Do not infer missing forms if evidence is uncertain.
+- A strong estimate form does not globally disqualify a lead.
+- It only blocks missing-form, no-contact-path, and no-estimate-path claims.
+- If another concrete issue exists, score based on that issue: premium perception gap, weak portfolio presentation, outdated site, bad mobile path, weak review/trust placement, or unclear service positioning.
+- Estimate Funnel A/sendable requires a concrete estimate-path issue: no contact/estimate form, weak/basic form, phone/email-only path, broken/social-only site, missing or buried CTA, bad mobile status, low visible trust/proof despite demand, or a form that is buried/generic/disconnected from premium services.
+- Do not use Estimate Funnel if the form is strong unless the actual estimate path is still visibly weak.
+- If a strong estimate form exists, do not use missing-form, no-contact-path, or no-estimate-path pain.
+- CTA terms alone are not proof of funnel pain.
+- Advanced Optimization is not enough for sendability unless tied to a concrete visible issue.
 - Hard disqualifier or score below 50 means Skip.
 - safe_outreach_claims must be an array of objects.
 - Each safe_outreach_claims object must have claim as a string and evidence_refs as an array of valid evidence IDs from that lead packet.
@@ -166,12 +281,18 @@ Rules:
 - recommended_action must be operational. Bad: "A lead - pursue." Good: "Build/send a no-site launch mockup focused on an owned homepage with review proof, phone CTA, and estimate request path."
 - opener must be safe to send or lightly edit.
 - opener must mention at least one specific evidence-backed observation.
+- Every opener must reference a real observable issue.
 - opener must not make fake money claims, guarantee results, or make unsupported competitor claims.
 - opener must not say "you are losing jobs" unless directly proven by packet evidence.
 
 Allowed best_angle values:
 - Website Rebuild
 - Estimate Funnel
+- Premium Perception Gap
+- Portfolio Rebuild
+- Mobile Quote Path Cleanup
+- Service Page Cleanup
+- Review/Trust Proof Upgrade
 - Website Cleanup
 - Tracking
 - Advanced Optimization
@@ -201,6 +322,7 @@ def write_llm_batches(
     selected = [ensure_evidence(record) for record in records]
     if only_candidates:
         selected = candidate_records(selected, fallback_vertical=fallback_vertical)
+        selected.sort(key=batch_sort_key)
     if limit > 0:
         selected = selected[:limit]
 
@@ -258,6 +380,12 @@ def main() -> int:
     for batch in written[:10]:
         print(f"[BATCH] {batch.prompt_path}")
         print(f"[EXPECT] {batch.expected_files_path}")
+        response_path = Path(args.output_dir) / f"{batch.batch_id}_response.json"
+        if response_path.exists():
+            print(
+                f"[WARN] Existing response bundle may be stale after regenerated evidence: {response_path}. "
+                f"Do not import or reuse it; copy a fresh model response from {batch.prompt_path}."
+            )
 
     return 0
 

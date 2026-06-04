@@ -30,6 +30,14 @@ AIRTABLE_ALLOWED_FIELDS = [
     "Lead Priority",
     "Offer Fit",
     "Site Status",
+    "Contact Form Detected",
+    "Estimate Form Detected",
+    "Form Strength",
+    "Form Detection Method",
+    "CTA Strength",
+    "Visible Pain Score",
+    "Visible Pain Reasons",
+    "Send Trigger",
     "AI Confidence",
     "Skip Reason",
     "Place Key",
@@ -43,7 +51,7 @@ AIRTABLE_ALLOWED_FIELDS = [
     "Next Action",
 ]
 
-INTEGER_FIELDS = {"Reviews", "Score Total"}
+INTEGER_FIELDS = {"Reviews", "Score Total", "Visible Pain Score"}
 FLOAT_FIELDS = {"Rating"}
 AI_CONFIDENCE_FIELD = "AI Confidence"
 AI_CONFIDENCE_LABELS = {"low", "medium", "high"}

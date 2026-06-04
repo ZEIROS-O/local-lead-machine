@@ -262,7 +262,15 @@ def evidence_summary(row: Dict[str, str], evidence: Dict[str, Any]) -> str:
     lines.append(f"- **Phones found:** {', '.join(website.get('phones_found', []) or []) or 'none'}")
     lines.append(f"- **Phone consistency:** {derived.get('phone_consistency', '')}")
     lines.append(f"- **Form found:** {derived.get('has_form', '')}")
+    lines.append(f"- **Contact form detected:** {website.get('contact_form_detected', '') or derived.get('contact_form_detected', '')}")
+    lines.append(f"- **Estimate form detected:** {website.get('estimate_form_detected', '') or derived.get('estimate_form_detected', '')}")
+    lines.append(f"- **Form strength:** {website.get('form_strength', '') or derived.get('form_strength', '')}")
+    lines.append(f"- **Form detection method:** {website.get('form_detection_method', '') or derived.get('form_detection_method', '')}")
     lines.append(f"- **CTA found:** {derived.get('has_cta', '')}")
+    lines.append(f"- **CTA strength:** {website.get('cta_strength', '') or derived.get('cta_strength', '')}")
+    lines.append(f"- **Visible pain score:** {row.get('Visible Pain Score', '') or evidence.get('visible_pain_score', '')}")
+    lines.append(f"- **Visible pain reasons:** {row.get('Visible Pain Reasons', '') or '; '.join(evidence.get('visible_pain_reasons', []) or [])}")
+    lines.append(f"- **Send trigger:** {row.get('Send Trigger', '') or evidence.get('send_trigger', '')}")
     lines.append(f"- **High-ticket terms:** {', '.join(website.get('high_ticket_terms', []) or []) or 'none'}")
     lines.append(f"- **Generic copy terms:** {', '.join(website.get('generic_copy_terms', []) or []) or 'none'}")
     lines.append(f"- **Social links:** {', '.join(website.get('social_links', []) or []) or 'none'}")
@@ -528,6 +536,11 @@ def main() -> int:
         offer_rank = {
             "Website Rebuild": 0,
             "Estimate Funnel": 1,
+            "Premium Perception Gap": 1,
+            "Portfolio Rebuild": 1,
+            "Mobile Quote Path Cleanup": 1,
+            "Service Page Cleanup": 2,
+            "Review/Trust Proof Upgrade": 2,
             "Website Cleanup": 2,
             "Tracking / Missed Call": 3,
             "Advanced Optimization": 4,

@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import upload_airtable
+from enrich_leads import detect_form_signals, scrape_site
 from lead_machine.airtable_sync import build_airtable_payload, plan_airtable_sync
 from lead_machine.evidence import build_evidence_profile
 from lead_machine.feedback import compute_feedback_metrics
@@ -56,6 +57,14 @@ class LeadMachineContractsTest(unittest.TestCase):
             "Specific Observation": "The site hides estimate requests.",
             "Lead Priority": "A",
             "Score Total": "86",
+            "Contact Form Detected": "No",
+            "Estimate Form Detected": "No",
+            "Form Strength": "None",
+            "Form Detection Method": "none",
+            "CTA Strength": "Weak",
+            "Visible Pain Score": "35",
+            "Visible Pain Reasons": "No estimate form detected; No clear estimate CTA",
+            "Send Trigger": "No estimate form detected",
             "AI Confidence": "medium",
             "Recommended Action": "Build mockup then SMS owner",
             "Opener": "Want me to send a cleaner estimate-page mockup?",
@@ -124,6 +133,14 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(fields["Outreach Channel"], "Google Maps")
         self.assertEqual(fields["Packet Eligible"], "Yes")
         self.assertEqual(fields["Sendable"], "Yes")
+        self.assertEqual(fields["Contact Form Detected"], "No")
+        self.assertEqual(fields["Estimate Form Detected"], "No")
+        self.assertEqual(fields["Form Strength"], "None")
+        self.assertEqual(fields["Form Detection Method"], "none")
+        self.assertEqual(fields["CTA Strength"], "Weak")
+        self.assertEqual(fields["Visible Pain Score"], 35)
+        self.assertEqual(fields["Visible Pain Reasons"], "No estimate form detected; No clear estimate CTA")
+        self.assertEqual(fields["Send Trigger"], "No estimate form detected")
 
     def test_airtable_csv_dry_run_accepts_sparse_scored_row_and_upserts_by_phone(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -402,6 +419,478 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertGreaterEqual(len(profile["evidence_items"]), 3)
         self.assertTrue(any(item["field"] == "third_party_tools" for item in profile["evidence_items"]))
 
+    def test_static_iosue_like_estimate_form_is_classified_strong(self) -> None:
+        html = """
+        <html>
+          <body>
+            <h1>Let's Discuss Your Property</h1>
+            <p>Contact us to schedule your estimate appointment.</p>
+            <form action="/request-estimate" method="post">
+              <label>First Name <input name="first_name"></label>
+              <label>Last Name <input name="last_name"></label>
+              <label>Company <input name="company"></label>
+              <label>Email <input type="email" name="email"></label>
+              <label>Phone <input type="tel" name="phone"></label>
+              <label>Property Address <input name="address"></label>
+              <label>Service Details <textarea name="service_details"></textarea></label>
+              <label>Upload project photos <input type="file" name="images"></label>
+              <div class="g-recaptcha" data-sitekey="abc123"></div>
+              <button type="submit">Submit Request</button>
+            </form>
+            <a href="https://facebook.com/example">Facebook</a>
+          </body>
+        </html>
+        """
+
+        signals = detect_form_signals(html, page_url="https://example.com/contact")
+
+        self.assertEqual(signals["contact_form_detected"], "Yes")
+        self.assertEqual(signals["estimate_form_detected"], "Yes")
+        self.assertEqual(signals["form_strength"], "Strong")
+        self.assertEqual(signals["form_detection_method"], "static_html")
+        self.assertIn("address", signals["form_fields"])
+        self.assertIn("details", signals["form_fields"])
+        self.assertTrue(signals["has_recaptcha"])
+
+    def test_iframe_provider_form_is_detected(self) -> None:
+        html = """
+        <html><body>
+          <h1>Request a Free Estimate</h1>
+          <iframe src="https://form.jotform.com/123456789"></iframe>
+          <p>This Jotform request form is protected by captcha.</p>
+        </body></html>
+        """
+
+        signals = detect_form_signals(html, page_url="https://example.com/free-estimate")
+
+        self.assertEqual(signals["contact_form_detected"], "Yes")
+        self.assertEqual(signals["estimate_form_detected"], "Yes")
+        self.assertEqual(signals["form_detection_method"], "embedded_provider")
+        self.assertGreaterEqual(signals["form_strength_rank"], 1)
+        self.assertIn("jotform", signals["provider_terms"])
+
+    def test_scrape_site_checks_candidate_estimate_contact_pages(self) -> None:
+        homepage = """
+        <html><body>
+          <a href="/services">Services</a>
+          <p>Schedule an Estimate for patios and retaining walls.</p>
+        </body></html>
+        """
+        estimate_page = """
+        <html><body>
+          <h1>Let's Discuss Your Property</h1>
+          <p>Complete the request form below to schedule your estimate appointment.</p>
+          <form>
+            <input name="first_name">
+            <input name="last_name">
+            <input type="email" name="email">
+            <input type="tel" name="phone">
+            <input name="address">
+            <textarea name="service_details"></textarea>
+            <input type="file" name="image_upload">
+            <div class="recaptcha"></div>
+            <button type="submit">Submit</button>
+          </form>
+        </body></html>
+        """
+
+        def fake_fetch(url: str, timeout: int = 15) -> dict[str, object]:
+            if url == "https://example.com":
+                return {"ok": True, "status_code": 200, "final_url": url, "html": homepage, "error": ""}
+            if url == "https://example.com/request-estimate":
+                return {"ok": True, "status_code": 200, "final_url": url, "html": estimate_page, "error": ""}
+            return {"ok": False, "status_code": 404, "final_url": url, "html": "", "error": ""}
+
+        with patch("enrich_leads.fetch_url", side_effect=fake_fetch):
+            site = scrape_site("https://example.com")
+
+        self.assertEqual(site["contact_form_detected"], "Yes")
+        self.assertEqual(site["estimate_form_detected"], "Yes")
+        self.assertEqual(site["form_strength"], "Strong")
+        self.assertEqual(site["form_detection_method"], "candidate_page")
+        self.assertNotIn("no_form_detected", site["site_issue_flags"])
+        self.assertIn("estimate", site["pages"])
+
+    def test_strong_estimate_form_blocks_no_pain_estimate_funnel_sendability(self) -> None:
+        enriched = {
+            "google": self._google_fixture(),
+            "evidence": {
+                "site_status": "okay",
+                "contact_form_detected": "Yes",
+                "estimate_form_detected": "Yes",
+                "form_strength": "Strong",
+                "form_detection_method": "candidate_page",
+                "has_contact_form": True,
+                "has_estimate_cta": True,
+                "raw_flags": [],
+                "evidence_items": [
+                    {"id": "E1", "field": "google_rating", "value": "4.9 stars / 130 reviews"},
+                    {"id": "E2", "field": "estimate_form_detected", "value": "Yes"},
+                    {"id": "E3", "field": "form_strength", "value": "Strong"},
+                ],
+            },
+        }
+        raw_score = self._manual_score(
+            subscores={
+                "icp_fit": 18,
+                "reputation_demand_proof": 14,
+                "web_conversion_pain": 22,
+                "mockup_leverage": 12,
+                "reachability": 8,
+                "offer_angle_clarity": 9,
+                "evidence_confidence": 5,
+            },
+            total_score=88,
+            grade="A",
+            evidence_refs=["E1", "E2", "E3"],
+            safe_outreach_claims=[
+                {"claim": "Your Google profile shows strong reviews.", "evidence_refs": ["E1"]},
+                {"claim": "Your site already has a strong estimate form.", "evidence_refs": ["E2", "E3"]},
+            ],
+        )
+
+        row = merge_manual_score(enriched, raw_score, fallback_vertical="hardscaping")
+
+        self.assertEqual(row["Lead Priority"], "A")
+        self.assertEqual(row["Sendable"], "No")
+        self.assertIn("Missing concrete conversion issue", row["Send Blockers"])
+        self.assertEqual(row["Packet Eligible"], "")
+        self.assertIn("Blocked by sendability", row["Packet Eligibility Reason"])
+        self.assertNotIn("missing contact form", row["Safe Outreach Claims"].lower())
+        self.assertNotIn("no contact form", row["Safe Outreach Claims"].lower())
+
+    def test_strong_estimate_form_with_premium_perception_gap_can_be_sendable(self) -> None:
+        enriched = {
+            "google": {
+                **self._google_fixture(),
+                "reviews": "18",
+            },
+            "evidence": {
+                "site_status": "okay",
+                "contact_form_detected": "Yes",
+                "estimate_form_detected": "Yes",
+                "form_strength": "Strong",
+                "form_detection_method": "candidate_page",
+                "cta_strength": "Strong",
+                "visible_pain_score": 36,
+                "visible_pain_reasons": ["Premium hardscape work is not reflected by the owned website"],
+                "visible_pain_categories": ["premium_perception_gap"],
+                "send_trigger": "Premium hardscape work is not reflected by the owned website",
+                "evidence_items": [
+                    {"id": "E1", "field": "google_rating", "value": "4.9 stars / 18 reviews"},
+                    {"id": "E2", "field": "form_strength", "value": "Strong"},
+                    {"id": "E3", "field": "visible_pain_categories", "value": "premium_perception_gap"},
+                    {
+                        "id": "E4",
+                        "field": "send_trigger",
+                        "value": "Premium hardscape work is not reflected by the owned website",
+                    },
+                ],
+            },
+        }
+        raw_score = self._manual_score(
+            best_angle="Premium Perception Gap",
+            evidence_refs=["E1", "E3", "E4"],
+            safe_outreach_claims=[
+                {"claim": "Your Google profile shows strong review proof.", "evidence_refs": ["E1"]},
+                {
+                    "claim": "The owned website does not reflect the premium hardscape work.",
+                    "evidence_refs": ["E3", "E4"],
+                },
+            ],
+            opener=(
+                "Your reviews look strong, but the site does not make the premium hardscape work obvious. "
+                "Want me to send a cleaner direction?"
+            ),
+            visible_pain_score=36,
+            visible_pain_reasons=["Premium hardscape work is not reflected by the owned website"],
+            send_trigger="Premium hardscape work is not reflected by the owned website",
+        )
+
+        row = merge_manual_score(enriched, raw_score, fallback_vertical="hardscaping")
+
+        self.assertEqual(row["Offer Fit"], "Premium Perception Gap")
+        self.assertEqual(row["Sendable"], "Yes")
+        self.assertNotIn("Strong estimate form exists", row["Send Blockers"])
+        self.assertNotIn("Missing concrete conversion issue", row["Send Blockers"])
+
+    def test_strong_estimate_form_with_weak_project_gallery_can_be_sendable(self) -> None:
+        enriched = {
+            "google": {
+                **self._google_fixture(),
+                "reviews": "22",
+            },
+            "evidence": {
+                "site_status": "okay",
+                "contact_form_detected": "Yes",
+                "estimate_form_detected": "Yes",
+                "form_strength": "Strong",
+                "form_detection_method": "candidate_page",
+                "visible_pain_score": 34,
+                "visible_pain_reasons": ["Project photos are buried or weak for high-ticket hardscaping"],
+                "visible_pain_categories": ["portfolio_presentation_pain"],
+                "send_trigger": "Project photos are buried or weak for high-ticket hardscaping",
+                "evidence_items": [
+                    {"id": "E1", "field": "google_rating", "value": "4.9 stars / 22 reviews"},
+                    {"id": "E2", "field": "form_strength", "value": "Strong"},
+                    {"id": "E3", "field": "visible_pain_categories", "value": "portfolio_presentation_pain"},
+                    {
+                        "id": "E4",
+                        "field": "send_trigger",
+                        "value": "Project photos are buried or weak for high-ticket hardscaping",
+                    },
+                ],
+            },
+        }
+        raw_score = self._manual_score(
+            best_angle="Portfolio Rebuild",
+            evidence_refs=["E1", "E3", "E4"],
+            safe_outreach_claims=[
+                {"claim": "Your Google profile shows strong review proof.", "evidence_refs": ["E1"]},
+                {"claim": "The project gallery is weak for high-ticket work.", "evidence_refs": ["E3", "E4"]},
+            ],
+            opener="Your reviews look strong, but the project gallery undersells the hardscape work.",
+            visible_pain_score=34,
+            visible_pain_reasons=["Project photos are buried or weak for high-ticket hardscaping"],
+            send_trigger="Project photos are buried or weak for high-ticket hardscaping",
+        )
+
+        row = merge_manual_score(enriched, raw_score, fallback_vertical="hardscaping")
+
+        self.assertEqual(row["Offer Fit"], "Portfolio Rebuild")
+        self.assertEqual(row["Sendable"], "Yes")
+        self.assertNotIn("Strong estimate form exists", row["Send Blockers"])
+
+    def test_strong_estimate_form_cannot_use_missing_form_claim(self) -> None:
+        enriched = {
+            "google": self._google_fixture(),
+            "evidence": {
+                "site_status": "okay",
+                "contact_form_detected": "Yes",
+                "estimate_form_detected": "Yes",
+                "form_strength": "Strong",
+                "visible_pain_score": 35,
+                "visible_pain_reasons": ["No estimate form detected"],
+                "visible_pain_categories": ["estimate_path_pain"],
+                "send_trigger": "No estimate form detected",
+                "evidence_items": [
+                    {"id": "E1", "field": "google_rating", "value": "4.9 stars / 130 reviews"},
+                    {"id": "E2", "field": "form_strength", "value": "Strong"},
+                    {"id": "E3", "field": "send_trigger", "value": "No estimate form detected"},
+                ],
+            },
+        }
+        raw_score = self._manual_score(
+            best_angle="Website Cleanup",
+            evidence_refs=["E1", "E2", "E3"],
+            safe_outreach_claims=[
+                {"claim": "Your Google profile shows strong reviews.", "evidence_refs": ["E1"]},
+                {"claim": "There is no estimate form on the site.", "evidence_refs": ["E3"]},
+            ],
+            opener="Your reviews are strong, but there is no estimate form on the site.",
+            visible_pain_score=35,
+            visible_pain_reasons=["No estimate form detected"],
+            send_trigger="No estimate form detected",
+        )
+
+        row = merge_manual_score(enriched, raw_score, fallback_vertical="hardscaping")
+
+        self.assertEqual(row["Sendable"], "No")
+        self.assertIn("Strong estimate form conflicts with missing-form claim", row["Send Blockers"])
+
+    def test_estimate_funnel_blocked_when_strong_form_has_only_non_estimate_pain(self) -> None:
+        enriched = {
+            "google": {
+                **self._google_fixture(),
+                "reviews": "18",
+            },
+            "evidence": {
+                "site_status": "okay",
+                "contact_form_detected": "Yes",
+                "estimate_form_detected": "Yes",
+                "form_strength": "Strong",
+                "visible_pain_score": 36,
+                "visible_pain_reasons": ["Premium hardscape work is not reflected by the owned website"],
+                "visible_pain_categories": ["premium_perception_gap"],
+                "send_trigger": "Premium hardscape work is not reflected by the owned website",
+                "evidence_items": [
+                    {"id": "E1", "field": "google_rating", "value": "4.9 stars / 18 reviews"},
+                    {"id": "E2", "field": "form_strength", "value": "Strong"},
+                    {"id": "E3", "field": "visible_pain_categories", "value": "premium_perception_gap"},
+                    {
+                        "id": "E4",
+                        "field": "send_trigger",
+                        "value": "Premium hardscape work is not reflected by the owned website",
+                    },
+                ],
+            },
+        }
+        raw_score = self._manual_score(
+            best_angle="Estimate Funnel",
+            evidence_refs=["E1", "E3", "E4"],
+            safe_outreach_claims=[
+                {"claim": "Your Google profile shows strong review proof.", "evidence_refs": ["E1"]},
+                {
+                    "claim": "The owned website does not reflect the premium hardscape work.",
+                    "evidence_refs": ["E3", "E4"],
+                },
+            ],
+            opener="Your reviews look strong, but the site does not make the premium hardscape work obvious.",
+            visible_pain_score=36,
+            visible_pain_reasons=["Premium hardscape work is not reflected by the owned website"],
+            send_trigger="Premium hardscape work is not reflected by the owned website",
+        )
+
+        row = merge_manual_score(enriched, raw_score, fallback_vertical="hardscaping")
+
+        self.assertEqual(row["Sendable"], "No")
+        self.assertIn("Estimate Funnel blocked by strong estimate form without estimate-path weakness", row["Send Blockers"])
+
+    def test_evidence_profile_derives_visible_pain_fields_and_send_trigger(self) -> None:
+        profile = build_evidence_profile(
+            {
+                "google": self._google_fixture(),
+                "website": {
+                    "site_status": "Loads",
+                    "final_url": "https://example.com",
+                    "homepage": {"url": "https://example.com", "text": "Call us for patio estimates."},
+                    "site_issue_flags": ["no_form_detected", "no_clear_cta_detected"],
+                    "contact_form_detected": "No",
+                    "estimate_form_detected": "No",
+                    "form_strength": "None",
+                    "cta_strength": "Weak",
+                    "emails_found": ["office@example.com"],
+                    "phones_found": ["(440) 637-5848"],
+                },
+            }
+        )
+
+        self.assertGreater(profile["visible_pain_score"], 0)
+        self.assertIn("No estimate form detected", profile["visible_pain_reasons"])
+        self.assertEqual(profile["send_trigger"], "No estimate form detected")
+        self.assertTrue(any(item["field"] == "send_trigger" for item in profile["evidence_items"]))
+
+    def test_evidence_profile_classifies_non_form_visible_pain_categories(self) -> None:
+        profile = build_evidence_profile(
+            {
+                "google": self._google_fixture(),
+                "website": {
+                    "site_status": "Loads",
+                    "final_url": "https://example.com",
+                    "homepage": {
+                        "url": "https://example.com",
+                        "text": "Schedule an Estimate hardscape patio retaining wall landscape design",
+                    },
+                    "site_issue_flags": [
+                        "premium_perception_gap",
+                        "weak_project_gallery",
+                        "low_visible_trust",
+                    ],
+                    "contact_form_detected": "Yes",
+                    "estimate_form_detected": "Yes",
+                    "form_strength": "Strong",
+                    "cta_strength": "Strong",
+                    "emails_found": ["office@example.com"],
+                    "phones_found": ["(440) 637-5848"],
+                    "high_ticket_terms": ["hardscape", "patio", "retaining wall"],
+                },
+            }
+        )
+
+        self.assertIn("premium_perception_gap", profile["visible_pain_categories"])
+        self.assertIn("portfolio_presentation_pain", profile["visible_pain_categories"])
+        self.assertIn("trust_proof_pain", profile["visible_pain_categories"])
+        self.assertNotIn("No estimate form detected", profile["visible_pain_reasons"])
+        self.assertEqual(profile["send_trigger"], "Premium work is undersold by the owned website")
+
+    def test_deterministic_scoring_does_not_make_strong_form_site_a_sendable_estimate_funnel(self) -> None:
+        enriched = {
+            "google": {
+                **self._google_fixture(),
+                "business_name": "Iosue Style Landscape Concepts",
+                "rating": "4.7",
+                "reviews": "39",
+            },
+            "website": {
+                "site_status": "Loads",
+                "site_issue_flags": [],
+                "final_url": "https://example.com",
+                "homepage": {"url": "https://example.com", "text": "Schedule an Estimate hardscape patio retaining wall"},
+                "pages": {},
+                "emails_found": ["office@example.com"],
+                "phones_found": ["(440) 637-5848"],
+                "social_links": ["https://facebook.com/example"],
+                "forms_found": True,
+                "contact_form_detected": "Yes",
+                "estimate_form_detected": "Yes",
+                "form_strength": "Strong",
+                "form_detection_method": "candidate_page",
+                "cta_terms": ["schedule", "request estimate"],
+                "cta_strength": "Strong",
+                "high_ticket_terms": ["hardscape", "patio", "retaining wall", "landscape design"],
+                "generic_copy_terms": [],
+                "combined_text": "Schedule an Estimate hardscape patio retaining wall landscape design gallery portfolio",
+            },
+            "derived": {
+                "phone_consistency": "matched",
+                "has_email": True,
+                "has_form": True,
+                "has_cta": True,
+                "has_social_links": True,
+                "has_high_ticket_terms": True,
+                "non_standard_site_or_booking": False,
+            },
+            "screenshots": {},
+        }
+
+        row = score_record(enriched, "hardscaping")
+
+        self.assertNotEqual(row["Lead Priority"], "A")
+        self.assertNotEqual(row["Offer Fit"], "Estimate Funnel")
+        self.assertEqual(row["Sendable"], "No")
+        self.assertEqual(row["Packet Eligible"], "")
+        self.assertEqual(row["Visible Pain Score"], 0)
+        self.assertEqual(row["Send Trigger"], "")
+        self.assertNotIn("no form detected", row["Evidence Notes"].lower())
+
+    def test_no_site_broken_and_social_only_can_be_sendable_with_demand_proof(self) -> None:
+        for status, trigger in [
+            ("No Website", "No owned website found"),
+            ("Broken Website", "Website appears broken"),
+            ("Social Only", "Social-only web presence"),
+        ]:
+            with self.subTest(status=status):
+                row = score_record(
+                    {
+                        "google": {
+                            **self._google_fixture(),
+                            "business_name": f"{status} Hardscapes",
+                            "rating": "4.8",
+                            "reviews": "18",
+                        },
+                        "website": {
+                            "site_status": status,
+                            "site_issue_flags": [],
+                            "pages": {},
+                            "emails_found": [],
+                            "phones_found": [],
+                            "forms_found": False,
+                            "cta_terms": [],
+                            "combined_text": "hardscape patio retaining wall outdoor living",
+                            "high_ticket_terms": ["hardscape", "patio", "retaining wall"],
+                        },
+                        "derived": {"has_high_ticket_terms": True},
+                        "screenshots": {},
+                    },
+                    "hardscaping",
+                )
+
+                self.assertEqual(row["Lead Priority"], "A")
+                self.assertEqual(row["Sendable"], "Yes")
+                self.assertEqual(row["Packet Eligible"], "Yes")
+                self.assertGreaterEqual(int(row["Visible Pain Score"]), 30)
+                self.assertEqual(row["Send Trigger"], trigger)
+
     def test_manual_score_validation_requires_evidence_references_and_merges_card_fields(self) -> None:
         enriched = {
             "google": {
@@ -455,9 +944,13 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(merged["Lead Priority"], "A")
         self.assertEqual(merged["AI Confidence"], "medium")
         self.assertEqual(merged["Recommended Action"], "Build mockup then SMS owner")
+        self.assertEqual(merged["Send Trigger"], "Jobber-only web presence")
+        self.assertGreater(int(merged["Visible Pain Score"]), 0)
+        self.assertIn("Jobber-only web presence", merged["Visible Pain Reasons"])
         self.assertEqual(card["grade"], "A")
         self.assertEqual(card["best_angle"], "Social/Jobber Escape")
         self.assertEqual(card["airtable_fields"]["Lead Priority"], "A")
+        self.assertEqual(card["airtable_fields"]["Send Trigger"], "Jobber-only web presence")
         self.assertTrue(card["sendable"])
         self.assertTrue(card["minimum_evidence_passed"])
         self.assertEqual(card["evidence_refs"], ["ev-google-rating", "ev-third-party-jobber"])
@@ -524,6 +1017,17 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertIn("total_score must equal the sum of all subscores.", prompt)
         self.assertIn("A = 80-100", prompt)
         self.assertIn("confidence must be one of low, medium, high.", prompt)
+        self.assertIn("No specific observation = no send.", prompt)
+        self.assertIn("Do not score A/sendable just because the business is reputable.", prompt)
+        self.assertIn("A strong estimate form does not globally disqualify a lead.", prompt)
+        self.assertIn("It only blocks missing-form, no-contact-path, and no-estimate-path claims.", prompt)
+        self.assertIn("Do not use Estimate Funnel if the form is strong unless the actual estimate path is still visibly weak.", prompt)
+        self.assertIn("Premium Perception Gap", prompt)
+        self.assertIn("Portfolio Rebuild", prompt)
+        self.assertIn("Mobile Quote Path Cleanup", prompt)
+        self.assertIn('"send_trigger": ""', prompt)
+        self.assertIn('"visible_pain_score": 0', prompt)
+        self.assertIn('"visible_pain_reasons": []', prompt)
         self.assertIn('"safe_outreach_claims"', prompt)
         self.assertIn('"unsafe_claims"', prompt)
         self.assertIn("Build/send a no-site launch mockup", prompt)
@@ -588,7 +1092,122 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertIn("A+ Landscaping LLC", prompt)
         self.assertIn("Barski Hardscaping", prompt)
         self.assertIn("ICP Fit / 20", prompt)
+        self.assertIn("No specific observation = no send.", prompt)
+        self.assertIn("A strong estimate form does not globally disqualify a lead.", prompt)
+        self.assertIn("Premium Perception Gap", prompt)
+        self.assertIn("Portfolio Rebuild", prompt)
+        self.assertIn('"send_trigger": ""', prompt)
         self.assertEqual(expected_files, ["chij123.json", "chij456.json"])
+
+    def test_llm_batch_only_candidates_ranks_visible_pain_before_high_review_decent_site(self) -> None:
+        high_review_decent = {
+            "google": {
+                **self._google_fixture(),
+                "business_name": "Polished High Review Hardscapes",
+                "reviews": "180",
+                "place_id": "ChIJHIGH",
+            },
+            "website": {
+                "site_status": "Loads",
+                "site_issue_flags": [],
+                "combined_text": "hardscape patio retaining wall request an estimate gallery reviews",
+                "contact_form_detected": "Yes",
+                "estimate_form_detected": "Yes",
+                "form_strength": "Strong",
+                "form_detection_method": "static_html",
+                "cta_strength": "Strong",
+                "forms_found": True,
+                "emails_found": ["office@example.com"],
+                "phones_found": ["(440) 637-5848"],
+                "high_ticket_terms": ["hardscape", "patio"],
+            },
+            "derived": {"has_high_ticket_terms": True},
+        }
+        visible_pain = {
+            "google": {
+                **self._google_fixture(),
+                "business_name": "Old School Patio Co",
+                "reviews": "12",
+                "place_id": "ChIJPAIN",
+            },
+            "website": {
+                "site_status": "No Website",
+                "site_issue_flags": [],
+                "combined_text": "hardscape patio retaining wall",
+                "high_ticket_terms": ["hardscape", "patio"],
+            },
+            "derived": {"has_high_ticket_terms": True},
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            batch_paths = write_llm_batches(
+                [high_review_decent, visible_pain],
+                Path(tmp),
+                fallback_vertical="hardscaping",
+                batch_size=2,
+                only_candidates=True,
+            )
+            expected_files = batch_paths[0].expected_files_path.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(expected_files, ["chijpain.json", "chijhigh.json"])
+
+    def test_llm_batch_ranking_does_not_penalize_strong_form_when_non_form_pain_exists(self) -> None:
+        weak_form_estimate_pain = {
+            "google": {
+                **self._google_fixture(),
+                "business_name": "Weak Form Patio Co",
+                "reviews": "12",
+                "place_id": "ChIJWEAKFORM",
+            },
+            "website": {
+                "site_status": "Loads",
+                "site_issue_flags": ["no_form_detected", "no_clear_cta_detected"],
+                "combined_text": "hardscape patio retaining wall",
+                "contact_form_detected": "No",
+                "estimate_form_detected": "No",
+                "form_strength": "None",
+                "cta_strength": "Weak",
+                "emails_found": ["office@example.com"],
+                "phones_found": ["(440) 637-5848"],
+                "high_ticket_terms": ["hardscape", "patio"],
+            },
+            "derived": {"has_high_ticket_terms": True},
+        }
+        strong_form_premium_pain = {
+            "google": {
+                **self._google_fixture(),
+                "business_name": "Premium Patio Co",
+                "reviews": "12",
+                "place_id": "ChIJPREMIUM",
+            },
+            "website": {
+                "site_status": "Loads",
+                "site_issue_flags": ["premium_perception_gap"],
+                "combined_text": "request an estimate hardscape patio retaining wall outdoor living",
+                "contact_form_detected": "Yes",
+                "estimate_form_detected": "Yes",
+                "form_strength": "Strong",
+                "form_detection_method": "candidate_page",
+                "cta_strength": "Strong",
+                "forms_found": True,
+                "emails_found": ["office@example.com"],
+                "phones_found": ["(440) 637-5848"],
+                "high_ticket_terms": ["hardscape", "patio", "retaining wall"],
+            },
+            "derived": {"has_high_ticket_terms": True},
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            batch_paths = write_llm_batches(
+                [weak_form_estimate_pain, strong_form_premium_pain],
+                Path(tmp),
+                fallback_vertical="hardscaping",
+                batch_size=2,
+                only_candidates=True,
+            )
+            expected_files = batch_paths[0].expected_files_path.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(expected_files, ["chijpremium.json", "chijweakform.json"])
 
     def test_llm_score_bundle_importer_writes_individual_score_json_files(self) -> None:
         score_one = self._manual_score(total_score=75, grade="B")
@@ -951,12 +1570,22 @@ class LeadMachineContractsTest(unittest.TestCase):
                 "Business Name": "A+ Landscaping LLC",
                 "Lead Priority": "A",
                 "AI Confidence": "medium",
+                "Contact Form Detected": "No",
+                "Estimate Form Detected": "No",
+                "Form Strength": "None",
+                "Form Detection Method": "none",
+                "CTA Strength": "Weak",
+                "Visible Pain Score": "35",
+                "Visible Pain Reasons": "No estimate form detected",
+                "Send Trigger": "No estimate form detected",
             },
         }
 
         payload = build_airtable_payload(card)
         self.assertEqual(payload["fields"]["Place Key"], "ChIJ123")
         self.assertEqual(payload["fields"]["Lead Priority"], "A")
+        self.assertEqual(payload["fields"]["Visible Pain Score"], 35)
+        self.assertEqual(payload["fields"]["Send Trigger"], "No estimate form detected")
 
         sync_plan = plan_airtable_sync([card], existing_records_by_key={"ChIJ123": "rec123"})
         self.assertEqual(sync_plan[0]["method"], "PATCH")
@@ -1041,6 +1670,71 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(row["Sendable"], "No")
         self.assertIn("Missing concrete conversion issue", row["Send Blockers"])
         self.assertEqual(row["Packet Eligible"], "")
+
+    def test_send_trigger_is_required_for_sendable_yes(self) -> None:
+        enriched = {
+            "google": self._google_fixture(),
+            "evidence": {
+                "site_status": "weak",
+                "visible_pain_score": 35,
+                "visible_pain_reasons": ["Generic/template website copy"],
+                "send_trigger": "",
+                "evidence_items": [
+                    {"id": "E1", "field": "google_rating", "value": "4.9 stars / 18 reviews"},
+                    {"id": "E2", "field": "site_issue_flags", "value": "generic_copy_signals"},
+                ],
+            },
+        }
+        raw_score = self._manual_score(
+            evidence_refs=["E1", "E2"],
+            safe_outreach_claims=[
+                {"claim": "Your Google profile has enough review proof.", "evidence_refs": ["E1"]},
+                {"claim": "The site has generic copy signals.", "evidence_refs": ["E2"]},
+            ],
+            airtable_fields={"Send Trigger": ""},
+        )
+
+        row = merge_manual_score(enriched, raw_score, fallback_vertical="hardscaping")
+
+        self.assertEqual(row["Sendable"], "No")
+        self.assertIn("Missing concrete send trigger", row["Send Blockers"])
+        self.assertEqual(row["Packet Eligible"], "")
+
+    def test_advanced_optimization_is_not_sendable_without_concrete_visible_pain(self) -> None:
+        enriched = {
+            "google": {
+                **self._google_fixture(),
+                "reviews": "92",
+            },
+            "evidence": {
+                "site_status": "okay",
+                "contact_form_detected": "Yes",
+                "estimate_form_detected": "Yes",
+                "form_strength": "Strong",
+                "cta_strength": "Strong",
+                "visible_pain_score": 0,
+                "visible_pain_reasons": [],
+                "send_trigger": "",
+                "evidence_items": [
+                    {"id": "E1", "field": "google_rating", "value": "4.9 stars / 92 reviews"},
+                    {"id": "E2", "field": "form_strength", "value": "Strong"},
+                ],
+            },
+        }
+        raw_score = self._manual_score(
+            best_angle="Advanced Optimization",
+            evidence_refs=["E1", "E2"],
+            safe_outreach_claims=[
+                {"claim": "Your Google profile shows strong reviews.", "evidence_refs": ["E1"]},
+                {"claim": "The site has a strong estimate form.", "evidence_refs": ["E2"]},
+            ],
+        )
+
+        row = merge_manual_score(enriched, raw_score, fallback_vertical="hardscaping")
+
+        self.assertEqual(row["Sendable"], "No")
+        self.assertIn("Advanced Optimization without concrete visible pain", row["Send Blockers"])
+        self.assertIn("Missing concrete send trigger", row["Send Blockers"])
 
     def test_manual_score_with_high_score_and_low_confidence_gets_blocked_but_evidence_can_pass(self) -> None:
         enriched = {
@@ -1136,10 +1830,14 @@ class LeadMachineContractsTest(unittest.TestCase):
         return {
             "site_status": site_status,
             "screenshots": {"desktop": "desktop.png", "mobile": "mobile.png"},
+            "visible_pain_score": 35 if site_status == "weak" else 0,
+            "visible_pain_reasons": ["No clear estimate CTA"] if site_status == "weak" else [],
+            "send_trigger": "No clear estimate CTA" if site_status == "weak" else "",
             "evidence_items": evidence_items
             or [
                 {"id": "E1", "field": "google_rating", "value": "4.9 stars / 130 reviews"},
                 {"id": "E2", "field": "site_issue_flags", "value": "no_clear_cta_detected"},
+                {"id": "E3", "field": "send_trigger", "value": "No clear estimate CTA"},
             ],
         }
 

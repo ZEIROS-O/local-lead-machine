@@ -68,6 +68,11 @@ def main() -> int:
     parser.add_argument("--priority", default="", help="Optional packet priority filter: A, B, C, Skip")
     parser.add_argument("--max-packets", type=int, default=0, help="Optional max packet count")
     parser.add_argument("--no-screenshots", action="store_true", help="Skip screenshots during enrichment")
+    parser.add_argument(
+        "--rendered-form-check",
+        action="store_true",
+        help="Use Playwright DOM rendering for uncertain form detection during enrichment",
+    )
     parser.add_argument("--limit", type=int, default=0, help="Optional max leads to enrich")
     parser.add_argument("--manual-llm", action="store_true", help="Generate/merge manual Claude or ChatGPT JSON scores")
     parser.add_argument("--llm-queue-dir", default="", help="Manual LLM queue directory. Default: review_queue_<batch>")
@@ -133,6 +138,8 @@ def main() -> int:
 
         if args.no_screenshots:
             cmd.append("--no-screenshots")
+        if args.rendered_form_check:
+            cmd.append("--rendered-form-check")
 
         if args.limit > 0:
             cmd.extend(["--limit", str(args.limit)])

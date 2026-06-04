@@ -47,6 +47,7 @@ USER_AGENT = (
 )
 
 DEFAULT_TIMEOUT = 15
+TLD_EXTRACTOR = tldextract.TLDExtract(cache_dir=False, suffix_list_urls=())
 
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 PHONE_RE = re.compile(
@@ -83,6 +84,59 @@ CTA_TERMS = [
     "call now",
     "submit",
 ]
+
+ESTIMATE_CTA_TERMS = [
+    "estimate",
+    "free estimate",
+    "request estimate",
+    "schedule estimate",
+    "schedule an estimate",
+    "quote",
+    "free quote",
+    "request a quote",
+    "get a quote",
+    "request service",
+    "schedule",
+    "appointment",
+    "consultation",
+]
+
+CONTACT_ESTIMATE_PATHS = [
+    "/contact",
+    "/contact-us",
+    "/request-estimate",
+    "/free-estimate",
+    "/get-a-quote",
+    "/quote",
+    "/estimate",
+    "/schedule",
+    "/request-a-quote",
+    "/request-service",
+    "/get-estimate",
+]
+
+FORM_PROVIDER_TERMS = [
+    "hubspot",
+    "jobber",
+    "jotform",
+    "typeform",
+    "gravity forms",
+    "gravityforms",
+    "gravity form",
+    "gform_wrapper",
+    "wpforms",
+    "formstack",
+    "squarespace form",
+    "sqs-block-form",
+    "wix form",
+    "wixforms",
+    "captcha",
+    "recaptcha",
+    "g-recaptcha",
+]
+
+CAPTCHA_TERMS = {"captcha", "recaptcha", "g-recaptcha"}
+FORM_STRENGTH_RANK = {"None": 0, "Weak": 1, "Basic": 2, "Strong": 3}
 
 HIGH_TICKET_TERMS = [
     "hardscape",
@@ -163,7 +217,7 @@ def normalize_url(url: str) -> str:
 def domain_of(url: str) -> str:
     if not url:
         return ""
-    parsed = tldextract.extract(url)
+    parsed = TLD_EXTRACTOR(url)
     if parsed.domain and parsed.suffix:
         return f"{parsed.domain}.{parsed.suffix}".lower()
     return urlparse(url).netloc.lower().replace("www.", "")
@@ -319,8 +373,231 @@ def extract_emails_phones(text: str, html: str) -> Tuple[List[str], List[str]]:
 
 
 def detect_forms(html: str) -> bool:
+    return detect_form_signals(html).get("forms_found") is True
+
+
+def _yes_no(value: bool | None) -> str:
+    if value is True:
+        return "Yes"
+    if value is False:
+        return "No"
+    return "Unknown"
+
+
+def _empty_form_signals() -> Dict[str, Any]:
+    return {
+        "forms_found": False,
+        "contact_form_detected": "No",
+        "estimate_form_detected": "No",
+        "form_strength": "None",
+        "form_strength_rank": 0,
+        "form_detection_method": "none",
+        "form_fields": [],
+        "provider_terms": [],
+        "has_recaptcha": False,
+        "has_embedded_provider": False,
+    }
+
+
+def _field_text_for_tag(tag: Any) -> str:
+    parts = [tag.name or "", tag.get_text(" ", strip=True)]
+    for attr in ("type", "name", "id", "class", "placeholder", "aria-label", "title", "value"):
+        value = tag.get(attr)
+        if isinstance(value, list):
+            parts.extend(str(item) for item in value)
+        elif value:
+            parts.append(str(value))
+    return " ".join(parts)
+
+
+def _detect_form_fields(soup: BeautifulSoup, text: str) -> List[str]:
+    controls = soup.find_all(["input", "textarea", "select", "button"])
+    control_text = " ".join(_field_text_for_tag(control) for control in controls)
+    combined = f"{text} {control_text}".lower()
+    combined = re.sub(r"[_\-]+", " ", combined)
+
+    fields = set()
+
+    if re.search(r"\b(first name|last name|full name|your name|name)\b", combined):
+        fields.add("name")
+    if "company" in combined or "business name" in combined:
+        fields.add("company")
+    if "email" in combined or any((control.get("type") or "").lower() == "email" for control in controls):
+        fields.add("email")
+    if re.search(r"\b(phone|tel|telephone|mobile)\b", combined) or any(
+        (control.get("type") or "").lower() == "tel" for control in controls
+    ):
+        fields.add("phone")
+    if re.search(r"\b(address|street|city|zip|postal|property address)\b", combined):
+        fields.add("address")
+    if re.search(
+        r"\b(service details|project details|details|message|description|comments|notes|tell us|how can we help)\b",
+        combined,
+    ):
+        fields.add("details")
+    if re.search(r"\b(upload|attach|attachment|photo|image|file)\b", combined) or any(
+        (control.get("type") or "").lower() == "file" for control in controls
+    ):
+        fields.add("upload")
+    if re.search(r"\b(submit|send|send message|request|schedule|book|start)\b", combined) or any(
+        (control.get("type") or "").lower() == "submit" for control in controls
+    ):
+        fields.add("submit")
+
+    return sorted(fields)
+
+
+def _detect_provider_terms(raw: str) -> List[str]:
+    lowered = (raw or "").lower()
+    found: List[str] = []
+    for term in FORM_PROVIDER_TERMS:
+        if term in lowered:
+            normalized = term.replace("g-recaptcha", "recaptcha")
+            if normalized not in found:
+                found.append(normalized)
+    return sorted(found)
+
+
+def detect_form_signals(
+    html: str,
+    *,
+    page_text: str = "",
+    page_url: str = "",
+    method: str = "static_html",
+) -> Dict[str, Any]:
     soup = BeautifulSoup(html or "", "lxml")
-    return bool(soup.find("form") or soup.find("input") or soup.find("textarea"))
+    visible_text = page_text or extract_visible_text(html)
+    lowered_text = f"{visible_text} {page_url}".lower()
+    raw_for_terms = " ".join([html or "", visible_text, page_url])
+
+    forms = soup.find_all("form")
+    controls = soup.find_all(["input", "textarea", "select", "button"])
+    embedded = soup.find_all(["iframe", "embed"])
+    provider_terms = _detect_provider_terms(raw_for_terms)
+    has_recaptcha = any(term in CAPTCHA_TERMS for term in provider_terms)
+    non_captcha_providers = [term for term in provider_terms if term not in CAPTCHA_TERMS]
+    fields = _detect_form_fields(soup, visible_text)
+
+    has_form = bool(forms)
+    has_controls = bool(controls)
+    has_embedded_provider = bool(embedded or non_captcha_providers)
+    has_form_like_markup = has_form or has_controls or has_embedded_provider or has_recaptcha
+
+    estimate_language = any(term in lowered_text for term in ESTIMATE_CTA_TERMS)
+    contact_language = any(
+        term in lowered_text
+        for term in ["contact", "get in touch", "message", "email", "phone", "call us", "let's discuss"]
+    )
+
+    if not has_form_like_markup:
+        return _empty_form_signals()
+
+    has_email_or_phone = "email" in fields or "phone" in fields
+    has_core_estimate_fields = (
+        "name" in fields
+        and has_email_or_phone
+        and "address" in fields
+        and "details" in fields
+        and "submit" in fields
+    )
+
+    contact_detected = (
+        has_form_like_markup
+        and (contact_language or estimate_language or len(fields) >= 2)
+        and (has_form or has_controls or has_embedded_provider or len(fields) >= 2)
+    )
+    estimate_detected = has_form_like_markup and estimate_language and (
+        has_core_estimate_fields or len(fields) >= 4 or has_embedded_provider
+    )
+
+    embedded_strong_fields = (
+        has_embedded_provider
+        and len(fields) >= 3
+        and has_email_or_phone
+        and "details" in fields
+        and "submit" in fields
+    )
+
+    if estimate_detected and (has_core_estimate_fields or embedded_strong_fields):
+        strength = "Strong"
+    elif estimate_detected and len(fields) >= 3 and has_email_or_phone:
+        strength = "Basic"
+    elif has_form and len(fields) >= 3 and has_email_or_phone:
+        strength = "Basic"
+    elif has_embedded_provider and estimate_language:
+        strength = "Basic"
+    else:
+        strength = "Weak"
+
+    resolved_method = method
+    if has_embedded_provider:
+        resolved_method = "embedded_provider"
+
+    return {
+        "forms_found": bool(contact_detected or estimate_detected or strength != "None"),
+        "contact_form_detected": _yes_no(contact_detected),
+        "estimate_form_detected": _yes_no(estimate_detected),
+        "form_strength": strength,
+        "form_strength_rank": FORM_STRENGTH_RANK[strength],
+        "form_detection_method": resolved_method,
+        "form_fields": fields,
+        "provider_terms": provider_terms,
+        "has_recaptcha": has_recaptcha,
+        "has_embedded_provider": has_embedded_provider,
+    }
+
+
+def merge_form_signals(current: Dict[str, Any], candidate: Dict[str, Any]) -> Dict[str, Any]:
+    if not current:
+        current = _empty_form_signals()
+    if not candidate:
+        return dict(current)
+
+    merged = dict(current)
+
+    fields = sorted(set(merged.get("form_fields") or []) | set(candidate.get("form_fields") or []))
+    providers = sorted(set(merged.get("provider_terms") or []) | set(candidate.get("provider_terms") or []))
+
+    if candidate.get("contact_form_detected") == "Yes":
+        merged["contact_form_detected"] = "Yes"
+    elif merged.get("contact_form_detected") not in {"Yes", "No"}:
+        merged["contact_form_detected"] = candidate.get("contact_form_detected", "Unknown")
+
+    if candidate.get("estimate_form_detected") == "Yes":
+        merged["estimate_form_detected"] = "Yes"
+    elif merged.get("estimate_form_detected") not in {"Yes", "No"}:
+        merged["estimate_form_detected"] = candidate.get("estimate_form_detected", "Unknown")
+
+    current_rank = int(merged.get("form_strength_rank") or FORM_STRENGTH_RANK.get(merged.get("form_strength"), 0))
+    candidate_rank = int(candidate.get("form_strength_rank") or FORM_STRENGTH_RANK.get(candidate.get("form_strength"), 0))
+    if candidate_rank > current_rank:
+        merged["form_strength"] = candidate.get("form_strength", "None")
+        merged["form_strength_rank"] = candidate_rank
+        merged["form_detection_method"] = candidate.get("form_detection_method", "none")
+
+    if candidate.get("form_detection_method") == "embedded_provider":
+        merged["form_detection_method"] = "embedded_provider"
+
+    merged["forms_found"] = bool(merged.get("forms_found") or candidate.get("forms_found"))
+    merged["form_fields"] = fields
+    merged["provider_terms"] = providers
+    merged["has_recaptcha"] = bool(merged.get("has_recaptcha") or candidate.get("has_recaptcha"))
+    merged["has_embedded_provider"] = bool(
+        merged.get("has_embedded_provider") or candidate.get("has_embedded_provider")
+    )
+    return merged
+
+
+def classify_cta_strength(ctas: List[str], text: str) -> str:
+    if not ctas:
+        return "None"
+    lowered = " ".join([text or "", " ".join(ctas)]).lower()
+    has_estimate_cta = any(term in lowered for term in ESTIMATE_CTA_TERMS)
+    if has_estimate_cta and len(ctas) >= 2:
+        return "Strong"
+    if has_estimate_cta:
+        return "Basic"
+    return "Weak"
 
 
 def detect_terms(text: str, terms: List[str]) -> List[str]:
@@ -350,18 +627,27 @@ def fetch_url(url: str, timeout: int = DEFAULT_TIMEOUT) -> Dict[str, Any]:
         }
 
 
-def find_candidate_page(base_url: str, internal_links: List[str], keywords: List[str]) -> str:
+def find_candidate_pages(base_url: str, internal_links: List[str], keywords: List[str]) -> List[str]:
+    root = f"{urlparse(base_url).scheme}://{urlparse(base_url).netloc}"
+    base_domain = domain_of(base_url)
+    candidates: List[str] = []
+
+    def add(url: str) -> None:
+        absolute = urljoin(root, url)
+        if domain_of(absolute) != base_domain:
+            return
+        if absolute not in candidates:
+            candidates.append(absolute)
+
     for link in internal_links:
         lowered = link.lower()
         if any(k in lowered for k in keywords):
-            return link
-
-    root = f"{urlparse(base_url).scheme}://{urlparse(base_url).netloc}"
+            add(link)
 
     fallback_paths = []
     for keyword in keywords:
-        if keyword == "contact":
-            fallback_paths += ["/contact", "/contact-us", "/get-estimate", "/request-estimate"]
+        if keyword in {"contact", "estimate", "quote", "schedule", "request"}:
+            fallback_paths += CONTACT_ESTIMATE_PATHS
         elif keyword == "service":
             fallback_paths += ["/services", "/our-services", "/service"]
         elif keyword == "about":
@@ -369,7 +655,33 @@ def find_candidate_page(base_url: str, internal_links: List[str], keywords: List
         elif keyword == "gallery":
             fallback_paths += ["/gallery", "/portfolio", "/projects", "/project-pictures", "/work"]
 
-    return urljoin(root, fallback_paths[0]) if fallback_paths else ""
+    for path in fallback_paths:
+        add(path)
+
+    return candidates
+
+
+def find_candidate_page(base_url: str, internal_links: List[str], keywords: List[str]) -> str:
+    pages = find_candidate_pages(base_url, internal_links, keywords)
+    return pages[0] if pages else ""
+
+
+def _candidate_page_name(page_url: str, existing: Dict[str, Dict[str, Any]], default: str) -> str:
+    lowered = page_url.lower()
+    if any(term in lowered for term in ["estimate", "quote", "schedule", "request"]):
+        base = "estimate"
+    elif "contact" in lowered:
+        base = "contact"
+    else:
+        base = default
+
+    if base not in existing:
+        return base
+
+    index = 2
+    while f"{base}_{index}" in existing:
+        index += 1
+    return f"{base}_{index}"
 
 
 def empty_site_result(status: str, flags: List[str], url: str = "", error: str = "") -> Dict[str, Any]:
@@ -391,6 +703,14 @@ def empty_site_result(status: str, flags: List[str], url: str = "", error: str =
         "phones_found": [],
         "social_links": [],
         "forms_found": False,
+        "contact_form_detected": "Unknown",
+        "estimate_form_detected": "Unknown",
+        "form_strength": "None",
+        "form_detection_method": "none",
+        "form_fields": [],
+        "form_provider_terms": [],
+        "has_recaptcha": False,
+        "cta_strength": "None",
         "cta_terms": [],
         "high_ticket_terms": [],
         "generic_copy_terms": [],
@@ -398,7 +718,7 @@ def empty_site_result(status: str, flags: List[str], url: str = "", error: str =
     }
 
 
-def scrape_site(website_url: str) -> Dict[str, Any]:
+def scrape_site(website_url: str, *, rendered_form_check: bool = False) -> Dict[str, Any]:
     url = normalize_url(website_url)
 
     if not url:
@@ -430,23 +750,34 @@ def scrape_site(website_url: str) -> Dict[str, Any]:
     links = extract_links(final_url, html)
 
     emails, phones = extract_emails_phones(text, html)
-    forms_found = detect_forms(html)
+    form_signals = detect_form_signals(html, page_text=text, page_url=final_url, method="static_html")
     ctas = detect_terms(text, CTA_TERMS)
     high_ticket = detect_terms(text, HIGH_TICKET_TERMS)
     generic_copy = detect_terms(text, GENERIC_COPY_TERMS)
 
     pages: Dict[str, Dict[str, Any]] = {}
 
-    page_targets = {
-        "contact": find_candidate_page(final_url, links["internal_links"], ["contact"]),
-        "services": find_candidate_page(final_url, links["internal_links"], ["service"]),
-        "about": find_candidate_page(final_url, links["internal_links"], ["about"]),
-        "gallery": find_candidate_page(final_url, links["internal_links"], ["gallery"]),
-    }
+    page_targets: List[Tuple[str, str]] = []
+    seen_page_urls = set()
+
+    def add_page_targets(urls: List[str], default_name: str) -> None:
+        for page_url in urls:
+            if not page_url or page_url in seen_page_urls:
+                continue
+            seen_page_urls.add(page_url)
+            page_targets.append((default_name, page_url))
+
+    add_page_targets(
+        find_candidate_pages(final_url, links["internal_links"], ["contact", "estimate", "quote", "schedule", "request"]),
+        "contact",
+    )
+    add_page_targets([find_candidate_page(final_url, links["internal_links"], ["service"])], "services")
+    add_page_targets([find_candidate_page(final_url, links["internal_links"], ["about"])], "about")
+    add_page_targets([find_candidate_page(final_url, links["internal_links"], ["gallery"])], "gallery")
 
     combined_text_parts = [text]
 
-    for page_name, page_url in page_targets.items():
+    for default_page_name, page_url in page_targets:
         if not page_url:
             continue
 
@@ -466,13 +797,19 @@ def scrape_site(website_url: str) -> Dict[str, Any]:
         if page_text:
             combined_text_parts.append(page_text)
 
-        if detect_forms(page_html):
-            forms_found = True
+        page_form_signals = detect_form_signals(
+            page_html,
+            page_text=page_text,
+            page_url=page_url,
+            method="candidate_page",
+        )
+        form_signals = merge_form_signals(form_signals, page_form_signals)
 
         ctas = sorted(set(ctas + detect_terms(page_text, CTA_TERMS)))
         high_ticket = sorted(set(high_ticket + detect_terms(page_text, HIGH_TICKET_TERMS)))
         generic_copy = sorted(set(generic_copy + detect_terms(page_text, GENERIC_COPY_TERMS)))
 
+        page_name = _candidate_page_name(page_url, pages, default_page_name)
         pages[page_name] = {
             "url": page_url,
             "ok": result.get("ok"),
@@ -480,11 +817,22 @@ def scrape_site(website_url: str) -> Dict[str, Any]:
             "title": page_title,
             "meta": page_meta,
             "text": clean_text(page_text, 6000),
+            "contact_form_detected": page_form_signals.get("contact_form_detected", "No"),
+            "estimate_form_detected": page_form_signals.get("estimate_form_detected", "No"),
+            "form_strength": page_form_signals.get("form_strength", "None"),
+            "form_detection_method": page_form_signals.get("form_detection_method", "none"),
         }
 
         time.sleep(0.1)
 
     combined_text = clean_text(" ".join(combined_text_parts), 30000)
+    cta_strength = classify_cta_strength(ctas, combined_text)
+
+    if rendered_form_check and form_signals.get("form_strength_rank", 0) <= 1 and ctas:
+        rendered_signals = detect_rendered_form(final_url)
+        form_signals = merge_form_signals(form_signals, rendered_signals)
+
+    forms_found = bool(form_signals.get("forms_found"))
 
     if not forms_found:
         flags.append("no_form_detected")
@@ -517,11 +865,48 @@ def scrape_site(website_url: str) -> Dict[str, Any]:
         "phones_found": phones,
         "social_links": links["social_links"],
         "forms_found": forms_found,
+        "contact_form_detected": form_signals.get("contact_form_detected", "No"),
+        "estimate_form_detected": form_signals.get("estimate_form_detected", "No"),
+        "form_strength": form_signals.get("form_strength", "None"),
+        "form_detection_method": form_signals.get("form_detection_method", "none"),
+        "form_fields": form_signals.get("form_fields", []),
+        "form_provider_terms": form_signals.get("provider_terms", []),
+        "has_recaptcha": form_signals.get("has_recaptcha", False),
         "cta_terms": ctas,
+        "cta_strength": cta_strength,
         "high_ticket_terms": high_ticket,
         "generic_copy_terms": generic_copy,
         "combined_text": combined_text,
     }
+
+
+def detect_rendered_form(url: str, timeout_ms: int = 20000) -> Dict[str, Any]:
+    signals = _empty_form_signals()
+    signals["form_detection_method"] = "rendered_browser"
+
+    if not url:
+        return signals
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1366, "height": 1000}, user_agent=USER_AGENT)
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            page.wait_for_timeout(1500)
+            html = page.content()
+            try:
+                text = page.inner_text("body", timeout=3000)
+            except Exception:
+                text = ""
+            browser.close()
+        rendered = detect_form_signals(html, page_text=text, page_url=url, method="rendered_browser")
+        if rendered.get("form_detection_method") != "embedded_provider":
+            rendered["form_detection_method"] = "rendered_browser"
+        return rendered
+    except PlaywrightTimeoutError:
+        return signals
+    except Exception:
+        return signals
 
 
 def screenshot_paths(business_name: str, place_id: str, screenshots_dir: Path) -> Tuple[Path, Path]:
@@ -581,12 +966,17 @@ def normalize_digits(phone: str) -> str:
     return digits
 
 
-def enrich_row(row: Dict[str, str], screenshots_dir: Path, take_shots: bool) -> Dict[str, Any]:
+def enrich_row(
+    row: Dict[str, str],
+    screenshots_dir: Path,
+    take_shots: bool,
+    rendered_form_check: bool = False,
+) -> Dict[str, Any]:
     lead = normalize_lead(row, fallback_vertical=row.get("category", "") or "service")
     gate = hard_icp_gate(lead)
 
     website_url = row.get("website_url", "") or ""
-    site = scrape_site(website_url)
+    site = scrape_site(website_url, rendered_form_check=rendered_form_check)
 
     screenshots = {"desktop": "", "mobile": "", "error": ""}
     screenshot_url = site.get("final_url") or normalize_url(website_url)
@@ -621,7 +1011,12 @@ def enrich_row(row: Dict[str, str], screenshots_dir: Path, take_shots: bool) -> 
             "phone_consistency": phone_consistency,
             "has_email": bool(site.get("emails_found")),
             "has_form": bool(site.get("forms_found")),
+            "contact_form_detected": site.get("contact_form_detected", "Unknown"),
+            "estimate_form_detected": site.get("estimate_form_detected", "Unknown"),
+            "form_strength": site.get("form_strength", "None"),
+            "form_detection_method": site.get("form_detection_method", "none"),
             "has_cta": bool(site.get("cta_terms")),
+            "cta_strength": site.get("cta_strength", "None"),
             "has_social_links": bool(site.get("social_links")),
             "has_high_ticket_terms": bool(site.get("high_ticket_terms")),
             "non_standard_site_or_booking": is_non_standard_site_or_booking_url(website_url)
@@ -651,6 +1046,11 @@ def main() -> int:
     parser.add_argument("--screenshots-dir", default="screenshots", help="Screenshot directory")
     parser.add_argument("--limit", type=int, default=0, help="Optional max leads to enrich")
     parser.add_argument("--no-screenshots", action="store_true", help="Skip screenshots")
+    parser.add_argument(
+        "--rendered-form-check",
+        action="store_true",
+        help="Use Playwright DOM rendering for uncertain form detection without taking screenshots",
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -673,6 +1073,7 @@ def main() -> int:
     print(f"[INFO] Loaded {len(rows)} leads from {input_path}")
     print(f"[INFO] MAX_WEBSITES_PER_RUN={max_websites}")
     print(f"[INFO] Screenshots={'off' if args.no_screenshots else 'on'}")
+    print(f"[INFO] Rendered form check={'on' if args.rendered_form_check else 'off'}")
 
     records: List[Dict[str, Any]] = []
 
@@ -683,7 +1084,12 @@ def main() -> int:
         print(f"[{i}/{len(rows)}] {name} | {website or 'NO WEBSITE'}")
 
         try:
-            enriched = enrich_row(row, screenshots_dir, take_shots=not args.no_screenshots)
+            enriched = enrich_row(
+                row,
+                screenshots_dir,
+                take_shots=not args.no_screenshots,
+                rendered_form_check=args.rendered_form_check,
+            )
             records.append(enriched)
 
             status = enriched["website"].get("site_status")
