@@ -51,6 +51,32 @@ FORM_ABSENCE_FLAGS = {
     "missing_estimate_path",
 }
 
+STATIC_FETCH_REVIEW_FLAGS = {
+    "static_fetch_failed",
+    "homepage_fetch_failed",
+    "rendered_check_needed",
+    "manual_visual_review_needed",
+}
+
+HARD_SITE_FAILURE_FLAGS = {
+    "dns_domain_failure",
+    "homepage_http_hard_failure",
+    "ssl_cert_hard_failure",
+    "broken_redirect",
+    "rendered_load_failed",
+    "parked_dead_domain",
+}
+
+VISUAL_AUDIT_SCORE_FIELDS = [
+    "visual_quality_score",
+    "premium_perception_score",
+    "mobile_visual_score",
+    "hero_clarity_score",
+    "cta_visibility_score",
+    "gallery_visibility_score",
+    "trust_proof_visibility_score",
+]
+
 PAIN_FLAG_RULES = {
     "premium_perception_gap": (22, "Premium work is undersold by the owned website", ["premium_perception_gap"]),
     "premium_brand_mismatch": (22, "Premium branding is not matched by the website", ["premium_perception_gap"]),
@@ -167,11 +193,18 @@ def _detect_from_text(text: str, mapping: Dict[str, List[str]]) -> List[str]:
 def _status_from_site(site: Dict[str, Any]) -> str:
     status = _clean(site.get("site_status")).lower()
     flags = set(site.get("site_issue_flags") or [])
+    normalized_flags = {str(flag).strip().lower() for flag in flags}
+    rendered_status = _clean(site.get("rendered_site_status")).lower()
     final_url = _clean(site.get("final_url")).lower()
     text = _clean(site.get("combined_text") or site.get("homepage", {}).get("text"))
 
     if status in {"no website", "missing"}:
         return "missing"
+    if rendered_status == "broken" or normalized_flags & HARD_SITE_FAILURE_FLAGS:
+        return "broken"
+    if rendered_status == "loaded" and status not in {"social only", "social_only", "facebook only", "jobber only", "jobber_only"}:
+        review_flags = normalized_flags - STATIC_FETCH_REVIEW_FLAGS
+        return "weak" if review_flags else "okay"
     if status in {"broken website", "broken"}:
         return "broken"
     if status in {"social only", "social_only", "facebook only"}:
@@ -182,13 +215,13 @@ def _status_from_site(site: Dict[str, Any]) -> str:
         return "social_only"
     if "getjobber.com" in final_url or "jobber" in text.lower():
         return "jobber_only"
-    if "homepage_fetch_failed" in flags:
+    if normalized_flags & STATIC_FETCH_REVIEW_FLAGS and not text:
+        return "unknown"
+    if not text and status and status not in {"unknown", "loaded", "loads", "okay", "strong"}:
         return "broken"
-    if not text and status:
-        return "broken"
-    if flags:
+    if normalized_flags:
         return "weak"
-    if status in {"loads", "okay", "strong"}:
+    if status in {"loaded", "loads", "okay", "strong"}:
         return "okay"
     return "unknown"
 
@@ -237,8 +270,8 @@ def _derive_visible_pain_profile(
     elif normalized_status == "jobber_only":
         add(32, "Jobber-only web presence", ["no_site_or_social_only_pain"])
 
-    if "homepage_fetch_failed" in flags:
-        add(35, "Website fetch failed", ["broken_site_pain"])
+    if flags & HARD_SITE_FAILURE_FLAGS and normalized_status != "broken":
+        add(40, "Website appears broken", ["broken_site_pain"])
     if "non_standard_site_or_booking_url" in flags or "non_standard_site_or_booking" in flags:
         add(28, "Non-standard booking or social URL", ["no_site_or_social_only_pain"])
     if "broken_form" in flags or "form_error" in flags:
@@ -297,6 +330,20 @@ def build_evidence_profile(enriched: Dict[str, Any]) -> Dict[str, Any]:
     google = enriched.get("google", {}) or {}
     screenshots = enriched.get("screenshots", {}) or {}
     derived = enriched.get("derived", {}) or {}
+    desktop_screenshot_path = _clean(screenshots.get("desktop") or site.get("desktop_screenshot_path"))
+    mobile_screenshot_path = _clean(screenshots.get("mobile") or site.get("mobile_screenshot_path"))
+    rendered_site_status = _clean(site.get("rendered_site_status")) or "Unknown"
+    rendered_status_reason = _clean(site.get("rendered_status_reason"))
+    visual_review_needed = _clean(site.get("visual_review_needed")) or _clean(derived.get("visual_review_needed")) or "No"
+    visual_pain_reasons = site.get("visual_pain_reasons") or []
+    if isinstance(visual_pain_reasons, str):
+        visual_pain_reasons = [part.strip() for part in re.split(r"[;\n]+", visual_pain_reasons) if part.strip()]
+    if not isinstance(visual_pain_reasons, list):
+        visual_pain_reasons = []
+    visual_scores = {
+        field: _clean(site.get(field)) or "Unknown"
+        for field in VISUAL_AUDIT_SCORE_FIELDS
+    }
 
     homepage = site.get("homepage", {}) or {}
     pages = site.get("pages", {}) or {}
@@ -370,6 +417,12 @@ def build_evidence_profile(enriched: Dict[str, Any]) -> Dict[str, Any]:
     _evidence_item(items, field="form_strength", value=form_strength, source_url=final_url)
     _evidence_item(items, field="form_detection_method", value=form_detection_method, source_url=final_url)
     _evidence_item(items, field="cta_strength", value=cta_strength, source_url=final_url)
+    _evidence_item(items, field="rendered_site_status", value=rendered_site_status, source_url=final_url)
+    _evidence_item(items, field="rendered_status_reason", value=rendered_status_reason, source_url=final_url)
+    _evidence_item(items, field="desktop_screenshot_path", value=desktop_screenshot_path, source_url=final_url, kind="screenshot", confidence="medium")
+    _evidence_item(items, field="mobile_screenshot_path", value=mobile_screenshot_path, source_url=final_url, kind="screenshot", confidence="medium")
+    _evidence_item(items, field="visual_review_needed", value=visual_review_needed, source_url=final_url, confidence="medium")
+    _evidence_item(items, field="visual_pain_reasons", value=", ".join(str(reason) for reason in visual_pain_reasons if str(reason).strip()), source_url=final_url, confidence="medium")
     _evidence_item(items, field="visible_pain_score", value=visible_pain["visible_pain_score"], source_url=final_url)
     _evidence_item(
         items,
@@ -384,11 +437,11 @@ def build_evidence_profile(enriched: Dict[str, Any]) -> Dict[str, Any]:
         source_url=final_url,
     )
     _evidence_item(items, field="send_trigger", value=visible_pain["send_trigger"], source_url=final_url)
-    if screenshots.get("desktop") or screenshots.get("mobile"):
+    if desktop_screenshot_path or mobile_screenshot_path:
         _evidence_item(
             items,
             field="screenshots",
-            value={"desktop": screenshots.get("desktop", ""), "mobile": screenshots.get("mobile", "")},
+            value={"desktop": desktop_screenshot_path, "mobile": mobile_screenshot_path},
             kind="screenshot",
             confidence="medium",
         )
@@ -403,6 +456,13 @@ def build_evidence_profile(enriched: Dict[str, Any]) -> Dict[str, Any]:
         "form_strength": form_strength,
         "form_detection_method": form_detection_method,
         "cta_strength": cta_strength,
+        "rendered_site_status": rendered_site_status,
+        "rendered_status_reason": rendered_status_reason,
+        "desktop_screenshot_path": desktop_screenshot_path,
+        "mobile_screenshot_path": mobile_screenshot_path,
+        "visual_review_needed": visual_review_needed,
+        **visual_scores,
+        "visual_pain_reasons": [str(reason).strip() for reason in visual_pain_reasons if str(reason).strip()],
         "visible_pain_score": visible_pain["visible_pain_score"],
         "visible_pain_reasons": visible_pain["visible_pain_reasons"],
         "visible_pain_categories": visible_pain["visible_pain_categories"],
@@ -416,7 +476,7 @@ def build_evidence_profile(enriched: Dict[str, Any]) -> Dict[str, Any]:
         "social_links": social_links,
         "third_party_tools": tools,
         "tracking_detected": tracking,
-        "screenshots": {"desktop": screenshots.get("desktop", ""), "mobile": screenshots.get("mobile", "")},
+        "screenshots": {"desktop": desktop_screenshot_path, "mobile": mobile_screenshot_path},
         "raw_flags": site.get("site_issue_flags") or [],
         "phone_consistency": derived.get("phone_consistency", "unknown"),
         "evidence_items": items,

@@ -73,6 +73,11 @@ def main() -> int:
         action="store_true",
         help="Use Playwright DOM rendering for uncertain form detection during enrichment",
     )
+    parser.add_argument(
+        "--rendered-site-check",
+        action="store_true",
+        help="Use Playwright browser rendering to classify loaded/broken/timeout site status during enrichment",
+    )
     parser.add_argument("--limit", type=int, default=0, help="Optional max leads to enrich")
     parser.add_argument("--manual-llm", action="store_true", help="Generate/merge manual Claude or ChatGPT JSON scores")
     parser.add_argument("--llm-queue-dir", default="", help="Manual LLM queue directory. Default: review_queue_<batch>")
@@ -140,6 +145,8 @@ def main() -> int:
             cmd.append("--no-screenshots")
         if args.rendered_form_check:
             cmd.append("--rendered-form-check")
+        if args.rendered_site_check:
+            cmd.append("--rendered-site-check")
 
         if args.limit > 0:
             cmd.extend(["--limit", str(args.limit)])

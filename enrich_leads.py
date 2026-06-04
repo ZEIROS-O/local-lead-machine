@@ -137,6 +137,16 @@ FORM_PROVIDER_TERMS = [
 
 CAPTCHA_TERMS = {"captcha", "recaptcha", "g-recaptcha"}
 FORM_STRENGTH_RANK = {"None": 0, "Weak": 1, "Basic": 2, "Strong": 3}
+VISUAL_UNKNOWN = "Unknown"
+VISUAL_AUDIT_SCORE_FIELDS = [
+    "visual_quality_score",
+    "premium_perception_score",
+    "mobile_visual_score",
+    "hero_clarity_score",
+    "cta_visibility_score",
+    "gallery_visibility_score",
+    "trust_proof_visibility_score",
+]
 
 HIGH_TICKET_TERMS = [
     "hardscape",
@@ -384,6 +394,18 @@ def _yes_no(value: bool | None) -> str:
     return "Unknown"
 
 
+def _empty_visual_audit_fields() -> Dict[str, Any]:
+    return {
+        "rendered_site_status": "Unknown",
+        "rendered_status_reason": "",
+        "desktop_screenshot_path": "",
+        "mobile_screenshot_path": "",
+        "visual_review_needed": "No",
+        **{field: VISUAL_UNKNOWN for field in VISUAL_AUDIT_SCORE_FIELDS},
+        "visual_pain_reasons": [],
+    }
+
+
 def _empty_form_signals() -> Dict[str, Any]:
     return {
         "forms_found": False,
@@ -605,26 +627,89 @@ def detect_terms(text: str, terms: List[str]) -> List[str]:
     return sorted({term for term in terms if term in lowered})
 
 
-def fetch_url(url: str, timeout: int = DEFAULT_TIMEOUT) -> Dict[str, Any]:
+def fetch_url(url: str, timeout: int = DEFAULT_TIMEOUT, retries: int = 1) -> Dict[str, Any]:
     headers = {"User-Agent": USER_AGENT}
+    last_result: Dict[str, Any] = {
+        "ok": False,
+        "status_code": "",
+        "final_url": "",
+        "html": "",
+        "error": "not attempted",
+        "error_type": "",
+    }
 
+    for attempt in range(max(1, retries + 1)):
+        try:
+            resp = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+            last_result = {
+                "ok": resp.status_code < 400,
+                "status_code": resp.status_code,
+                "final_url": resp.url,
+                "html": resp.text or "",
+                "error": "",
+                "error_type": "",
+            }
+            if resp.status_code < 400:
+                return last_result
+            if attempt < retries and (resp.status_code == 404 or resp.status_code >= 500):
+                time.sleep(0.2)
+                continue
+            return last_result
+        except requests.RequestException as exc:
+            last_result = {
+                "ok": False,
+                "status_code": "",
+                "final_url": "",
+                "html": "",
+                "error": str(exc),
+                "error_type": exc.__class__.__name__,
+            }
+            if attempt < retries and not isinstance(
+                exc,
+                (
+                    requests.exceptions.SSLError,
+                    requests.exceptions.TooManyRedirects,
+                    requests.exceptions.InvalidURL,
+                    requests.exceptions.MissingSchema,
+                ),
+            ):
+                time.sleep(0.2)
+                continue
+            return last_result
+
+    return last_result
+
+
+def classify_hard_static_failure(fetch_result: Dict[str, Any]) -> Tuple[str, str]:
+    status_code = fetch_result.get("status_code")
     try:
-        resp = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
-        return {
-            "ok": resp.status_code < 400,
-            "status_code": resp.status_code,
-            "final_url": resp.url,
-            "html": resp.text or "",
-            "error": "",
-        }
-    except requests.RequestException as exc:
-        return {
-            "ok": False,
-            "status_code": "",
-            "final_url": "",
-            "html": "",
-            "error": str(exc),
-        }
+        code = int(status_code)
+    except (TypeError, ValueError):
+        code = 0
+
+    if code == 404 or code >= 500:
+        return "homepage_http_hard_failure", f"Homepage returned HTTP {code} after retry."
+
+    error_type = str(fetch_result.get("error_type") or "").lower()
+    error = str(fetch_result.get("error") or "").lower()
+    if "ssl" in error_type or "certificate" in error or "cert" in error:
+        return "ssl_cert_hard_failure", "Static fetch failed with a hard SSL/certificate error."
+    if "toomanyredirects" in error_type or "too many redirects" in error:
+        return "broken_redirect", "Static fetch failed because the homepage redirect chain did not resolve."
+    if any(
+        term in error
+        for term in [
+            "name or service not known",
+            "temporary failure in name resolution",
+            "failed to resolve",
+            "nameresolutionerror",
+            "name_resolution",
+            "nodename nor servname",
+        ]
+    ):
+        return "dns_domain_failure", "Static fetch failed because the domain could not be resolved."
+
+    return "", ""
 
 
 def find_candidate_pages(base_url: str, internal_links: List[str], keywords: List[str]) -> List[str]:
@@ -685,7 +770,7 @@ def _candidate_page_name(page_url: str, existing: Dict[str, Dict[str, Any]], def
 
 
 def empty_site_result(status: str, flags: List[str], url: str = "", error: str = "") -> Dict[str, Any]:
-    return {
+    result = {
         "site_status": status,
         "site_issue_flags": flags,
         "final_url": url,
@@ -716,6 +801,12 @@ def empty_site_result(status: str, flags: List[str], url: str = "", error: str =
         "generic_copy_terms": [],
         "combined_text": "",
     }
+    result.update(_empty_visual_audit_fields())
+    if "manual_visual_review_needed" in flags:
+        result["visual_review_needed"] = "Yes"
+    if error and not result.get("rendered_status_reason"):
+        result["rendered_status_reason"] = error
+    return result
 
 
 def scrape_site(website_url: str, *, rendered_form_check: bool = False) -> Dict[str, Any]:
@@ -732,11 +823,20 @@ def scrape_site(website_url: str, *, rendered_form_check: bool = False) -> Dict[
     home = fetch_url(url)
 
     if not home["ok"]:
+        hard_flag, hard_reason = classify_hard_static_failure(home)
+        failure_flags = flags + ["static_fetch_failed"]
+        if hard_flag:
+            return empty_site_result(
+                "Broken Website",
+                failure_flags + [hard_flag],
+                home.get("final_url") or url,
+                hard_reason or home.get("error") or "",
+            )
         return empty_site_result(
-            "Broken Website",
-            flags + ["homepage_fetch_failed"],
+            "Unknown",
+            failure_flags + ["rendered_check_needed", "manual_visual_review_needed"],
             home.get("final_url") or url,
-            home.get("error") or "",
+            home.get("error") or "Static fetch failed; browser-rendered check needed before site-status claims.",
         )
 
     final_url = home["final_url"] or url
@@ -846,9 +946,9 @@ def scrape_site(website_url: str, *, rendered_form_check: bool = False) -> Dict[
     if is_social_url(final_url):
         site_status = "Social Only"
     else:
-        site_status = "Loads"
+        site_status = "Loaded"
 
-    return {
+    result = {
         "site_status": site_status,
         "site_issue_flags": sorted(set(flags)),
         "final_url": final_url,
@@ -878,6 +978,8 @@ def scrape_site(website_url: str, *, rendered_form_check: bool = False) -> Dict[
         "generic_copy_terms": generic_copy,
         "combined_text": combined_text,
     }
+    result.update(_empty_visual_audit_fields())
+    return result
 
 
 def detect_rendered_form(url: str, timeout_ms: int = 20000) -> Dict[str, Any]:
@@ -909,22 +1011,51 @@ def detect_rendered_form(url: str, timeout_ms: int = 20000) -> Dict[str, Any]:
         return signals
 
 
-def screenshot_paths(business_name: str, place_id: str, screenshots_dir: Path) -> Tuple[Path, Path]:
-    ident = safe_slug(f"{business_name}-{place_id[:8]}")
-    return (
-        screenshots_dir / f"{ident}-desktop.png",
-        screenshots_dir / f"{ident}-mobile.png",
-    )
+def _classify_rendered_exception(exc: Exception) -> Tuple[str, str]:
+    if isinstance(exc, PlaywrightTimeoutError):
+        return "Timeout", f"Browser render timed out: {exc}"
+
+    message = str(exc)
+    lowered = message.lower()
+    if any(
+        term in lowered
+        for term in [
+            "err_name_not_resolved",
+            "err_cert",
+            "certificate",
+            "ssl",
+            "too_many_redirects",
+            "err_too_many_redirects",
+            "err_connection_refused",
+        ]
+    ):
+        return "Broken", f"Browser-rendered load failed: {message}"
+    return "Unknown", f"Browser-rendered check unavailable: {message}"
 
 
-def take_screenshots(url: str, desktop_path: Path, mobile_path: Path, timeout_ms: int = 25000) -> Dict[str, Any]:
+def check_rendered_site(
+    url: str,
+    *,
+    desktop_path: Path | None = None,
+    mobile_path: Path | None = None,
+    timeout_ms: int = 25000,
+) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "desktop": "",
+        "mobile": "",
+        "error": "",
+        "rendered_site_status": "Unknown",
+        "rendered_status_reason": "",
+    }
     if not url:
-        return {"desktop": "", "mobile": "", "error": "no_url"}
+        result["error"] = "no_url"
+        result["rendered_status_reason"] = "No URL available for browser-rendered check."
+        return result
 
-    desktop_path.parent.mkdir(parents=True, exist_ok=True)
-    mobile_path.parent.mkdir(parents=True, exist_ok=True)
-
-    result = {"desktop": "", "mobile": "", "error": ""}
+    if desktop_path:
+        desktop_path.parent.mkdir(parents=True, exist_ok=True)
+    if mobile_path:
+        mobile_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
         with sync_playwright() as p:
@@ -934,29 +1065,109 @@ def take_screenshots(url: str, desktop_path: Path, mobile_path: Path, timeout_ms
                 viewport={"width": 1440, "height": 1200},
                 user_agent=USER_AGENT,
             )
-            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            response = page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
             page.wait_for_timeout(1500)
-            page.screenshot(path=str(desktop_path), full_page=True)
-            result["desktop"] = str(desktop_path)
+            status_code = response.status if response else 0
+            final_url = page.url
+            if status_code == 404 or status_code >= 500:
+                result["rendered_site_status"] = "Broken"
+                result["rendered_status_reason"] = f"Browser rendered homepage returned HTTP {status_code}."
+                browser.close()
+                return result
+            if status_code >= 400:
+                result["rendered_site_status"] = "Unknown"
+                result["rendered_status_reason"] = (
+                    f"Browser rendered homepage returned HTTP {status_code}; manual review needed before broken-site claims."
+                )
+                browser.close()
+                return result
+            if desktop_path:
+                page.screenshot(path=str(desktop_path), full_page=True)
+                result["desktop"] = str(desktop_path)
 
-            mobile = browser.new_page(
-                viewport={"width": 390, "height": 1200},
-                is_mobile=True,
-                user_agent=USER_AGENT,
+            result["rendered_site_status"] = "Loaded"
+            result["rendered_status_reason"] = (
+                f"Browser rendered homepage successfully"
+                + (f" at {final_url}." if final_url and final_url != url else ".")
             )
-            mobile.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-            mobile.wait_for_timeout(1500)
-            mobile.screenshot(path=str(mobile_path), full_page=True)
-            result["mobile"] = str(mobile_path)
+
+            if mobile_path:
+                mobile = browser.new_page(
+                    viewport={"width": 390, "height": 1200},
+                    is_mobile=True,
+                    user_agent=USER_AGENT,
+                )
+                mobile_response = mobile.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                mobile.wait_for_timeout(1500)
+                mobile_status = mobile_response.status if mobile_response else 0
+                if mobile_status >= 400:
+                    result["error"] = f"mobile_http_{mobile_status}"
+                else:
+                    mobile.screenshot(path=str(mobile_path), full_page=True)
+                    result["mobile"] = str(mobile_path)
 
             browser.close()
+            return result
 
-    except PlaywrightTimeoutError as exc:
-        result["error"] = f"timeout: {exc}"
     except Exception as exc:
-        result["error"] = str(exc)
+        status, reason = _classify_rendered_exception(exc)
+        result["rendered_site_status"] = status
+        result["rendered_status_reason"] = reason
+        result["error"] = reason
+        return result
 
-    return result
+
+def screenshot_paths(business_name: str, place_id: str, screenshots_dir: Path) -> Tuple[Path, Path]:
+    ident = safe_slug(f"{business_name}-{place_id[:8]}")
+    return (
+        screenshots_dir / f"{ident}-desktop.png",
+        screenshots_dir / f"{ident}-mobile.png",
+    )
+
+
+def take_screenshots(url: str, desktop_path: Path, mobile_path: Path, timeout_ms: int = 25000) -> Dict[str, Any]:
+    return check_rendered_site(
+        url,
+        desktop_path=desktop_path,
+        mobile_path=mobile_path,
+        timeout_ms=timeout_ms,
+    )
+
+
+def apply_rendered_site_result(site: Dict[str, Any], rendered: Dict[str, Any]) -> Dict[str, Any]:
+    if not rendered:
+        return site
+
+    updated = dict(site)
+    flags = {str(flag).strip() for flag in updated.get("site_issue_flags") or [] if str(flag).strip()}
+    rendered_status = str(rendered.get("rendered_site_status") or "Unknown").strip() or "Unknown"
+    rendered_reason = str(rendered.get("rendered_status_reason") or rendered.get("error") or "").strip()
+
+    updated["rendered_site_status"] = rendered_status
+    updated["rendered_status_reason"] = rendered_reason
+    updated["desktop_screenshot_path"] = str(rendered.get("desktop") or updated.get("desktop_screenshot_path") or "")
+    updated["mobile_screenshot_path"] = str(rendered.get("mobile") or updated.get("mobile_screenshot_path") or "")
+
+    if rendered_status == "Loaded":
+        flags.discard("rendered_check_needed")
+        if updated.get("site_status") not in {"No Website", "Social Only", "Jobber Only"}:
+            updated["site_status"] = "Loaded"
+        if "static_fetch_failed" in flags or updated.get("desktop_screenshot_path") or updated.get("mobile_screenshot_path"):
+            flags.add("manual_visual_review_needed")
+            updated["visual_review_needed"] = "Yes"
+    elif rendered_status == "Broken":
+        flags.add("rendered_load_failed")
+        if updated.get("site_status") != "No Website":
+            updated["site_status"] = "Broken Website"
+        updated["visual_review_needed"] = "No"
+    elif rendered_status in {"Timeout", "Unknown"}:
+        if updated.get("site_status") not in {"No Website", "Broken Website", "Social Only", "Jobber Only"}:
+            updated["site_status"] = "Unknown"
+        flags.add("manual_visual_review_needed")
+        updated["visual_review_needed"] = "Yes"
+
+    updated["site_issue_flags"] = sorted(flags)
+    return updated
 
 
 def normalize_digits(phone: str) -> str:
@@ -971,6 +1182,7 @@ def enrich_row(
     screenshots_dir: Path,
     take_shots: bool,
     rendered_form_check: bool = False,
+    rendered_site_check: bool = False,
 ) -> Dict[str, Any]:
     lead = normalize_lead(row, fallback_vertical=row.get("category", "") or "service")
     gate = hard_icp_gate(lead)
@@ -981,13 +1193,27 @@ def enrich_row(
     screenshots = {"desktop": "", "mobile": "", "error": ""}
     screenshot_url = site.get("final_url") or normalize_url(website_url)
 
-    if take_shots and screenshot_url and site.get("site_status") not in {"No Website", "Broken Website"}:
-        desktop_path, mobile_path = screenshot_paths(
-            row.get("business_name", "lead"),
-            row.get("place_id", ""),
-            screenshots_dir,
+    should_check_rendered = (
+        screenshot_url
+        and site.get("site_status") != "No Website"
+        and (
+            take_shots
+            or rendered_site_check
+            or "rendered_check_needed" in set(site.get("site_issue_flags") or [])
         )
-        screenshots = take_screenshots(screenshot_url, desktop_path, mobile_path)
+    )
+
+    if should_check_rendered:
+        if take_shots:
+            desktop_path, mobile_path = screenshot_paths(
+                row.get("business_name", "lead"),
+                row.get("place_id", ""),
+                screenshots_dir,
+            )
+            screenshots = take_screenshots(screenshot_url, desktop_path, mobile_path)
+        else:
+            screenshots = check_rendered_site(screenshot_url)
+        site = apply_rendered_site_result(site, screenshots)
 
     google_phone = row.get("phone", "")
     website_phones = site.get("phones_found", [])
@@ -1017,6 +1243,8 @@ def enrich_row(
             "form_detection_method": site.get("form_detection_method", "none"),
             "has_cta": bool(site.get("cta_terms")),
             "cta_strength": site.get("cta_strength", "None"),
+            "rendered_site_status": site.get("rendered_site_status", "Unknown"),
+            "visual_review_needed": site.get("visual_review_needed", "No"),
             "has_social_links": bool(site.get("social_links")),
             "has_high_ticket_terms": bool(site.get("high_ticket_terms")),
             "non_standard_site_or_booking": is_non_standard_site_or_booking_url(website_url)
@@ -1051,6 +1279,11 @@ def main() -> int:
         action="store_true",
         help="Use Playwright DOM rendering for uncertain form detection without taking screenshots",
     )
+    parser.add_argument(
+        "--rendered-site-check",
+        action="store_true",
+        help="Use Playwright browser rendering to classify loaded/broken/timeout site status without requiring screenshots",
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -1074,6 +1307,7 @@ def main() -> int:
     print(f"[INFO] MAX_WEBSITES_PER_RUN={max_websites}")
     print(f"[INFO] Screenshots={'off' if args.no_screenshots else 'on'}")
     print(f"[INFO] Rendered form check={'on' if args.rendered_form_check else 'off'}")
+    print(f"[INFO] Rendered site check={'on' if args.rendered_site_check else 'off'}")
 
     records: List[Dict[str, Any]] = []
 
@@ -1089,6 +1323,7 @@ def main() -> int:
                 screenshots_dir,
                 take_shots=not args.no_screenshots,
                 rendered_form_check=args.rendered_form_check,
+                rendered_site_check=args.rendered_site_check,
             )
             records.append(enriched)
 

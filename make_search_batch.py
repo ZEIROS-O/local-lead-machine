@@ -625,6 +625,7 @@ def run_search_batch(
     root: Path = Path("."),
     api_key: Optional[str] = None,
     no_screenshots: bool = True,
+    rendered_site_check: bool = False,
     sleep_seconds: float = 0.15,
     max_searches: Optional[int] = None,
     max_details: Optional[int] = None,
@@ -699,7 +700,12 @@ def run_search_batch(
         _progress(f"[ENRICH {enrich_index}/{len(rows_to_enrich)}] {_pick(row, 'business_name', 'Business Name') or 'unknown'}")
         try:
             enriched_records.append(
-                enrich_row(row, screenshots_dir=screenshots_dir, take_shots=not no_screenshots)
+                enrich_row(
+                    row,
+                    screenshots_dir=screenshots_dir,
+                    take_shots=not no_screenshots,
+                    rendered_site_check=rendered_site_check,
+                )
             )
         except Exception as exc:
             errors.append(f"Enrichment failed for {row.get('business_name') or row.get('Business Name')}: {exc}")
@@ -820,6 +826,11 @@ def main() -> int:
     parser.add_argument("--config", required=True, help="Search config JSON path")
     parser.add_argument("--batch", default="", help="Optional batch guard; must match config batch")
     parser.add_argument("--no-screenshots", action="store_true", help="Skip screenshots during enrichment")
+    parser.add_argument(
+        "--rendered-site-check",
+        action="store_true",
+        help="Use Playwright browser rendering to classify loaded/broken/timeout site status during enrichment",
+    )
     parser.add_argument("--sleep", type=float, default=0.15, help="Seconds between Google/detail calls")
     parser.add_argument("--max-searches", type=int, default=None, help="Optional cap on expanded query×geo searches")
     parser.add_argument("--max-details", type=int, default=None, help="Optional cap on Place Details calls")
@@ -832,6 +843,7 @@ def main() -> int:
             batch=args.batch,
             api_key=os.getenv("GOOGLE_PLACES_API_KEY", ""),
             no_screenshots=args.no_screenshots,
+            rendered_site_check=args.rendered_site_check,
             sleep_seconds=args.sleep,
             max_searches=args.max_searches,
             max_details=args.max_details,

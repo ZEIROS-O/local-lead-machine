@@ -64,6 +64,11 @@ Rules:
 - No specific observation = no send.
 - More reviews require stronger proof of visible pain.
 - Do not infer missing forms if evidence is uncertain.
+- Static fetch failure alone does not prove the website is broken.
+- If rendered_site_status is Loaded, do not claim the website is broken.
+- If a rendered site loads but looks weak, classify the issue as outdated, poor, Website Cleanup, Website Rebuild, or Premium Perception Gap, not broken.
+- Visual claims require screenshot paths, rendered browser evidence, DOM evidence, or explicit manual review notes.
+- No screenshot/rendered evidence means no strong visual claims.
 - A strong estimate form does not globally disqualify a lead.
 - It only blocks missing-form, no-contact-path, and no-estimate-path claims.
 - If another concrete issue exists, score based on that issue: premium perception gap, weak portfolio presentation, outdated site, bad mobile path, weak review/trust placement, or unclear service positioning.

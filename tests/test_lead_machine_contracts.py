@@ -1162,6 +1162,9 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertIn("A strong estimate form does not globally disqualify a lead.", prompt)
         self.assertIn("It only blocks missing-form, no-contact-path, and no-estimate-path claims.", prompt)
         self.assertIn("Do not use Estimate Funnel if the form is strong unless the actual estimate path is still visibly weak.", prompt)
+        self.assertIn("Static fetch failure alone does not prove the website is broken.", prompt)
+        self.assertIn("If rendered_site_status is Loaded, do not claim the website is broken.", prompt)
+        self.assertIn("No screenshot/rendered evidence means no strong visual claims.", prompt)
         self.assertIn("Premium Perception Gap", prompt)
         self.assertIn("Portfolio Rebuild", prompt)
         self.assertIn("Mobile Quote Path Cleanup", prompt)
@@ -1234,6 +1237,9 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertIn("ICP Fit / 20", prompt)
         self.assertIn("No specific observation = no send.", prompt)
         self.assertIn("A strong estimate form does not globally disqualify a lead.", prompt)
+        self.assertIn("Static fetch failure alone does not prove the website is broken.", prompt)
+        self.assertIn("If rendered_site_status is Loaded, do not claim the website is broken.", prompt)
+        self.assertIn("No screenshot/rendered evidence means no strong visual claims.", prompt)
         self.assertIn("Premium Perception Gap", prompt)
         self.assertIn("Portfolio Rebuild", prompt)
         self.assertIn('"send_trigger": ""', prompt)
@@ -1924,6 +1930,76 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(row["Minimum Evidence Passed"], "Yes")
         self.assertEqual(row["Packet Eligible"], "Yes")
         self.assertIn("no owned website or conversion asset", row["Safe Outreach Claims"])
+
+    def test_static_fetch_failure_with_rendered_load_is_not_broken_claim(self) -> None:
+        record = {
+            "google": {
+                **self._google_fixture(),
+                "business_name": "BG Contracting",
+                "reviews": "18",
+                "rating": "4.8",
+            },
+            "website": {
+                "site_status": "Loaded",
+                "rendered_site_status": "Loaded",
+                "rendered_status_reason": "Browser rendered homepage successfully after static fetch failed.",
+                "visual_review_needed": "Yes",
+                "site_issue_flags": [
+                    "static_fetch_failed",
+                    "rendered_check_needed",
+                    "manual_visual_review_needed",
+                    "outdated_site",
+                    "premium_perception_gap",
+                ],
+                "final_url": "https://bgcontracting.example",
+                "domain": "bgcontracting.example",
+                "homepage": {
+                    "url": "https://bgcontracting.example",
+                    "status_code": "",
+                    "title": "",
+                    "meta": "",
+                    "text": "",
+                    "error": "static request timed out",
+                },
+                "pages": {},
+                "emails_found": ["office@bgcontracting.example"],
+                "phones_found": ["(440) 555-0199"],
+                "forms_found": False,
+                "contact_form_detected": "Unknown",
+                "estimate_form_detected": "Unknown",
+                "form_strength": "None",
+                "form_detection_method": "none",
+                "cta_strength": "Unknown",
+                "cta_terms": [],
+                "high_ticket_terms": ["hardscaping", "retaining wall", "patio"],
+                "generic_copy_terms": [],
+                "combined_text": "",
+            },
+            "derived": {
+                "phone_consistency": "matched",
+                "has_form": False,
+                "has_high_ticket_terms": True,
+                "non_standard_site_or_booking": False,
+            },
+            "screenshots": {
+                "desktop": "screenshots/bg-contracting-desktop.png",
+                "mobile": "screenshots/bg-contracting-mobile.png",
+                "error": "",
+            },
+        }
+        record["evidence"] = build_evidence_profile(record)
+
+        row = score_record(record, "hardscaping")
+
+        self.assertEqual(row["Site Status"], "Loaded")
+        self.assertEqual(row["Rendered Site Status"], "Loaded")
+        self.assertEqual(row["Visual Review Needed"], "Yes")
+        self.assertNotEqual(row["Send Trigger"], "Website appears broken")
+        self.assertNotIn("website appears broken", row["Safe Outreach Claims"].lower())
+        self.assertNotIn("appears broken", row["Opener"].lower())
+        self.assertIn(row["Offer Fit"], {"Website Rebuild", "Premium Perception Gap", "Website Cleanup"})
+        self.assertEqual(row["Sendable"], "Yes")
+        self.assertEqual(row["Packet Eligible"], "Yes")
 
     def test_high_scoring_hallucinated_lead_gets_blocked_when_claims_are_ungrounded(self) -> None:
         enriched = {

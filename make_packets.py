@@ -50,6 +50,17 @@ EXTRA_FIELDS = [
     "AI Confidence",
     "Manual Reviewed",
     "Skip Reason",
+    "Rendered Site Status",
+    "Rendered Status Reason",
+    "Visual Review Needed",
+    "Visual Quality Score",
+    "Premium Perception Score",
+    "Mobile Visual Score",
+    "Hero Clarity Score",
+    "CTA Visibility Score",
+    "Gallery Visibility Score",
+    "Trust Proof Visibility Score",
+    "Visual Pain Reasons",
     "Desktop Screenshot Path",
     "Mobile Screenshot Path",
     "Score Total",
@@ -269,6 +280,17 @@ def evidence_summary(row: Dict[str, str], evidence: Dict[str, Any]) -> str:
     lines.append(f"- **Form detection method:** {website.get('form_detection_method', '') or derived.get('form_detection_method', '')}")
     lines.append(f"- **CTA found:** {derived.get('has_cta', '')}")
     lines.append(f"- **CTA strength:** {website.get('cta_strength', '') or derived.get('cta_strength', '')}")
+    lines.append(f"- **Rendered site status:** {row.get('Rendered Site Status', '') or website.get('rendered_site_status', '') or evidence.get('rendered_site_status', '')}")
+    lines.append(f"- **Rendered status reason:** {row.get('Rendered Status Reason', '') or website.get('rendered_status_reason', '') or evidence.get('rendered_status_reason', '')}")
+    lines.append(f"- **Visual review needed:** {row.get('Visual Review Needed', '') or website.get('visual_review_needed', '') or evidence.get('visual_review_needed', '')}")
+    lines.append(f"- **Visual quality score:** {row.get('Visual Quality Score', '') or evidence.get('visual_quality_score', '')}")
+    lines.append(f"- **Premium perception score:** {row.get('Premium Perception Score', '') or evidence.get('premium_perception_score', '')}")
+    lines.append(f"- **Mobile visual score:** {row.get('Mobile Visual Score', '') or evidence.get('mobile_visual_score', '')}")
+    lines.append(f"- **Hero clarity score:** {row.get('Hero Clarity Score', '') or evidence.get('hero_clarity_score', '')}")
+    lines.append(f"- **CTA visibility score:** {row.get('CTA Visibility Score', '') or evidence.get('cta_visibility_score', '')}")
+    lines.append(f"- **Gallery visibility score:** {row.get('Gallery Visibility Score', '') or evidence.get('gallery_visibility_score', '')}")
+    lines.append(f"- **Trust proof visibility score:** {row.get('Trust Proof Visibility Score', '') or evidence.get('trust_proof_visibility_score', '')}")
+    lines.append(f"- **Visual pain reasons:** {row.get('Visual Pain Reasons', '') or '; '.join(evidence.get('visual_pain_reasons', []) or [])}")
     lines.append(f"- **Visible pain score:** {row.get('Visible Pain Score', '') or evidence.get('visible_pain_score', '')}")
     lines.append(f"- **Visible pain reasons:** {row.get('Visible Pain Reasons', '') or '; '.join(evidence.get('visible_pain_reasons', []) or [])}")
     lines.append(f"- **Send trigger:** {row.get('Send Trigger', '') or evidence.get('send_trigger', '')}")
@@ -279,8 +301,8 @@ def evidence_summary(row: Dict[str, str], evidence: Dict[str, Any]) -> str:
 
     lines.append("### Screenshot Paths")
     lines.append("")
-    lines.append(f"- **Desktop:** `{row.get('Desktop Screenshot Path', '') or screenshots.get('desktop', '')}`")
-    lines.append(f"- **Mobile:** `{row.get('Mobile Screenshot Path', '') or screenshots.get('mobile', '')}`")
+    lines.append(f"- **Desktop:** `{row.get('Desktop Screenshot Path', '') or evidence.get('desktop_screenshot_path', '') or screenshots.get('desktop', '')}`")
+    lines.append(f"- **Mobile:** `{row.get('Mobile Screenshot Path', '') or evidence.get('mobile_screenshot_path', '') or screenshots.get('mobile', '')}`")
     lines.append("")
 
     lines.append("### Homepage")
@@ -489,6 +511,8 @@ def write_index(output_dir: Path, packet_rows: List[Dict[str, str]]) -> None:
         "Email",
         "Website URL",
         "Google Maps URL",
+        "Rendered Site Status",
+        "Visual Review Needed",
         "Desktop Screenshot Path",
         "Mobile Screenshot Path",
         "Score Total",

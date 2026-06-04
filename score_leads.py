@@ -971,11 +971,25 @@ def score_record(record: Dict[str, Any], fallback_vertical: str) -> Dict[str, An
         vertical,
     )
 
+    g = record.get("google", {})
+    w = record.get("website", {})
+    screenshots = record.get("screenshots", {})
+
     evidence_profile = record.get("evidence", {}) or {}
     visible_pain_reasons = evidence_profile.get("visible_pain_reasons") or []
     visible_pain_reasons_text = "; ".join(str(reason) for reason in visible_pain_reasons if str(reason).strip())
     send_trigger = str(evidence_profile.get("send_trigger") or "").strip()
     visible_pain_score = evidence_profile.get("visible_pain_score", 0)
+    visual_pain_reasons = evidence_profile.get("visual_pain_reasons") or []
+    visual_pain_reasons_text = "; ".join(str(reason) for reason in visual_pain_reasons if str(reason).strip())
+    rendered_site_status = str(evidence_profile.get("rendered_site_status") or "").strip()
+    rendered_status_reason = str(evidence_profile.get("rendered_status_reason") or "").strip()
+    desktop_screenshot_path = (
+        str(evidence_profile.get("desktop_screenshot_path") or "").strip() or screenshots.get("desktop", "")
+    )
+    mobile_screenshot_path = (
+        str(evidence_profile.get("mobile_screenshot_path") or "").strip() or screenshots.get("mobile", "")
+    )
 
     evidence_notes = "; ".join(
         [
@@ -986,10 +1000,6 @@ def score_record(record: Dict[str, Any], fallback_vertical: str) -> Dict[str, An
             f"Visible pain {visible_pain_score}: {visible_pain_reasons_text or 'none'}",
         ]
     )
-
-    g = record.get("google", {})
-    w = record.get("website", {})
-    screenshots = record.get("screenshots", {})
 
     safe_claims = deterministic_safe_claims(record, offer_fit)
     evidence_refs: List[str] = []
@@ -1026,6 +1036,32 @@ def score_record(record: Dict[str, Any], fallback_vertical: str) -> Dict[str, An
         "Form Strength": form_status(record, "form_strength", "None"),
         "Form Detection Method": form_status(record, "form_detection_method", "none"),
         "CTA Strength": form_status(record, "cta_strength", "None"),
+        "Rendered Site Status": rendered_site_status,
+        "rendered_site_status": rendered_site_status,
+        "Rendered Status Reason": rendered_status_reason,
+        "rendered_status_reason": rendered_status_reason,
+        "Desktop Screenshot Path": desktop_screenshot_path,
+        "desktop_screenshot_path": desktop_screenshot_path,
+        "Mobile Screenshot Path": mobile_screenshot_path,
+        "mobile_screenshot_path": mobile_screenshot_path,
+        "Visual Review Needed": evidence_profile.get("visual_review_needed", ""),
+        "visual_review_needed": evidence_profile.get("visual_review_needed", ""),
+        "Visual Quality Score": evidence_profile.get("visual_quality_score", ""),
+        "visual_quality_score": evidence_profile.get("visual_quality_score", ""),
+        "Premium Perception Score": evidence_profile.get("premium_perception_score", ""),
+        "premium_perception_score": evidence_profile.get("premium_perception_score", ""),
+        "Mobile Visual Score": evidence_profile.get("mobile_visual_score", ""),
+        "mobile_visual_score": evidence_profile.get("mobile_visual_score", ""),
+        "Hero Clarity Score": evidence_profile.get("hero_clarity_score", ""),
+        "hero_clarity_score": evidence_profile.get("hero_clarity_score", ""),
+        "CTA Visibility Score": evidence_profile.get("cta_visibility_score", ""),
+        "cta_visibility_score": evidence_profile.get("cta_visibility_score", ""),
+        "Gallery Visibility Score": evidence_profile.get("gallery_visibility_score", ""),
+        "gallery_visibility_score": evidence_profile.get("gallery_visibility_score", ""),
+        "Trust Proof Visibility Score": evidence_profile.get("trust_proof_visibility_score", ""),
+        "trust_proof_visibility_score": evidence_profile.get("trust_proof_visibility_score", ""),
+        "Visual Pain Reasons": visual_pain_reasons_text,
+        "visual_pain_reasons": visual_pain_reasons,
         "Visible Pain Score": visible_pain_score,
         "visible_pain_score": visible_pain_score,
         "Visible Pain Reasons": visible_pain_reasons_text,
@@ -1036,8 +1072,6 @@ def score_record(record: Dict[str, Any], fallback_vertical: str) -> Dict[str, An
         "AI Confidence": "medium",
         "Manual Reviewed": "",
         "Skip Reason": skip_reason(record, priority, total, offer_fit, fit_flags),
-        "Desktop Screenshot Path": screenshots.get("desktop", ""),
-        "Mobile Screenshot Path": screenshots.get("mobile", ""),
         "Raw Evidence": json.dumps(record, ensure_ascii=False),
         "Score Total": total,
         "Score Strength": strength,
@@ -1093,12 +1127,42 @@ def write_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+CORE_EVIDENCE_FIELDS = ("visible_pain_score", "visible_pain_reasons", "send_trigger")
+RENDERED_EVIDENCE_FIELDS = (
+    "rendered_site_status",
+    "rendered_status_reason",
+    "desktop_screenshot_path",
+    "mobile_screenshot_path",
+    "visual_review_needed",
+    "visual_quality_score",
+    "premium_perception_score",
+    "mobile_visual_score",
+    "hero_clarity_score",
+    "cta_visibility_score",
+    "gallery_visibility_score",
+    "trust_proof_visibility_score",
+    "visual_pain_reasons",
+    "screenshots",
+)
+
+
+def _with_missing_rendered_evidence(record: Dict[str, Any], evidence: Dict[str, Any]) -> Dict[str, Any]:
+    if all(key in evidence for key in RENDERED_EVIDENCE_FIELDS):
+        return record
+    rebuilt = build_evidence_profile(record)
+    merged = dict(evidence)
+    for key in RENDERED_EVIDENCE_FIELDS:
+        if key not in merged and key in rebuilt:
+            merged[key] = rebuilt[key]
+    updated = dict(record)
+    updated["evidence"] = merged
+    return updated
+
+
 def ensure_evidence(record: Dict[str, Any]) -> Dict[str, Any]:
     evidence = record.get("evidence")
-    if isinstance(evidence, dict) and all(
-        key in evidence for key in ("visible_pain_score", "visible_pain_reasons", "send_trigger")
-    ):
-        return record
+    if isinstance(evidence, dict) and all(key in evidence for key in CORE_EVIDENCE_FIELDS):
+        return _with_missing_rendered_evidence(record, evidence)
     updated = dict(record)
     updated["evidence"] = build_evidence_profile(record)
     return updated

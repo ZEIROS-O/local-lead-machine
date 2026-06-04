@@ -246,6 +246,10 @@ def merge_manual_score(
     if visible_pain_score in ("", None):
         visible_pain_score = fallback_pain["visible_pain_score"]
     send_trigger = validated.get("send_trigger") or evidence.get("send_trigger", "") or fallback_pain["send_trigger"]
+    visual_pain_reasons = evidence.get("visual_pain_reasons") or []
+    if isinstance(visual_pain_reasons, str):
+        visual_pain_reasons = [part.strip() for part in visual_pain_reasons.split(";") if part.strip()]
+    visual_pain_reasons_text = "; ".join(str(reason) for reason in visual_pain_reasons if str(reason).strip())
 
     email = ""
     if website.get("emails_found"):
@@ -280,6 +284,36 @@ def merge_manual_score(
         "Form Strength": evidence.get("form_strength", ""),
         "Form Detection Method": evidence.get("form_detection_method", ""),
         "CTA Strength": evidence.get("cta_strength", ""),
+        "Rendered Site Status": evidence.get("rendered_site_status", ""),
+        "rendered_site_status": evidence.get("rendered_site_status", ""),
+        "Rendered Status Reason": evidence.get("rendered_status_reason", ""),
+        "rendered_status_reason": evidence.get("rendered_status_reason", ""),
+        "Desktop Screenshot Path": evidence.get("desktop_screenshot_path", "")
+        or evidence.get("screenshots", {}).get("desktop", ""),
+        "desktop_screenshot_path": evidence.get("desktop_screenshot_path", "")
+        or evidence.get("screenshots", {}).get("desktop", ""),
+        "Mobile Screenshot Path": evidence.get("mobile_screenshot_path", "")
+        or evidence.get("screenshots", {}).get("mobile", ""),
+        "mobile_screenshot_path": evidence.get("mobile_screenshot_path", "")
+        or evidence.get("screenshots", {}).get("mobile", ""),
+        "Visual Review Needed": evidence.get("visual_review_needed", ""),
+        "visual_review_needed": evidence.get("visual_review_needed", ""),
+        "Visual Quality Score": evidence.get("visual_quality_score", ""),
+        "visual_quality_score": evidence.get("visual_quality_score", ""),
+        "Premium Perception Score": evidence.get("premium_perception_score", ""),
+        "premium_perception_score": evidence.get("premium_perception_score", ""),
+        "Mobile Visual Score": evidence.get("mobile_visual_score", ""),
+        "mobile_visual_score": evidence.get("mobile_visual_score", ""),
+        "Hero Clarity Score": evidence.get("hero_clarity_score", ""),
+        "hero_clarity_score": evidence.get("hero_clarity_score", ""),
+        "CTA Visibility Score": evidence.get("cta_visibility_score", ""),
+        "cta_visibility_score": evidence.get("cta_visibility_score", ""),
+        "Gallery Visibility Score": evidence.get("gallery_visibility_score", ""),
+        "gallery_visibility_score": evidence.get("gallery_visibility_score", ""),
+        "Trust Proof Visibility Score": evidence.get("trust_proof_visibility_score", ""),
+        "trust_proof_visibility_score": evidence.get("trust_proof_visibility_score", ""),
+        "Visual Pain Reasons": visual_pain_reasons_text,
+        "visual_pain_reasons": visual_pain_reasons,
         "Visible Pain Score": visible_pain_score,
         "visible_pain_score": visible_pain_score,
         "Visible Pain Reasons": visible_pain_reasons_text,
@@ -292,8 +326,6 @@ def merge_manual_score(
         "AI Confidence": validated["confidence"],
         "Manual Reviewed": "",
         "Skip Reason": "; ".join(validated.get("hard_disqualifiers") or []) if validated["grade"] == "Skip" else "",
-        "Desktop Screenshot Path": evidence.get("screenshots", {}).get("desktop", ""),
-        "Mobile Screenshot Path": evidence.get("screenshots", {}).get("mobile", ""),
         "Raw Evidence": json.dumps(enriched, ensure_ascii=False),
         "Score Total": validated["total_score"],
         "Score ICP Fit": subscores["icp_fit"],

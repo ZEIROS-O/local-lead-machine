@@ -213,7 +213,7 @@ class SearchWorkflowTest(unittest.TestCase):
                 },
             }
 
-            def fake_enrich(row, screenshots_dir, take_shots):
+            def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False):
                 return {"google": row, "website": {"site_status": "No Website"}, "derived": {}, "screenshots": {}}
 
             with patch("make_search_batch.text_search", return_value=text_results), patch(
@@ -237,6 +237,56 @@ class SearchWorkflowTest(unittest.TestCase):
             self.assertTrue(result.enriched_path.exists())
             self.assertTrue(result.report_path.exists())
 
+    def test_runner_can_pass_rendered_site_check_to_enrichment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "search_configs/test_hardscaping_001.json"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                json.dumps(_config(queries=["hardscaping Cleveland OH"], geo_slices=["Cleveland OH"]).to_dict()),
+                encoding="utf-8",
+            )
+
+            details = {
+                "id": "place-1",
+                "displayName": {"text": "Patio Pros"},
+                "formattedAddress": "123 Main St, Cleveland, OH 44101, USA",
+                "nationalPhoneNumber": "(216) 555-0100",
+                "websiteUri": "https://patiopros.example",
+                "googleMapsUri": "https://maps.google.com/?cid=1",
+                "rating": 4.8,
+                "userRatingCount": 28,
+                "primaryType": "landscaper",
+            }
+            calls = []
+
+            def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False):
+                calls.append(
+                    {
+                        "take_shots": take_shots,
+                        "rendered_site_check": rendered_site_check,
+                        "screenshots_dir": str(screenshots_dir),
+                    }
+                )
+                return {"google": row, "website": {"site_status": "Loaded"}, "derived": {}, "screenshots": {}}
+
+            with patch("make_search_batch.text_search", return_value=[{"id": "place-1"}]), patch(
+                "make_search_batch.place_details", return_value=details
+            ), patch("make_search_batch.enrich_row", side_effect=fake_enrich), redirect_stdout(io.StringIO()):
+                make_search_batch.run_search_batch(
+                    config_path=config_path,
+                    batch="test_hardscaping_001",
+                    root=root,
+                    api_key="test-key",
+                    no_screenshots=False,
+                    rendered_site_check=True,
+                )
+
+            self.assertEqual(len(calls), 1)
+            self.assertTrue(calls[0]["take_shots"])
+            self.assertTrue(calls[0]["rendered_site_check"])
+            self.assertTrue(calls[0]["screenshots_dir"].endswith("screenshots/test_hardscaping_001"))
+
     def test_runner_skips_early_duplicate_place_ids_before_details(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -257,7 +307,7 @@ class SearchWorkflowTest(unittest.TestCase):
                 "primaryType": "landscaper",
             }
 
-            def fake_enrich(row, screenshots_dir, take_shots):
+            def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False):
                 return {"google": row, "website": {"site_status": "No Website"}, "derived": {}, "screenshots": {}}
 
             with patch("make_search_batch.text_search", return_value=text_results), patch(
@@ -301,7 +351,7 @@ class SearchWorkflowTest(unittest.TestCase):
                     "primaryType": "patio contractor",
                 }
 
-            def fake_enrich(row, screenshots_dir, take_shots):
+            def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False):
                 return {"google": row, "website": {"site_status": "No Website"}, "derived": {}, "screenshots": {}}
 
             with patch("make_search_batch.text_search", side_effect=fake_text_search) as search_call, patch(
@@ -347,7 +397,7 @@ class SearchWorkflowTest(unittest.TestCase):
                 "primaryType": "patio contractor",
             }
 
-            def fake_enrich(row, screenshots_dir, take_shots):
+            def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False):
                 return {"google": row, "website": {"site_status": "No Website"}, "derived": {}, "screenshots": {}}
 
             progress = io.StringIO()
@@ -399,6 +449,10 @@ class SearchWorkflowTest(unittest.TestCase):
                 "Packet Eligibility Reason": "debug reason",
                 "Recommended Action": "Build mockup",
                 "Site Status": "broken",
+                "Rendered Site Status": "Loaded",
+                "Rendered Status Reason": "Browser loaded after static fetch failed.",
+                "Visual Review Needed": "Yes",
+                "Visual Quality Score": "Unknown",
             },
         }
 
@@ -409,6 +463,10 @@ class SearchWorkflowTest(unittest.TestCase):
         self.assertEqual(fields["Site Status"], "Broken")
         for internal_field in make_search_batch.INTERNAL_AIRTABLE_FIELDS:
             self.assertNotIn(internal_field, fields)
+        self.assertNotIn("Rendered Site Status", fields)
+        self.assertNotIn("Rendered Status Reason", fields)
+        self.assertNotIn("Visual Review Needed", fields)
+        self.assertNotIn("Visual Quality Score", fields)
 
     def test_airtable_payload_normalizes_site_status_single_select_values(self) -> None:
         cases = {

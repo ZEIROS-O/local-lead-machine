@@ -68,12 +68,42 @@ def read_jsonl(path: Path) -> List[Dict[str, Any]]:
     return records
 
 
+CORE_EVIDENCE_FIELDS = ("visible_pain_score", "visible_pain_reasons", "send_trigger")
+RENDERED_EVIDENCE_FIELDS = (
+    "rendered_site_status",
+    "rendered_status_reason",
+    "desktop_screenshot_path",
+    "mobile_screenshot_path",
+    "visual_review_needed",
+    "visual_quality_score",
+    "premium_perception_score",
+    "mobile_visual_score",
+    "hero_clarity_score",
+    "cta_visibility_score",
+    "gallery_visibility_score",
+    "trust_proof_visibility_score",
+    "visual_pain_reasons",
+    "screenshots",
+)
+
+
+def _with_missing_rendered_evidence(record: Dict[str, Any], evidence: Dict[str, Any]) -> Dict[str, Any]:
+    if all(key in evidence for key in RENDERED_EVIDENCE_FIELDS):
+        return record
+    rebuilt = build_evidence_profile(record)
+    merged = dict(evidence)
+    for key in RENDERED_EVIDENCE_FIELDS:
+        if key not in merged and key in rebuilt:
+            merged[key] = rebuilt[key]
+    updated = dict(record)
+    updated["evidence"] = merged
+    return updated
+
+
 def ensure_evidence(record: Dict[str, Any]) -> Dict[str, Any]:
     evidence = record.get("evidence")
-    if isinstance(evidence, dict) and all(
-        key in evidence for key in ("visible_pain_score", "visible_pain_reasons", "send_trigger")
-    ):
-        return record
+    if isinstance(evidence, dict) and all(key in evidence for key in CORE_EVIDENCE_FIELDS):
+        return _with_missing_rendered_evidence(record, evidence)
     updated = dict(record)
     updated["evidence"] = build_evidence_profile(record)
     return updated
@@ -264,6 +294,11 @@ Rules:
 - No specific observation = no send.
 - More reviews require stronger proof of visible pain.
 - Do not infer missing forms if evidence is uncertain.
+- Static fetch failure alone does not prove the website is broken.
+- If rendered_site_status is Loaded, do not claim the website is broken.
+- If a rendered site loads but looks weak, classify the issue as outdated, poor, Website Cleanup, Website Rebuild, or Premium Perception Gap, not broken.
+- Visual claims require screenshot paths, rendered browser evidence, DOM evidence, or explicit manual review notes.
+- No screenshot/rendered evidence means no strong visual claims.
 - A strong estimate form does not globally disqualify a lead.
 - It only blocks missing-form, no-contact-path, and no-estimate-path claims.
 - If another concrete issue exists, score based on that issue: premium perception gap, weak portfolio presentation, outdated site, bad mobile path, weak review/trust placement, or unclear service positioning.

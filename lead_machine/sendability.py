@@ -66,7 +66,12 @@ CONCRETE_SITE_STATUSES = {
 HARD_CONCRETE_SITE_STATUSES = CONCRETE_SITE_STATUSES - {"weak"}
 
 CONCRETE_ISSUE_FLAGS = {
-    "homepage_fetch_failed",
+    "dns_domain_failure",
+    "homepage_http_hard_failure",
+    "ssl_cert_hard_failure",
+    "broken_redirect",
+    "rendered_load_failed",
+    "parked_dead_domain",
     "non_standard_site_or_booking_url",
     "non_standard_site_or_booking",
     "premium_perception_gap",
@@ -181,6 +186,7 @@ GENERIC_OPTIMIZATION_REASONS = {
 CONCRETE_ISSUE_FIELDS = {
     "site_status",
     "site_issue_flags",
+    "rendered_site_status",
     "contact_form",
     "contact_form_detected",
     "estimate_form_detected",
@@ -464,6 +470,8 @@ def has_concrete_conversion_issue(row: Dict[str, Any]) -> bool:
         if field == "site_status" and value_text in CONCRETE_SITE_STATUSES:
             if strong_estimate_form and value_text == "weak":
                 continue
+            return True
+        if field == "rendered_site_status" and value_text == "broken":
             return True
         if field == "site_issue_flags" and any(flag in value_text for flag in CONCRETE_ISSUE_FLAGS):
             if strong_estimate_form and not any(
