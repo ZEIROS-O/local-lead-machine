@@ -31,6 +31,11 @@ from typing import Any, Dict, List, Tuple
 from dotenv import load_dotenv
 
 from import_llm_score_bundle import import_score_bundle
+from lead_machine.buyer_signals import (
+    buyer_intent_summary,
+    ensure_buyer_intent,
+    has_money_signal as buyer_has_money_signal,
+)
 from lead_machine.evidence import build_evidence_profile
 from lead_machine.lead_card import build_lead_card
 from lead_machine import llm_client
@@ -215,6 +220,20 @@ DEFAULT_MAX_LLM_USD_PER_RUN = 5.0
 SONNET_4_6_INPUT_USD_PER_MILLION_TOKENS = 3.0
 SONNET_4_6_OUTPUT_USD_PER_MILLION_TOKENS = 15.0
 
+SCORE_WEIGHTS = {
+    "business_strength": 30,
+    "online_weakness": 35,
+    "offer_fit": 20,
+    "buyer_intent": 15,
+    "raw_business_strength": 40,
+    "raw_online_weakness": 40,
+    "raw_offer_fit": 20,
+    "priority_thresholds": {
+        "cap_to_c_below": 35,
+        "skip_below": 25,
+    },
+}
+
 
 def getenv_int(name: str, default: int) -> int:
     raw = os.getenv(name, "").strip()
@@ -287,9 +306,19 @@ def more_restrictive(a: str, b: str) -> str:
     return a if PRIORITY_RANK.get(a, 9) >= PRIORITY_RANK.get(b, 9) else b
 
 
+def weighted_score(raw_score: int, raw_max: int, weight: int) -> int:
+    if raw_max <= 0:
+        return 0
+    return min(weight, round(max(0, raw_score) * weight / raw_max))
+
+
 def is_no_or_broken(record: Dict[str, Any]) -> bool:
     status = record.get("website", {}).get("site_status", "Unknown")
     return status in {"No Website", "Broken Website", "Social Only"}
+
+
+def has_money_signal(record: Dict[str, Any]) -> bool:
+    return buyer_has_money_signal(record)
 
 
 def form_status(record: Dict[str, Any], key: str, default: str = "") -> str:
@@ -388,6 +417,7 @@ def fit_ceiling(
     rating = safe_float(g.get("rating"))
     reviews = safe_int(g.get("reviews"))
     no_site = is_no_or_broken(record)
+    money_signal = has_money_signal(record)
     profile = profile or resolve_profile(_record_vertical(record) or vertical, source_query=_record_source_query(record))
     family = profile.family
 
@@ -421,10 +451,17 @@ def fit_ceiling(
             return "B", flags
         return "C", flags
 
+    if no_site and not money_signal:
+        flags.append("bad site without buyer-intent money signal")
+        return "C", flags
+
     # Inverted-U review logic.
     # 5-20 reviews = best first-wave owner-led band. More reviews need clearer visible pain.
     if reviews >= 75:
         flags.append("75+ reviews requires very clear visible pain")
+        if money_signal and no_site:
+            flags.append("buyer-intent money signal supports high-review structural gap")
+            return "A", flags
         return ("A" if no_site else "B"), flags
 
     if reviews >= 21:
@@ -619,6 +656,51 @@ def score_online_weakness(record: Dict[str, Any]) -> Tuple[int, List[str]]:
     return min(score, 40), evidence
 
 
+def score_buyer_intent(record: Dict[str, Any]) -> Tuple[int, List[str]]:
+    buyer_intent = ensure_buyer_intent(record)
+    stack = buyer_intent.get("crm_booking_stack") or {}
+    review_velocity = buyer_intent.get("review_velocity") or {}
+    ads = buyer_intent.get("ads") or {}
+    detected_tools = stack.get("detected_tools") or []
+    if isinstance(detected_tools, str):
+        detected_tools = [part.strip() for part in detected_tools.replace(",", ";").split(";") if part.strip()]
+
+    score = 0
+    evidence: List[str] = []
+
+    if stack.get("has_paid_crm"):
+        score += 8
+        evidence.append(f"paid CRM/booking stack detected ({', '.join(str(tool) for tool in detected_tools)})")
+    elif detected_tools:
+        score += 3
+        evidence.append(f"booking/form tools detected ({', '.join(str(tool) for tool in detected_tools)})")
+
+    velocity_band = str(review_velocity.get("velocity_band") or "").strip().lower()
+    if velocity_band == "live":
+        score += 5
+        evidence.append("live review velocity by count/rating")
+    elif velocity_band == "steady":
+        score += 2
+        evidence.append("steady review proof by count/rating")
+
+    yes_ads = [
+        field
+        for field in ("google_ad_transparency", "meta_ad_library", "lsa_badge")
+        if ads.get(field) == "yes"
+    ]
+    if yes_ads:
+        score += 4
+        evidence.append(f"ad signal detected ({', '.join(yes_ads)})")
+
+    if buyer_intent.get("money_signal"):
+        score += 2
+        evidence.append("buyer-intent money signal present")
+    else:
+        evidence.append("no buyer-intent money signal")
+
+    return min(score, SCORE_WEIGHTS["buyer_intent"]), evidence
+
+
 def choose_offer_fit(record: Dict[str, Any], strength: int, weakness: int) -> Tuple[str, int, List[str]]:
     w = record.get("website", {})
     d = record.get("derived", {})
@@ -781,10 +863,10 @@ def classify_priority(
     priority = more_restrictive(base, ceiling)
 
     # If it scores absurdly low, don't keep it high.
-    if total < 35:
+    if total < SCORE_WEIGHTS["priority_thresholds"]["cap_to_c_below"]:
         priority = more_restrictive(priority, "C")
 
-    if total < 25:
+    if total < SCORE_WEIGHTS["priority_thresholds"]["skip_below"]:
         priority = "Skip"
 
     return priority, ceiling, fit_flags
@@ -1034,13 +1116,29 @@ def score_record(record: Dict[str, Any], fallback_vertical: str) -> Dict[str, An
     vertical = infer_vertical(record, fallback_vertical)
     profile = resolve_profile(_record_vertical(record) or vertical, source_query=_record_source_query(record))
 
-    strength, strength_evidence = score_business_strength(record, vertical, profile=profile)
-    weakness, weakness_evidence = score_online_weakness(record)
-    offer_fit, offer_score, offer_evidence = choose_offer_fit(record, strength, weakness)
+    raw_strength, strength_evidence = score_business_strength(record, vertical, profile=profile)
+    raw_weakness, weakness_evidence = score_online_weakness(record)
+    buyer_intent_score, buyer_intent_evidence = score_buyer_intent(record)
+    offer_fit, raw_offer_score, offer_evidence = choose_offer_fit(record, raw_strength, raw_weakness)
 
-    total = strength + weakness + offer_score
+    strength = weighted_score(
+        raw_strength,
+        SCORE_WEIGHTS["raw_business_strength"],
+        SCORE_WEIGHTS["business_strength"],
+    )
+    weakness = weighted_score(
+        raw_weakness,
+        SCORE_WEIGHTS["raw_online_weakness"],
+        SCORE_WEIGHTS["online_weakness"],
+    )
+    offer_score = weighted_score(
+        raw_offer_score,
+        SCORE_WEIGHTS["raw_offer_fit"],
+        SCORE_WEIGHTS["offer_fit"],
+    )
+    total = min(100, strength + weakness + offer_score + buyer_intent_score)
     priority, fit_cap, fit_flags = classify_priority(total, record, offer_fit, vertical, profile=profile)
-    website_quality = infer_website_quality(record, weakness, offer_fit)
+    website_quality = infer_website_quality(record, raw_weakness, offer_fit)
     angle = best_service_angle(record, vertical, offer_fit)
 
     observation = make_observation(
@@ -1059,6 +1157,8 @@ def score_record(record: Dict[str, Any], fallback_vertical: str) -> Dict[str, An
     screenshots = record.get("screenshots", {})
 
     evidence_profile = record.get("evidence", {}) or {}
+    buyer_summary = buyer_intent_summary(record)
+    money_signal = "Yes" if has_money_signal(record) else "No"
     visible_pain_reasons = evidence_profile.get("visible_pain_reasons") or []
     visible_pain_reasons_text = "; ".join(str(reason) for reason in visible_pain_reasons if str(reason).strip())
     send_trigger = str(evidence_profile.get("send_trigger") or "").strip()
@@ -1076,9 +1176,10 @@ def score_record(record: Dict[str, Any], fallback_vertical: str) -> Dict[str, An
 
     evidence_notes = "; ".join(
         [
-            f"Strength {strength}/40: {', '.join(strength_evidence) or 'none'}",
-            f"Weakness {weakness}/40: {', '.join(weakness_evidence) or 'none'}",
+            f"Strength {strength}/{SCORE_WEIGHTS['business_strength']}: {', '.join(strength_evidence) or 'none'}",
+            f"Weakness {weakness}/{SCORE_WEIGHTS['online_weakness']}: {', '.join(weakness_evidence) or 'none'}",
             f"Offer {offer_score}/20: {offer_fit} ({', '.join(offer_evidence) or 'none'})",
+            f"Buyer intent {buyer_intent_score}/{SCORE_WEIGHTS['buyer_intent']}: {', '.join(buyer_intent_evidence) or 'none'}",
             f"Fit cap: {fit_cap} ({', '.join(fit_flags) or 'none'})",
             f"Visible pain {visible_pain_score}: {visible_pain_reasons_text or 'none'}",
         ]
@@ -1151,6 +1252,10 @@ def score_record(record: Dict[str, Any], fallback_vertical: str) -> Dict[str, An
         "visible_pain_reasons": visible_pain_reasons,
         "Send Trigger": send_trigger,
         "send_trigger": send_trigger,
+        "Money Signal": money_signal,
+        "money_signal": money_signal,
+        "Buyer Intent Signals": buyer_summary,
+        "buyer_intent_signals": buyer_summary,
         "Evidence Notes": evidence_notes,
         "AI Confidence": "medium",
         "Manual Reviewed": "",
@@ -1160,6 +1265,7 @@ def score_record(record: Dict[str, Any], fallback_vertical: str) -> Dict[str, An
         "Score Strength": strength,
         "Score Weakness": weakness,
         "Score Offer": offer_score,
+        "Score Buyer Intent": buyer_intent_score,
         "Fit Ceiling": fit_cap,
         "Fit Flags": ", ".join(fit_flags),
         "Review Fit Band": review_fit_band(record, vertical),
@@ -1244,10 +1350,12 @@ def _with_missing_rendered_evidence(record: Dict[str, Any], evidence: Dict[str, 
 
 def ensure_evidence(record: Dict[str, Any]) -> Dict[str, Any]:
     evidence = record.get("evidence")
+    ensure_buyer_intent(record)
     if isinstance(evidence, dict) and all(key in evidence for key in CORE_EVIDENCE_FIELDS):
         return _with_missing_rendered_evidence(record, evidence)
     updated = dict(record)
     updated["evidence"] = build_evidence_profile(record)
+    ensure_buyer_intent(updated)
     return updated
 
 

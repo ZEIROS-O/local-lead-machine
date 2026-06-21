@@ -38,6 +38,8 @@ AIRTABLE_ALLOWED_FIELDS = [
     "Visible Pain Score",
     "Visible Pain Reasons",
     "Send Trigger",
+    "Money Signal",
+    "Buyer Intent Signals",
     "AI Confidence",
     "Skip Reason",
     "Place Key",
@@ -105,6 +107,10 @@ def normalize_airtable_value(field: str, value: Any) -> Any:
     if field == SITE_STATUS_FIELD:
         label = " ".join(str(value or "").strip().casefold().replace("_", " ").split())
         return SITE_STATUS_LABELS.get(label)
+
+    if field in SERVICE_ANGLE_FIELDS:
+        label = " ".join(str(value or "").strip().casefold().replace("_", " ").split())
+        return SERVICE_ANGLE_LABELS.get(label)
 
     if field in INTEGER_FIELDS:
         number = _parse_finite_float(value)

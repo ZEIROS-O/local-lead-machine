@@ -35,6 +35,7 @@ from dotenv import load_dotenv
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
+from lead_machine.buyer_signals import build_buyer_intent
 from lead_machine.evidence import build_evidence_profile
 from lead_machine.icp import hard_icp_gate
 from lead_machine.schema import normalize_lead
@@ -134,6 +135,15 @@ FORM_PROVIDER_TERMS = [
     "captcha",
     "recaptcha",
     "g-recaptcha",
+    "servicetitan",
+    "service titan",
+    "thryv",
+    "urable",
+    "booksy",
+    "square appointments",
+    "squareup.com/appointments",
+    "mobile tech rx",
+    "mobiletechrx",
 ]
 
 CAPTCHA_TERMS = {"captcha", "recaptcha", "g-recaptcha"}
@@ -207,6 +217,13 @@ def getenv_int(name: str, default: int) -> int:
     except ValueError:
         print(f"[WARN] Invalid {name}={raw!r}; using {default}", file=sys.stderr)
         return default
+
+
+def getenv_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "y", "on"}
 
 
 def safe_slug(text: str, fallback: str = "lead") -> str:
@@ -1190,6 +1207,7 @@ def enrich_row(
     take_shots: bool,
     rendered_form_check: bool = False,
     rendered_site_check: bool = False,
+    buyer_intent_ads_check: bool = False,
 ) -> Dict[str, Any]:
     lead = normalize_lead(row, fallback_vertical=row.get("category", "") or "service")
     profile = resolve_profile(lead.vertical, source_query=lead.source_query)
@@ -1262,6 +1280,7 @@ def enrich_row(
         },
     }
     record["evidence"] = build_evidence_profile(record)
+    build_buyer_intent(record, ads_check=buyer_intent_ads_check)
     return record
 
 
@@ -1316,6 +1335,8 @@ def main() -> int:
     print(f"[INFO] Screenshots={'off' if args.no_screenshots else 'on'}")
     print(f"[INFO] Rendered form check={'on' if args.rendered_form_check else 'off'}")
     print(f"[INFO] Rendered site check={'on' if args.rendered_site_check else 'off'}")
+    buyer_intent_ads_check = getenv_bool("BUYER_INTENT_ADS_CHECK", False)
+    print(f"[INFO] Buyer-intent ads check={'on' if buyer_intent_ads_check else 'off'}")
 
     records: List[Dict[str, Any]] = []
 
@@ -1332,6 +1353,7 @@ def main() -> int:
                 take_shots=not args.no_screenshots,
                 rendered_form_check=args.rendered_form_check,
                 rendered_site_check=args.rendered_site_check,
+                buyer_intent_ads_check=buyer_intent_ads_check,
             )
             records.append(enriched)
 
@@ -1352,6 +1374,7 @@ def main() -> int:
                 "derived": {},
             }
             error_record["evidence"] = build_evidence_profile(error_record)
+            build_buyer_intent(error_record, ads_check=buyer_intent_ads_check)
             records.append(error_record)
 
         time.sleep(0.2)

@@ -1086,6 +1086,7 @@ class LeadMachineContractsTest(unittest.TestCase):
                         },
                         "derived": {"has_high_ticket_terms": True},
                         "screenshots": {},
+                        "buyer_intent": self._buyer_intent_fixture(),
                     },
                     "hardscaping",
                 )
@@ -2176,6 +2177,123 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertIn("Missing concrete send trigger", row["Send Blockers"])
         self.assertEqual(row["Packet Eligible"], "")
 
+    def test_weak_form_with_money_signal_avoids_visible_pain_blocker(self) -> None:
+        enriched = {
+            "google": {
+                **self._google_fixture(),
+                "reviews": "130",
+            },
+            "buyer_intent": {
+                "crm_booking_stack": {
+                    "detected_tools": ["ServiceTitan"],
+                    "has_paid_crm": True,
+                    "evidence": ["Detected paid CRM/booking tool: ServiceTitan"],
+                },
+                "review_velocity": {
+                    "velocity_band": "steady",
+                    "source": "count_only",
+                    "evidence": ["130 Google reviews with 4.9 rating"],
+                },
+                "ads": {
+                    "google_ad_transparency": "unknown",
+                    "meta_ad_library": "unknown",
+                    "lsa_badge": "unknown",
+                    "errors": [],
+                },
+                "money_signal": True,
+                "evidence": ["Paid CRM/booking stack detected"],
+            },
+            "evidence": {
+                "site_status": "weak",
+                "contact_form_detected": "Yes",
+                "estimate_form_detected": "Yes",
+                "form_strength": "Weak",
+                "visible_pain_score": 18,
+                "visible_pain_reasons": ["Weak estimate form detected"],
+                "visible_pain_categories": ["estimate_path_pain"],
+                "send_trigger": "Weak estimate form detected",
+                "evidence_items": [
+                    {"id": "E1", "field": "google_rating", "value": "4.9 stars / 130 reviews"},
+                    {"id": "E2", "field": "form_strength", "value": "Weak"},
+                    {"id": "E3", "field": "send_trigger", "value": "Weak estimate form detected"},
+                ],
+            },
+        }
+        raw_score = self._manual_score(
+            evidence_refs=["E1", "E2", "E3"],
+            visible_pain_score=18,
+            visible_pain_reasons=["Weak estimate form detected"],
+            visible_pain_categories=["estimate_path_pain"],
+            send_trigger="Weak estimate form detected",
+            safe_outreach_claims=[
+                {"claim": "Your Google profile shows strong review proof.", "evidence_refs": ["E1"]},
+                {"claim": "The estimate form looks weak for the demand signal.", "evidence_refs": ["E2", "E3"]},
+            ],
+            opener="Your reviews look strong, but the estimate form feels weak for that demand.",
+        )
+
+        row = merge_manual_score(enriched, raw_score, fallback_vertical="hardscaping")
+
+        self.assertEqual(row["Sendable"], "Yes")
+        self.assertEqual(row["Money Signal"], "Yes")
+        self.assertNotIn("Visible pain too weak for review count", row["Send Blockers"])
+
+    def test_bad_site_without_money_signal_is_blocked(self) -> None:
+        enriched = {
+            "google": {
+                **self._google_fixture(),
+                "reviews": "18",
+            },
+            "buyer_intent": {
+                "crm_booking_stack": {"detected_tools": [], "has_paid_crm": False, "evidence": []},
+                "review_velocity": {
+                    "velocity_band": "steady",
+                    "source": "count_only",
+                    "evidence": ["18 Google reviews with 4.9 rating"],
+                },
+                "ads": {
+                    "google_ad_transparency": "unknown",
+                    "meta_ad_library": "unknown",
+                    "lsa_badge": "unknown",
+                    "errors": [],
+                },
+                "money_signal": False,
+                "evidence": [],
+            },
+            "evidence": {
+                "site_status": "missing",
+                "visible_pain_score": 40,
+                "visible_pain_reasons": ["No owned website found"],
+                "visible_pain_categories": ["no_site_or_social_only_pain"],
+                "send_trigger": "No owned website found",
+                "evidence_items": [
+                    {"id": "E1", "field": "google_rating", "value": "4.9 stars / 18 reviews"},
+                    {"id": "E2", "field": "site_status", "value": "missing"},
+                    {"id": "E3", "field": "send_trigger", "value": "No owned website found"},
+                ],
+            },
+        }
+        raw_score = self._manual_score(
+            best_angle="Website Rebuild",
+            evidence_refs=["E1", "E2", "E3"],
+            visible_pain_score=40,
+            visible_pain_reasons=["No owned website found"],
+            visible_pain_categories=["no_site_or_social_only_pain"],
+            send_trigger="No owned website found",
+            safe_outreach_claims=[
+                {"claim": "No owned website is visible.", "evidence_refs": ["E2", "E3"]},
+                {"claim": "The Google profile has review proof.", "evidence_refs": ["E1"]},
+            ],
+            opener="I could not find an owned website, only the Google profile.",
+        )
+
+        row = merge_manual_score(enriched, raw_score, fallback_vertical="hardscaping")
+
+        self.assertEqual(row["Sendable"], "No")
+        self.assertEqual(row["Money Signal"], "No")
+        self.assertIn("Missing buyer-intent money signal", row["Send Blockers"])
+        self.assertEqual(row["Packet Eligible"], "")
+
     def test_advanced_optimization_is_not_sendable_without_concrete_visible_pain(self) -> None:
         enriched = {
             "google": {
@@ -2251,6 +2369,7 @@ class LeadMachineContractsTest(unittest.TestCase):
                 },
                 "derived": {},
                 "screenshots": {},
+                "buyer_intent": self._buyer_intent_fixture(),
             },
             "hardscaping",
         )
@@ -2316,6 +2435,7 @@ class LeadMachineContractsTest(unittest.TestCase):
                 "mobile": "screenshots/bg-contracting-mobile.png",
                 "error": "",
             },
+            "buyer_intent": self._buyer_intent_fixture(),
         }
         record["evidence"] = build_evidence_profile(record)
 
@@ -2400,6 +2520,79 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(row["Lead Priority"], "Skip")
         self.assertIn("franchise/brand denylist", row["Fit Flags"])
 
+    def test_no_money_bad_site_cannot_be_deterministic_a(self) -> None:
+        row = score_record(
+            {
+                "google": {
+                    **self._google_fixture(),
+                    "rating": "4.9",
+                    "reviews": "18",
+                },
+                "website": {
+                    "site_status": "No Website",
+                    "site_issue_flags": [],
+                    "combined_text": "hardscape patio retaining wall",
+                    "high_ticket_terms": ["hardscape", "patio", "retaining wall"],
+                },
+                "buyer_intent": {
+                    "crm_booking_stack": {"detected_tools": [], "has_paid_crm": False, "evidence": []},
+                    "review_velocity": {"velocity_band": "steady", "source": "count_only", "evidence": []},
+                    "ads": {
+                        "google_ad_transparency": "unknown",
+                        "meta_ad_library": "unknown",
+                        "lsa_badge": "unknown",
+                        "errors": [],
+                    },
+                    "money_signal": False,
+                    "evidence": [],
+                },
+                "derived": {"has_high_ticket_terms": True},
+            },
+            "hardscaping",
+        )
+
+        self.assertNotEqual(row["Lead Priority"], "A")
+        self.assertIn(row["Lead Priority"], {"C", "Skip"})
+        self.assertEqual(row["Sendable"], "No")
+        self.assertIn("Missing buyer-intent money signal", row["Send Blockers"])
+
+    def test_money_signal_defends_high_review_bad_site_deterministic_tier(self) -> None:
+        base_record = {
+            "google": {
+                **self._google_fixture(),
+                "rating": "4.9",
+                "reviews": "92",
+            },
+            "website": {
+                "site_status": "No Website",
+                "site_issue_flags": [],
+                "combined_text": "hardscape patio retaining wall ServiceTitan",
+                "high_ticket_terms": ["hardscape", "patio", "retaining wall"],
+            },
+            "buyer_intent": {
+                "crm_booking_stack": {
+                    "detected_tools": ["ServiceTitan"],
+                    "has_paid_crm": True,
+                    "evidence": ["Detected paid CRM/booking tool: ServiceTitan"],
+                },
+                "review_velocity": {"velocity_band": "live", "source": "count_only", "evidence": []},
+                "ads": {
+                    "google_ad_transparency": "unknown",
+                    "meta_ad_library": "unknown",
+                    "lsa_badge": "unknown",
+                    "errors": [],
+                },
+                "money_signal": True,
+                "evidence": ["Paid CRM/booking stack detected"],
+            },
+            "derived": {"has_high_ticket_terms": True},
+        }
+
+        row = score_record(base_record, "hardscaping")
+
+        self.assertEqual(row["Lead Priority"], "A")
+        self.assertEqual(row["Money Signal"], "Yes")
+
     def _google_fixture(self) -> dict:
         return {
             "business_name": "A+ Landscaping LLC",
@@ -2410,6 +2603,28 @@ class LeadMachineContractsTest(unittest.TestCase):
             "rating": "4.9",
             "reviews": "130",
             "place_id": "ChIJ123",
+        }
+
+    def _buyer_intent_fixture(self) -> dict:
+        return {
+            "crm_booking_stack": {
+                "detected_tools": ["ServiceTitan"],
+                "has_paid_crm": True,
+                "evidence": ["Detected paid CRM/booking tool: ServiceTitan"],
+            },
+            "review_velocity": {
+                "velocity_band": "steady",
+                "source": "count_only",
+                "evidence": ["18 Google reviews with 4.8 rating"],
+            },
+            "ads": {
+                "google_ad_transparency": "unknown",
+                "meta_ad_library": "unknown",
+                "lsa_badge": "unknown",
+                "errors": [],
+            },
+            "money_signal": True,
+            "evidence": ["Paid CRM/booking stack detected"],
         }
 
     def _evidence_fixture(self, *, site_status: str, evidence_items: list | None = None) -> dict:

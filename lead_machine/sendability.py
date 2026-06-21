@@ -4,6 +4,8 @@ import json
 import re
 from typing import Any, Dict, Iterable, List, Sequence, Set
 
+from .buyer_signals import buyer_intent_summary, has_money_signal as buyer_has_money_signal
+
 
 MIN_SENDABLE_SCORE = 65
 MIN_SENDABLE_CONFIDENCE = 0.75
@@ -15,6 +17,7 @@ DEMAND_BLOCKER = "Missing proof-of-demand signal"
 RATING_BLOCKER = "Rating below 4.0 minimum"
 REVIEW_COUNT_BLOCKER = "Review count below sendable minimum"
 VISIBLE_PAIN_BLOCKER = "Visible pain too weak for review count"
+MONEY_SIGNAL_BLOCKER = "Missing buyer-intent money signal"
 STRONG_FORM_NO_PAIN_BLOCKER = "Strong estimate form exists / no concrete visible conversion issue"
 ADVANCED_OPTIMIZATION_BLOCKER = "Advanced Optimization without concrete visible pain"
 FORM_ABSENCE_CLAIM_BLOCKER = "Strong estimate form conflicts with missing-form claim"
@@ -31,6 +34,7 @@ EVIDENCE_BLOCKERS = {
     CONVERSION_ISSUE_BLOCKER,
     SEND_TRIGGER_BLOCKER,
     VISIBLE_PAIN_BLOCKER,
+    MONEY_SIGNAL_BLOCKER,
     STRONG_FORM_NO_PAIN_BLOCKER,
     ADVANCED_OPTIMIZATION_BLOCKER,
     FORM_ABSENCE_CLAIM_BLOCKER,
@@ -329,11 +333,17 @@ def evaluate_sendability(row: Dict[str, Any]) -> Dict[str, Any]:
         blockers.append(REVIEW_COUNT_BLOCKER)
 
     required_pain = required_visible_pain_score(reviews)
-    if not is_exceptional_low_review_fit(row) and visible_pain_score < required_pain:
+    if not (
+        has_money_signal(row)
+        and concrete_issue
+    ) and not is_exceptional_low_review_fit(row) and visible_pain_score < required_pain:
         blockers.append(VISIBLE_PAIN_BLOCKER)
 
     if not has_demand_signal(row):
         blockers.append(DEMAND_BLOCKER)
+
+    if not has_money_signal(row) and is_bad_site_only_signal(row):
+        blockers.append(MONEY_SIGNAL_BLOCKER)
 
     if not _pick(row, "best_angle", "Offer Fit", "Best Service Angle"):
         blockers.append(ANGLE_BLOCKER)
@@ -369,6 +379,8 @@ def evaluate_sendability(row: Dict[str, Any]) -> Dict[str, Any]:
         "send_trigger": send_trigger,
         "visible_pain_score": visible_pain_score,
         "visible_pain_reasons": visible_pain_reasons,
+        "money_signal": has_money_signal(row),
+        "buyer_intent_signals": buyer_intent_summary(row),
     }
 
 
@@ -390,6 +402,10 @@ def apply_sendability(row: Dict[str, Any]) -> Dict[str, Any]:
     updated["visible_pain_score"] = result["visible_pain_score"]
     updated["Visible Pain Reasons"] = "; ".join(result["visible_pain_reasons"])
     updated["visible_pain_reasons"] = result["visible_pain_reasons"]
+    updated["Money Signal"] = "Yes" if result["money_signal"] else "No"
+    updated["money_signal"] = updated["Money Signal"]
+    updated["Buyer Intent Signals"] = result["buyer_intent_signals"]
+    updated["buyer_intent_signals"] = result["buyer_intent_signals"]
 
     if updated.get("Packet Eligible") == "Yes" and not result["sendable"]:
         updated["Packet Eligible"] = ""
@@ -720,6 +736,53 @@ def _best_angle(row: Dict[str, Any]) -> str:
     return _pick(row, "best_angle", "Offer Fit", "Best Service Angle")
 
 
+def has_money_signal(row: Dict[str, Any]) -> bool:
+    return buyer_has_money_signal(row)
+
+
+def is_bad_site_only_signal(row: Dict[str, Any]) -> bool:
+    categories = set(get_visible_pain_categories(row))
+    status = _normalized_site_status(row)
+    bad_site_status = status in {
+        "missing",
+        "no website",
+        "no_website",
+        "broken",
+        "broken website",
+        "broken_website",
+        "social only",
+        "social_only",
+        "jobber only",
+        "jobber_only",
+    }
+    allowed_categories = {"no_site_or_social_only_pain", "broken_site_pain"}
+    if bad_site_status:
+        allowed_categories.add("estimate_path_pain")
+    if categories - allowed_categories:
+        return False
+
+    if _clean(_pick(row, "Form Strength", "form_strength")).lower() in {"weak", "basic"}:
+        return False
+
+    angle = _best_angle(row).lower()
+    if angle and angle not in {"website rebuild", "no-site launch", "social/jobber escape"}:
+        return False
+
+    if bad_site_status:
+        return True
+
+    trigger = get_send_trigger(row).lower()
+    return any(
+        phrase in trigger
+        for phrase in (
+            "no owned website",
+            "website appears broken",
+            "social-only web presence",
+            "jobber-only web presence",
+        )
+    )
+
+
 def _review_count(row: Dict[str, Any]) -> int:
     raw = _raw_evidence(row)
     google = raw.get("google", {}) if isinstance(raw, dict) else {}
@@ -742,6 +805,9 @@ def _normalized_site_status(row: Dict[str, Any]) -> str:
 
 
 def has_demand_signal(row: Dict[str, Any]) -> bool:
+    if has_money_signal(row):
+        return True
+
     reviews = _parse_int(_pick(row, "Reviews", "reviews", "google_review_count"))
     rating = _parse_float(_pick(row, "Rating", "rating", "google_rating"))
     if reviews >= 5 or (rating >= 4.5 and reviews > 0):

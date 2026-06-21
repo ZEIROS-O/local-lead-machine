@@ -55,6 +55,8 @@ CSV_AIRTABLE_FIELDS = [
     "Visible Pain Score",
     "Visible Pain Reasons",
     "Send Trigger",
+    "Money Signal",
+    "Buyer Intent Signals",
     "AI Confidence",
     "Skip Reason",
     "Score Total",

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
+from lead_machine.buyer_signals import buyer_intent_summary, ensure_buyer_intent
 from lead_machine.evidence import build_evidence_profile
 from lead_machine.icp import hard_icp_gate
 from lead_machine.icp_lanes import SELECTABLE_LANES, classify_icp_lane, lane_sort_key
@@ -103,10 +104,12 @@ def _with_missing_rendered_evidence(record: Dict[str, Any], evidence: Dict[str, 
 
 def ensure_evidence(record: Dict[str, Any]) -> Dict[str, Any]:
     evidence = record.get("evidence")
+    ensure_buyer_intent(record)
     if isinstance(evidence, dict) and all(key in evidence for key in CORE_EVIDENCE_FIELDS):
         return _with_missing_rendered_evidence(record, evidence)
     updated = dict(record)
     updated["evidence"] = build_evidence_profile(record)
+    ensure_buyer_intent(updated)
     return updated
 
 
@@ -134,6 +137,8 @@ def lead_packet_for_record(record: Dict[str, Any], *, fallback_vertical: str) ->
         "lead": lead.to_dict(),
         "screenshots": (evidence.get("screenshots") or website.get("screenshots") or record.get("screenshots") or {}),
         "evidence": evidence,
+        "buyer_intent": record.get("buyer_intent") or {},
+        "buyer_intent_summary": buyer_intent_summary(record),
         "website_text": str(website.get("combined_text") or "")[:WEBSITE_TEXT_LIMIT],
     }
 
@@ -298,6 +303,9 @@ Rules:
 - Do not score A/sendable just because the business is reputable.
 - Do not score A/sendable just because the business fits hardscaping.
 - The best lead is one where the website is visibly worse than the actual business.
+- Buyer intent is required for A/B quality: look for fixable gap times money signal, not just a bad website.
+- Use buyer_intent_summary as evidence for money/demand context. Paid CRM/booking tools, live review velocity, and known ad signals can support demand proof.
+- Bad site alone without buyer_intent.money_signal should not be an A lead.
 - No specific observation = no send.
 - More reviews require stronger proof of visible pain.
 - Do not infer missing forms if evidence is uncertain.
