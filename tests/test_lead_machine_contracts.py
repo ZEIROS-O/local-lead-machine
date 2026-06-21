@@ -1618,6 +1618,148 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(kwargs["json"]["max_tokens"], 4096)
         self.assertEqual(kwargs["json"]["messages"][0]["content"], "score this batch")
 
+    def test_llm_client_uses_configured_connect_and_read_timeout_tuple(self) -> None:
+        from lead_machine.llm_client import score_batch
+
+        score = self._manual_score(total_score=75, grade="B")
+        response = {
+            "content": [{"type": "text", "text": json.dumps({"batch_id": "batch_001", "scores": [{"score_file": "chij123.json", "score": score}]})}],
+            "usage": {"input_tokens": 123, "output_tokens": 45},
+        }
+
+        class FakeResponse:
+            status_code = 200
+            text = json.dumps(response)
+
+            def json(self) -> dict:
+                return response
+
+        env = {
+            "ANTHROPIC_API_KEY": "test-key",
+            "ANTHROPIC_CONNECT_TIMEOUT_SECONDS": "7",
+            "ANTHROPIC_READ_TIMEOUT_SECONDS": "88",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            with patch("lead_machine.llm_client.requests.post", return_value=FakeResponse()) as post:
+                score_batch("score this batch", model="claude-sonnet-4-6", max_tokens=4096)
+
+        _, kwargs = post.call_args
+        self.assertEqual(kwargs["timeout"], (7, 88))
+
+    def test_llm_client_retries_timeout_up_to_max_retries(self) -> None:
+        import requests
+        from lead_machine.llm_client import score_batch
+
+        score = self._manual_score(total_score=75, grade="B")
+        response = {
+            "content": [{"type": "text", "text": json.dumps({"batch_id": "batch_001", "scores": [{"score_file": "chij123.json", "score": score}]})}],
+            "usage": {"input_tokens": 123, "output_tokens": 45},
+        }
+
+        class FakeResponse:
+            status_code = 200
+            text = json.dumps(response)
+
+            def json(self) -> dict:
+                return response
+
+        env = {
+            "ANTHROPIC_API_KEY": "test-key",
+            "ANTHROPIC_MAX_RETRIES": "2",
+            "ANTHROPIC_RETRY_BACKOFF_SECONDS": "2",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            with patch(
+                "lead_machine.llm_client.requests.post",
+                side_effect=[requests.exceptions.ReadTimeout("read timed out"), requests.exceptions.Timeout("timed out"), FakeResponse()],
+            ) as post:
+                with patch("time.sleep") as sleep:
+                    result = score_batch("score this batch", model="claude-sonnet-4-6", max_tokens=4096)
+
+        self.assertEqual(result["bundle"]["batch_id"], "batch_001")
+        self.assertEqual(post.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [2, 4])
+
+    def test_llm_client_retries_500_and_503_responses(self) -> None:
+        from lead_machine.llm_client import score_batch
+
+        score = self._manual_score(total_score=75, grade="B")
+        success = {
+            "content": [{"type": "text", "text": json.dumps({"batch_id": "batch_001", "scores": [{"score_file": "chij123.json", "score": score}]})}],
+            "usage": {"input_tokens": 123, "output_tokens": 45},
+        }
+
+        class FakeResponse:
+            def __init__(self, status_code: int, payload: dict | None = None) -> None:
+                self.status_code = status_code
+                self._payload = payload or {}
+                self.text = json.dumps(payload or {"error": "temporary"})
+
+            def json(self) -> dict:
+                return self._payload
+
+        env = {
+            "ANTHROPIC_API_KEY": "test-key",
+            "ANTHROPIC_MAX_RETRIES": "2",
+            "ANTHROPIC_RETRY_BACKOFF_SECONDS": "2",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            with patch(
+                "lead_machine.llm_client.requests.post",
+                side_effect=[FakeResponse(500), FakeResponse(503), FakeResponse(200, success)],
+            ) as post:
+                with patch("time.sleep") as sleep:
+                    result = score_batch("score this batch", model="claude-sonnet-4-6", max_tokens=4096)
+
+        self.assertEqual(result["bundle"]["batch_id"], "batch_001")
+        self.assertEqual(post.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [2, 4])
+
+    def test_llm_client_does_not_retry_deterministic_400_response(self) -> None:
+        from lead_machine.llm_client import score_batch
+
+        class FakeResponse:
+            status_code = 400
+            text = "bad request"
+
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key", "ANTHROPIC_MAX_RETRIES": "2"}, clear=False):
+            with patch("lead_machine.llm_client.requests.post", return_value=FakeResponse()) as post:
+                with patch("time.sleep") as sleep:
+                    with self.assertRaises(RuntimeError) as caught:
+                        score_batch("score this batch", model="claude-sonnet-4-6", max_tokens=4096)
+
+        self.assertEqual(post.call_count, 1)
+        sleep.assert_not_called()
+        self.assertIn("Anthropic API error 400", str(caught.exception))
+
+    def test_llm_client_final_retry_error_includes_timeout_settings_and_attempts(self) -> None:
+        import requests
+        from lead_machine.llm_client import score_batch
+
+        env = {
+            "ANTHROPIC_API_KEY": "test-key",
+            "ANTHROPIC_CONNECT_TIMEOUT_SECONDS": "15",
+            "ANTHROPIC_READ_TIMEOUT_SECONDS": "180",
+            "ANTHROPIC_MAX_RETRIES": "2",
+            "ANTHROPIC_RETRY_BACKOFF_SECONDS": "2",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            with patch(
+                "lead_machine.llm_client.requests.post",
+                side_effect=requests.exceptions.ReadTimeout("read timed out"),
+            ) as post:
+                with patch("time.sleep"):
+                    with self.assertRaises(RuntimeError) as caught:
+                        score_batch("score this batch", model="claude-sonnet-4-6", max_tokens=4096)
+
+        message = str(caught.exception)
+        self.assertEqual(post.call_count, 3)
+        self.assertIn("model=claude-sonnet-4-6", message)
+        self.assertIn("connect_timeout=15", message)
+        self.assertIn("read_timeout=180", message)
+        self.assertIn("attempts=3", message)
+        self.assertIn("read timed out", message)
+
     def test_api_llm_caps_stop_before_next_batch_call(self) -> None:
         from score_leads import score_records_api_run
 
