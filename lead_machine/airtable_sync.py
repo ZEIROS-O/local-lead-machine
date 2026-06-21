@@ -69,7 +69,28 @@ SITE_STATUS_LABELS = {
     "social only": "Social Only",
     "facebook only": "Social Only",
 }
-TYPED_AIRTABLE_FIELDS = INTEGER_FIELDS | FLOAT_FIELDS | {AI_CONFIDENCE_FIELD, SITE_STATUS_FIELD}
+OFFER_FIT_FIELD = "Offer Fit"
+BEST_SERVICE_ANGLE_FIELD = "Best Service Angle"
+SERVICE_ANGLE_FIELDS = {OFFER_FIT_FIELD, BEST_SERVICE_ANGLE_FIELD}
+SERVICE_ANGLE_LABELS = {
+    "social/jobber escape": "No-Site Launch",
+    "no-site launch": "No-Site Launch",
+    "no site launch": "No-Site Launch",
+    "social jobber escape": "No-Site Launch",
+    "owned weak site rebuild": "Website Rebuild",
+    "premium perception gap": "Website Rebuild",
+    "portfolio presentation gap": "Website Rebuild",
+    "website rebuild": "Website Rebuild",
+    "estimate funnel": "Estimate Funnel",
+    "optimization only": "Automation / Follow-Up",
+    "automation / follow up": "Automation / Follow-Up",
+    "automation/follow up": "Automation / Follow-Up",
+    "automation / follow-up": "Automation / Follow-Up",
+    "automation/follow-up": "Automation / Follow-Up",
+}
+TYPED_AIRTABLE_FIELDS = (
+    INTEGER_FIELDS | FLOAT_FIELDS | {AI_CONFIDENCE_FIELD, SITE_STATUS_FIELD} | SERVICE_ANGLE_FIELDS
+)
 
 
 def _parse_finite_float(value: Any) -> Optional[float]:

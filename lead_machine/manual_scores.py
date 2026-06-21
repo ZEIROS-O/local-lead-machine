@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Set
 
 from .schema import normalize_lead
+from .buyer_signals import buyer_intent_summary, ensure_buyer_intent, has_money_signal
 from .sendability import apply_sendability, normalize_evidence_refs, normalize_safe_outreach_claims, normalize_unsafe_claims
 
 
@@ -229,6 +230,7 @@ def merge_manual_score(
     google = enriched.get("google", {}) or {}
     website = enriched.get("website", {}) or {}
     evidence = enriched.get("evidence", {}) or {}
+    ensure_buyer_intent(enriched)
     lead = normalize_lead(google, fallback_vertical=fallback_vertical, source_batch=google.get("source_query", ""))
     subscores = validated["subscores"]
 
@@ -341,6 +343,10 @@ def merge_manual_score(
         "visible_pain_categories": visible_pain_categories,
         "Send Trigger": send_trigger,
         "send_trigger": send_trigger,
+        "Money Signal": "Yes" if has_money_signal(enriched) else "No",
+        "money_signal": "Yes" if has_money_signal(enriched) else "No",
+        "Buyer Intent Signals": buyer_intent_summary(enriched),
+        "buyer_intent_signals": buyer_intent_summary(enriched),
         "Evidence Notes": "; ".join(str(ref) for ref in validated.get("evidence_refs", [])),
         "AI Confidence": validated["confidence"],
         "Manual Reviewed": "",

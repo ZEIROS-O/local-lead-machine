@@ -23,6 +23,12 @@ THIRD_PARTY_TOOLS = {
     "Angi": ["angi.com", "homeadvisor"],
     "GHL": ["gohighlevel", "leadconnector"],
     "Housecall Pro": ["housecallpro"],
+    "ServiceTitan": ["servicetitan", "service titan"],
+    "Thryv": ["thryv"],
+    "Urable": ["urable"],
+    "Booksy": ["booksy"],
+    "Square Appointments": ["square appointments", "squareup.com/appointments", "square.site/appointments"],
+    "Mobile Tech RX": ["mobile tech rx", "mobiletechrx", "mobiletechrx.com"],
 }
 
 TRUST_TERMS = [

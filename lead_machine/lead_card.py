@@ -33,6 +33,8 @@ AIRTABLE_CARD_FIELDS = [
     "Visible Pain Score",
     "Visible Pain Reasons",
     "Send Trigger",
+    "Money Signal",
+    "Buyer Intent Signals",
     "Evidence Notes",
     "AI Confidence",
     "Skip Reason",
