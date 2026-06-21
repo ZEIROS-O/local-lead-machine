@@ -206,8 +206,11 @@ class ManualScoreRun:
 class ApiLlmRun:
     manual_run: ManualScoreRun
     calls: int
+    input_tokens: int
+    output_tokens: int
     tokens: int
     usd: float
+    caps: Dict[str, int | float]
     stopped_by_cap: bool
     stop_reason: str = ""
 
@@ -1473,6 +1476,8 @@ def score_records_api_run(
     selected = [ensure_evidence(record) for record in records]
     bundle_dir = scores_dir / "_api_bundles"
     calls = 0
+    input_tokens = 0
+    output_tokens = 0
     tokens = 0
     usd = 0.0
     stopped_by_cap = False
@@ -1499,7 +1504,12 @@ def score_records_api_run(
         bundle = result["bundle"]
         usage = result.get("usage") or {}
         calls += 1
-        tokens += safe_int(usage.get("total_tokens"))
+        batch_input_tokens = safe_int(usage.get("input_tokens"))
+        batch_output_tokens = safe_int(usage.get("output_tokens"))
+        batch_total_tokens = safe_int(usage.get("total_tokens")) or batch_input_tokens + batch_output_tokens
+        input_tokens += batch_input_tokens
+        output_tokens += batch_output_tokens
+        tokens += batch_total_tokens
         usd += estimate_llm_usd(usage)
 
         bundle_dir.mkdir(parents=True, exist_ok=True)
@@ -1516,11 +1526,33 @@ def score_records_api_run(
     return ApiLlmRun(
         manual_run=manual_run,
         calls=calls,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
         tokens=tokens,
         usd=usd,
+        caps={
+            "MAX_LLM_CALLS_PER_RUN": max_calls,
+            "MAX_LLM_TOKENS_PER_RUN": max_tokens_per_run,
+            "MAX_LLM_USD_PER_RUN": max_usd_per_run,
+        },
         stopped_by_cap=stopped_by_cap,
         stop_reason=stop_reason,
     )
+
+
+def write_llm_usage(path: Path, run: ApiLlmRun) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "calls": run.calls,
+        "input_tokens": run.input_tokens,
+        "output_tokens": run.output_tokens,
+        "total_tokens": run.tokens,
+        "estimated_usd": run.usd,
+        "caps": run.caps,
+        "stopped_by_cap": run.stopped_by_cap,
+        "stop_reason": run.stop_reason,
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def print_manual_only_scored_summary(run: ManualScoreRun) -> None:
@@ -1577,6 +1609,11 @@ def main() -> int:
         default=DEFAULT_LLM_MAX_TOKENS,
         help="API LLM max output tokens per batch",
     )
+    parser.add_argument(
+        "--llm-usage-output",
+        default="",
+        help="Optional API LLM usage/cap metadata JSON output",
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -1604,6 +1641,9 @@ def main() -> int:
     elif args.mode == "api-llm":
         if not args.scores_dir:
             raise SystemExit("--scores-dir is required when --mode api-llm")
+        max_calls = getenv_int("MAX_LLM_CALLS_PER_RUN", DEFAULT_MAX_LLM_CALLS_PER_RUN)
+        max_tokens_per_run = getenv_int("MAX_LLM_TOKENS_PER_RUN", DEFAULT_MAX_LLM_TOKENS_PER_RUN)
+        max_usd_per_run = getenv_float("MAX_LLM_USD_PER_RUN", DEFAULT_MAX_LLM_USD_PER_RUN)
         api_run = score_records_api_run(
             records,
             scores_dir=Path(args.scores_dir),
@@ -1611,15 +1651,20 @@ def main() -> int:
             batch_size=args.llm_batch_size,
             model=(os.getenv("LLM_SCORING_MODEL") or DEFAULT_LLM_SCORING_MODEL).strip(),
             max_tokens=args.llm_max_tokens,
-            max_calls=getenv_int("MAX_LLM_CALLS_PER_RUN", DEFAULT_MAX_LLM_CALLS_PER_RUN),
-            max_tokens_per_run=getenv_int("MAX_LLM_TOKENS_PER_RUN", DEFAULT_MAX_LLM_TOKENS_PER_RUN),
-            max_usd_per_run=getenv_float("MAX_LLM_USD_PER_RUN", DEFAULT_MAX_LLM_USD_PER_RUN),
+            max_calls=max_calls,
+            max_tokens_per_run=max_tokens_per_run,
+            max_usd_per_run=max_usd_per_run,
         )
         scored = api_run.manual_run.rows
         print(f"[LLM] Calls: {api_run.calls}")
         print(f"[LLM] Tokens: {api_run.tokens}")
         print(f"[LLM] Estimated USD: {api_run.usd:.4f}")
         print(f"[LLM] Missing scores skipped: {len(api_run.manual_run.missing_scores)}")
+        if api_run.stopped_by_cap:
+            print(f"[LLM] Stopped by cap: {api_run.stop_reason}")
+        if args.llm_usage_output:
+            write_llm_usage(Path(args.llm_usage_output), api_run)
+            print(f"[LLM] Usage metadata: {args.llm_usage_output}")
     else:
         scored = [score_record(record, args.vertical) for record in records]
 
