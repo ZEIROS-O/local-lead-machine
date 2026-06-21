@@ -4,6 +4,7 @@ import csv
 import io
 import json
 import os
+import re
 import tempfile
 import unittest
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
@@ -1662,8 +1663,7 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual([missing.lead_name for missing in run.manual_run.missing_scores], ["Second Landscaping"])
 
     def test_api_llm_token_cap_stops_before_batch_that_could_exceed_remaining_budget(self) -> None:
-        from make_llm_batch import build_batch_prompt, lead_packet_for_record
-        from score_leads import ensure_evidence, score_records_api_run
+        from score_leads import build_api_llm_scoring_prompt, build_llm_scoring_record, score_records_api_run
 
         first_score = self._manual_score(total_score=75, grade="B")
         first_enriched = {
@@ -1685,11 +1685,11 @@ class LeadMachineContractsTest(unittest.TestCase):
                 "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
             }
 
-        projected_prompt = build_batch_prompt(
-            [lead_packet_for_record(ensure_evidence(dict(first_enriched)), fallback_vertical="hardscaping")],
+        projected_prompt = build_api_llm_scoring_prompt(
+            [build_llm_scoring_record(dict(first_enriched), fallback_vertical="hardscaping")],
             batch_id="batch_001",
         )
-        projected_tokens = len(projected_prompt.encode("utf-8")) + 20
+        projected_tokens = (len(projected_prompt) + 3) // 4 + 20
 
         with tempfile.TemporaryDirectory() as tmp:
             with patch("score_leads.llm_client.score_batch", side_effect=fake_score_batch) as score_batch:
@@ -1714,8 +1714,7 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual([missing.lead_name for missing in run.manual_run.missing_scores], ["Second Landscaping"])
 
     def test_api_llm_usd_cap_stops_before_batch_that_could_exceed_remaining_budget(self) -> None:
-        from make_llm_batch import build_batch_prompt, lead_packet_for_record
-        from score_leads import ensure_evidence, estimate_llm_usd, score_records_api_run
+        from score_leads import build_api_llm_scoring_prompt, build_llm_scoring_record, estimate_llm_usd, score_records_api_run
 
         first_score = self._manual_score(total_score=75, grade="B")
         first_enriched = {
@@ -1737,12 +1736,12 @@ class LeadMachineContractsTest(unittest.TestCase):
                 "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
             }
 
-        projected_prompt = build_batch_prompt(
-            [lead_packet_for_record(ensure_evidence(dict(first_enriched)), fallback_vertical="hardscaping")],
+        projected_prompt = build_api_llm_scoring_prompt(
+            [build_llm_scoring_record(dict(first_enriched), fallback_vertical="hardscaping")],
             batch_id="batch_001",
         )
         projected_usd = estimate_llm_usd(
-            {"input_tokens": len(projected_prompt.encode("utf-8")), "output_tokens": 20}
+            {"input_tokens": (len(projected_prompt) + 3) // 4, "output_tokens": 20}
         )
         first_call_usd = estimate_llm_usd({"input_tokens": 1, "output_tokens": 1})
 
@@ -1856,6 +1855,246 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(manual_code, 0)
         self.assertEqual(api_code, 0)
         self.assertEqual(api_bytes, manual_bytes)
+
+    def _huge_detailing_record(self, *, name: str = "A+ Detailing LLC", place_id: str = "ChIJ123") -> dict:
+        giant_text = (
+            "Ceramic coating packages include paint correction before installation. "
+            "Call or text for a quote and appointment. "
+            + ("generic navigation filler SHOULD_NOT_APPEAR_IN_COMPACT_PROMPT " * 900)
+        )
+        return {
+            "google": {
+                **self._google_fixture(),
+                "business_name": name,
+                "place_id": place_id,
+                "category": "auto_detailing",
+                "address": "123 Main St, Kirtland, OH",
+            },
+            "website": {
+                "site_status": "weak",
+                "final_url": "https://example.com",
+                "homepage": {"url": "https://example.com", "text": giant_text},
+                "pages": {
+                    "services": {
+                        "url": "https://example.com/services",
+                        "text": "Paint protection film and PPF installs are available. Request an estimate online.",
+                    },
+                    "about": {
+                        "url": "https://example.com/about",
+                        "text": "Award winning team. " + ("about filler " * 600),
+                    },
+                },
+                "combined_text": giant_text,
+                "cta_strength": "Weak",
+                "contact_form_detected": "No",
+                "estimate_form_detected": "No",
+                "form_strength": "None",
+                "form_detection_method": "none",
+                "high_ticket_terms": ["ceramic coating", "paint correction", "PPF"],
+                "third_party_tools": ["ServiceTitan"],
+                "social_links": ["https://facebook.com/example-detailing"],
+                "desktop_screenshot_path": "screenshots/detailing-desktop.png",
+                "mobile_screenshot_path": "screenshots/detailing-mobile.png",
+                "visual_review_needed": "Yes",
+                "visual_quality_score": "Weak",
+            },
+            "screenshots": {"desktop": "screenshots/detailing-desktop.png", "mobile": "screenshots/detailing-mobile.png"},
+            "evidence": self._evidence_fixture(
+                site_status="weak",
+                evidence_items=[
+                    {"id": "E1", "field": "google_rating", "value": "4.9 stars / 130 reviews"},
+                    {"id": "E2", "field": "cta_strength", "value": "Weak"},
+                    {"id": "E3", "field": "estimate_form_detected", "value": "No"},
+                    {"id": "E4", "field": "third_party_tools", "value": "ServiceTitan"},
+                    {"id": "E5", "field": "screenshots", "value": {"desktop": "screenshots/detailing-desktop.png", "mobile": "screenshots/detailing-mobile.png"}},
+                ],
+            ),
+            "buyer_intent": self._buyer_intent_fixture(),
+            "safe_outreach_claims": [{"claim": "Your site mentions ceramic coating.", "evidence_refs": ["E2"]}],
+        }
+
+    def test_llm_scoring_record_preserves_full_enriched_text_but_compacts_prompt(self) -> None:
+        from score_leads import build_api_llm_scoring_prompt, build_llm_scoring_record
+
+        record = self._huge_detailing_record()
+        original_combined = record["website"]["combined_text"]
+        original_homepage = record["website"]["homepage"]["text"]
+        original_pages_text = record["website"]["pages"]["about"]["text"]
+
+        compact = build_llm_scoring_record(record, fallback_vertical="detailing")
+        prompt = build_api_llm_scoring_prompt([compact], batch_id="batch_001")
+
+        self.assertEqual(record["website"]["combined_text"], original_combined)
+        self.assertEqual(record["website"]["homepage"]["text"], original_homepage)
+        self.assertEqual(record["website"]["pages"]["about"]["text"], original_pages_text)
+        self.assertNotIn(original_combined, prompt)
+        self.assertNotIn("SHOULD_NOT_APPEAR_IN_COMPACT_PROMPT", prompt)
+        self.assertIn("Ceramic coating packages include paint correction before installation.", prompt)
+        self.assertIn("Paint protection film and PPF installs are available.", prompt)
+        self.assertLess(len(json.dumps(compact, ensure_ascii=False)), 6000)
+
+    def test_llm_scoring_record_preserves_screenshot_paths_and_visual_flags(self) -> None:
+        from score_leads import build_llm_scoring_record
+
+        compact = build_llm_scoring_record(self._huge_detailing_record(), fallback_vertical="detailing")
+
+        self.assertEqual(compact["screenshots"]["desktop"], "screenshots/detailing-desktop.png")
+        self.assertEqual(compact["screenshots"]["mobile"], "screenshots/detailing-mobile.png")
+        self.assertEqual(compact["visual_review"]["visual_review_needed"], "Yes")
+        self.assertEqual(compact["visual_review"]["visual_quality_score"], "Weak")
+
+    def test_api_llm_compact_prompt_for_ten_huge_leads_stays_under_run_token_cap(self) -> None:
+        from score_leads import build_api_llm_scoring_prompt, build_llm_scoring_record, estimate_prompt_tokens
+
+        records = [
+            build_llm_scoring_record(
+                self._huge_detailing_record(name=f"Detailing {index}", place_id=f"ChIJ{index}"),
+                fallback_vertical="detailing",
+            )
+            for index in range(10)
+        ]
+        prompt = build_api_llm_scoring_prompt(records, batch_id="batch_001")
+
+        self.assertLess(estimate_prompt_tokens(prompt), 100_000)
+
+    def test_api_llm_limit_ten_makes_at_least_one_call_under_normal_caps(self) -> None:
+        from score_leads import score_records_api_run
+
+        records = [
+            self._huge_detailing_record(name=f"Detailing {index}", place_id=f"ChIJ{index}")
+            for index in range(10)
+        ]
+
+        def fake_score_batch(prompt: str, *, model: str, max_tokens: int) -> dict:
+            score_files = sorted(set(re.findall(r'"score_file": "([^"]+\.json)"', prompt)))
+            return {
+                "bundle": {
+                    "batch_id": "batch_001",
+                    "scores": [
+                        {"score_file": score_file, "score": self._manual_score(total_score=75, grade="B")}
+                        for score_file in score_files
+                    ],
+                },
+                "usage": {"input_tokens": 1000, "output_tokens": 500, "total_tokens": 1500},
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("score_leads.llm_client.score_batch", side_effect=fake_score_batch) as score_batch:
+                run = score_records_api_run(
+                    records,
+                    scores_dir=Path(tmp) / "scores",
+                    fallback_vertical="detailing",
+                    batch_size=5,
+                    model="claude-sonnet-4-6",
+                    max_tokens=4096,
+                    max_calls=0,
+                    max_tokens_per_run=100_000,
+                    max_usd_per_run=0.0,
+                )
+
+        self.assertGreaterEqual(score_batch.call_count, 1)
+        self.assertGreaterEqual(run.calls, 1)
+
+    def test_api_llm_shrinks_chunk_when_projected_prompt_exceeds_token_cap(self) -> None:
+        from score_leads import build_api_llm_scoring_prompt, build_llm_scoring_record, estimate_prompt_tokens, score_records_api_run
+
+        first = self._huge_detailing_record(name="First Detail", place_id="ChIJ1")
+        second = self._huge_detailing_record(name="Second Detail", place_id="ChIJ2")
+        single_prompt = build_api_llm_scoring_prompt(
+            [build_llm_scoring_record(first, fallback_vertical="detailing")],
+            batch_id="batch_001",
+        )
+        double_prompt = build_api_llm_scoring_prompt(
+            [
+                build_llm_scoring_record(first, fallback_vertical="detailing"),
+                build_llm_scoring_record(second, fallback_vertical="detailing"),
+            ],
+            batch_id="batch_001",
+        )
+        run_cap = estimate_prompt_tokens(single_prompt) + 20 + 50
+        self.assertLess(run_cap, estimate_prompt_tokens(double_prompt) + 20)
+
+        def fake_score_batch(prompt: str, *, model: str, max_tokens: int) -> dict:
+            score_files = sorted(set(re.findall(r'"score_file": "([^"]+\.json)"', prompt)))
+            return {
+                "bundle": {
+                    "batch_id": "batch_001",
+                    "scores": [
+                        {"score_file": score_file, "score": self._manual_score(total_score=75, grade="B")}
+                        for score_file in score_files
+                    ],
+                },
+                "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("score_leads.llm_client.score_batch", side_effect=fake_score_batch) as score_batch:
+                run = score_records_api_run(
+                    [first, second],
+                    scores_dir=Path(tmp) / "scores",
+                    fallback_vertical="detailing",
+                    batch_size=2,
+                    model="claude-sonnet-4-6",
+                    max_tokens=20,
+                    max_calls=0,
+                    max_tokens_per_run=run_cap,
+                    max_usd_per_run=0.0,
+                )
+
+        self.assertEqual(score_batch.call_count, 2)
+        self.assertEqual(run.calls, 2)
+        self.assertFalse(run.stopped_by_cap)
+
+    def test_api_llm_skips_single_record_that_exceeds_token_cap(self) -> None:
+        from score_leads import score_records_api_run
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("score_leads.llm_client.score_batch") as score_batch:
+                run = score_records_api_run(
+                    [self._huge_detailing_record()],
+                    scores_dir=Path(tmp) / "scores",
+                    fallback_vertical="detailing",
+                    batch_size=1,
+                    model="claude-sonnet-4-6",
+                    max_tokens=20,
+                    max_calls=0,
+                    max_tokens_per_run=10,
+                    max_usd_per_run=0.0,
+                )
+
+        score_batch.assert_not_called()
+        self.assertEqual(len(run.skipped_records or []), 1)
+        self.assertEqual((run.skipped_records or [])[0].reason, "single_record_exceeds_token_cap")
+
+    def test_api_llm_invalid_json_writes_raw_debug_output_before_raising(self) -> None:
+        from lead_machine.llm_client import InvalidLlmResponse
+        from score_leads import score_records_api_run
+
+        raw_text = '{"batch_id":"batch_001","scores":[{"score_file":"chij123.json","score":{"opener":"unterminated'
+
+        with tempfile.TemporaryDirectory() as tmp:
+            scores_dir = Path(tmp) / "scores"
+            with patch(
+                "score_leads.llm_client.score_batch",
+                side_effect=InvalidLlmResponse("Invalid LLM score bundle JSON: Unterminated string", raw_text=raw_text),
+            ):
+                with self.assertRaises(ValueError) as caught:
+                    score_records_api_run(
+                        [self._huge_detailing_record()],
+                        scores_dir=scores_dir,
+                        fallback_vertical="detailing",
+                        batch_size=1,
+                        model="claude-sonnet-4-6",
+                        max_tokens=8192,
+                        max_calls=0,
+                        max_tokens_per_run=100_000,
+                        max_usd_per_run=0.0,
+                    )
+
+            debug_path = scores_dir / "_api_bundles" / "batch_001_invalid_response_attempt_1.txt"
+            self.assertTrue(debug_path.exists())
+            self.assertEqual(debug_path.read_text(encoding="utf-8"), raw_text)
+            self.assertIn(str(debug_path), str(caught.exception))
 
     def test_manual_score_loader_accepts_new_schema_and_normalizes_mismatched_total(self) -> None:
         raw_score = self._manual_score(total_score=1, grade="Skip")

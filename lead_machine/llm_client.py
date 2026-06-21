@@ -15,6 +15,12 @@ ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_LLM_SCORING_MODEL = "claude-sonnet-4-6"
 
 
+class InvalidLlmResponse(ValueError):
+    def __init__(self, message: str, *, raw_text: str) -> None:
+        super().__init__(message)
+        self.raw_text = raw_text
+
+
 def _response_text(data: Dict[str, Any]) -> str:
     parts = []
     for item in data.get("content") or []:
@@ -30,7 +36,10 @@ def _parse_score_bundle(text: str) -> Dict[str, Any]:
     try:
         bundle = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise ValueError(f"Invalid LLM score bundle JSON: {exc.msg} at line {exc.lineno} column {exc.colno}") from exc
+        raise InvalidLlmResponse(
+            f"Invalid LLM score bundle JSON: {exc.msg} at line {exc.lineno} column {exc.colno}",
+            raw_text=text,
+        ) from exc
     if not isinstance(bundle, dict):
         raise ValueError("LLM score bundle must be one JSON object")
     validate_bundle_scores(bundle)

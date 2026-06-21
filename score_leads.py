@@ -19,6 +19,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import json
 import os
@@ -44,7 +45,7 @@ from lead_machine.manual_scores import load_manual_score, merge_manual_score
 from lead_machine.schema import normalize_lead
 from lead_machine.sendability import apply_sendability
 from lead_machine.verticals import VerticalProfile, resolve_profile
-from make_llm_batch import build_batch_prompt, chunk_records, lead_packet_for_record
+from make_llm_batch import MANUAL_SCORE_SCHEMA, score_file_for_record
 
 
 PRIORITY_RANK = {"A": 0, "B": 1, "C": 2, "Skip": 3}
@@ -203,6 +204,13 @@ class ManualScoreRun:
 
 
 @dataclass(frozen=True)
+class ApiLlmSkip:
+    lead_name: str
+    score_file: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class ApiLlmRun:
     manual_run: ManualScoreRun
     calls: int
@@ -213,6 +221,7 @@ class ApiLlmRun:
     caps: Dict[str, int | float]
     stopped_by_cap: bool
     stop_reason: str = ""
+    skipped_records: List[ApiLlmSkip] | None = None
 
 
 DEFAULT_LLM_SCORING_MODEL = "claude-sonnet-4-6"
@@ -222,6 +231,60 @@ DEFAULT_MAX_LLM_TOKENS_PER_RUN = 100_000
 DEFAULT_MAX_LLM_USD_PER_RUN = 5.0
 SONNET_4_6_INPUT_USD_PER_MILLION_TOKENS = 3.0
 SONNET_4_6_OUTPUT_USD_PER_MILLION_TOKENS = 15.0
+MAX_LLM_SCORING_STRING_CHARS = 1500
+MAX_LLM_SCORING_SNIPPET_CHARS = 300
+MAX_LLM_SCORING_SNIPPETS = 8
+
+LLM_SCORING_SNIPPET_TERMS = (
+    "ceramic coating",
+    "paint protection film",
+    "paint correction",
+    "mobile detailing",
+    "window tint",
+    "vehicle wrap",
+    "booking",
+    "estimate",
+    "quote",
+    "appointment",
+    "contact",
+    "call",
+    "text",
+    "trust",
+    "review",
+    "testimonial",
+    "no clear",
+    "weak",
+    "missing",
+    "buried",
+    "cta",
+    "ppf",
+)
+
+LLM_SCORING_EVIDENCE_FIELDS = {
+    "site_status",
+    "site_issue_flags",
+    "third_party_tools",
+    "contact_form",
+    "contact_form_detected",
+    "estimate_form_detected",
+    "form_strength",
+    "form_detection_method",
+    "cta_terms",
+    "cta_strength",
+    "services_detected",
+    "trust_signals",
+    "rendered_site_status",
+    "rendered_status_reason",
+    "desktop_screenshot_path",
+    "mobile_screenshot_path",
+    "visual_review_needed",
+    "visual_pain_reasons",
+    "visible_pain_score",
+    "visible_pain_reasons",
+    "visible_pain_categories",
+    "send_trigger",
+    "screenshots",
+}
 
 SCORE_WEIGHTS = {
     "business_strength": 30,
@@ -1443,6 +1506,297 @@ def estimate_llm_usd(usage: Dict[str, Any]) -> float:
     ) / 1_000_000
 
 
+def estimate_prompt_tokens(prompt: str) -> int:
+    if not prompt:
+        return 0
+    return max(1, (len(prompt) + 3) // 4)
+
+
+def _truncate_for_llm(value: Any, *, max_chars: int = MAX_LLM_SCORING_STRING_CHARS) -> Any:
+    if isinstance(value, str):
+        cleaned = re.sub(r"\s+", " ", value).strip()
+        if len(cleaned) <= max_chars:
+            return cleaned
+        if max_chars <= 3:
+            return cleaned[:max_chars]
+        return cleaned[: max_chars - 3].rstrip() + "..."
+    if isinstance(value, list):
+        return [_truncate_for_llm(item, max_chars=max_chars) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _truncate_for_llm(item, max_chars=max_chars) for key, item in value.items()}
+    return value
+
+
+def _text_sources_for_llm(record: Dict[str, Any]) -> List[Tuple[str, str, str]]:
+    website = record.get("website", {}) if isinstance(record.get("website"), dict) else {}
+    homepage = website.get("homepage", {}) if isinstance(website.get("homepage"), dict) else {}
+    pages = website.get("pages", {}) if isinstance(website.get("pages"), dict) else {}
+    sources: List[Tuple[str, str, str]] = []
+
+    sources.append(("website.combined_text", str(website.get("final_url") or homepage.get("url") or ""), str(website.get("combined_text") or "")))
+    sources.append(("website.homepage.text", str(homepage.get("url") or ""), str(homepage.get("text") or "")))
+    for page_name, page in pages.items():
+        if not isinstance(page, dict):
+            continue
+        sources.append((f"website.pages.{page_name}.text", str(page.get("url") or ""), str(page.get("text") or "")))
+    return sources
+
+
+def _snippet_around(text: str, start: int, *, max_chars: int = MAX_LLM_SCORING_SNIPPET_CHARS) -> str:
+    sentence_left = max(text.rfind(".", 0, start), text.rfind("!", 0, start), text.rfind("?", 0, start), text.rfind("\n", 0, start))
+    sentence_right_candidates = [pos for pos in (text.find(".", start), text.find("!", start), text.find("?", start), text.find("\n", start)) if pos >= 0]
+    if sentence_right_candidates:
+        sentence_right = min(sentence_right_candidates) + 1
+        sentence_left = sentence_left + 1 if sentence_left >= 0 else 0
+        sentence = text[sentence_left:sentence_right].strip()
+        if sentence and len(sentence) <= max_chars:
+            return _truncate_for_llm(sentence, max_chars=max_chars)
+
+    left = max(0, start - max_chars // 2)
+    right = min(len(text), left + max_chars)
+    left = max(0, right - max_chars)
+    snippet = text[left:right].strip()
+    if left > 0:
+        snippet = "..." + snippet
+    if right < len(text):
+        snippet = snippet + "..."
+    return _truncate_for_llm(snippet, max_chars=max_chars)
+
+
+def _selected_text_snippets(record: Dict[str, Any], *, max_snippets: int = MAX_LLM_SCORING_SNIPPETS) -> List[Dict[str, str]]:
+    snippets: List[Dict[str, str]] = []
+    seen: set[str] = set()
+    for source, source_url, text in _text_sources_for_llm(record):
+        if len(snippets) >= max_snippets:
+            break
+        if not text:
+            continue
+        lowered = text.lower()
+        for term in LLM_SCORING_SNIPPET_TERMS:
+            if len(snippets) >= max_snippets:
+                break
+            index = lowered.find(term)
+            if index < 0:
+                continue
+            snippet = _snippet_around(text, index)
+            fingerprint = re.sub(r"\W+", "", snippet.lower())
+            if not fingerprint or fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            snippets.append(
+                {
+                    "kind": "page_text",
+                    "source": source,
+                    "source_url": source_url,
+                    "matched_term": term,
+                    "text": snippet,
+                }
+            )
+    return snippets
+
+
+def _selected_evidence_item_snippets(record: Dict[str, Any], *, max_snippets: int) -> List[Dict[str, Any]]:
+    evidence = record.get("evidence", {}) if isinstance(record.get("evidence"), dict) else {}
+    selected: List[Dict[str, Any]] = []
+    for item in evidence.get("evidence_items", []) or []:
+        if len(selected) >= max_snippets:
+            break
+        if not isinstance(item, dict):
+            continue
+        field = str(item.get("field") or "")
+        value_text = json.dumps(item.get("value"), ensure_ascii=False) if isinstance(item.get("value"), (dict, list)) else str(item.get("value") or "")
+        if field not in LLM_SCORING_EVIDENCE_FIELDS and not any(term in value_text.lower() for term in LLM_SCORING_SNIPPET_TERMS):
+            continue
+        selected.append(
+            {
+                "kind": "evidence_item",
+                "id": str(item.get("id") or ""),
+                "field": field,
+                "value": _truncate_for_llm(item.get("value"), max_chars=MAX_LLM_SCORING_SNIPPET_CHARS),
+                "source_url": _truncate_for_llm(str(item.get("source_url") or ""), max_chars=MAX_LLM_SCORING_SNIPPET_CHARS),
+                "confidence": str(item.get("confidence") or ""),
+            }
+        )
+    return selected
+
+
+def _visual_review_capsule(evidence: Dict[str, Any], website: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "visual_review_needed": evidence.get("visual_review_needed") or website.get("visual_review_needed") or "",
+        "visual_quality_score": evidence.get("visual_quality_score") or website.get("visual_quality_score") or "",
+        "premium_perception_score": evidence.get("premium_perception_score") or website.get("premium_perception_score") or "",
+        "mobile_visual_score": evidence.get("mobile_visual_score") or website.get("mobile_visual_score") or "",
+        "hero_clarity_score": evidence.get("hero_clarity_score") or website.get("hero_clarity_score") or "",
+        "cta_visibility_score": evidence.get("cta_visibility_score") or website.get("cta_visibility_score") or "",
+        "gallery_visibility_score": evidence.get("gallery_visibility_score") or website.get("gallery_visibility_score") or "",
+        "trust_proof_visibility_score": evidence.get("trust_proof_visibility_score") or website.get("trust_proof_visibility_score") or "",
+        "visual_pain_reasons": evidence.get("visual_pain_reasons") or website.get("visual_pain_reasons") or [],
+    }
+
+
+def build_llm_scoring_record(record: Dict[str, Any], *, fallback_vertical: str = "service") -> Dict[str, Any]:
+    working = ensure_evidence(copy.deepcopy(record))
+    google = working.get("google", {}) if isinstance(working.get("google"), dict) else {}
+    website = working.get("website", {}) if isinstance(working.get("website"), dict) else {}
+    evidence = working.get("evidence", {}) if isinstance(working.get("evidence"), dict) else {}
+    buyer_intent = working.get("buyer_intent", {}) if isinstance(working.get("buyer_intent"), dict) else {}
+    lead = normalize_lead(google, fallback_vertical=fallback_vertical, source_batch=google.get("source_query", ""))
+    screenshots = working.get("screenshots") or website.get("screenshots") or evidence.get("screenshots") or {}
+    selected_text = _selected_text_snippets(working)
+    selected_items = _selected_evidence_item_snippets(working, max_snippets=max(0, MAX_LLM_SCORING_SNIPPETS - len(selected_text)))
+
+    capsule = {
+        "score_file": score_file_for_record(working, fallback_vertical=fallback_vertical),
+        "lead": {
+            "business_name": lead.business_name,
+            "vertical": lead.vertical,
+            "category": google.get("category", ""),
+            "city": lead.city,
+            "address": google.get("address", ""),
+            "phone": lead.phone,
+            "rating": lead.google_rating,
+            "reviews": lead.google_review_count,
+            "website_url": lead.website,
+            "google_maps_url": lead.maps_url,
+        },
+        "website_status": {
+            "site_status": evidence.get("site_status") or website.get("site_status") or "",
+            "rendered_site_status": evidence.get("rendered_site_status") or website.get("rendered_site_status") or "",
+            "rendered_status_reason": evidence.get("rendered_status_reason") or website.get("rendered_status_reason") or "",
+            "raw_flags": evidence.get("raw_flags") or website.get("site_issue_flags") or [],
+        },
+        "conversion_pain": {
+            "current_website_quality": website.get("quality") or website.get("site_quality") or "",
+            "visible_pain_score": evidence.get("visible_pain_score", ""),
+            "visible_pain_reasons": evidence.get("visible_pain_reasons") or [],
+            "visible_pain_categories": evidence.get("visible_pain_categories") or [],
+            "send_trigger": evidence.get("send_trigger") or "",
+            "cta_strength": evidence.get("cta_strength") or website.get("cta_strength") or "",
+        },
+        "forms_and_cta": {
+            "contact_form_detected": evidence.get("contact_form_detected") or website.get("contact_form_detected") or "",
+            "estimate_form_detected": evidence.get("estimate_form_detected") or website.get("estimate_form_detected") or "",
+            "form_strength": evidence.get("form_strength") or website.get("form_strength") or "",
+            "form_detection_method": evidence.get("form_detection_method") or website.get("form_detection_method") or "",
+            "has_estimate_cta": evidence.get("has_estimate_cta", ""),
+            "cta_terms": website.get("cta_terms") or [],
+        },
+        "provider_evidence": {
+            "third_party_tools": evidence.get("third_party_tools") or website.get("third_party_tools") or [],
+            "has_online_booking": evidence.get("has_online_booking", ""),
+            "crm_booking_stack": buyer_intent.get("crm_booking_stack") or {},
+        },
+        "service_evidence": {
+            "high_ticket_terms": website.get("high_ticket_terms") or evidence.get("services_detected") or [],
+            "services_detected": evidence.get("services_detected") or [],
+            "trust_signals": evidence.get("trust_signals") or [],
+        },
+        "buyer_intent": buyer_intent,
+        "buyer_intent_summary": buyer_intent_summary(working),
+        "money_signal": "Yes" if has_money_signal(working) else "No",
+        "safe_outreach_claims": working.get("safe_outreach_claims") or evidence.get("safe_outreach_claims") or [],
+        "sendability_evidence": {
+            "minimum_evidence_inputs": {
+                "visible_pain_score": evidence.get("visible_pain_score", ""),
+                "visible_pain_reasons": evidence.get("visible_pain_reasons") or [],
+                "send_trigger": evidence.get("send_trigger") or "",
+                "money_signal": "Yes" if has_money_signal(working) else "No",
+                "buyer_intent_summary": buyer_intent_summary(working),
+            }
+        },
+        "screenshots": {
+            "desktop": screenshots.get("desktop") or website.get("desktop_screenshot_path") or evidence.get("desktop_screenshot_path") or "",
+            "mobile": screenshots.get("mobile") or website.get("mobile_screenshot_path") or evidence.get("mobile_screenshot_path") or "",
+        },
+        "visual_review": _visual_review_capsule(evidence, website),
+        "selected_evidence_snippets": [*selected_text, *selected_items][:MAX_LLM_SCORING_SNIPPETS],
+    }
+    return _truncate_for_llm(capsule)
+
+
+def build_api_llm_scoring_prompt(compact_records: List[Dict[str, Any]], *, batch_id: str) -> str:
+    response_example = {
+        "batch_id": batch_id,
+        "scores": [
+            {
+                "score_file": compact_records[0]["score_file"] if compact_records else "phone-xxxxxxxxxx.json",
+                "score": MANUAL_SCORE_SCHEMA,
+            }
+        ],
+    }
+
+    return f"""# API LLM Lead Scoring - {batch_id}
+
+You are scoring compact lead evidence capsules for local-service outreach.
+
+Important evidence boundary:
+- Each compact record is a distilled evidence capsule built from the enriched JSONL.
+- The full source evidence remains in the enriched file for packets, debugging, manual review, and future asset generation.
+- Score only from the capsule below.
+- Do not invent claims, visual observations, forms, service lines, money intent, or conversion pain that the capsule does not support.
+- Preserve exact snippets when using them for safe outreach wording.
+
+JSON-only response requirements:
+- Response must be one valid JSON object only.
+- First character must be {{ and last character must be }}.
+- No markdown fences.
+- No commentary.
+- No reasoning outside JSON.
+- Use one scores item per compact record.
+- Every score_file must exactly match a score_file listed in compact_records.
+
+Shared rubric:
+- ICP Fit / 20
+- Reputation + Demand Proof / 15
+- Web Conversion Pain / 25
+- Mockup Leverage / 15
+- Reachability / 10
+- Offer Angle Clarity / 10
+- Evidence Confidence / 5
+
+Rules:
+- Score and confidence are separate.
+- total_score must equal the sum of all subscores.
+- grade rules: A = 80-100, B = 65-79, C = 50-64, Skip = below 50 or hard disqualifier.
+- confidence must be one of low, medium, high.
+- safe_outreach_claims must be evidence-backed and safe to say.
+- safe_outreach_claims must be an array of objects with claim and evidence_refs.
+- evidence_refs should use valid IDs from selected_evidence_snippets where kind=evidence_item.
+- If an exact text snippet supports a claim but no evidence item ID directly supports it, lower evidence confidence instead of inventing an evidence ref.
+- unsafe_claims must list tempting claims that the capsule does not prove.
+- Buyer intent is required for A/B quality: look for fixable gap times money signal, not just a bad website.
+- Bad site alone without buyer_intent.money_signal should not be an A lead.
+- Visual claims require screenshot paths, visual-review flags, rendered browser evidence, DOM evidence, or explicit manual review notes in the capsule.
+- Do not infer missing forms if evidence is uncertain.
+- If rendered_site_status is Loaded, do not claim the website is broken.
+- If a strong estimate form exists, do not use missing-form, no-contact-path, or no-estimate-path pain unless the capsule also shows another concrete estimate-path weakness.
+- opener must mention at least one specific evidence-backed observation and must not make unsupported money, competitor, or lost-job claims.
+
+Allowed best_angle values:
+- Website Rebuild
+- Estimate Funnel
+- Premium Perception Gap
+- Portfolio Rebuild
+- Mobile Quote Path Cleanup
+- Service Page Cleanup
+- Review/Trust Proof Upgrade
+- Website Cleanup
+- Tracking
+- Advanced Optimization
+- No-Site Launch
+- Social/Jobber Escape
+
+Manual score schema for each scores[].score:
+{json.dumps(MANUAL_SCORE_SCHEMA, ensure_ascii=False, indent=2)}
+
+Required response format:
+{json.dumps(response_example, ensure_ascii=False, indent=2)}
+
+compact_records:
+{json.dumps(compact_records, ensure_ascii=False, indent=2)}
+"""
+
+
 def _hit_llm_cap(
     *,
     calls: int,
@@ -1459,6 +1813,112 @@ def _hit_llm_cap(
     if max_usd_per_run > 0 and usd >= max_usd_per_run:
         return "MAX_LLM_USD_PER_RUN"
     return ""
+
+
+def _hit_projected_llm_cap(
+    *,
+    prompt: str,
+    max_tokens: int,
+    tokens: int,
+    usd: float,
+    max_tokens_per_run: int,
+    max_usd_per_run: float,
+) -> str:
+    projected_input_tokens = estimate_prompt_tokens(prompt)
+    projected_output_tokens = max(0, max_tokens)
+    projected_total_tokens = projected_input_tokens + projected_output_tokens
+
+    if max_tokens_per_run > 0 and tokens + projected_total_tokens > max_tokens_per_run:
+        return "MAX_LLM_TOKENS_PER_RUN"
+
+    projected_usd = estimate_llm_usd(
+        {
+            "input_tokens": projected_input_tokens,
+            "output_tokens": projected_output_tokens,
+        }
+    )
+    if max_usd_per_run > 0 and usd + projected_usd > max_usd_per_run:
+        return "MAX_LLM_USD_PER_RUN"
+
+    return ""
+
+
+def _print_llm_cap_check(
+    *,
+    estimated_prompt_tokens: int,
+    max_tokens: int,
+    used_tokens: int,
+    run_cap: int,
+    batch_size: int,
+) -> None:
+    projected_total = estimated_prompt_tokens + max(0, max_tokens)
+    print(
+        "[LLM CAP CHECK] "
+        f"estimated_prompt_tokens={estimated_prompt_tokens} "
+        f"max_tokens={max_tokens} "
+        f"used_tokens={used_tokens} "
+        f"run_cap={run_cap} "
+        f"projected_total={projected_total} "
+        f"batch_size={batch_size}"
+    )
+
+
+def _projected_usd_for_prompt(prompt_tokens: int, max_tokens: int) -> float:
+    return estimate_llm_usd({"input_tokens": prompt_tokens, "output_tokens": max(0, max_tokens)})
+
+
+def _lead_name_for_skip(record: Dict[str, Any], *, fallback_vertical: str) -> str:
+    google = record.get("google", {}) or {}
+    lead = normalize_lead(google, fallback_vertical=fallback_vertical, source_batch=google.get("source_query", ""))
+    return lead.business_name
+
+
+def _write_invalid_llm_response(bundle_dir: Path, *, batch_id: str, attempt: int, raw_text: str) -> Path:
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    debug_path = bundle_dir / f"{batch_id}_invalid_response_attempt_{attempt}.txt"
+    debug_path.write_text(raw_text, encoding="utf-8")
+    return debug_path
+
+
+def _looks_truncated_llm_response(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "unterminated string",
+            "expecting value",
+            "expecting ',' delimiter",
+            "expecting property name enclosed in double quotes",
+        )
+    )
+
+
+def _score_batch_with_debug(
+    prompt: str,
+    *,
+    batch_id: str,
+    bundle_dir: Path,
+    model: str,
+    max_tokens: int,
+) -> Dict[str, Any]:
+    attempt = 1
+    current_max_tokens = max_tokens
+    while True:
+        try:
+            return llm_client.score_batch(prompt, model=model, max_tokens=current_max_tokens)
+        except llm_client.InvalidLlmResponse as exc:
+            debug_path = _write_invalid_llm_response(
+                bundle_dir,
+                batch_id=batch_id,
+                attempt=attempt,
+                raw_text=exc.raw_text,
+            )
+            if attempt == 1 and current_max_tokens < 8192 and _looks_truncated_llm_response(exc):
+                attempt += 1
+                current_max_tokens = max(8192, current_max_tokens * 2)
+                print(f"[LLM RETRY] Invalid/truncated JSON; raw response saved to {debug_path}; retrying with max_tokens={current_max_tokens}")
+                continue
+            raise ValueError(f"{exc}; raw LLM response saved to {debug_path}") from exc
 
 
 def score_records_api_run(
@@ -1482,8 +1942,12 @@ def score_records_api_run(
     usd = 0.0
     stopped_by_cap = False
     stop_reason = ""
+    skipped_records: List[ApiLlmSkip] = []
+    index = 0
+    batch_index = 1
+    configured_batch_size = max(1, batch_size)
 
-    for batch_index, chunk in enumerate(chunk_records(selected, batch_size), start=1):
+    while index < len(selected):
         stop_reason = _hit_llm_cap(
             calls=calls,
             tokens=tokens,
@@ -1497,10 +1961,78 @@ def score_records_api_run(
             stopped_by_cap = True
             break
 
+        current_batch_size = min(configured_batch_size, len(selected) - index)
         batch_id = f"batch_{batch_index:03d}"
-        packets = [lead_packet_for_record(record, fallback_vertical=fallback_vertical) for record in chunk]
-        prompt = build_batch_prompt(packets, batch_id=batch_id)
-        result = llm_client.score_batch(prompt, model=model, max_tokens=max_tokens)
+        prompt = ""
+        chunk: List[Dict[str, Any]] = []
+        while current_batch_size > 0:
+            chunk = selected[index : index + current_batch_size]
+            compact_records = [
+                build_llm_scoring_record(record, fallback_vertical=fallback_vertical)
+                for record in chunk
+            ]
+            prompt = build_api_llm_scoring_prompt(compact_records, batch_id=batch_id)
+            estimated_prompt_tokens = estimate_prompt_tokens(prompt)
+            projected_total_tokens = estimated_prompt_tokens + max(0, max_tokens)
+            _print_llm_cap_check(
+                estimated_prompt_tokens=estimated_prompt_tokens,
+                max_tokens=max_tokens,
+                used_tokens=tokens,
+                run_cap=max_tokens_per_run,
+                batch_size=current_batch_size,
+            )
+
+            chunk_exceeds_run_cap = max_tokens_per_run > 0 and projected_total_tokens > max_tokens_per_run
+            remaining_exceeds_run_cap = (
+                max_tokens_per_run > 0 and tokens + projected_total_tokens > max_tokens_per_run
+            )
+            projected_usd = _projected_usd_for_prompt(estimated_prompt_tokens, max_tokens)
+            remaining_exceeds_usd_cap = max_usd_per_run > 0 and usd + projected_usd > max_usd_per_run
+
+            if (chunk_exceeds_run_cap or remaining_exceeds_run_cap or remaining_exceeds_usd_cap) and current_batch_size > 1:
+                current_batch_size = max(1, current_batch_size // 2)
+                continue
+
+            if chunk_exceeds_run_cap:
+                skipped = ApiLlmSkip(
+                    lead_name=_lead_name_for_skip(chunk[0], fallback_vertical=fallback_vertical),
+                    score_file=score_file_for_record(chunk[0], fallback_vertical=fallback_vertical),
+                    reason="single_record_exceeds_token_cap",
+                )
+                skipped_records.append(skipped)
+                print(f"[LLM SKIP] {skipped.score_file}: {skipped.reason}")
+                index += 1
+                prompt = ""
+                break
+
+            if remaining_exceeds_run_cap:
+                stop_reason = "MAX_LLM_TOKENS_PER_RUN"
+                print(f"[STOP] Hit {stop_reason}")
+                stopped_by_cap = True
+                prompt = ""
+                break
+
+            if remaining_exceeds_usd_cap:
+                stop_reason = "MAX_LLM_USD_PER_RUN"
+                print(f"[STOP] Hit {stop_reason}")
+                stopped_by_cap = True
+                prompt = ""
+                break
+
+            break
+
+        if stopped_by_cap:
+            break
+        if not prompt:
+            continue
+
+        result = _score_batch_with_debug(
+            prompt,
+            batch_id=batch_id,
+            bundle_dir=bundle_dir,
+            model=model,
+            max_tokens=max_tokens,
+        )
         bundle = result["bundle"]
         usage = result.get("usage") or {}
         calls += 1
@@ -1516,6 +2048,8 @@ def score_records_api_run(
         bundle_path = bundle_dir / f"{batch_id}_response.json"
         bundle_path.write_text(json.dumps(bundle, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         import_score_bundle(bundle_path, scores_dir)
+        index += len(chunk)
+        batch_index += 1
 
     manual_run = score_records_manual_run(
         selected,
@@ -1537,6 +2071,7 @@ def score_records_api_run(
         },
         stopped_by_cap=stopped_by_cap,
         stop_reason=stop_reason,
+        skipped_records=skipped_records,
     )
 
 
@@ -1551,6 +2086,10 @@ def write_llm_usage(path: Path, run: ApiLlmRun) -> None:
         "caps": run.caps,
         "stopped_by_cap": run.stopped_by_cap,
         "stop_reason": run.stop_reason,
+        "skipped_records": [
+            {"lead_name": skipped.lead_name, "score_file": skipped.score_file, "reason": skipped.reason}
+            for skipped in (run.skipped_records or [])
+        ],
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -1660,6 +2199,9 @@ def main() -> int:
         print(f"[LLM] Tokens: {api_run.tokens}")
         print(f"[LLM] Estimated USD: {api_run.usd:.4f}")
         print(f"[LLM] Missing scores skipped: {len(api_run.manual_run.missing_scores)}")
+        print(f"[LLM] Records skipped by LLM caps: {len(api_run.skipped_records or [])}")
+        for skipped in api_run.skipped_records or []:
+            print(f"[LLM] - {skipped.score_file}: {skipped.reason}")
         if api_run.stopped_by_cap:
             print(f"[LLM] Stopped by cap: {api_run.stop_reason}")
         if args.llm_usage_output:
