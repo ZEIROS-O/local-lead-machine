@@ -19,7 +19,13 @@ except ModuleNotFoundError:
     def load_dotenv() -> bool:
         return False
 
-from enrich_leads import enrich_row
+from enrich_leads import (
+    SLOW_ENRICH_SECONDS,
+    elapsed_seconds,
+    enrichment_log_fields,
+    enrich_row,
+    format_elapsed,
+)
 from places_search import normalize_place, place_details, text_search
 from lead_machine.schema import GENERIC_DOMAINS, normalize_domain, normalize_phone, slug
 
@@ -718,18 +724,37 @@ def run_search_batch(
             warnings.append(f"Hit --max-enrich={max_enrich}; skipped remaining enrichment rows")
             _progress(f"Enrichment cap active: {len(rows_to_enrich)} of {len(passed_rows)} rows")
     for enrich_index, row in enumerate(rows_to_enrich, start=1):
-        _progress(f"[ENRICH {enrich_index}/{len(rows_to_enrich)}] {_pick(row, 'business_name', 'Business Name') or 'unknown'}")
+        business_name = _pick(row, "business_name", "Business Name") or "unknown"
+        website_url = _pick(row, "website_url", "Website URL")
+        lead_started_at = time.monotonic()
+        enriched: Dict[str, Any] | None = None
+        caught_error = ""
+        _progress(f"[ENRICH start {enrich_index}/{len(rows_to_enrich)}] {business_name}")
         try:
-            enriched_records.append(
-                enrich_row(
-                    row,
-                    screenshots_dir=screenshots_dir,
-                    take_shots=not no_screenshots,
-                    rendered_site_check=rendered_site_check,
-                )
+            enriched = enrich_row(
+                row,
+                screenshots_dir=screenshots_dir,
+                take_shots=not no_screenshots,
+                rendered_site_check=rendered_site_check,
             )
+            enriched_records.append(enriched)
         except Exception as exc:
-            errors.append(f"Enrichment failed for {row.get('business_name') or row.get('Business Name')}: {exc}")
+            caught_error = str(exc)
+            errors.append(f"Enrichment failed for {business_name}: {exc}")
+        finally:
+            elapsed = float(
+                (enriched or {}).get("enrichment", {}).get("elapsed_seconds") or elapsed_seconds(lead_started_at)
+            )
+            fields = enrichment_log_fields(enriched or {}, fallback_error=caught_error)
+            _progress(
+                f"[ENRICH {enrich_index}/{len(rows_to_enrich)}] {business_name} "
+                f"elapsed={format_elapsed(elapsed)}s "
+                f"site_status={fields['site_status']} "
+                f"pages_checked={fields['pages_checked']} "
+                f"errors={fields['error']}"
+            )
+            if elapsed > SLOW_ENRICH_SECONDS:
+                _progress(f"[SLOW ENRICH] {business_name} elapsed={format_elapsed(elapsed)}s website={website_url}")
     write_jsonl(enriched_path, enriched_records)
 
     top_candidate_names = [

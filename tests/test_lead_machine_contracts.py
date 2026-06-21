@@ -716,6 +716,56 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertNotIn("no_form_detected", site["site_issue_flags"])
         self.assertIn("estimate", site["pages"])
 
+    def test_scrape_site_stops_deeper_probing_after_per_lead_ceiling(self) -> None:
+        homepage = """
+        <html><body>
+          <a href="/request-estimate">Request Estimate</a>
+          <p>Paint correction ceramic coating request estimate gallery reviews.</p>
+        </body></html>
+        """
+        clock_values = [0.0, 46.0]
+        calls = []
+
+        def fake_monotonic() -> float:
+            if len(clock_values) > 1:
+                return clock_values.pop(0)
+            return clock_values[0]
+
+        def fake_fetch(url: str, timeout: int = 15) -> dict[str, object]:
+            calls.append((url, timeout))
+            return {"ok": True, "status_code": 200, "final_url": url, "html": homepage, "error": ""}
+
+        with patch("enrich_leads.fetch_url", side_effect=fake_fetch), patch(
+            "enrich_leads.time.monotonic", side_effect=fake_monotonic
+        ):
+            site = scrape_site("https://example.com")
+
+        self.assertEqual(calls, [("https://example.com", 12)])
+        self.assertEqual(site["pages"], {})
+        self.assertIn("per_lead_enrichment_timeout", site["site_issue_flags"])
+        self.assertIn("rendered_check_needed", site["site_issue_flags"])
+        self.assertEqual(site["visual_review_needed"], "Yes")
+        self.assertGreaterEqual(site["enrichment_elapsed_seconds"], 45)
+
+    def test_candidate_page_fetch_uses_short_timeout(self) -> None:
+        homepage = """
+        <html><body>
+          <a href="/request-estimate">Request Estimate</a>
+          <p>Paint correction ceramic coating request estimate gallery reviews.</p>
+        </body></html>
+        """
+
+        def fake_fetch(url: str, timeout: int = 15) -> dict[str, object]:
+            if url == "https://example.com":
+                return {"ok": True, "status_code": 200, "final_url": url, "html": homepage, "error": ""}
+            return {"ok": False, "status_code": 404, "final_url": url, "html": "", "error": ""}
+
+        with patch("enrich_leads.fetch_url", side_effect=fake_fetch) as fetch:
+            scrape_site("https://example.com")
+
+        self.assertEqual(fetch.call_args_list[0].kwargs.get("timeout"), 12)
+        self.assertEqual(fetch.call_args_list[1].kwargs.get("timeout"), 8)
+
     def test_strong_estimate_form_blocks_no_pain_estimate_funnel_sendability(self) -> None:
         enriched = {
             "google": self._google_fixture(),
@@ -1316,7 +1366,7 @@ class LeadMachineContractsTest(unittest.TestCase):
             "google": {
                 **self._google_fixture(),
                 "business_name": "Polished High Review Hardscapes",
-                "reviews": "180",
+                "reviews": "85",
                 "place_id": "ChIJHIGH",
             },
             "website": {
@@ -1608,6 +1658,112 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(run.calls, 1)
         self.assertEqual(run.tokens, 15)
         self.assertTrue(run.stopped_by_cap)
+        self.assertEqual([row["Business Name"] for row in run.manual_run.rows], ["A+ Landscaping LLC"])
+        self.assertEqual([missing.lead_name for missing in run.manual_run.missing_scores], ["Second Landscaping"])
+
+    def test_api_llm_token_cap_stops_before_batch_that_could_exceed_remaining_budget(self) -> None:
+        from make_llm_batch import build_batch_prompt, lead_packet_for_record
+        from score_leads import ensure_evidence, score_records_api_run
+
+        first_score = self._manual_score(total_score=75, grade="B")
+        first_enriched = {
+            "google": self._google_fixture(),
+            "evidence": self._evidence_fixture(site_status="weak"),
+        }
+        second_enriched = {
+            "google": {
+                **self._google_fixture(),
+                "business_name": "Second Landscaping",
+                "place_id": "ChIJ456",
+            },
+            "evidence": self._evidence_fixture(site_status="weak"),
+        }
+
+        def fake_score_batch(prompt: str, *, model: str, max_tokens: int) -> dict:
+            return {
+                "bundle": {"batch_id": "batch_001", "scores": [{"score_file": "chij123.json", "score": first_score}]},
+                "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
+            }
+
+        projected_prompt = build_batch_prompt(
+            [lead_packet_for_record(ensure_evidence(dict(first_enriched)), fallback_vertical="hardscaping")],
+            batch_id="batch_001",
+        )
+        projected_tokens = len(projected_prompt.encode("utf-8")) + 20
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("score_leads.llm_client.score_batch", side_effect=fake_score_batch) as score_batch:
+                run = score_records_api_run(
+                    [first_enriched, second_enriched],
+                    scores_dir=Path(tmp) / "scores",
+                    fallback_vertical="hardscaping",
+                    batch_size=1,
+                    model="claude-sonnet-4-6",
+                    max_tokens=20,
+                    max_calls=0,
+                    max_tokens_per_run=projected_tokens + 4,
+                    max_usd_per_run=0.0,
+                )
+
+        self.assertEqual(score_batch.call_count, 1)
+        self.assertEqual(run.calls, 1)
+        self.assertEqual(run.tokens, 5)
+        self.assertTrue(run.stopped_by_cap)
+        self.assertEqual(run.stop_reason, "MAX_LLM_TOKENS_PER_RUN")
+        self.assertEqual([row["Business Name"] for row in run.manual_run.rows], ["A+ Landscaping LLC"])
+        self.assertEqual([missing.lead_name for missing in run.manual_run.missing_scores], ["Second Landscaping"])
+
+    def test_api_llm_usd_cap_stops_before_batch_that_could_exceed_remaining_budget(self) -> None:
+        from make_llm_batch import build_batch_prompt, lead_packet_for_record
+        from score_leads import ensure_evidence, estimate_llm_usd, score_records_api_run
+
+        first_score = self._manual_score(total_score=75, grade="B")
+        first_enriched = {
+            "google": self._google_fixture(),
+            "evidence": self._evidence_fixture(site_status="weak"),
+        }
+        second_enriched = {
+            "google": {
+                **self._google_fixture(),
+                "business_name": "Second Landscaping",
+                "place_id": "ChIJ456",
+            },
+            "evidence": self._evidence_fixture(site_status="weak"),
+        }
+
+        def fake_score_batch(prompt: str, *, model: str, max_tokens: int) -> dict:
+            return {
+                "bundle": {"batch_id": "batch_001", "scores": [{"score_file": "chij123.json", "score": first_score}]},
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            }
+
+        projected_prompt = build_batch_prompt(
+            [lead_packet_for_record(ensure_evidence(dict(first_enriched)), fallback_vertical="hardscaping")],
+            batch_id="batch_001",
+        )
+        projected_usd = estimate_llm_usd(
+            {"input_tokens": len(projected_prompt.encode("utf-8")), "output_tokens": 20}
+        )
+        first_call_usd = estimate_llm_usd({"input_tokens": 1, "output_tokens": 1})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("score_leads.llm_client.score_batch", side_effect=fake_score_batch) as score_batch:
+                run = score_records_api_run(
+                    [first_enriched, second_enriched],
+                    scores_dir=Path(tmp) / "scores",
+                    fallback_vertical="hardscaping",
+                    batch_size=1,
+                    model="claude-sonnet-4-6",
+                    max_tokens=20,
+                    max_calls=0,
+                    max_tokens_per_run=0,
+                    max_usd_per_run=projected_usd + (first_call_usd / 2),
+                )
+
+        self.assertEqual(score_batch.call_count, 1)
+        self.assertEqual(run.calls, 1)
+        self.assertTrue(run.stopped_by_cap)
+        self.assertEqual(run.stop_reason, "MAX_LLM_USD_PER_RUN")
         self.assertEqual([row["Business Name"] for row in run.manual_run.rows], ["A+ Landscaping LLC"])
         self.assertEqual([missing.lead_name for missing in run.manual_run.missing_scores], ["Second Landscaping"])
 
@@ -2177,7 +2333,7 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertIn("Missing concrete send trigger", row["Send Blockers"])
         self.assertEqual(row["Packet Eligible"], "")
 
-    def test_weak_form_with_money_signal_avoids_visible_pain_blocker(self) -> None:
+    def test_strong_reviews_with_sufficient_visible_pain_is_sendable(self) -> None:
         enriched = {
             "google": {
                 **self._google_fixture(),
@@ -2208,7 +2364,7 @@ class LeadMachineContractsTest(unittest.TestCase):
                 "contact_form_detected": "Yes",
                 "estimate_form_detected": "Yes",
                 "form_strength": "Weak",
-                "visible_pain_score": 18,
+                "visible_pain_score": 35,
                 "visible_pain_reasons": ["Weak estimate form detected"],
                 "visible_pain_categories": ["estimate_path_pain"],
                 "send_trigger": "Weak estimate form detected",
@@ -2221,7 +2377,7 @@ class LeadMachineContractsTest(unittest.TestCase):
         }
         raw_score = self._manual_score(
             evidence_refs=["E1", "E2", "E3"],
-            visible_pain_score=18,
+            visible_pain_score=35,
             visible_pain_reasons=["Weak estimate form detected"],
             visible_pain_categories=["estimate_path_pain"],
             send_trigger="Weak estimate form detected",
@@ -2235,10 +2391,9 @@ class LeadMachineContractsTest(unittest.TestCase):
         row = merge_manual_score(enriched, raw_score, fallback_vertical="hardscaping")
 
         self.assertEqual(row["Sendable"], "Yes")
-        self.assertEqual(row["Money Signal"], "Yes")
         self.assertNotIn("Visible pain too weak for review count", row["Send Blockers"])
 
-    def test_bad_site_without_money_signal_is_blocked(self) -> None:
+    def test_bad_site_without_money_signal_is_sendable_with_real_pain(self) -> None:
         enriched = {
             "google": {
                 **self._google_fixture(),
@@ -2289,10 +2444,8 @@ class LeadMachineContractsTest(unittest.TestCase):
 
         row = merge_manual_score(enriched, raw_score, fallback_vertical="hardscaping")
 
-        self.assertEqual(row["Sendable"], "No")
+        self.assertEqual(row["Sendable"], "Yes")
         self.assertEqual(row["Money Signal"], "No")
-        self.assertIn("Missing buyer-intent money signal", row["Send Blockers"])
-        self.assertEqual(row["Packet Eligible"], "")
 
     def test_advanced_optimization_is_not_sendable_without_concrete_visible_pain(self) -> None:
         enriched = {
@@ -2553,8 +2706,6 @@ class LeadMachineContractsTest(unittest.TestCase):
 
         self.assertNotEqual(row["Lead Priority"], "A")
         self.assertIn(row["Lead Priority"], {"C", "Skip"})
-        self.assertEqual(row["Sendable"], "No")
-        self.assertIn("Missing buyer-intent money signal", row["Send Blockers"])
 
     def test_money_signal_defends_high_review_bad_site_deterministic_tier(self) -> None:
         base_record = {

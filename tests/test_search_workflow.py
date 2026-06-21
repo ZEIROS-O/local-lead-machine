@@ -305,6 +305,59 @@ class SearchWorkflowTest(unittest.TestCase):
             self.assertTrue(calls[0]["rendered_site_check"])
             self.assertTrue(calls[0]["screenshots_dir"].endswith("screenshots/test_hardscaping_001"))
 
+    def test_runner_logs_completed_enrichment_elapsed_status_pages_and_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "search_configs/test_hardscaping_001.json"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                json.dumps(_config(queries=["hardscaping Cleveland OH"], geo_slices=["Cleveland OH"]).to_dict()),
+                encoding="utf-8",
+            )
+
+            details = {
+                "id": "place-1",
+                "displayName": {"text": "Patio Pros"},
+                "formattedAddress": "123 Main St, Cleveland, OH 44101, USA",
+                "nationalPhoneNumber": "(216) 555-0100",
+                "websiteUri": "https://patiopros.example",
+                "googleMapsUri": "https://maps.google.com/?cid=1",
+                "rating": 4.8,
+                "userRatingCount": 28,
+                "primaryType": "landscaper",
+            }
+
+            def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False):
+                return {
+                    "google": row,
+                    "website": {
+                        "site_status": "Loaded",
+                        "pages": {"contact": {"url": "https://patiopros.example/contact"}},
+                        "homepage": {"error": ""},
+                    },
+                    "derived": {},
+                    "screenshots": {},
+                    "enrichment": {"elapsed_seconds": 2.4},
+                }
+
+            stdout = io.StringIO()
+            with patch("make_search_batch.text_search", return_value=[{"id": "place-1"}]), patch(
+                "make_search_batch.place_details", return_value=details
+            ), patch("make_search_batch.enrich_row", side_effect=fake_enrich), redirect_stdout(stdout):
+                make_search_batch.run_search_batch(
+                    config_path=config_path,
+                    batch="test_hardscaping_001",
+                    root=root,
+                    api_key="test-key",
+                    no_screenshots=True,
+                )
+
+            log = stdout.getvalue()
+            self.assertIn(
+                "[ENRICH 1/1] Patio Pros elapsed=2.4s site_status=Loaded pages_checked=1 errors=",
+                log,
+            )
+
     def test_runner_skips_early_duplicate_place_ids_before_details(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

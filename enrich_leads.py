@@ -24,13 +24,14 @@ import os
 import re
 import sys
 import time
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 from urllib.parse import urljoin, urlparse
 
 import requests
 import tldextract
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from dotenv import load_dotenv
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
@@ -49,7 +50,12 @@ USER_AGENT = (
 )
 
 DEFAULT_TIMEOUT = 15
+HOMEPAGE_FETCH_TIMEOUT = 12
+CANDIDATE_PAGE_FETCH_TIMEOUT = 8
+SLOW_ENRICH_SECONDS = 30.0
+PER_LEAD_ENRICH_TIMEOUT_SECONDS = 45.0
 TLD_EXTRACTOR = tldextract.TLDExtract(cache_dir=False, suffix_list_urls=())
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 PHONE_RE = re.compile(
@@ -224,6 +230,41 @@ def getenv_bool(name: str, default: bool = False) -> bool:
     if not raw:
         return default
     return raw in {"1", "true", "yes", "y", "on"}
+
+
+def elapsed_seconds(started_at: float) -> float:
+    return max(0.0, time.monotonic() - started_at)
+
+
+def format_elapsed(seconds: float) -> str:
+    return f"{seconds:.1f}"
+
+
+def short_error(text: Any, max_chars: int = 120) -> str:
+    cleaned = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[: max_chars - 3].rstrip() + "..."
+
+
+def enrichment_log_fields(record: Dict[str, Any], *, fallback_error: str = "") -> Dict[str, Any]:
+    website = record.get("website") or {}
+    pages = website.get("pages") if isinstance(website, dict) else {}
+    homepage = website.get("homepage") if isinstance(website, dict) else {}
+    enrichment = record.get("enrichment") or {}
+
+    error = (
+        fallback_error
+        or website.get("enrichment_error", "")
+        or website.get("error", "")
+        or (homepage.get("error", "") if isinstance(homepage, dict) else "")
+        or enrichment.get("error", "")
+    )
+    return {
+        "site_status": website.get("site_status", "Unknown") if isinstance(website, dict) else "Unknown",
+        "pages_checked": len(pages) if isinstance(pages, dict) else 0,
+        "error": short_error(error),
+    }
 
 
 def safe_slug(text: str, fallback: str = "lead") -> str:
@@ -827,41 +868,64 @@ def empty_site_result(status: str, flags: List[str], url: str = "", error: str =
     return result
 
 
+def mark_per_lead_timeout(site: Dict[str, Any], *, elapsed: float, error: str = "") -> Dict[str, Any]:
+    updated = dict(site)
+    flags = {str(flag).strip() for flag in updated.get("site_issue_flags") or [] if str(flag).strip()}
+    flags.add("per_lead_enrichment_timeout")
+    if updated.get("site_status") != "No Website":
+        flags.add("rendered_check_needed")
+        flags.add("manual_visual_review_needed")
+        updated["visual_review_needed"] = "Yes"
+    updated["site_issue_flags"] = sorted(flags)
+    updated["enrichment_elapsed_seconds"] = round(elapsed, 1)
+    updated["enrichment_error"] = error or f"Per-lead enrichment ceiling exceeded after {format_elapsed(elapsed)}s."
+    return updated
+
+
 def scrape_site(
     website_url: str,
     *,
     rendered_form_check: bool = False,
     high_ticket_terms: List[str] | tuple[str, ...] | None = None,
+    started_at: float | None = None,
+    per_lead_timeout: float = PER_LEAD_ENRICH_TIMEOUT_SECONDS,
 ) -> Dict[str, Any]:
+    started_at = time.monotonic() if started_at is None else started_at
     url = normalize_url(website_url)
     high_ticket_terms = high_ticket_terms or HIGH_TICKET_TERMS
 
     if not url:
-        return empty_site_result("No Website", ["no_website"])
+        site = empty_site_result("No Website", ["no_website"])
+        site["enrichment_elapsed_seconds"] = round(elapsed_seconds(started_at), 1)
+        return site
 
     flags: List[str] = []
 
     if is_non_standard_site_or_booking_url(url):
         flags.append("non_standard_site_or_booking_url")
 
-    home = fetch_url(url)
+    home = fetch_url(url, timeout=HOMEPAGE_FETCH_TIMEOUT)
 
     if not home["ok"]:
         hard_flag, hard_reason = classify_hard_static_failure(home)
         failure_flags = flags + ["static_fetch_failed"]
         if hard_flag:
-            return empty_site_result(
+            site = empty_site_result(
                 "Broken Website",
                 failure_flags + [hard_flag],
                 home.get("final_url") or url,
                 hard_reason or home.get("error") or "",
             )
-        return empty_site_result(
+            site["enrichment_elapsed_seconds"] = round(elapsed_seconds(started_at), 1)
+            return site
+        site = empty_site_result(
             "Unknown",
             failure_flags + ["rendered_check_needed", "manual_visual_review_needed"],
             home.get("final_url") or url,
             home.get("error") or "Static fetch failed; browser-rendered check needed before site-status claims.",
         )
+        site["enrichment_elapsed_seconds"] = round(elapsed_seconds(started_at), 1)
+        return site
 
     final_url = home["final_url"] or url
     html = home["html"]
@@ -880,6 +944,9 @@ def scrape_site(
     generic_copy = detect_terms(text, GENERIC_COPY_TERMS)
 
     pages: Dict[str, Dict[str, Any]] = {}
+
+    def timed_out() -> bool:
+        return elapsed_seconds(started_at) > per_lead_timeout
 
     page_targets: List[Tuple[str, str]] = []
     seen_page_urls = set()
@@ -900,8 +967,12 @@ def scrape_site(
     add_page_targets([find_candidate_page(final_url, links["internal_links"], ["gallery"])], "gallery")
 
     combined_text_parts = [text]
+    enrichment_timed_out = False
 
     for default_page_name, page_url in page_targets:
+        if timed_out():
+            enrichment_timed_out = True
+            break
         if not page_url:
             continue
 
@@ -909,7 +980,7 @@ def scrape_site(
         if domain_of(page_url) != domain_of(final_url):
             continue
 
-        result = fetch_url(page_url, timeout=DEFAULT_TIMEOUT)
+        result = fetch_url(page_url, timeout=CANDIDATE_PAGE_FETCH_TIMEOUT)
         page_html = result.get("html") or ""
         page_text = extract_visible_text(page_html) if result.get("ok") else ""
         page_title, page_meta = extract_title_meta(page_html) if page_html else ("", "")
@@ -952,7 +1023,15 @@ def scrape_site(
     combined_text = clean_text(" ".join(combined_text_parts), 30000)
     cta_strength = classify_cta_strength(ctas, combined_text)
 
-    if rendered_form_check and form_signals.get("form_strength_rank", 0) <= 1 and ctas:
+    if timed_out():
+        enrichment_timed_out = True
+
+    if (
+        rendered_form_check
+        and not enrichment_timed_out
+        and form_signals.get("form_strength_rank", 0) <= 1
+        and ctas
+    ):
         rendered_signals = detect_rendered_form(final_url)
         form_signals = merge_form_signals(form_signals, rendered_signals)
 
@@ -1003,6 +1082,10 @@ def scrape_site(
         "combined_text": combined_text,
     }
     result.update(_empty_visual_audit_fields())
+    elapsed = elapsed_seconds(started_at)
+    result["enrichment_elapsed_seconds"] = round(elapsed, 1)
+    if enrichment_timed_out:
+        result = mark_per_lead_timeout(result, elapsed=elapsed)
     return result
 
 
@@ -1209,18 +1292,29 @@ def enrich_row(
     rendered_site_check: bool = False,
     buyer_intent_ads_check: bool = False,
 ) -> Dict[str, Any]:
+    started_at = time.monotonic()
     lead = normalize_lead(row, fallback_vertical=row.get("category", "") or "service")
     profile = resolve_profile(lead.vertical, source_query=lead.source_query)
     gate = hard_icp_gate(lead)
 
     website_url = row.get("website_url", "") or ""
-    site = scrape_site(website_url, rendered_form_check=rendered_form_check, high_ticket_terms=profile.high_ticket_terms)
+    site = scrape_site(
+        website_url,
+        rendered_form_check=rendered_form_check,
+        high_ticket_terms=profile.high_ticket_terms,
+        started_at=started_at,
+    )
 
     screenshots = {"desktop": "", "mobile": "", "error": ""}
     screenshot_url = site.get("final_url") or normalize_url(website_url)
+    elapsed_after_static = elapsed_seconds(started_at)
+    per_lead_timed_out = elapsed_after_static > PER_LEAD_ENRICH_TIMEOUT_SECONDS or "per_lead_enrichment_timeout" in set(
+        site.get("site_issue_flags") or []
+    )
 
     should_check_rendered = (
         screenshot_url
+        and not per_lead_timed_out
         and site.get("site_status") != "No Website"
         and (
             take_shots
@@ -1230,15 +1324,17 @@ def enrich_row(
     )
 
     if should_check_rendered:
+        remaining_timeout_ms = max(1000, int((PER_LEAD_ENRICH_TIMEOUT_SECONDS - elapsed_seconds(started_at)) * 1000))
+        rendered_timeout_ms = min(25000, remaining_timeout_ms)
         if take_shots:
             desktop_path, mobile_path = screenshot_paths(
                 row.get("business_name", "lead"),
                 row.get("place_id", ""),
                 screenshots_dir,
             )
-            screenshots = take_screenshots(screenshot_url, desktop_path, mobile_path)
+            screenshots = take_screenshots(screenshot_url, desktop_path, mobile_path, timeout_ms=rendered_timeout_ms)
         else:
-            screenshots = check_rendered_site(screenshot_url)
+            screenshots = check_rendered_site(screenshot_url, timeout_ms=rendered_timeout_ms)
         site = apply_rendered_site_result(site, screenshots)
 
     google_phone = row.get("phone", "")
@@ -1279,8 +1375,13 @@ def enrich_row(
             "hard_icp_reasons": gate.reasons,
         },
     }
+    total_elapsed = elapsed_seconds(started_at)
+    record["enrichment"] = {"elapsed_seconds": round(total_elapsed, 1)}
+    record["website"]["enrichment_elapsed_seconds"] = round(total_elapsed, 1)
     record["evidence"] = build_evidence_profile(record)
     build_buyer_intent(record, ads_check=buyer_intent_ads_check)
+    record["enrichment"]["elapsed_seconds"] = round(elapsed_seconds(started_at), 1)
+    record["website"]["enrichment_elapsed_seconds"] = record["enrichment"]["elapsed_seconds"]
     return record
 
 
@@ -1343,6 +1444,9 @@ def main() -> int:
     for i, row in enumerate(rows, start=1):
         name = row.get("business_name", "")
         website = row.get("website_url", "")
+        lead_started_at = time.monotonic()
+        enriched: Dict[str, Any] | None = None
+        caught_error = ""
 
         print(f"[{i}/{len(rows)}] {name} | {website or 'NO WEBSITE'}")
 
@@ -1357,25 +1461,39 @@ def main() -> int:
             )
             records.append(enriched)
 
-            status = enriched["website"].get("site_status")
-            flags = ",".join(enriched["website"].get("site_issue_flags", []))
-            print(f"    status={status} flags={flags or 'none'}")
-
         except Exception as exc:
+            caught_error = str(exc)
             print(f"[ERROR] Enrichment failed for {name}: {exc}", file=sys.stderr)
             error_record = {
                 "google": row,
                 "website": {
                     "site_status": "Unknown",
                     "site_issue_flags": ["enrichment_exception"],
-                    "error": str(exc),
+                    "error": caught_error,
+                    "pages": {},
                 },
                 "screenshots": {},
                 "derived": {},
+                "enrichment": {"elapsed_seconds": round(elapsed_seconds(lead_started_at), 1), "error": caught_error},
             }
             error_record["evidence"] = build_evidence_profile(error_record)
             build_buyer_intent(error_record, ads_check=buyer_intent_ads_check)
+            error_record["enrichment"]["elapsed_seconds"] = round(elapsed_seconds(lead_started_at), 1)
             records.append(error_record)
+            enriched = error_record
+
+        elapsed = float((enriched or {}).get("enrichment", {}).get("elapsed_seconds") or elapsed_seconds(lead_started_at))
+        fields = enrichment_log_fields(enriched or {}, fallback_error=caught_error)
+        print(
+            f"[ENRICH {i}/{len(rows)}] {name or 'unknown'} "
+            f"elapsed={format_elapsed(elapsed)}s "
+            f"site_status={fields['site_status']} "
+            f"pages_checked={fields['pages_checked']} "
+            f"errors={fields['error']}",
+            flush=True,
+        )
+        if elapsed > SLOW_ENRICH_SECONDS:
+            print(f"[SLOW ENRICH] {name or 'unknown'} elapsed={format_elapsed(elapsed)}s website={website}", flush=True)
 
         time.sleep(0.2)
 

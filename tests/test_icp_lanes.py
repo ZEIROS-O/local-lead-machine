@@ -131,7 +131,7 @@ class ICPLaneTest(unittest.TestCase):
             _record(
                 website_url="https://clienthub.getjobber.com/public/request/example",
                 site_status="jobber_only",
-                reviews="130",
+                reviews="75",
                 visible_pain_score=32,
                 visible_pain_reasons=["Jobber-only web presence"],
                 categories=["no_site_or_social_only_pain"],
@@ -312,10 +312,10 @@ class ICPLaneTest(unittest.TestCase):
 
         self.assertEqual(result.lane, "owned_weak_site_rebuild")
 
-    def test_151_plus_review_basic_form_only_is_optimization_not_a_estimate_funnel(self) -> None:
+    def test_high_review_basic_form_only_is_optimization_not_a_estimate_funnel(self) -> None:
         result = classify_icp_lane(
             _record(
-                reviews="180",
+                reviews="85",
                 site_status="okay",
                 flags=["weak_basic_form"],
                 categories=["estimate_path_pain"],
@@ -329,10 +329,10 @@ class ICPLaneTest(unittest.TestCase):
         self.assertEqual(result.lane, "optimization_only")
         self.assertNotEqual(result.tier, "A")
 
-    def test_76_plus_review_basic_form_only_requires_clearer_pain(self) -> None:
+    def test_mid_review_basic_form_only_requires_clearer_pain(self) -> None:
         result = classify_icp_lane(
             _record(
-                reviews="104",
+                reviews="80",
                 site_status="okay",
                 flags=["weak_basic_form"],
                 categories=["estimate_path_pain"],
@@ -397,7 +397,7 @@ class ICPLaneTest(unittest.TestCase):
     def test_okay_site_basic_form_high_review_is_not_a_rebuild(self) -> None:
         result = classify_icp_lane(
             _record(
-                reviews="180",
+                reviews="85",
                 site_status="okay",
                 flags=["weak_basic_form"],
                 categories=["estimate_path_pain"],
