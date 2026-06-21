@@ -53,22 +53,22 @@ Smallest highest-value cut: kills the clipboard, adds automated verification, tu
 a loop. Purely additive (new mode) → lowest regression risk.
 
 **Tasks**
-- [ ] **`lead_machine/llm_client.py`** — `score_batch(prompt, *, model, max_tokens) -> dict` POSTs to
+- [x] **`lead_machine/llm_client.py`** — `score_batch(prompt, *, model, max_tokens) -> dict` POSTs to
   the Anthropic Messages API (`https://api.anthropic.com/v1/messages`) via the existing `requests`
   dep (**no SDK**). Mirror the HTTP helper at `places_search.py:170` (`request_json`); headers
   `x-api-key`, `anthropic-version`; error-on-4xx. Read `ANTHROPIC_API_KEY` + `LLM_SCORING_MODEL` via
   `os.getenv` after `load_dotenv()` (pattern: `places_search.py:272`). Parse the model text as the
   score **bundle** `{"batch_id", "scores":[…]}` — exact shape
   `import_llm_score_bundle.validate_bundle_scores()` expects. Return `usage` tokens for cost tracking.
-- [ ] **Caps** — `MAX_LLM_CALLS_PER_RUN`, `MAX_LLM_TOKENS_PER_RUN`, `MAX_LLM_USD_PER_RUN`. Mirror
+- [x] **Caps** — `MAX_LLM_CALLS_PER_RUN`, `MAX_LLM_TOKENS_PER_RUN`, `MAX_LLM_USD_PER_RUN`. Mirror
   `places_search.py` `getenv_int` (lines 85-93) + `[STOP] Hit MAX_*` break pattern (lines 304-330).
   Track cumulative calls/tokens/$ across batches; estimate $ from Sonnet 4.6 pricing. On cap: stop
   issuing batches, write partial results.
-- [ ] **`--mode api-llm`** in `score_leads.py` (alongside `manual-llm` at `score_leads.py:1280`):
+- [x] **`--mode api-llm`** in `score_leads.py` (alongside `manual-llm` at `score_leads.py:1280`):
   build packets + `build_batch_prompt()` verbatim → `llm_client.score_batch()` (cap-gated) → write
   bundle through existing `import_score_bundle()` (`import_llm_score_bundle.py:119`, schema/validation
   unchanged) → fall through to existing `score_records_manual_run()` read/merge → identical CSV.
-- [ ] **`.env`** — add `ANTHROPIC_API_KEY`, `LLM_SCORING_MODEL=claude-sonnet-4-6`, the three `MAX_LLM_*` caps.
+- [x] **`.env`** — add `ANTHROPIC_API_KEY`, `LLM_SCORING_MODEL=claude-sonnet-4-6`, the three `MAX_LLM_*` caps.
 
 **Done when:** `score_leads.py --mode api-llm` yields the **same scored CSV** as the manual path, zero
 copy-paste; `--mode manual-llm` still works as fallback.

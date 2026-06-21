@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from lead_machine.icp_lanes import classify_icp_lane
+from lead_machine.verticals import resolve_profile
 from make_icp_lane_report import write_lane_report
 from make_llm_batch import write_llm_batches
 
@@ -93,6 +94,19 @@ def _record(
 
 
 class ICPLaneTest(unittest.TestCase):
+    def test_vertical_profile_resolves_detailing_from_source_query(self) -> None:
+        profile = resolve_profile("", source_query="ceramic coating Cleveland OH")
+
+        self.assertEqual(profile.key, "detailing")
+        self.assertIn("ceramic coating", profile.high_ticket_terms)
+        self.assertIn("mister car wash", profile.franchise_denylist)
+
+    def test_unknown_vertical_falls_back_to_hardscaping_profile(self) -> None:
+        profile = resolve_profile("unknown vertical", source_query="")
+
+        self.assertEqual(profile.key, "hardscaping")
+        self.assertIn("retaining wall", profile.service_terms)
+
     def test_missing_website_with_demand_and_phone_is_no_site_launch(self) -> None:
         result = classify_icp_lane(
             _record(
@@ -231,6 +245,57 @@ class ICPLaneTest(unittest.TestCase):
 
         self.assertEqual(result.lane, "estimate_funnel")
         self.assertIn(result.tier, {"A", "B"})
+
+    def test_detailing_batch_uses_detailing_service_evidence_for_fit(self) -> None:
+        result = classify_icp_lane(
+            _record(
+                business_name="Mirror Finish Auto Spa",
+                category="Auto detailing service",
+                source_query="ceramic coating Cleveland OH",
+                vertical="detailing",
+                reviews="42",
+                flags=["weak_basic_form"],
+                categories=["estimate_path_pain"],
+                visible_pain_score=24,
+                visible_pain_reasons=["Basic estimate form only"],
+                send_trigger="Basic estimate form only",
+                form_strength="Basic",
+                combined_text=(
+                    "ceramic coating paint correction ppf paint protection film "
+                    "mobile detailing request an estimate gallery reviews"
+                ),
+                high_ticket_terms=["ceramic coating", "paint correction", "ppf", "paint protection film"],
+            )
+        )
+
+        self.assertEqual(result.lane, "estimate_funnel")
+        self.assertIn(result.tier, {"A", "B"})
+
+    def test_detailing_batch_caps_generic_car_service_without_service_evidence(self) -> None:
+        result = classify_icp_lane(
+            _record(
+                business_name="Cleveland Auto Service",
+                category="Auto service",
+                source_query="ceramic coating Cleveland OH",
+                vertical="detailing",
+                reviews="54",
+                flags=["missing_estimate_path"],
+                categories=["estimate_path_pain"],
+                visible_pain_score=32,
+                visible_pain_reasons=["No estimate form detected"],
+                send_trigger="No estimate form detected",
+                estimate_form_detected="No",
+                contact_form_detected="Yes",
+                form_strength="None",
+                cta_strength="Strong",
+                has_estimate_cta=True,
+                combined_text="auto service repair maintenance call for a quote",
+                high_ticket_terms=[],
+            )
+        )
+
+        self.assertEqual(result.lane, "estimate_funnel")
+        self.assertLessEqual(result.score, 64)
 
     def test_owned_weak_site_without_visual_status_can_populate_rebuild_lane(self) -> None:
         result = classify_icp_lane(

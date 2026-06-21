@@ -38,6 +38,7 @@ from playwright.sync_api import sync_playwright
 from lead_machine.evidence import build_evidence_profile
 from lead_machine.icp import hard_icp_gate
 from lead_machine.schema import normalize_lead
+from lead_machine.verticals import resolve_profile
 
 
 USER_AGENT = (
@@ -809,8 +810,14 @@ def empty_site_result(status: str, flags: List[str], url: str = "", error: str =
     return result
 
 
-def scrape_site(website_url: str, *, rendered_form_check: bool = False) -> Dict[str, Any]:
+def scrape_site(
+    website_url: str,
+    *,
+    rendered_form_check: bool = False,
+    high_ticket_terms: List[str] | tuple[str, ...] | None = None,
+) -> Dict[str, Any]:
     url = normalize_url(website_url)
+    high_ticket_terms = high_ticket_terms or HIGH_TICKET_TERMS
 
     if not url:
         return empty_site_result("No Website", ["no_website"])
@@ -852,7 +859,7 @@ def scrape_site(website_url: str, *, rendered_form_check: bool = False) -> Dict[
     emails, phones = extract_emails_phones(text, html)
     form_signals = detect_form_signals(html, page_text=text, page_url=final_url, method="static_html")
     ctas = detect_terms(text, CTA_TERMS)
-    high_ticket = detect_terms(text, HIGH_TICKET_TERMS)
+    high_ticket = detect_terms(text, high_ticket_terms)
     generic_copy = detect_terms(text, GENERIC_COPY_TERMS)
 
     pages: Dict[str, Dict[str, Any]] = {}
@@ -906,7 +913,7 @@ def scrape_site(website_url: str, *, rendered_form_check: bool = False) -> Dict[
         form_signals = merge_form_signals(form_signals, page_form_signals)
 
         ctas = sorted(set(ctas + detect_terms(page_text, CTA_TERMS)))
-        high_ticket = sorted(set(high_ticket + detect_terms(page_text, HIGH_TICKET_TERMS)))
+        high_ticket = sorted(set(high_ticket + detect_terms(page_text, high_ticket_terms)))
         generic_copy = sorted(set(generic_copy + detect_terms(page_text, GENERIC_COPY_TERMS)))
 
         page_name = _candidate_page_name(page_url, pages, default_page_name)
@@ -1185,10 +1192,11 @@ def enrich_row(
     rendered_site_check: bool = False,
 ) -> Dict[str, Any]:
     lead = normalize_lead(row, fallback_vertical=row.get("category", "") or "service")
+    profile = resolve_profile(lead.vertical, source_query=lead.source_query)
     gate = hard_icp_gate(lead)
 
     website_url = row.get("website_url", "") or ""
-    site = scrape_site(website_url, rendered_form_check=rendered_form_check)
+    site = scrape_site(website_url, rendered_form_check=rendered_form_check, high_ticket_terms=profile.high_ticket_terms)
 
     screenshots = {"desktop": "", "mobile": "", "error": ""}
     screenshot_url = site.get("final_url") or normalize_url(website_url)

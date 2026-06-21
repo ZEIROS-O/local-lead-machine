@@ -8,6 +8,12 @@ from urllib.parse import urlparse
 from .evidence import build_evidence_profile
 from .icp import hard_icp_gate
 from .schema import normalize_lead
+from .verticals import (
+    HARDSCAPE_BATCH_TERMS as PROFILE_HARDSCAPE_BATCH_TERMS,
+    HARDSCAPE_SERVICE_TERMS as PROFILE_HARDSCAPE_SERVICE_TERMS,
+    VerticalProfile,
+    resolve_profile,
+)
 
 
 LANES = (
@@ -170,34 +176,8 @@ TARGET_SERVICE_TERMS = {
     "renovation",
 }
 
-HARDSCAPE_BATCH_TERMS = {
-    "hardscape",
-    "hardscaping",
-    "paver",
-    "pavers",
-    "patio",
-    "retaining wall",
-    "outdoor living",
-}
-
-HARDSCAPE_SERVICE_TERMS = {
-    "hardscape",
-    "hardscaping",
-    "patio",
-    "paver",
-    "pavers",
-    "retaining wall",
-    "concrete",
-    "stamped concrete",
-    "decorative concrete",
-    "masonry",
-    "outdoor living",
-    "outdoor kitchen",
-    "fire pit",
-    "landscape design",
-    "landscape construction",
-    "design-build",
-}
+HARDSCAPE_BATCH_TERMS = set(PROFILE_HARDSCAPE_BATCH_TERMS)
+HARDSCAPE_SERVICE_TERMS = set(PROFILE_HARDSCAPE_SERVICE_TERMS)
 
 SITE_WEAKNESS_FLAGS = {
     "generic_copy_signals",
@@ -236,6 +216,7 @@ class _LaneContext:
     google: Dict[str, Any]
     website: Dict[str, Any]
     evidence: Dict[str, Any]
+    profile: VerticalProfile
     primary_url: str
     status: str
     rendered_status: str
@@ -252,8 +233,8 @@ class _LaneContext:
     has_owned_site: bool
     is_non_owned_url: bool
     strong_estimate_form: bool
-    hardscaping_batch: bool
-    hardscape_service_evidence: bool
+    target_batch: bool
+    target_service_evidence: bool
 
 
 def classify_icp_lane(record: Dict[str, Any]) -> ICPLaneResult:
@@ -310,6 +291,7 @@ def _context(record: Dict[str, Any]) -> _LaneContext:
     google = record.get("google", {}) if isinstance(record.get("google"), dict) else {}
     website = record.get("website", {}) if isinstance(record.get("website"), dict) else {}
     evidence = _evidence(record)
+    profile = _profile_for_record(record, google)
     primary_url = _primary_url(record, google, website)
     status = _normalize_status(_pick(evidence, "site_status") or _pick(website, "site_status"))
     rendered_status = _normalize_status(_pick(evidence, "rendered_site_status") or _pick(website, "rendered_site_status"))
@@ -361,6 +343,7 @@ def _context(record: Dict[str, Any]) -> _LaneContext:
         google=google,
         website=website,
         evidence=evidence,
+        profile=profile,
         primary_url=primary_url,
         status=status,
         rendered_status=rendered_status,
@@ -379,8 +362,8 @@ def _context(record: Dict[str, Any]) -> _LaneContext:
         has_owned_site=has_owned_site,
         is_non_owned_url=is_non_owned_url,
         strong_estimate_form=strong_estimate_form,
-        hardscaping_batch=_is_hardscaping_batch(record, google),
-        hardscape_service_evidence=_has_any_phrase(service_text, HARDSCAPE_SERVICE_TERMS),
+        target_batch=_is_target_batch(record, google, profile),
+        target_service_evidence=_has_any_phrase(service_text, profile.service_terms),
     )
 
 
@@ -404,7 +387,12 @@ def _evidence(record: Dict[str, Any]) -> Dict[str, Any]:
 
 def _hard_blockers(ctx: _LaneContext) -> List[str]:
     blockers: List[str] = []
-    lead = normalize_lead(ctx.google or ctx.record, fallback_vertical=_pick(ctx.google, "vertical", "Vertical") or "service")
+    lead = normalize_lead(
+        ctx.google or ctx.record,
+        fallback_vertical=_pick(ctx.google, "vertical", "Vertical")
+        or _pick(ctx.record, "vertical", "Vertical")
+        or ctx.profile.key,
+    )
     gate = hard_icp_gate(lead)
     if not ctx.phone:
         blockers.append("missing phone")
@@ -417,6 +405,12 @@ def _hard_blockers(ctx: _LaneContext) -> List[str]:
     if any(term in ctx.text for term in IRRELEVANT_TERMS):
         blockers.append("irrelevant or supply-side business")
     return blockers
+
+
+def _profile_for_record(record: Dict[str, Any], google: Dict[str, Any]) -> VerticalProfile:
+    vertical = _pick(record, "vertical", "Vertical") or _pick(google, "vertical", "Vertical")
+    source_query = _pick(record, "source_query", "Source Query") or _pick(google, "source_query", "Source Query")
+    return resolve_profile(vertical, source_query=source_query)
 
 
 def _choose_lane(ctx: _LaneContext) -> tuple[str, List[str]]:
@@ -448,8 +442,8 @@ def _choose_lane(ctx: _LaneContext) -> tuple[str, List[str]]:
         if _reviews_require_clear_pain(ctx) and not _clear_concrete_pain(ctx):
             return "optimization_only", reasons + ["76+ reviews requires clear concrete pain"]
         estimate_reasons = ["estimate-path issue"]
-        if _hardscaping_service_fit_missing(ctx):
-            estimate_reasons.append("hardscaping service evidence is weak/generic")
+        if _target_service_fit_missing(ctx):
+            estimate_reasons.append(f"{ctx.profile.key} service evidence is weak/generic")
         if _weak_estimate_signal_only(ctx):
             estimate_reasons.append("quote-path signal is basic or weak-form-only")
         return "estimate_funnel", reasons + estimate_reasons
@@ -492,7 +486,7 @@ def _score(ctx: _LaneContext, *, lane: str, blockers: List[str]) -> int:
             score = min(score, 64)
 
     if lane == "estimate_funnel":
-        if _hardscaping_service_fit_missing(ctx):
+        if _target_service_fit_missing(ctx):
             score = min(score, 64)
         if _weak_estimate_signal_only(ctx) and not _strong_project_value_fit(ctx):
             score = min(score, 79)
@@ -535,8 +529,8 @@ def _demand_points(ctx: _LaneContext) -> int:
 def _service_fit_points(ctx: _LaneContext) -> int:
     if any(term in ctx.text for term in IRRELEVANT_TERMS):
         return 0
-    if ctx.hardscaping_batch:
-        if ctx.hardscape_service_evidence:
+    if ctx.target_batch:
+        if ctx.target_service_evidence:
             return 20
         if any(term in ctx.service_text for term in GENERIC_SERVICE_TERMS):
             return 10
@@ -870,7 +864,7 @@ def _service_evidence_text(
     return " ".join(part for part in parts if part).lower()
 
 
-def _is_hardscaping_batch(record: Dict[str, Any], google: Dict[str, Any]) -> bool:
+def _is_target_batch(record: Dict[str, Any], google: Dict[str, Any], profile: VerticalProfile) -> bool:
     text = " ".join(
         [
             _pick(google, "source_query", "Source Query"),
@@ -879,11 +873,11 @@ def _is_hardscaping_batch(record: Dict[str, Any], google: Dict[str, Any]) -> boo
             _pick(record, "vertical", "Vertical"),
         ]
     ).lower()
-    return _has_any_phrase(text, HARDSCAPE_BATCH_TERMS)
+    return _has_any_phrase(text, profile.batch_terms)
 
 
-def _hardscaping_service_fit_missing(ctx: _LaneContext) -> bool:
-    return ctx.hardscaping_batch and not ctx.hardscape_service_evidence
+def _target_service_fit_missing(ctx: _LaneContext) -> bool:
+    return ctx.target_batch and not ctx.target_service_evidence
 
 
 def _has_site_itself_weak_pain(ctx: _LaneContext) -> bool:
@@ -942,9 +936,9 @@ def _no_estimate_with_visible_contact_path(ctx: _LaneContext) -> bool:
 
 
 def _strong_project_value_fit(ctx: _LaneContext) -> bool:
-    if not ctx.hardscaping_batch or not ctx.hardscape_service_evidence:
+    if not ctx.target_batch or not ctx.target_service_evidence:
         return False
-    return _phrase_match_count(ctx.service_text, HARDSCAPE_SERVICE_TERMS) >= 3 and ctx.visible_pain_score >= 28
+    return _phrase_match_count(ctx.service_text, ctx.profile.service_terms) >= 3 and ctx.visible_pain_score >= 28
 
 
 def _has_any_phrase(text: str, terms: Iterable[str]) -> bool:

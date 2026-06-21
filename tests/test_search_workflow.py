@@ -69,6 +69,24 @@ class SearchWorkflowTest(unittest.TestCase):
             make_search_batch.SearchConfig.from_dict(broken, source_path=Path("broken.json"))
         self.assertIn("queries", str(caught.exception))
 
+    def test_search_config_can_load_geo_slices_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "search_configs"
+            geo_dir = config_dir / "geo_slices"
+            geo_dir.mkdir(parents=True)
+            (geo_dir / "cleveland.json").write_text(
+                json.dumps(["Cleveland OH", "Lakewood OH", "Solon OH"]),
+                encoding="utf-8",
+            )
+            data = _config().to_dict()
+            data.pop("geo_slices")
+            data["geo_slices_ref"] = "cleveland"
+
+            config = make_search_batch.SearchConfig.from_dict(data, source_path=config_dir / "detailing.json")
+
+        self.assertEqual(config.geo_slices, ["Cleveland OH", "Lakewood OH", "Solon OH"])
+
     def test_query_geo_expansion_replaces_base_location(self) -> None:
         expanded = make_search_batch.expand_searches(_config())
 

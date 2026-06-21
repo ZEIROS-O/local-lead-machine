@@ -1,0 +1,52 @@
+{
+  "batch": "detailing_cleveland_full_001",
+  "vertical": "detailing",
+  "location": "Cleveland OH",
+  "limit_per_query": 20,
+  "queries": [
+    "ceramic coating Cleveland OH",
+    "paint correction Cleveland OH",
+    "ppf installer Cleveland OH",
+    "paint protection film Cleveland OH",
+    "auto detailing Cleveland OH",
+    "car detailing Cleveland OH",
+    "mobile detailing Cleveland OH",
+    "ceramic pro Cleveland OH",
+    "xpel installer Cleveland OH",
+    "window tint Cleveland OH",
+    "vehicle wrap Cleveland OH",
+    "paint enhancement Cleveland OH"
+  ],
+  "geo_slices_ref": "cleveland",
+  "min_rating": 4.3,
+  "min_reviews": 5,
+  "allow_missing_website": true,
+  "exclude_terms": [
+    "express wash",
+    "car wash tunnel",
+    "automatic car wash",
+    "self-serve car wash",
+    "oil change",
+    "quick lube",
+    "dealership service",
+    "dealer service",
+    "tire shop",
+    "body shop",
+    "collision"
+  ],
+  "boost_terms": [
+    "ceramic coating",
+    "paint correction",
+    "ppf",
+    "paint protection film",
+    "auto detailing",
+    "car detailing",
+    "mobile detailing",
+    "ceramic pro",
+    "xpel",
+    "gtechniq",
+    "window tint",
+    "vehicle wrap",
+    "paint enhancement"
+  ]
+}

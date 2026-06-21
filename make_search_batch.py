@@ -24,7 +24,7 @@ from places_search import normalize_place, place_details, text_search
 from lead_machine.schema import GENERIC_DOMAINS, normalize_domain, normalize_phone, slug
 
 
-REQUIRED_CONFIG_FIELDS = ["batch", "vertical", "location", "limit_per_query", "queries", "geo_slices"]
+REQUIRED_CONFIG_FIELDS = ["batch", "vertical", "location", "limit_per_query", "queries"]
 
 REQUIRED_FINAL_FIELDS = [
     "Business Name",
@@ -98,6 +98,25 @@ COMMERCIAL_MAINTENANCE_TERMS = [
 ]
 
 
+def _load_geo_slices_ref(ref: str, *, source_path: Path) -> List[str]:
+    cleaned = ref.strip()
+    if not cleaned:
+        return []
+    ref_path = Path(cleaned)
+    if not ref_path.suffix:
+        ref_path = ref_path.with_suffix(".json")
+    if not ref_path.is_absolute():
+        if ref_path.parent == Path("."):
+            ref_path = source_path.parent / "geo_slices" / ref_path
+        else:
+            ref_path = source_path.parent / ref_path
+    try:
+        data = json.loads(ref_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ValueError(f"Search config geo_slices_ref not found: {cleaned}") from exc
+    return _string_list(data)
+
+
 @dataclass(frozen=True)
 class SearchConfig:
     batch: str
@@ -121,6 +140,8 @@ class SearchConfig:
 
         queries = _string_list(data.get("queries"))
         geo_slices = _string_list(data.get("geo_slices"))
+        if not geo_slices and data.get("geo_slices_ref"):
+            geo_slices = _load_geo_slices_ref(str(data.get("geo_slices_ref") or ""), source_path=source_path)
         if not queries:
             raise ValueError("Search config field queries must contain at least one query")
         if not geo_slices:

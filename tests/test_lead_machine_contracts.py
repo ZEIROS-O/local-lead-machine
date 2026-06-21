@@ -157,6 +157,71 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(fields["Visible Pain Reasons"], "No estimate form detected; No clear estimate CTA")
         self.assertEqual(fields["Send Trigger"], "No estimate form detected")
 
+    def test_airtable_csv_dry_run_normalizes_lane_labels_for_select_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "scored.csv"
+            self._write_airtable_csv(
+                csv_path,
+                [
+                    self._airtable_csv_row(
+                        **{
+                            "Best Service Angle": "Social/Jobber Escape",
+                            "Offer Fit": "social_jobber_escape",
+                            "Send Trigger": "social_jobber_escape lane: no owned website",
+                        }
+                    )
+                ],
+            )
+
+            code, stdout, stderr = self._run_upload(["upload_airtable.py", "--input", str(csv_path)])
+
+        self.assertEqual(code, 0, stderr)
+        planned = self._dry_run_plan(stdout)
+        fields = planned[0]["payload"]["fields"]  # type: ignore[index]
+        self.assertEqual(fields["Offer Fit"], "No-Site Launch")
+        self.assertEqual(fields["Best Service Angle"], "No-Site Launch")
+        self.assertEqual(fields["Send Trigger"], "social_jobber_escape lane: no owned website")
+
+    def test_airtable_payload_normalizes_all_internal_lane_labels_for_select_fields(self) -> None:
+        cases = {
+            "Social/Jobber Escape": "No-Site Launch",
+            "no_site_launch": "No-Site Launch",
+            "social_jobber_escape": "No-Site Launch",
+            "owned_weak_site_rebuild": "Website Rebuild",
+            "premium_perception_gap": "Website Rebuild",
+            "portfolio_presentation_gap": "Website Rebuild",
+            "estimate_funnel": "Estimate Funnel",
+            "optimization_only": "Automation / Follow-Up",
+        }
+        supported_select_values = set(cases.values())
+
+        for lane, expected in cases.items():
+            with self.subTest(lane=lane):
+                card = {
+                    "place_id_or_unique_key": "ChIJ123",
+                    "best_angle": lane,
+                    "airtable_fields": {
+                        "Business Name": "A+ Landscaping LLC",
+                        "Best Service Angle": lane,
+                        "Offer Fit": lane,
+                        "Specific Observation": f"Internal lane: {lane}",
+                        "Visible Pain Reasons": f"Internal lane: {lane}",
+                        "Send Trigger": f"Internal lane: {lane}",
+                        "Opener": f"Internal lane: {lane}",
+                    },
+                }
+
+                fields = build_airtable_payload(card)["fields"]
+
+                self.assertEqual(fields["Offer Fit"], expected)
+                self.assertEqual(fields["Best Service Angle"], expected)
+                self.assertIn(fields["Offer Fit"], supported_select_values)
+                self.assertIn(fields["Best Service Angle"], supported_select_values)
+                self.assertEqual(fields["Specific Observation"], f"Internal lane: {lane}")
+                self.assertEqual(fields["Visible Pain Reasons"], f"Internal lane: {lane}")
+                self.assertEqual(fields["Send Trigger"], f"Internal lane: {lane}")
+                self.assertEqual(fields["Opener"], f"Internal lane: {lane}")
+
     def test_airtable_csv_dry_run_accepts_sparse_scored_row_and_upserts_by_phone(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             csv_path = Path(tmp) / "scored.csv"
@@ -1469,6 +1534,172 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertIn("unsafe score_file", str(caught.exception))
         self.assertFalse((scores_dir / "bad.json").exists())
 
+    def test_llm_client_posts_anthropic_message_and_parses_score_bundle(self) -> None:
+        from lead_machine.llm_client import score_batch
+
+        score = self._manual_score(total_score=75, grade="B")
+        response = {
+            "content": [{"type": "text", "text": json.dumps({"batch_id": "batch_001", "scores": [{"score_file": "chij123.json", "score": score}]})}],
+            "usage": {"input_tokens": 123, "output_tokens": 45},
+        }
+
+        class FakeResponse:
+            status_code = 200
+            text = json.dumps(response)
+
+            def json(self) -> dict:
+                return response
+
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}, clear=False):
+            with patch("lead_machine.llm_client.requests.post", return_value=FakeResponse()) as post:
+                result = score_batch("score this batch", model="claude-sonnet-4-6", max_tokens=4096)
+
+        self.assertEqual(result["bundle"]["batch_id"], "batch_001")
+        self.assertEqual(result["bundle"]["scores"][0]["score_file"], "chij123.json")
+        self.assertEqual(result["usage"]["input_tokens"], 123)
+        self.assertEqual(result["usage"]["output_tokens"], 45)
+        self.assertEqual(result["usage"]["total_tokens"], 168)
+        _, kwargs = post.call_args
+        self.assertEqual(kwargs["headers"]["x-api-key"], "test-key")
+        self.assertEqual(kwargs["headers"]["anthropic-version"], "2023-06-01")
+        self.assertEqual(kwargs["json"]["model"], "claude-sonnet-4-6")
+        self.assertEqual(kwargs["json"]["max_tokens"], 4096)
+        self.assertEqual(kwargs["json"]["messages"][0]["content"], "score this batch")
+
+    def test_api_llm_caps_stop_before_next_batch_call(self) -> None:
+        from score_leads import score_records_api_run
+
+        first_score = self._manual_score(total_score=75, grade="B")
+        first_enriched = {
+            "google": self._google_fixture(),
+            "evidence": self._evidence_fixture(site_status="weak"),
+        }
+        second_enriched = {
+            "google": {
+                **self._google_fixture(),
+                "business_name": "Second Landscaping",
+                "place_id": "ChIJ456",
+            },
+            "evidence": self._evidence_fixture(site_status="weak"),
+        }
+
+        def fake_score_batch(prompt: str, *, model: str, max_tokens: int) -> dict:
+            return {
+                "bundle": {"batch_id": "batch_001", "scores": [{"score_file": "chij123.json", "score": first_score}]},
+                "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("score_leads.llm_client.score_batch", side_effect=fake_score_batch) as score_batch:
+                run = score_records_api_run(
+                    [first_enriched, second_enriched],
+                    scores_dir=Path(tmp) / "scores",
+                    fallback_vertical="hardscaping",
+                    batch_size=1,
+                    model="claude-sonnet-4-6",
+                    max_tokens=4096,
+                    max_calls=1,
+                    max_tokens_per_run=0,
+                    max_usd_per_run=0.0,
+                )
+
+        self.assertEqual(score_batch.call_count, 1)
+        self.assertEqual(run.calls, 1)
+        self.assertEqual(run.tokens, 15)
+        self.assertTrue(run.stopped_by_cap)
+        self.assertEqual([row["Business Name"] for row in run.manual_run.rows], ["A+ Landscaping LLC"])
+        self.assertEqual([missing.lead_name for missing in run.manual_run.missing_scores], ["Second Landscaping"])
+
+    def test_api_llm_mode_writes_byte_identical_csv_to_manual_bundle_import(self) -> None:
+        score_one = self._manual_score(total_score=75, grade="B")
+        score_two = self._manual_score(
+            total_score=86,
+            grade="A",
+            subscores={
+                "icp_fit": 18,
+                "reputation_demand_proof": 14,
+                "web_conversion_pain": 22,
+                "mockup_leverage": 12,
+                "reachability": 8,
+                "offer_angle_clarity": 8,
+                "evidence_confidence": 4,
+            },
+            best_angle="No-Site Launch",
+        )
+        first_enriched = {
+            "google": self._google_fixture(),
+            "evidence": self._evidence_fixture(site_status="weak"),
+        }
+        second_enriched = {
+            "google": {
+                **self._google_fixture(),
+                "business_name": "Second Landscaping",
+                "place_id": "ChIJ456",
+            },
+            "evidence": self._evidence_fixture(site_status="weak"),
+        }
+        bundle = {
+            "batch_id": "batch_001",
+            "scores": [
+                {"score_file": "chij123.json", "score": score_one},
+                {"score_file": "chij456.json", "score": score_two},
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            input_path = tmp_path / "enriched.jsonl"
+            input_path.write_text(f"{json.dumps(first_enriched)}\n{json.dumps(second_enriched)}\n", encoding="utf-8")
+            manual_scores_dir = tmp_path / "manual_scores"
+            api_scores_dir = tmp_path / "api_scores"
+            manual_output = tmp_path / "manual.csv"
+            api_output = tmp_path / "api.csv"
+            bundle_path = tmp_path / "bundle.json"
+            bundle_path.write_text(json.dumps(bundle), encoding="utf-8")
+            import_score_bundle(bundle_path, manual_scores_dir)
+
+            manual_argv = [
+                "score_leads.py",
+                "--input",
+                str(input_path),
+                "--output",
+                str(manual_output),
+                "--vertical",
+                "hardscaping",
+                "--mode",
+                "manual-llm",
+                "--scores-dir",
+                str(manual_scores_dir),
+            ]
+            with patch("sys.argv", manual_argv):
+                manual_code = score_leads_main()
+
+            api_argv = [
+                "score_leads.py",
+                "--input",
+                str(input_path),
+                "--output",
+                str(api_output),
+                "--vertical",
+                "hardscaping",
+                "--mode",
+                "api-llm",
+                "--scores-dir",
+                str(api_scores_dir),
+                "--llm-batch-size",
+                "2",
+            ]
+            with patch("score_leads.llm_client.score_batch", return_value={"bundle": bundle, "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}}):
+                with patch("sys.argv", api_argv):
+                    api_code = score_leads_main()
+
+            manual_bytes = manual_output.read_bytes()
+            api_bytes = api_output.read_bytes()
+
+        self.assertEqual(manual_code, 0)
+        self.assertEqual(api_code, 0)
+        self.assertEqual(api_bytes, manual_bytes)
+
     def test_manual_score_loader_accepts_new_schema_and_normalizes_mismatched_total(self) -> None:
         raw_score = self._manual_score(total_score=1, grade="Skip")
 
@@ -2128,6 +2359,46 @@ class LeadMachineContractsTest(unittest.TestCase):
 
         self.assertFalse(is_eligible(row, include_all=False, priority_filter=None))
         self.assertTrue(is_eligible(row, include_all=True, priority_filter=None))
+
+    def test_score_record_uses_record_vertical_profile_for_detailing_denylist(self) -> None:
+        row = score_record(
+            {
+                "google": {
+                    **self._google_fixture(),
+                    "business_name": "Mister Car Wash Cleveland",
+                    "category": "Car detailing service",
+                    "source_query": "ceramic coating Cleveland OH",
+                    "vertical": "detailing",
+                    "rating": "4.8",
+                    "reviews": "28",
+                },
+                "website": {
+                    "site_status": "No Website",
+                    "site_issue_flags": [],
+                    "combined_text": "ceramic coating paint correction ppf",
+                    "high_ticket_terms": ["ceramic coating", "paint correction", "ppf"],
+                },
+                "derived": {
+                    "has_high_ticket_terms": True,
+                    "has_social_links": False,
+                },
+                "evidence": {
+                    "site_status": "No Website",
+                    "visible_pain_score": 40,
+                    "visible_pain_reasons": ["No owned website found"],
+                    "visible_pain_categories": ["no_site_or_social_only_pain"],
+                    "send_trigger": "No owned website found",
+                    "evidence_items": [
+                        {"id": "ev-rating", "field": "google_rating", "value": "4.8 / 28"},
+                        {"id": "ev-trigger", "field": "send_trigger", "value": "No owned website found"},
+                    ],
+                },
+            },
+            "hardscaping",
+        )
+
+        self.assertEqual(row["Lead Priority"], "Skip")
+        self.assertIn("franchise/brand denylist", row["Fit Flags"])
 
     def _google_fixture(self) -> dict:
         return {

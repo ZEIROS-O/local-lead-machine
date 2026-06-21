@@ -21,17 +21,25 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+from dotenv import load_dotenv
+
+from import_llm_score_bundle import import_score_bundle
 from lead_machine.evidence import build_evidence_profile
 from lead_machine.lead_card import build_lead_card
+from lead_machine import llm_client
 from lead_machine.llm_queue import safe_slug
 from lead_machine.manual_scores import load_manual_score, merge_manual_score
 from lead_machine.schema import normalize_lead
 from lead_machine.sendability import apply_sendability
+from lead_machine.verticals import VerticalProfile, resolve_profile
+from make_llm_batch import build_batch_prompt, chunk_records, lead_packet_for_record
 
 
 PRIORITY_RANK = {"A": 0, "B": 1, "C": 2, "Skip": 3}
@@ -189,6 +197,47 @@ class ManualScoreRun:
     missing_scores: List[MissingManualScore]
 
 
+@dataclass(frozen=True)
+class ApiLlmRun:
+    manual_run: ManualScoreRun
+    calls: int
+    tokens: int
+    usd: float
+    stopped_by_cap: bool
+    stop_reason: str = ""
+
+
+DEFAULT_LLM_SCORING_MODEL = "claude-sonnet-4-6"
+DEFAULT_LLM_MAX_TOKENS = 4096
+DEFAULT_MAX_LLM_CALLS_PER_RUN = 5
+DEFAULT_MAX_LLM_TOKENS_PER_RUN = 100_000
+DEFAULT_MAX_LLM_USD_PER_RUN = 5.0
+SONNET_4_6_INPUT_USD_PER_MILLION_TOKENS = 3.0
+SONNET_4_6_OUTPUT_USD_PER_MILLION_TOKENS = 15.0
+
+
+def getenv_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"[WARN] Invalid {name}={raw!r}; using {default}", file=sys.stderr)
+        return default
+
+
+def getenv_float(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        print(f"[WARN] Invalid {name}={raw!r}; using {default}", file=sys.stderr)
+        return default
+
+
 def safe_float(value: Any, default: float = 0.0) -> float:
     try:
         if value in ("", None):
@@ -220,7 +269,17 @@ def text_blob(record: Dict[str, Any]) -> str:
     return " ".join(str(p or "") for p in parts).lower()
 
 
-def has_any(text: str, terms: List[str]) -> bool:
+def _record_source_query(record: Dict[str, Any]) -> str:
+    g = record.get("google", {}) if isinstance(record.get("google"), dict) else {}
+    return str(record.get("source_query") or record.get("Source Query") or g.get("source_query") or g.get("Source Query") or "")
+
+
+def _record_vertical(record: Dict[str, Any]) -> str:
+    g = record.get("google", {}) if isinstance(record.get("google"), dict) else {}
+    return str(record.get("vertical") or record.get("Vertical") or g.get("vertical") or g.get("Vertical") or "")
+
+
+def has_any(text: str, terms: List[str] | tuple[str, ...]) -> bool:
     return any(term.lower() in text for term in terms)
 
 
@@ -301,15 +360,21 @@ def infer_vertical(record: Dict[str, Any], fallback: str) -> str:
 
 
 def vertical_family(vertical: str) -> str:
+    profile = resolve_profile(vertical)
+    if profile.key != "hardscaping" or "hard" in vertical.lower() or "landscap" in vertical.lower() or "masonry" in vertical.lower():
+        return profile.family
     v = vertical.lower()
     if "roof" in v:
         return "roofing"
-    if "hardscap" in v or "masonry" in v or "landscap" in v:
-        return "hardscaping"
     return "other"
 
 
-def fit_ceiling(record: Dict[str, Any], vertical: str) -> Tuple[str, List[str]]:
+def fit_ceiling(
+    record: Dict[str, Any],
+    vertical: str,
+    *,
+    profile: VerticalProfile | None = None,
+) -> Tuple[str, List[str]]:
     """
     Caps priority based on ICP closeability.
 
@@ -323,11 +388,12 @@ def fit_ceiling(record: Dict[str, Any], vertical: str) -> Tuple[str, List[str]]:
     rating = safe_float(g.get("rating"))
     reviews = safe_int(g.get("reviews"))
     no_site = is_no_or_broken(record)
-    family = vertical_family(vertical)
+    profile = profile or resolve_profile(_record_vertical(record) or vertical, source_query=_record_source_query(record))
+    family = profile.family
 
     flags: List[str] = []
 
-    if any(f in name for f in FRANCHISE_DENYLIST):
+    if any(f in name for f in profile.franchise_denylist):
         flags.append("franchise/brand denylist")
         return "Skip", flags
 
@@ -375,7 +441,12 @@ def fit_ceiling(record: Dict[str, Any], vertical: str) -> Tuple[str, List[str]]:
     return "A", flags
 
 
-def score_business_strength(record: Dict[str, Any], vertical: str) -> Tuple[int, List[str]]:
+def score_business_strength(
+    record: Dict[str, Any],
+    vertical: str,
+    *,
+    profile: VerticalProfile | None = None,
+) -> Tuple[int, List[str]]:
     """
     Strength score is still useful, but it no longer directly controls priority.
     """
@@ -383,7 +454,8 @@ def score_business_strength(record: Dict[str, Any], vertical: str) -> Tuple[int,
     w = record.get("website", {})
     d = record.get("derived", {})
     blob = text_blob(record)
-    family = vertical_family(vertical)
+    profile = profile or resolve_profile(_record_vertical(record) or vertical, source_query=_record_source_query(record))
+    family = profile.family
 
     rating = safe_float(g.get("rating"))
     reviews = safe_int(g.get("reviews"))
@@ -423,7 +495,10 @@ def score_business_strength(record: Dict[str, Any], vertical: str) -> Tuple[int,
             score += 4
             evidence.append(f"{reviews} reviews, higher-review business needs stronger visible pain")
 
-    if has_any(blob, HIGH_TICKET_TERMS) or d.get("has_high_ticket_terms"):
+    high_ticket_terms = profile.high_ticket_terms
+    if profile.key == "hardscaping":
+        high_ticket_terms = tuple(dict.fromkeys([*profile.high_ticket_terms, *HIGH_TICKET_TERMS]))
+    if has_any(blob, high_ticket_terms) or d.get("has_high_ticket_terms"):
         score += 10
         evidence.append("high-ticket services detected")
 
@@ -692,9 +767,16 @@ def base_priority_from_delta(record: Dict[str, Any], offer_fit: str) -> str:
     return "Skip"
 
 
-def classify_priority(total: int, record: Dict[str, Any], offer_fit: str, vertical: str) -> Tuple[str, str, List[str]]:
+def classify_priority(
+    total: int,
+    record: Dict[str, Any],
+    offer_fit: str,
+    vertical: str,
+    *,
+    profile: VerticalProfile | None = None,
+) -> Tuple[str, str, List[str]]:
     base = base_priority_from_delta(record, offer_fit)
-    ceiling, fit_flags = fit_ceiling(record, vertical)
+    ceiling, fit_flags = fit_ceiling(record, vertical, profile=profile)
 
     priority = more_restrictive(base, ceiling)
 
@@ -950,13 +1032,14 @@ def review_fit_band(record: Dict[str, Any], vertical: str) -> str:
 def score_record(record: Dict[str, Any], fallback_vertical: str) -> Dict[str, Any]:
     record = ensure_evidence(record)
     vertical = infer_vertical(record, fallback_vertical)
+    profile = resolve_profile(_record_vertical(record) or vertical, source_query=_record_source_query(record))
 
-    strength, strength_evidence = score_business_strength(record, vertical)
+    strength, strength_evidence = score_business_strength(record, vertical, profile=profile)
     weakness, weakness_evidence = score_online_weakness(record)
     offer_fit, offer_score, offer_evidence = choose_offer_fit(record, strength, weakness)
 
     total = strength + weakness + offer_score
-    priority, fit_cap, fit_flags = classify_priority(total, record, offer_fit, vertical)
+    priority, fit_cap, fit_flags = classify_priority(total, record, offer_fit, vertical, profile=profile)
     website_quality = infer_website_quality(record, weakness, offer_fit)
     angle = best_service_angle(record, vertical, offer_fit)
 
@@ -1240,6 +1323,98 @@ def score_records_manual(
     ).rows
 
 
+def estimate_llm_usd(usage: Dict[str, Any]) -> float:
+    input_tokens = safe_int(usage.get("input_tokens"))
+    output_tokens = safe_int(usage.get("output_tokens"))
+    return (
+        input_tokens * SONNET_4_6_INPUT_USD_PER_MILLION_TOKENS
+        + output_tokens * SONNET_4_6_OUTPUT_USD_PER_MILLION_TOKENS
+    ) / 1_000_000
+
+
+def _hit_llm_cap(
+    *,
+    calls: int,
+    tokens: int,
+    usd: float,
+    max_calls: int,
+    max_tokens_per_run: int,
+    max_usd_per_run: float,
+) -> str:
+    if max_calls > 0 and calls >= max_calls:
+        return "MAX_LLM_CALLS_PER_RUN"
+    if max_tokens_per_run > 0 and tokens >= max_tokens_per_run:
+        return "MAX_LLM_TOKENS_PER_RUN"
+    if max_usd_per_run > 0 and usd >= max_usd_per_run:
+        return "MAX_LLM_USD_PER_RUN"
+    return ""
+
+
+def score_records_api_run(
+    records: List[Dict[str, Any]],
+    *,
+    scores_dir: Path,
+    fallback_vertical: str,
+    batch_size: int = 5,
+    model: str = DEFAULT_LLM_SCORING_MODEL,
+    max_tokens: int = DEFAULT_LLM_MAX_TOKENS,
+    max_calls: int = DEFAULT_MAX_LLM_CALLS_PER_RUN,
+    max_tokens_per_run: int = DEFAULT_MAX_LLM_TOKENS_PER_RUN,
+    max_usd_per_run: float = DEFAULT_MAX_LLM_USD_PER_RUN,
+) -> ApiLlmRun:
+    selected = [ensure_evidence(record) for record in records]
+    bundle_dir = scores_dir / "_api_bundles"
+    calls = 0
+    tokens = 0
+    usd = 0.0
+    stopped_by_cap = False
+    stop_reason = ""
+
+    for batch_index, chunk in enumerate(chunk_records(selected, batch_size), start=1):
+        stop_reason = _hit_llm_cap(
+            calls=calls,
+            tokens=tokens,
+            usd=usd,
+            max_calls=max_calls,
+            max_tokens_per_run=max_tokens_per_run,
+            max_usd_per_run=max_usd_per_run,
+        )
+        if stop_reason:
+            print(f"[STOP] Hit {stop_reason}")
+            stopped_by_cap = True
+            break
+
+        batch_id = f"batch_{batch_index:03d}"
+        packets = [lead_packet_for_record(record, fallback_vertical=fallback_vertical) for record in chunk]
+        prompt = build_batch_prompt(packets, batch_id=batch_id)
+        result = llm_client.score_batch(prompt, model=model, max_tokens=max_tokens)
+        bundle = result["bundle"]
+        usage = result.get("usage") or {}
+        calls += 1
+        tokens += safe_int(usage.get("total_tokens"))
+        usd += estimate_llm_usd(usage)
+
+        bundle_dir.mkdir(parents=True, exist_ok=True)
+        bundle_path = bundle_dir / f"{batch_id}_response.json"
+        bundle_path.write_text(json.dumps(bundle, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        import_score_bundle(bundle_path, scores_dir)
+
+    manual_run = score_records_manual_run(
+        selected,
+        scores_dir=scores_dir,
+        fallback_vertical=fallback_vertical,
+        only_scored=True,
+    )
+    return ApiLlmRun(
+        manual_run=manual_run,
+        calls=calls,
+        tokens=tokens,
+        usd=usd,
+        stopped_by_cap=stopped_by_cap,
+        stop_reason=stop_reason,
+    )
+
+
 def print_manual_only_scored_summary(run: ManualScoreRun) -> None:
     print(f"[MANUAL] Scored records processed: {len(run.rows)}")
     print(f"[MANUAL] Missing scores skipped: {len(run.missing_scores)}")
@@ -1273,12 +1448,13 @@ def sort_key(row: Dict[str, Any]) -> Tuple[int, int, int, int, int]:
 
 
 def main() -> int:
+    load_dotenv()
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True, help="Input enriched JSONL")
     parser.add_argument("--output", required=True, help="Output scored CSV")
     parser.add_argument("--vertical", default="service", help="Fallback vertical label")
-    parser.add_argument("--mode", choices=["deterministic", "manual-llm"], default="deterministic")
-    parser.add_argument("--scores-dir", default="", help="Manual LLM score JSON directory")
+    parser.add_argument("--mode", choices=["deterministic", "manual-llm", "api-llm"], default="deterministic")
+    parser.add_argument("--scores-dir", default="", help="Manual/API LLM score JSON directory")
     parser.add_argument("--cards-output", default="", help="Optional lead cards JSONL output")
     parser.add_argument(
         "--only-scored",
@@ -1286,6 +1462,13 @@ def main() -> int:
         help="Manual LLM mode: skip enriched records without a matching score JSON",
     )
     parser.add_argument("--limit", type=int, default=0, help="Optional max records to score")
+    parser.add_argument("--llm-batch-size", type=int, default=5, help="API LLM leads per batch")
+    parser.add_argument(
+        "--llm-max-tokens",
+        type=int,
+        default=DEFAULT_LLM_MAX_TOKENS,
+        help="API LLM max output tokens per batch",
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -1310,6 +1493,25 @@ def main() -> int:
         scored = manual_run.rows
         if args.only_scored:
             print_manual_only_scored_summary(manual_run)
+    elif args.mode == "api-llm":
+        if not args.scores_dir:
+            raise SystemExit("--scores-dir is required when --mode api-llm")
+        api_run = score_records_api_run(
+            records,
+            scores_dir=Path(args.scores_dir),
+            fallback_vertical=args.vertical,
+            batch_size=args.llm_batch_size,
+            model=(os.getenv("LLM_SCORING_MODEL") or DEFAULT_LLM_SCORING_MODEL).strip(),
+            max_tokens=args.llm_max_tokens,
+            max_calls=getenv_int("MAX_LLM_CALLS_PER_RUN", DEFAULT_MAX_LLM_CALLS_PER_RUN),
+            max_tokens_per_run=getenv_int("MAX_LLM_TOKENS_PER_RUN", DEFAULT_MAX_LLM_TOKENS_PER_RUN),
+            max_usd_per_run=getenv_float("MAX_LLM_USD_PER_RUN", DEFAULT_MAX_LLM_USD_PER_RUN),
+        )
+        scored = api_run.manual_run.rows
+        print(f"[LLM] Calls: {api_run.calls}")
+        print(f"[LLM] Tokens: {api_run.tokens}")
+        print(f"[LLM] Estimated USD: {api_run.usd:.4f}")
+        print(f"[LLM] Missing scores skipped: {len(api_run.manual_run.missing_scores)}")
     else:
         scored = [score_record(record, args.vertical) for record in records]
 
