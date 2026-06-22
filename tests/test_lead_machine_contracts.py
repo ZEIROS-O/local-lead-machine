@@ -2497,6 +2497,92 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertIn("buyer_intent", debug_payload["allowed_refs"])
         self.assertNotIn("fake_unknown_ref", debug_payload["allowed_refs"])
 
+    def test_api_llm_merge_accepts_ev_refs_shown_in_compact_capsule_text_only(self) -> None:
+        from score_leads import build_llm_scoring_record, score_records_api_run
+
+        record = self._huge_detailing_record(name="Capsule Ref Detail", place_id="ChIJ789")
+        record["website"]["combined_text"] = (
+            "Ceramic coating evidence ev-services_detected-9 appears in the compact capsule text only."
+        )
+        record["website"]["homepage"]["text"] = record["website"]["combined_text"]
+        compact = build_llm_scoring_record(record, fallback_vertical="detailing")
+
+        self.assertIn("ev-services_detected-9", json.dumps(compact, ensure_ascii=False))
+        self.assertIn(
+            "ev-services_detected-9",
+            {option["id"] for option in compact["evidence_ref_options"]},
+        )
+
+        shown_ref_score = self._manual_score(
+            total_score=75,
+            grade="B",
+            evidence_refs=["ev-services_detected-9"],
+            safe_outreach_claims=[
+                {"claim": "Your site mentions ceramic coating.", "evidence_refs": ["ev-services_detected-9"]}
+            ],
+        )
+        fake_ref_score = self._manual_score(
+            total_score=75,
+            grade="B",
+            evidence_refs=["fake_unknown_ref"],
+            safe_outreach_claims=[
+                {"claim": "Your site mentions ceramic coating.", "evidence_refs": ["fake_unknown_ref"]}
+            ],
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            scores_dir = Path(tmp) / "scores"
+            with patch(
+                "score_leads.llm_client.score_batch",
+                return_value={
+                    "bundle": {
+                        "batch_id": "batch_001",
+                        "scores": [{"score_file": "chij789.json", "score": shown_ref_score}],
+                    },
+                    "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                },
+            ):
+                run = score_records_api_run(
+                    [record],
+                    scores_dir=scores_dir,
+                    fallback_vertical="detailing",
+                    batch_size=1,
+                    model="claude-sonnet-4-6",
+                    max_tokens=4096,
+                    max_calls=0,
+                    max_tokens_per_run=100_000,
+                    max_usd_per_run=0.0,
+                )
+
+        self.assertEqual(run.manual_run.rows[0]["Evidence Refs"], json.dumps(["ev-services_detected-9"]))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            scores_dir = Path(tmp) / "scores"
+            with patch(
+                "score_leads.llm_client.score_batch",
+                return_value={
+                    "bundle": {
+                        "batch_id": "batch_001",
+                        "scores": [{"score_file": "chij789.json", "score": fake_ref_score}],
+                    },
+                    "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                },
+            ):
+                with self.assertRaises(ValueError) as caught:
+                    score_records_api_run(
+                        [record],
+                        scores_dir=scores_dir,
+                        fallback_vertical="detailing",
+                        batch_size=1,
+                        model="claude-sonnet-4-6",
+                        max_tokens=4096,
+                        max_calls=0,
+                        max_tokens_per_run=100_000,
+                        max_usd_per_run=0.0,
+                    )
+
+        self.assertIn("Unknown evidence_refs: fake_unknown_ref", str(caught.exception))
+
     def test_api_llm_compact_prompt_for_ten_huge_leads_stays_under_run_token_cap(self) -> None:
         from score_leads import build_api_llm_scoring_prompt, build_llm_scoring_record, estimate_prompt_tokens
 

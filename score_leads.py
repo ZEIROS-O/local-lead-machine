@@ -1520,6 +1520,7 @@ RENDERED_EVIDENCE_FIELDS = (
     "visual_pain_reasons",
     "screenshots",
 )
+EV_REF_ID_RE = re.compile(r"\bev-[A-Za-z0-9_-]+(?:[.:][A-Za-z0-9_-]+)*\b")
 
 
 def _with_missing_rendered_evidence(record: Dict[str, Any], evidence: Dict[str, Any]) -> Dict[str, Any]:
@@ -1887,6 +1888,49 @@ def _append_evidence_ref_option(
     seen_ids.add(cleaned_id)
 
 
+def _iter_prompt_visible_strings(value: Any) -> List[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        strings: List[str] = []
+        for item in value.values():
+            strings.extend(_iter_prompt_visible_strings(item))
+        return strings
+    if isinstance(value, list):
+        strings = []
+        for item in value:
+            strings.extend(_iter_prompt_visible_strings(item))
+        return strings
+    return []
+
+
+def _add_prompt_visible_ev_ref_options(capsule: Dict[str, Any]) -> None:
+    options = capsule.setdefault("evidence_ref_options", [])
+    if not isinstance(options, list):
+        options = []
+        capsule["evidence_ref_options"] = options
+    seen_ids = {
+        str(option.get("id") or "").strip()
+        for option in options
+        if isinstance(option, dict) and option.get("id")
+    }
+    visible_payload = {
+        key: value
+        for key, value in capsule.items()
+        if key != "evidence_ref_options"
+    }
+    for text in _iter_prompt_visible_strings(visible_payload):
+        for match in EV_REF_ID_RE.finditer(text):
+            _append_evidence_ref_option(
+                options,
+                seen_ids,
+                option_id=match.group(0),
+                label="Prompt-visible evidence ref",
+                snippet=_snippet_around(text, match.start(), max_chars=140),
+                source="compact_record",
+            )
+
+
 def _build_evidence_ref_options(record: Dict[str, Any], *, lead: Any | None = None) -> List[Dict[str, str]]:
     google = record.get("google", {}) if isinstance(record.get("google"), dict) else {}
     website = record.get("website", {}) if isinstance(record.get("website"), dict) else {}
@@ -2083,7 +2127,10 @@ def build_llm_scoring_record(record: Dict[str, Any], *, fallback_vertical: str =
         "selected_evidence_snippets": [*selected_text, *selected_items][:MAX_LLM_SCORING_SNIPPETS],
         "evidence_ref_options": _build_evidence_ref_options(working, lead=lead),
     }
-    return _truncate_for_llm(capsule)
+    compact = _truncate_for_llm(capsule)
+    if isinstance(compact, dict):
+        _add_prompt_visible_ev_ref_options(compact)
+    return compact
 
 
 def build_api_llm_scoring_prompt(compact_records: List[Dict[str, Any]], *, batch_id: str) -> str:
