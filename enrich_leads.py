@@ -37,6 +37,7 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
 from lead_machine.buyer_signals import build_buyer_intent
+from lead_machine.email_hygiene import clean_emails
 from lead_machine.evidence import build_evidence_profile
 from lead_machine.icp import hard_icp_gate
 from lead_machine.schema import normalize_lead
@@ -938,6 +939,7 @@ def scrape_site(
     links = extract_links(final_url, html)
 
     emails, phones = extract_emails_phones(text, html)
+    emails = clean_emails(emails, business_domain=domain_of(final_url))
     form_signals = detect_form_signals(html, page_text=text, page_url=final_url, method="static_html")
     ctas = detect_terms(text, CTA_TERMS)
     high_ticket = detect_terms(text, high_ticket_terms)
@@ -986,7 +988,7 @@ def scrape_site(
         page_title, page_meta = extract_title_meta(page_html) if page_html else ("", "")
 
         page_emails, page_phones = extract_emails_phones(page_text, page_html)
-        emails = sorted(set(emails + page_emails))
+        emails = clean_emails(emails + page_emails, business_domain=domain_of(final_url))
         phones = sorted(set(phones + page_phones))
 
         if page_text:

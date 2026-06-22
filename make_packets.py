@@ -19,6 +19,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from lead_machine.email_hygiene import emails_text, sanitize_record_emails
+
 
 CORE_AIRTABLE_FIELDS = [
     "Business Name",
@@ -167,9 +169,22 @@ def read_rows(paths: List[Path]) -> List[Dict[str, str]]:
             for index, row in enumerate(csv.DictReader(f)):
                 row["_source_file"] = str(path)
                 row["_source_index"] = str(index)
-                rows.append(row)
+                rows.append(sanitize_packet_row(row))
 
     return rows
+
+
+def sanitize_packet_row(row: Dict[str, str]) -> Dict[str, str]:
+    cleaned = dict(row)
+    raw_evidence = parse_raw_evidence(cleaned)
+    website = raw_evidence.get("website", {}) if raw_evidence else {}
+    business_domain = (
+        website.get("domain")
+        or website.get("final_url")
+        or cleaned.get("Website URL", "")
+    )
+    cleaned["Email"] = emails_text(cleaned.get("Email", ""), business_domain=business_domain)
+    return cleaned
 
 
 def parse_raw_evidence(row: Dict[str, str]) -> Dict[str, Any]:
@@ -178,7 +193,10 @@ def parse_raw_evidence(row: Dict[str, str]) -> Dict[str, Any]:
         return {}
 
     try:
-        return json.loads(raw)
+        loaded = json.loads(raw)
+        if isinstance(loaded, dict):
+            return sanitize_record_emails(loaded)
+        return {}
     except Exception:
         return {}
 
@@ -432,6 +450,7 @@ Existing draft row:
 
 
 def packet_markdown(row: Dict[str, str]) -> str:
+    row = sanitize_packet_row(row)
     evidence = parse_raw_evidence(row)
 
     lines: List[str] = []

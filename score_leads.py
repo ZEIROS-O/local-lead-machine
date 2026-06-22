@@ -37,6 +37,7 @@ from lead_machine.buyer_signals import (
     ensure_buyer_intent,
     has_money_signal as buyer_has_money_signal,
 )
+from lead_machine.email_hygiene import emails_text, sanitize_record_emails
 from lead_machine.evidence import build_evidence_profile
 from lead_machine.lead_card import build_lead_card
 from lead_machine import llm_client
@@ -1180,7 +1181,9 @@ def review_fit_band(record: Dict[str, Any], vertical: str) -> str:
 
 
 def score_record(record: Dict[str, Any], fallback_vertical: str) -> Dict[str, Any]:
+    record = sanitize_record_emails(record)
     record = ensure_evidence(record)
+    record = sanitize_record_emails(record)
     vertical = infer_vertical(record, fallback_vertical)
     profile = resolve_profile(_record_vertical(record) or vertical, source_query=_record_source_query(record))
 
@@ -1266,7 +1269,10 @@ def score_record(record: Dict[str, Any], fallback_vertical: str) -> Dict[str, An
         "Vertical": vertical,
         "City": g.get("city", ""),
         "Phone": g.get("phone", ""),
-        "Email": ", ".join(w.get("emails_found", [])),
+        "Email": emails_text(
+            w.get("emails_found", []),
+            business_domain=w.get("domain") or w.get("final_url") or g.get("website_url", ""),
+        ),
         "Website URL": g.get("website_url", ""),
         "Google Maps URL": g.get("google_maps_url", ""),
         "Reviews": g.get("reviews", ""),

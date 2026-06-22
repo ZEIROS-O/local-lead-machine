@@ -158,6 +158,101 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(fields["Visible Pain Reasons"], "No estimate form detected; No clear estimate CTA")
         self.assertEqual(fields["Send Trigger"], "No estimate form detected")
 
+    def test_scored_csv_suppresses_placeholder_emails_and_prefers_business_domain(self) -> None:
+        record = {
+            "google": {
+                "business_name": "Fresh Shine Detail",
+                "city": "Cleveland",
+                "phone": "(216) 555-1212",
+                "website_url": "https://freshshinedetail.com",
+                "google_maps_url": "https://maps.google.com/?cid=detail123",
+                "reviews": 48,
+                "rating": 4.8,
+                "source_query": "ceramic coating cleveland",
+            },
+            "website": {
+                "site_status": "Poor",
+                "domain": "freshshinedetail.com",
+                "final_url": "https://freshshinedetail.com",
+                "emails_found": [
+                    "user@domain.com",
+                    "team@gmail.com",
+                    "hello@freshshinedetail.com",
+                    "test@example.com",
+                    "noreply@freshshinedetail.com",
+                ],
+                "phones_found": ["2165551212"],
+                "site_issue_flags": ["weak_basic_form", "only_phone_email_path"],
+                "contact_form_detected": "No",
+                "estimate_form_detected": "No",
+                "form_strength": "None",
+                "form_detection_method": "none",
+                "cta_strength": "Weak",
+                "high_ticket_terms": ["ceramic coating"],
+            },
+            "evidence": {
+                "visible_pain_score": 35,
+                "visible_pain_reasons": ["Only phone/email estimate path"],
+                "visible_pain_categories": ["estimate_path_pain"],
+                "send_trigger": "Only phone/email estimate path",
+                "evidence_items": [],
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "scored.csv"
+            write_csv(csv_path, [score_record(record, "detailing")])
+            with csv_path.open(newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["Email"], "hello@freshshinedetail.com, team@gmail.com")
+        self.assertNotIn("user@domain.com", rows[0]["Raw Evidence"])
+
+    def test_make_packets_suppresses_placeholder_emails_from_packet_artifacts(self) -> None:
+        raw_evidence = {
+            "website": {
+                "domain": "freshshinedetail.com",
+                "final_url": "https://freshshinedetail.com",
+                "emails_found": [
+                    "user@domain.com",
+                    "hello@freshshinedetail.com",
+                    "team@gmail.com",
+                    "donotreply@freshshinedetail.com",
+                ],
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "scored.csv"
+            packet_dir = Path(tmp) / "packets"
+            self._write_airtable_csv(
+                csv_path,
+                [
+                    self._airtable_csv_row(
+                        **{
+                            "Business Name": "Fresh Shine Detail",
+                            "Email": "user@domain.com, hello@freshshinedetail.com, team@gmail.com",
+                            "Website URL": "https://freshshinedetail.com",
+                            "Raw Evidence": json.dumps(raw_evidence),
+                        }
+                    )
+                ],
+            )
+
+            code, _stdout, stderr = self._run_make_packets(
+                ["make_packets.py", "--inputs", str(csv_path), "--output-dir", str(packet_dir)]
+            )
+            packet_text = next(packet_dir.glob("*/*.md")).read_text(encoding="utf-8")
+            index_text = (packet_dir / "packet_index.csv").read_text(encoding="utf-8")
+
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("hello@freshshinedetail.com, team@gmail.com", packet_text)
+        self.assertIn("hello@freshshinedetail.com, team@gmail.com", index_text)
+        self.assertNotIn("user@domain.com", packet_text)
+        self.assertNotIn("donotreply@freshshinedetail.com", packet_text)
+        self.assertNotIn("user@domain.com", index_text)
+
     def test_airtable_csv_dry_run_normalizes_lane_labels_for_select_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             csv_path = Path(tmp) / "scored.csv"

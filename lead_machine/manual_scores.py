@@ -4,8 +4,9 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Set
 
-from .schema import normalize_lead
 from .buyer_signals import buyer_intent_summary, ensure_buyer_intent, has_money_signal
+from .email_hygiene import emails_text
+from .schema import normalize_lead
 from .sendability import apply_sendability, normalize_evidence_refs, normalize_safe_outreach_claims, normalize_unsafe_claims
 
 
@@ -277,7 +278,10 @@ def merge_manual_score(
 
     email = ""
     if website.get("emails_found"):
-        email = ", ".join(website.get("emails_found") or [])
+        email = emails_text(
+            website.get("emails_found") or [],
+            business_domain=website.get("domain") or website.get("final_url") or lead.website,
+        )
 
     packet_eligible = "Yes" if validated["grade"] in {"A", "B"} else ""
     row = {
