@@ -36,6 +36,7 @@ from lead_machine.buyer_signals import (
     buyer_intent_summary,
     ensure_buyer_intent,
     has_money_signal as buyer_has_money_signal,
+    review_demand_band as buyer_review_demand_band,
 )
 from lead_machine.email_hygiene import emails_text, sanitize_record_emails
 from lead_machine.evidence import build_evidence_profile
@@ -579,27 +580,20 @@ def score_business_strength(
         score += 3
         evidence.append(f"acceptable rating {rating}")
 
-    # Inverted-U: reward enough proof, not infinite proof.
-    if family == "hardscaping":
-        if 5 <= reviews <= 20:
-            score += 10
-            evidence.append(f"{reviews} reviews inside 5-20 hardscaping sweet spot")
-        elif 21 <= reviews <= 75:
-            score += 7
-            evidence.append(f"{reviews} reviews, workable proof but needs visible pain")
-        elif reviews > 75:
-            score += 4
-            evidence.append(f"{reviews} reviews, higher-review business needs stronger visible pain")
-    else:
-        if 5 <= reviews <= 20:
-            score += 10
-            evidence.append(f"{reviews} reviews inside 5-20 sweet spot")
-        elif 21 <= reviews <= 75:
-            score += 7
-            evidence.append(f"{reviews} reviews, workable proof but needs visible pain")
-        elif reviews > 75:
-            score += 4
-            evidence.append(f"{reviews} reviews, higher-review business needs stronger visible pain")
+    # Inverted-U: ideal_growth is the best reputation/demand fit, while mature businesses need sharper pain.
+    review_band = review_fit_band(record, vertical)
+    if review_band == "ideal_growth":
+        score += 10
+        evidence.append(f"{reviews} reviews in ideal_growth demand band")
+    elif review_band == "early_proof":
+        score += 6
+        evidence.append(f"{reviews} reviews in early_proof demand band")
+    elif review_band == "established":
+        score += 5
+        evidence.append(f"{reviews} reviews in established demand band; needs clear visible pain")
+    elif review_band == "mature":
+        score += 3
+        evidence.append(f"{reviews} reviews in mature demand band; requires strong conversion pain")
 
     high_ticket_terms = profile.high_ticket_terms
     if profile.key == "hardscaping":
@@ -728,7 +722,7 @@ def score_online_weakness(record: Dict[str, Any]) -> Tuple[int, List[str]]:
 def score_buyer_intent(record: Dict[str, Any]) -> Tuple[int, List[str]]:
     buyer_intent = ensure_buyer_intent(record)
     stack = buyer_intent.get("crm_booking_stack") or {}
-    review_velocity = buyer_intent.get("review_velocity") or {}
+    review_signal = buyer_intent.get("review_demand_signal") or buyer_intent.get("review_profile") or {}
     ads = buyer_intent.get("ads") or {}
     detected_tools = stack.get("detected_tools") or []
     if isinstance(detected_tools, str):
@@ -744,13 +738,13 @@ def score_buyer_intent(record: Dict[str, Any]) -> Tuple[int, List[str]]:
         score += 3
         evidence.append(f"booking/form tools detected ({', '.join(str(tool) for tool in detected_tools)})")
 
-    velocity_band = str(review_velocity.get("velocity_band") or "").strip().lower()
-    if velocity_band == "live":
+    demand_band = str(review_signal.get("demand_band") or "").strip().lower()
+    if demand_band == "ideal_growth":
         score += 5
-        evidence.append("live review velocity by count/rating")
-    elif velocity_band == "steady":
+        evidence.append("ideal-growth review demand band")
+    elif demand_band in {"early_proof", "established", "mature"}:
         score += 2
-        evidence.append("steady review proof by count/rating")
+        evidence.append(f"{demand_band} review demand band")
 
     yes_ads = [
         field
@@ -1167,17 +1161,12 @@ def deterministic_opener(record: Dict[str, Any], offer_fit: str) -> str:
 
 
 def review_fit_band(record: Dict[str, Any], vertical: str) -> str:
-    reviews = safe_int(record.get("google", {}).get("reviews"))
-
-    if reviews >= 75:
-        return "High 75+ needs very clear pain"
-    if 21 <= reviews <= 75:
-        return "Allowed 21-75 needs clear pain"
-    if 5 <= reviews <= 20:
-        return "Ideal 5-20"
-    if reviews < 5:
-        return "Very thin 0-4"
-    return "Out of band"
+    working = dict(record)
+    google = dict(working.get("google", {}) or {})
+    if vertical and not google.get("vertical"):
+        google["vertical"] = vertical
+        working["google"] = google
+    return buyer_review_demand_band(working)
 
 
 def score_record(record: Dict[str, Any], fallback_vertical: str) -> Dict[str, Any]:
@@ -1343,6 +1332,7 @@ def score_record(record: Dict[str, Any], fallback_vertical: str) -> Dict[str, An
         "Fit Ceiling": fit_cap,
         "Fit Flags": ", ".join(fit_flags),
         "Review Fit Band": review_fit_band(record, vertical),
+        "Review Demand Band": review_fit_band(record, vertical),
         "Opener": deterministic_opener(record, offer_fit),
         "Evidence Refs": json.dumps(evidence_refs, ensure_ascii=False),
         "Safe Outreach Claims": json.dumps(safe_claims, ensure_ascii=False),
@@ -2028,6 +2018,12 @@ Rules:
 - If an exact text snippet supports a claim but no evidence_ref_options ID directly supports it, lower evidence confidence instead of inventing an evidence ref.
 - unsafe_claims must list tempting claims that the capsule does not prove.
 - Buyer intent is required for A/B quality: look for fixable gap times money signal, not just a bad website.
+- Paid CRM/booking tools and known ad signals can support money intent.
+- Count-only review demand bands support reputation fit, not money intent by themselves.
+- ideal_growth should increase ICP/reputation fit.
+- established/mature is not bad by itself, but requires stronger concrete conversion pain to be sendable.
+- mature plus no concrete conversion pain should be blocked or manual-review, not packet eligible.
+- mature plus an obvious broken/missing estimate path can still be high value when backed by money intent or very strong conversion-pain evidence.
 - Bad site alone without buyer_intent.money_signal should not be an A lead.
 - Visual claims require screenshot paths, visual-review flags, rendered browser evidence, DOM evidence, or explicit manual review notes in the capsule.
 - Do not infer missing forms if evidence is uncertain.
@@ -2717,7 +2713,7 @@ def main() -> int:
             f'{row.get("Rating", "")}/{row.get("Reviews", "")} | '
             f'{row.get("Offer Fit", "")} | '
             f'{row.get("Current Website Quality", "")} | '
-            f'{row.get("Review Fit Band", "")}'
+            f'{row.get("Review Demand Band", "") or row.get("Review Fit Band", "")}'
         )
 
     return 0

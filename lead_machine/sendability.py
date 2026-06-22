@@ -4,7 +4,7 @@ import json
 import re
 from typing import Any, Dict, Iterable, List, Sequence, Set
 
-from .buyer_signals import buyer_intent_summary, has_money_signal as buyer_has_money_signal
+from .buyer_signals import buyer_intent_summary, has_money_signal as buyer_has_money_signal, review_demand_band
 
 
 MIN_SENDABLE_SCORE = 65
@@ -16,7 +16,7 @@ SEND_TRIGGER_BLOCKER = "Missing concrete send trigger"
 DEMAND_BLOCKER = "Missing proof-of-demand signal"
 RATING_BLOCKER = "Rating below 4.0 minimum"
 REVIEW_COUNT_BLOCKER = "Review count below sendable minimum"
-VISIBLE_PAIN_BLOCKER = "Visible pain too weak for review count"
+VISIBLE_PAIN_BLOCKER = "Visible conversion pain too weak for business maturity"
 MONEY_SIGNAL_BLOCKER = "Missing buyer-intent money signal"
 STRONG_FORM_NO_PAIN_BLOCKER = "Strong estimate form exists / no concrete visible conversion issue"
 ADVANCED_OPTIMIZATION_BLOCKER = "Advanced Optimization without concrete visible pain"
@@ -34,7 +34,6 @@ EVIDENCE_BLOCKERS = {
     CONVERSION_ISSUE_BLOCKER,
     SEND_TRIGGER_BLOCKER,
     VISIBLE_PAIN_BLOCKER,
-    MONEY_SIGNAL_BLOCKER,
     STRONG_FORM_NO_PAIN_BLOCKER,
     ADVANCED_OPTIMIZATION_BLOCKER,
     FORM_ABSENCE_CLAIM_BLOCKER,
@@ -332,18 +331,14 @@ def evaluate_sendability(row: Dict[str, Any]) -> Dict[str, Any]:
     if reviews < 5 and not is_exceptional_low_review_fit(row):
         blockers.append(REVIEW_COUNT_BLOCKER)
 
-    required_pain = required_visible_pain_score(reviews)
-    if not (
-        has_money_signal(row)
-        and concrete_issue
-    ) and not is_exceptional_low_review_fit(row) and visible_pain_score < required_pain:
+    money_signal = has_money_signal(row)
+    review_band = _review_demand_band(row)
+    required_pain = required_visible_pain_score(reviews, review_band=review_band, money_signal=money_signal)
+    if not is_exceptional_low_review_fit(row) and visible_pain_score < required_pain:
         blockers.append(VISIBLE_PAIN_BLOCKER)
 
     if not has_demand_signal(row):
         blockers.append(DEMAND_BLOCKER)
-
-    if not has_money_signal(row) and is_bad_site_only_signal(row):
-        blockers.append(MONEY_SIGNAL_BLOCKER)
 
     if not _pick(row, "best_angle", "Offer Fit", "Best Service Angle"):
         blockers.append(ANGLE_BLOCKER)
@@ -379,7 +374,7 @@ def evaluate_sendability(row: Dict[str, Any]) -> Dict[str, Any]:
         "send_trigger": send_trigger,
         "visible_pain_score": visible_pain_score,
         "visible_pain_reasons": visible_pain_reasons,
-        "money_signal": has_money_signal(row),
+        "money_signal": money_signal,
         "buyer_intent_signals": buyer_intent_summary(row),
     }
 
@@ -714,7 +709,11 @@ def get_visible_pain_categories(row: Dict[str, Any]) -> List[str]:
     return []
 
 
-def required_visible_pain_score(reviews: int) -> int:
+def required_visible_pain_score(reviews: int, *, review_band: str = "", money_signal: bool = False) -> int:
+    if review_band == "mature" and not money_signal:
+        return 40
+    if review_band == "mature":
+        return 35
     if reviews >= 75:
         return 30
     if reviews >= 21:
@@ -738,6 +737,16 @@ def _best_angle(row: Dict[str, Any]) -> str:
 
 def has_money_signal(row: Dict[str, Any]) -> bool:
     return buyer_has_money_signal(row)
+
+
+def _review_demand_band(row: Dict[str, Any]) -> str:
+    explicit = _clean(_pick(row, "Review Demand Band", "Review Fit Band", "review_demand_band", "review_fit_band")).lower()
+    if explicit:
+        return explicit
+    raw = _raw_evidence(row)
+    if isinstance(raw, dict):
+        return review_demand_band(raw)
+    return ""
 
 
 def is_bad_site_only_signal(row: Dict[str, Any]) -> bool:

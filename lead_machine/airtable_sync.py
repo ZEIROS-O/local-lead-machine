@@ -40,6 +40,7 @@ AIRTABLE_ALLOWED_FIELDS = [
     "Send Trigger",
     "Money Signal",
     "Buyer Intent Signals",
+    "Review Demand Band",
     "AI Confidence",
     "Skip Reason",
     "Place Key",

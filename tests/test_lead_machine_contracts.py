@@ -14,6 +14,7 @@ from unittest.mock import patch
 import upload_airtable
 from enrich_leads import detect_form_signals, scrape_site
 from lead_machine.airtable_sync import build_airtable_payload, plan_airtable_sync
+from lead_machine.buyer_signals import BUYER_INTENT_LOGIC_VERSION
 from lead_machine.evidence import build_evidence_profile
 from lead_machine.feedback import compute_feedback_metrics
 from lead_machine.icp import hard_icp_gate
@@ -23,7 +24,7 @@ from lead_machine.manual_scores import load_manual_score, merge_manual_score
 from lead_machine.schema import normalize_lead, row_dedupe_keys
 from lead_machine.sendability import flatten_safe_outreach_claims, normalize_evidence_refs
 from make_packets import is_eligible, main as make_packets_main, packet_markdown
-from make_llm_batch import write_llm_batches
+from make_llm_batch import build_batch_prompt, write_llm_batches
 from import_llm_score_bundle import import_score_bundle
 from score_leads import main as score_leads_main
 from score_leads import score_record, score_records_manual, write_csv
@@ -3089,6 +3090,7 @@ class LeadMachineContractsTest(unittest.TestCase):
                 "reviews": "130",
             },
             "buyer_intent": {
+                "logic_version": BUYER_INTENT_LOGIC_VERSION,
                 "crm_booking_stack": {
                     "detected_tools": ["ServiceTitan"],
                     "has_paid_crm": True,
@@ -3470,6 +3472,7 @@ class LeadMachineContractsTest(unittest.TestCase):
                 "high_ticket_terms": ["hardscape", "patio", "retaining wall"],
             },
             "buyer_intent": {
+                "logic_version": BUYER_INTENT_LOGIC_VERSION,
                 "crm_booking_stack": {
                     "detected_tools": ["ServiceTitan"],
                     "has_paid_crm": True,
@@ -3493,6 +3496,137 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(row["Lead Priority"], "A")
         self.assertEqual(row["Money Signal"], "Yes")
 
+    def test_score_record_surfaces_ideal_growth_review_demand_band(self) -> None:
+        row = score_record(
+            {
+                "google": {
+                    **self._google_fixture(),
+                    "rating": "4.7",
+                    "reviews": "20",
+                },
+                "website": {
+                    "site_status": "Loaded",
+                    "site_issue_flags": ["no_clear_cta_detected", "weak_basic_form"],
+                    "combined_text": "hardscape patio retaining wall estimate",
+                    "high_ticket_terms": ["hardscape", "patio", "retaining wall"],
+                    "forms_found": True,
+                    "contact_form_detected": "Yes",
+                    "estimate_form_detected": "Yes",
+                    "form_strength": "Weak",
+                    "cta_strength": "Weak",
+                },
+                "evidence": {
+                    "site_status": "weak",
+                    "visible_pain_score": 35,
+                    "visible_pain_reasons": ["Weak estimate path"],
+                    "visible_pain_categories": ["estimate_path_pain"],
+                    "send_trigger": "Weak estimate path",
+                    "evidence_items": [
+                        {"id": "E1", "field": "google_rating", "value": "4.7 stars / 20 reviews"},
+                        {"id": "E2", "field": "form_strength", "value": "Weak"},
+                        {"id": "E3", "field": "send_trigger", "value": "Weak estimate path"},
+                    ],
+                },
+                "derived": {"has_high_ticket_terms": True, "has_form": True},
+            },
+            "hardscaping",
+        )
+
+        self.assertEqual(row["Review Demand Band"], "ideal_growth")
+        self.assertEqual(row["Review Fit Band"], "ideal_growth")
+
+    def test_batch_prompt_separates_money_intent_from_count_only_review_demand(self) -> None:
+        prompt = build_batch_prompt([], batch_id="batch_test")
+
+        self.assertIn("Paid CRM/booking tools and known ad signals can support money intent.", prompt)
+        self.assertIn("Count-only review demand bands support reputation fit, not money intent by themselves.", prompt)
+        self.assertNotIn("live review velocity", prompt)
+
+    def test_mature_high_review_strong_funnel_is_not_sendable(self) -> None:
+        enriched = {
+            "google": {
+                **self._google_fixture(),
+                "rating": "5.0",
+                "reviews": "260",
+            },
+            "evidence": {
+                "site_status": "okay",
+                "contact_form_detected": "Yes",
+                "estimate_form_detected": "Yes",
+                "form_strength": "Strong",
+                "cta_strength": "Strong",
+                "visible_pain_score": 0,
+                "visible_pain_reasons": [],
+                "visible_pain_categories": [],
+                "send_trigger": "",
+                "evidence_items": [
+                    {"id": "E1", "field": "google_rating", "value": "5.0 stars / 260 reviews"},
+                    {"id": "E2", "field": "form_strength", "value": "Strong estimate form"},
+                ],
+            },
+        }
+        raw_score = self._manual_score(
+            best_angle="Review/Trust Proof Upgrade",
+            evidence_refs=["E1", "E2"],
+            safe_outreach_claims=[
+                {"claim": "Your Google profile shows mature review proof.", "evidence_refs": ["E1"]},
+                {"claim": "The site has a strong estimate form.", "evidence_refs": ["E2"]},
+            ],
+            opener="Your reviews are strong and the estimate form is visible.",
+        )
+
+        row = merge_manual_score(enriched, raw_score, fallback_vertical="hardscaping")
+
+        self.assertEqual(row["Sendable"], "No")
+        self.assertEqual(row["Packet Eligible"], "")
+        self.assertIn("Missing concrete conversion issue", row["Send Blockers"])
+        self.assertIn("Visible conversion pain too weak for business maturity", row["Send Blockers"])
+
+    def test_mature_high_review_missing_estimate_path_can_be_sendable_with_money_signal(self) -> None:
+        enriched = {
+            "google": {
+                **self._google_fixture(),
+                "rating": "4.9",
+                "reviews": "260",
+            },
+            "buyer_intent": self._buyer_intent_fixture(),
+            "evidence": {
+                "site_status": "weak",
+                "contact_form_detected": "No",
+                "estimate_form_detected": "No",
+                "form_strength": "None",
+                "cta_strength": "Weak",
+                "visible_pain_score": 45,
+                "visible_pain_reasons": ["Missing estimate path"],
+                "visible_pain_categories": ["estimate_path_pain"],
+                "send_trigger": "Missing estimate path",
+                "evidence_items": [
+                    {"id": "E1", "field": "google_rating", "value": "4.9 stars / 260 reviews"},
+                    {"id": "E2", "field": "site_issue_flags", "value": "missing_estimate_path"},
+                    {"id": "E3", "field": "send_trigger", "value": "Missing estimate path"},
+                    {"id": "buyer_intent", "field": "buyer_intent", "value": "paid CRM detected"},
+                ],
+            },
+        }
+        raw_score = self._manual_score(
+            evidence_refs=["E1", "E2", "E3", "buyer_intent"],
+            visible_pain_score=45,
+            visible_pain_reasons=["Missing estimate path"],
+            visible_pain_categories=["estimate_path_pain"],
+            send_trigger="Missing estimate path",
+            safe_outreach_claims=[
+                {"claim": "Your Google profile shows mature review proof.", "evidence_refs": ["E1"]},
+                {"claim": "The estimate path appears missing.", "evidence_refs": ["E2", "E3"]},
+            ],
+            opener="Your reviews look strong, but I could not find a clear estimate path.",
+        )
+
+        row = merge_manual_score(enriched, raw_score, fallback_vertical="hardscaping")
+
+        self.assertEqual(row["Money Signal"], "Yes")
+        self.assertEqual(row["Sendable"], "Yes")
+        self.assertNotIn("Visible conversion pain too weak for business maturity", row["Send Blockers"])
+
     def _google_fixture(self) -> dict:
         return {
             "business_name": "A+ Landscaping LLC",
@@ -3507,6 +3641,7 @@ class LeadMachineContractsTest(unittest.TestCase):
 
     def _buyer_intent_fixture(self) -> dict:
         return {
+            "logic_version": BUYER_INTENT_LOGIC_VERSION,
             "crm_booking_stack": {
                 "detected_tools": ["ServiceTitan"],
                 "has_paid_crm": True,

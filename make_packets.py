@@ -87,6 +87,7 @@ EXTRA_FIELDS = [
     "Fit Ceiling",
     "Fit Flags",
     "Review Fit Band",
+    "Review Demand Band",
     "Packet Eligible",
     "Packet Eligibility Reason",
     "Sendable",
@@ -265,7 +266,7 @@ def evidence_summary(row: Dict[str, str], evidence: Dict[str, Any]) -> str:
     lines.append(f"- **Website quality:** {row.get('Current Website Quality', '')}")
     lines.append(f"- **Offer fit:** {row.get('Offer Fit', '')}")
     lines.append(f"- **Lead priority:** {row.get('Lead Priority', '')}")
-    lines.append(f"- **Review fit band:** {row.get('Review Fit Band', '')}")
+    lines.append(f"- **Review demand band:** {row.get('Review Demand Band', '') or row.get('Review Fit Band', '')}")
     lines.append(f"- **Fit flags:** {row.get('Fit Flags', '') or 'none'}")
     lines.append(f"- **Score:** {row.get('Score Total', '')} total / {row.get('Score Strength', '')} strength / {row.get('Score Weakness', '')} weakness / {row.get('Score Offer', '')} offer")
     lines.append("")
@@ -467,7 +468,7 @@ def packet_markdown(row: Dict[str, str]) -> str:
     lines.append(f"- **Offer Fit:** {row.get('Offer Fit', '')}")
     lines.append(f"- **Website Quality:** {row.get('Current Website Quality', '')}")
     lines.append(f"- **Site Status:** {row.get('Site Status', '')}")
-    lines.append(f"- **Review Band:** {row.get('Review Fit Band', '')}")
+    lines.append(f"- **Review Demand Band:** {row.get('Review Demand Band', '') or row.get('Review Fit Band', '')}")
     lines.append(f"- **Score Total:** {row.get('Score Total', '')}")
     lines.append("")
     lines.append("## Current Airtable Draft")
@@ -541,6 +542,7 @@ def write_index(output_dir: Path, packet_rows: List[Dict[str, str]]) -> None:
         "Sendability Blockers",
         "Send Blockers",
         "Review Fit Band",
+        "Review Demand Band",
         "Fit Flags",
         "Source File",
     ]

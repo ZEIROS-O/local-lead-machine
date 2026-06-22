@@ -16,11 +16,19 @@ UNKNOWN_ADS = {
     "errors": [],
 }
 
-REVIEW_VELOCITY_THRESHOLDS = {
-    "live_min_reviews": 75,
-    "live_min_rating": 4.5,
-    "steady_min_reviews": 5,
-    "steady_min_rating": 4.0,
+REVIEW_DEMAND_THRESHOLDS = {
+    "detailing": {
+        "early_proof_min": 5,
+        "ideal_growth_min": 15,
+        "established_min": 126,
+        "mature_min": 401,
+    },
+    "default": {
+        "early_proof_min": 5,
+        "ideal_growth_min": 15,
+        "established_min": 76,
+        "mature_min": 201,
+    },
 }
 
 PAID_CRM = {
@@ -36,6 +44,7 @@ PAID_CRM = {
 }
 
 ADS_TIMEOUT_SECONDS = 3
+BUYER_INTENT_LOGIC_VERSION = 2
 
 
 def build_buyer_intent(record: Dict[str, Any], *, ads_check: bool = False) -> Dict[str, Any]:
@@ -44,29 +53,33 @@ def build_buyer_intent(record: Dict[str, Any], *, ads_check: bool = False) -> Di
     has_paid_crm = bool(paid_tools)
     crm_evidence = [f"Detected paid CRM/booking tool: {tool}" for tool in paid_tools]
 
-    review_velocity = _review_velocity(record)
+    review_profile = _review_profile(record)
+    review_velocity = _legacy_review_velocity(record, review_profile)
     ads = _ads_signals(record, ads_check=ads_check)
 
     known_ad_yes = any(
         ads.get(field) == "yes"
         for field in ("google_ad_transparency", "meta_ad_library", "lsa_badge")
     )
-    money_signal = has_paid_crm or known_ad_yes or review_velocity["velocity_band"] == "live"
+    money_signal = has_paid_crm or known_ad_yes
 
     evidence: List[str] = []
     evidence.extend(crm_evidence)
-    if review_velocity["velocity_band"] in {"live", "steady"}:
-        evidence.extend(review_velocity["evidence"])
+    if review_profile["demand_band"] != "thin":
+        evidence.extend(review_profile["evidence"])
     for field in ("google_ad_transparency", "meta_ad_library", "lsa_badge"):
         if ads.get(field) == "yes":
             evidence.append(f"{field.replace('_', ' ')} detected")
 
     buyer_intent = {
+        "logic_version": BUYER_INTENT_LOGIC_VERSION,
         "crm_booking_stack": {
             "detected_tools": detected_tools,
             "has_paid_crm": has_paid_crm,
             "evidence": crm_evidence,
         },
+        "review_profile": review_profile,
+        "review_demand_signal": review_profile,
         "review_velocity": review_velocity,
         "ads": ads,
         "money_signal": bool(money_signal),
@@ -88,16 +101,16 @@ def has_money_signal(record: Dict[str, Any]) -> bool:
     if not buyer_intent:
         raw = record.get("Money Signal") or record.get("money_signal")
         return str(raw).strip().lower() in {"yes", "true", "1"}
-    return bool(buyer_intent.get("money_signal"))
+    return _buyer_intent_has_money_signal(buyer_intent)
 
 
 def buyer_intent_summary(record: Dict[str, Any]) -> str:
     buyer_intent = _buyer_intent_from_record(record)
     if not buyer_intent:
-        return "money_signal=unknown; tools=none; review_velocity=unknown; ads=unknown"
+        return "money_signal=unknown; tools=none; review_demand_band=unknown; ads=unknown"
 
     stack = buyer_intent.get("crm_booking_stack") or {}
-    review_velocity = buyer_intent.get("review_velocity") or {}
+    review_signal = _review_signal_from_buyer_intent(buyer_intent)
     ads = buyer_intent.get("ads") or {}
     tools = stack.get("detected_tools") or []
     if isinstance(tools, str):
@@ -109,9 +122,9 @@ def buyer_intent_summary(record: Dict[str, Any]) -> str:
     }
     ads_text = ", ".join(f"{key}={value}" for key, value in sorted(known_ads.items())) or "unknown"
     return (
-        f"money_signal={'yes' if bool(buyer_intent.get('money_signal')) else 'no'}; "
+        f"money_signal={'yes' if _buyer_intent_has_money_signal(buyer_intent) else 'no'}; "
         f"tools={', '.join(str(tool) for tool in tools) or 'none'}; "
-        f"review_velocity={review_velocity.get('velocity_band') or 'unknown'}; "
+        f"review_demand_band={review_signal.get('demand_band') or review_signal.get('velocity_band') or 'unknown'}; "
         f"ads={ads_text}"
     )
 
@@ -134,7 +147,37 @@ def _buyer_intent_from_record(record: Dict[str, Any]) -> Dict[str, Any]:
 def _valid_buyer_intent(value: Any) -> bool:
     if not isinstance(value, dict):
         return False
+    if _buyer_intent_logic_version(value) < BUYER_INTENT_LOGIC_VERSION:
+        return False
     return all(key in value for key in ("crm_booking_stack", "review_velocity", "ads", "money_signal", "evidence"))
+
+
+def _buyer_intent_logic_version(value: Dict[str, Any]) -> int:
+    raw_version = value.get("logic_version", value.get("version"))
+    try:
+        return int(raw_version)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _buyer_intent_has_money_signal(buyer_intent: Dict[str, Any]) -> bool:
+    stack = buyer_intent.get("crm_booking_stack") or {}
+    if stack.get("has_paid_crm"):
+        return True
+
+    ads = buyer_intent.get("ads") or {}
+    return any(
+        ads.get(field) == "yes"
+        for field in ("google_ad_transparency", "meta_ad_library", "lsa_badge")
+    )
+
+
+def _review_signal_from_buyer_intent(buyer_intent: Dict[str, Any]) -> Dict[str, Any]:
+    for key in ("review_demand_signal", "review_profile", "review_velocity"):
+        value = buyer_intent.get(key)
+        if isinstance(value, dict):
+            return value
+    return {}
 
 
 def _detected_tools(record: Dict[str, Any]) -> List[str]:
@@ -174,7 +217,11 @@ def _record_text(record: Dict[str, Any]) -> str:
     return " ".join(str(part or "") for part in parts)
 
 
-def _review_velocity(record: Dict[str, Any]) -> Dict[str, Any]:
+def review_demand_band(record: Dict[str, Any]) -> str:
+    return str(_review_profile(record).get("demand_band") or "thin")
+
+
+def _review_profile(record: Dict[str, Any]) -> Dict[str, Any]:
     google = record.get("google", {}) if isinstance(record.get("google"), dict) else {}
     rating = _safe_float(
         record.get("Rating")
@@ -189,20 +236,57 @@ def _review_velocity(record: Dict[str, Any]) -> Dict[str, Any]:
         or google.get("reviews")
     )
 
-    thresholds = REVIEW_VELOCITY_THRESHOLDS
-    if reviews >= thresholds["live_min_reviews"] and rating >= thresholds["live_min_rating"]:
-        band = "live"
-    elif reviews >= thresholds["steady_min_reviews"] and rating >= thresholds["steady_min_rating"]:
-        band = "steady"
+    thresholds = REVIEW_DEMAND_THRESHOLDS["detailing" if _vertical_family(record) == "detailing" else "default"]
+    if reviews >= thresholds["mature_min"]:
+        band = "mature"
+    elif reviews >= thresholds["established_min"]:
+        band = "established"
+    elif reviews >= thresholds["ideal_growth_min"]:
+        band = "ideal_growth"
+    elif reviews >= thresholds["early_proof_min"]:
+        band = "early_proof"
     else:
         band = "thin"
 
     evidence = [f"{reviews} Google reviews with {rating:g} rating"] if reviews or rating else []
     return {
-        "velocity_band": band,
+        "demand_band": band,
         "source": "count_only",
+        "reviews": reviews,
+        "rating": rating,
         "evidence": evidence,
     }
+
+
+def _legacy_review_velocity(record: Dict[str, Any], review_profile: Dict[str, Any]) -> Dict[str, Any]:
+    reviews = int(review_profile.get("reviews") or 0)
+    rating = float(review_profile.get("rating") or 0.0)
+    if reviews >= 75 and rating >= 4.5:
+        band = "live"
+    elif reviews >= 5 and rating >= 4.0:
+        band = "steady"
+    else:
+        band = "thin"
+    return {
+        "velocity_band": band,
+        "source": "count_only",
+        "evidence": list(review_profile.get("evidence") or []),
+    }
+
+
+def _vertical_family(record: Dict[str, Any]) -> str:
+    google = record.get("google", {}) if isinstance(record.get("google"), dict) else {}
+    parts = [
+        record.get("vertical"),
+        record.get("Vertical"),
+        google.get("vertical"),
+        google.get("source_query"),
+        google.get("category"),
+    ]
+    text = " ".join(str(part or "").lower() for part in parts)
+    if any(term in text for term in ("detailing", "detailer", "ceramic coating", "paint correction", "ppf")):
+        return "detailing"
+    return "default"
 
 
 def _ads_signals(record: Dict[str, Any], *, ads_check: bool) -> Dict[str, Any]:

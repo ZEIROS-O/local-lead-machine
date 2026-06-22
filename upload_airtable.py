@@ -57,6 +57,7 @@ CSV_AIRTABLE_FIELDS = [
     "Send Trigger",
     "Money Signal",
     "Buyer Intent Signals",
+    "Review Demand Band",
     "AI Confidence",
     "Skip Reason",
     "Score Total",
