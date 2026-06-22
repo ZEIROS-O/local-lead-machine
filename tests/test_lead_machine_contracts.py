@@ -2004,6 +2004,201 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual([row["Business Name"] for row in run.manual_run.rows], ["A+ Landscaping LLC"])
         self.assertEqual([missing.lead_name for missing in run.manual_run.missing_scores], ["Second Landscaping"])
 
+    def _run_score_leads(self, argv: list[str]) -> tuple[int, str, str]:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with patch("sys.argv", argv), redirect_stdout(stdout), redirect_stderr(stderr):
+            code = score_leads_main()
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def _write_enriched_jsonl(self, path: Path) -> None:
+        record = {
+            "google": self._google_fixture(),
+            "evidence": self._evidence_fixture(site_status="weak"),
+        }
+        path.write_text(json.dumps(record, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    def _fake_score_batch_factory(self):
+        score = self._manual_score(total_score=75, grade="B")
+
+        def fake_score_batch(prompt: str, *, model: str, max_tokens: int) -> dict:
+            return {
+                "bundle": {
+                    "batch_id": "batch_001",
+                    "scores": [{"score_file": "chij123.json", "score": score}],
+                },
+                "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+            }
+
+        return fake_score_batch
+
+    def test_dry_run_llm_cost_does_not_call_llm(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            input_path = Path(tmp) / "enriched.jsonl"
+            output_path = Path(tmp) / "scored.csv"
+            self._write_enriched_jsonl(input_path)
+            argv = [
+                "score_leads.py",
+                "--mode", "api-llm",
+                "--input", str(input_path),
+                "--output", str(output_path),
+                "--scores-dir", str(Path(tmp) / "scores"),
+                "--vertical", "hardscaping",
+                "--dry-run-llm-cost",
+            ]
+            with patch("score_leads.llm_client.score_batch") as score_batch:
+                code, stdout, stderr = self._run_score_leads(argv)
+
+            self.assertEqual(code, 0, stderr)
+            score_batch.assert_not_called()
+            self.assertFalse(output_path.exists())
+            self.assertIn("[LLM COST]", stdout)
+            self.assertIn("batches=1", stdout)
+            self.assertIn("projected_usd=", stdout)
+            self.assertIn("[DRY-RUN]", stdout)
+
+    def test_projected_cost_over_threshold_refuses_without_confirm(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            input_path = Path(tmp) / "enriched.jsonl"
+            output_path = Path(tmp) / "scored.csv"
+            self._write_enriched_jsonl(input_path)
+            argv = [
+                "score_leads.py",
+                "--mode", "api-llm",
+                "--input", str(input_path),
+                "--output", str(output_path),
+                "--scores-dir", str(Path(tmp) / "scores"),
+                "--vertical", "hardscaping",
+            ]
+            with patch.dict(os.environ, {"LLM_SPEND_CONFIRM_USD": "0.0001"}, clear=False):
+                with patch("score_leads.llm_client.score_batch") as score_batch:
+                    code, stdout, stderr = self._run_score_leads(argv)
+
+                self.assertEqual(code, 1)
+                score_batch.assert_not_called()
+                self.assertFalse(output_path.exists())
+                self.assertIn("[REFUSE]", stdout)
+                self.assertIn("--confirm-llm-spend", stdout)
+
+    def test_confirm_llm_spend_allows_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            input_path = Path(tmp) / "enriched.jsonl"
+            output_path = Path(tmp) / "scored.csv"
+            self._write_enriched_jsonl(input_path)
+            argv = [
+                "score_leads.py",
+                "--mode", "api-llm",
+                "--input", str(input_path),
+                "--output", str(output_path),
+                "--scores-dir", str(Path(tmp) / "scores"),
+                "--vertical", "hardscaping",
+                "--confirm-llm-spend",
+            ]
+            with patch.dict(os.environ, {"LLM_SPEND_CONFIRM_USD": "0.0001"}, clear=False):
+                with patch(
+                    "score_leads.llm_client.score_batch",
+                    side_effect=self._fake_score_batch_factory(),
+                ) as score_batch:
+                    code, stdout, stderr = self._run_score_leads(argv)
+
+                self.assertEqual(code, 0, stderr)
+                score_batch.assert_called_once()
+                self.assertTrue(output_path.exists())
+
+    def test_stale_scores_dir_refuses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            input_path = Path(tmp) / "enriched.jsonl"
+            output_path = Path(tmp) / "scored.csv"
+            self._write_enriched_jsonl(input_path)
+            scores_dir = Path(tmp) / "scores"
+            scores_dir.mkdir(parents=True)
+            (scores_dir / "stale_old.json").write_text("{}", encoding="utf-8")
+            argv = [
+                "score_leads.py",
+                "--mode", "api-llm",
+                "--input", str(input_path),
+                "--output", str(output_path),
+                "--scores-dir", str(scores_dir),
+                "--vertical", "hardscaping",
+            ]
+            with patch("score_leads.llm_client.score_batch") as score_batch:
+                code, stdout, stderr = self._run_score_leads(argv)
+
+            self.assertEqual(code, 1)
+            score_batch.assert_not_called()
+            self.assertTrue((scores_dir / "stale_old.json").exists())
+            self.assertIn("[REFUSE]", stdout)
+            self.assertIn("--fresh-scores-dir", stdout)
+
+    def test_fresh_scores_dir_clears_stale_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            input_path = Path(tmp) / "enriched.jsonl"
+            output_path = Path(tmp) / "scored.csv"
+            self._write_enriched_jsonl(input_path)
+            scores_dir = Path(tmp) / "scores"
+            bundle_dir = scores_dir / "_api_bundles"
+            bundle_dir.mkdir(parents=True)
+            (scores_dir / "stale_old.json").write_text("{}", encoding="utf-8")
+            (bundle_dir / "old_bundle.json").write_text("{}", encoding="utf-8")
+            argv = [
+                "score_leads.py",
+                "--mode", "api-llm",
+                "--input", str(input_path),
+                "--output", str(output_path),
+                "--scores-dir", str(scores_dir),
+                "--vertical", "hardscaping",
+                "--fresh-scores-dir",
+            ]
+            with patch(
+                "score_leads.llm_client.score_batch",
+                side_effect=self._fake_score_batch_factory(),
+            ) as score_batch:
+                code, stdout, stderr = self._run_score_leads(argv)
+
+            self.assertEqual(code, 0, stderr)
+            score_batch.assert_called_once()
+            self.assertFalse((scores_dir / "stale_old.json").exists())
+            self.assertFalse((bundle_dir / "old_bundle.json").exists())
+            self.assertIn("[FRESH]", stdout)
+
+    def test_usage_metadata_written_after_successful_call_even_if_validation_fails(self) -> None:
+        from score_leads import score_records_api_run
+
+        enriched = {
+            "google": self._google_fixture(),
+            "evidence": self._evidence_fixture(site_status="weak"),
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            usage_path = Path(tmp) / "usage.json"
+            with patch(
+                "score_leads.llm_client.score_batch",
+                side_effect=self._fake_score_batch_factory(),
+            ):
+                with patch(
+                    "score_leads.score_records_manual_run",
+                    side_effect=ValueError("merge validation failed"),
+                ):
+                    with self.assertRaises(ValueError):
+                        score_records_api_run(
+                            [enriched],
+                            scores_dir=Path(tmp) / "scores",
+                            fallback_vertical="hardscaping",
+                            batch_size=1,
+                            model="claude-sonnet-4-6",
+                            max_tokens=4096,
+                            max_calls=0,
+                            max_tokens_per_run=0,
+                            max_usd_per_run=0.0,
+                            usage_output_path=usage_path,
+                        )
+
+            self.assertTrue(usage_path.exists())
+            payload = json.loads(usage_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["calls"], 1)
+            self.assertEqual(payload["total_tokens"], 15)
+            self.assertTrue(payload["partial"])
+
     def test_api_llm_mode_writes_byte_identical_csv_to_manual_bundle_import(self) -> None:
         score_one = self._manual_score(total_score=75, grade="B")
         score_two = self._manual_score(
@@ -3728,6 +3923,48 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(row["Packet Eligible"], "Yes")
         self.assertTrue(row["Manual Review Reason"])
         self.assertTrue(is_eligible(row, include_all=False, priority_filter=None))
+
+    def test_refresh_packet_tiers_backfills_old_rehab_style_csv_row(self) -> None:
+        from refresh_packet_tiers import refresh_csv
+
+        enriched = self._facebook_only_evidence(
+            reviews="45",
+            reasons=[
+                "No standalone website — business presence is Facebook-only",
+                "No clear estimate CTA detected",
+                "Phone number hard to find on the page",
+            ],
+        )
+        enriched["google"]["business_name"] = "Rehab Auto Spa"
+        raw_score = self._facebook_only_score(confidence="low")
+        scored = merge_manual_score(enriched, raw_score, fallback_vertical="detailing")
+
+        old_row = dict(scored)
+        old_row.pop("Packet Tier", None)
+        old_row.pop("Manual Review Reason", None)
+        old_row["Packet Eligible"] = ""
+        old_row["Packet Eligibility Reason"] = ""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            input_path = Path(tmp) / "old_scored.csv"
+            output_path = Path(tmp) / "refreshed.csv"
+            fieldnames = [key for key in old_row if key not in {"Packet Tier", "Manual Review Reason"}]
+            with input_path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerow(old_row)
+
+            refresh_csv(input_path, output_path)
+
+            with output_path.open(newline="", encoding="utf-8") as f:
+                [row] = list(csv.DictReader(f))
+
+        self.assertEqual(row["Business Name"], "Rehab Auto Spa")
+        self.assertEqual(row["Lead Priority"], scored["Lead Priority"])
+        self.assertEqual(row["Packet Tier"], "Manual Review Packet")
+        self.assertEqual(row["Packet Eligible"], "Yes")
+        self.assertIn("Manual Review Packet", row["Packet Eligibility Reason"])
+        self.assertTrue(row["Manual Review Reason"])
 
     def test_c_no_site_facebook_only_below_b_is_manual_review_packet(self) -> None:
         enriched = self._facebook_only_evidence(

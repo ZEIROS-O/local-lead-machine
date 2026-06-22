@@ -24,6 +24,7 @@ import csv
 import json
 import os
 import re
+import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -230,11 +231,22 @@ class ApiLlmRun:
     new_records_selected: int = 0
 
 
+@dataclass(frozen=True)
+class LlmCostEstimate:
+    records_selected: int
+    batches: int
+    prompt_tokens: int
+    max_output_tokens: int
+    projected_total_tokens: int
+    projected_usd: float
+
+
 DEFAULT_LLM_SCORING_MODEL = "claude-sonnet-4-6"
 DEFAULT_LLM_MAX_TOKENS = 4096
 DEFAULT_MAX_LLM_CALLS_PER_RUN = 5
 DEFAULT_MAX_LLM_TOKENS_PER_RUN = 100_000
 DEFAULT_MAX_LLM_USD_PER_RUN = 5.0
+DEFAULT_LLM_SPEND_CONFIRM_USD = 0.50
 SONNET_4_6_INPUT_USD_PER_MILLION_TOKENS = 3.0
 SONNET_4_6_OUTPUT_USD_PER_MILLION_TOKENS = 15.0
 MAX_LLM_SCORING_STRING_CHARS = 1500
@@ -2549,6 +2561,77 @@ def _score_batch_with_debug(
             raise ValueError(f"{exc}; raw LLM response saved to {debug_path}") from exc
 
 
+def estimate_api_llm_cost(
+    records: List[Dict[str, Any]],
+    *,
+    fallback_vertical: str,
+    batch_size: int = 5,
+    max_tokens: int = DEFAULT_LLM_MAX_TOKENS,
+    resume_scored_keys: set[str] | None = None,
+) -> LlmCostEstimate:
+    """
+    Estimate API-LLM cost without making any Anthropic call.
+
+    Selects records the same way a real run would (resume filtering), batches them
+    exactly like ``score_records_api_run`` would at the configured batch size, and
+    sums estimated prompt tokens plus the worst-case output tokens per batch.
+    """
+    unscored_records, _ = filter_unscored_records(
+        records,
+        existing_keys=resume_scored_keys or set(),
+        fallback_vertical=fallback_vertical,
+    )
+    selected = [ensure_evidence(record) for record in unscored_records]
+    configured_batch_size = max(1, batch_size)
+
+    prompt_tokens = 0
+    batches = 0
+    for index in range(0, len(selected), configured_batch_size):
+        chunk = selected[index : index + configured_batch_size]
+        compact_records = [
+            build_llm_scoring_record(record, fallback_vertical=fallback_vertical)
+            for record in chunk
+        ]
+        batches += 1
+        prompt = build_api_llm_scoring_prompt(compact_records, batch_id=f"batch_{batches:03d}")
+        prompt_tokens += estimate_prompt_tokens(prompt)
+
+    max_output_tokens = batches * max(0, max_tokens)
+    projected_total_tokens = prompt_tokens + max_output_tokens
+    projected_usd = estimate_llm_usd(
+        {"input_tokens": prompt_tokens, "output_tokens": max_output_tokens}
+    )
+    return LlmCostEstimate(
+        records_selected=len(selected),
+        batches=batches,
+        prompt_tokens=prompt_tokens,
+        max_output_tokens=max_output_tokens,
+        projected_total_tokens=projected_total_tokens,
+        projected_usd=projected_usd,
+    )
+
+
+def scores_dir_has_artifacts(scores_dir: Path) -> bool:
+    if not scores_dir.exists():
+        return False
+    if any(scores_dir.glob("*.json")):
+        return True
+    bundle_dir = scores_dir / "_api_bundles"
+    return bundle_dir.exists() and any(bundle_dir.iterdir())
+
+
+def clear_scores_dir(scores_dir: Path) -> None:
+    """Remove score JSON files and the _api_bundles directory under scores_dir."""
+    if not scores_dir.exists():
+        return
+    for path in scores_dir.glob("*.json"):
+        if path.is_file():
+            path.unlink()
+    bundle_dir = scores_dir / "_api_bundles"
+    if bundle_dir.exists():
+        shutil.rmtree(bundle_dir)
+
+
 def score_records_api_run(
     records: List[Dict[str, Any]],
     *,
@@ -2561,6 +2644,7 @@ def score_records_api_run(
     max_tokens_per_run: int = DEFAULT_MAX_LLM_TOKENS_PER_RUN,
     max_usd_per_run: float = DEFAULT_MAX_LLM_USD_PER_RUN,
     resume_scored_keys: set[str] | None = None,
+    usage_output_path: Path | None = None,
 ) -> ApiLlmRun:
     unscored_records, skipped_already_scored = filter_unscored_records(
         records,
@@ -2692,6 +2776,30 @@ def score_records_api_run(
         index += len(chunk)
         batch_index += 1
 
+        if usage_output_path is not None:
+            # Write usage metadata after every successful call so dashboard spend
+            # stays visible locally even if a later merge/validation step crashes.
+            _write_llm_usage_payload(
+                usage_output_path,
+                _llm_usage_payload(
+                    calls=calls,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    total_tokens=tokens,
+                    usd=usd,
+                    caps={
+                        "MAX_LLM_CALLS_PER_RUN": max_calls,
+                        "MAX_LLM_TOKENS_PER_RUN": max_tokens_per_run,
+                        "MAX_LLM_USD_PER_RUN": max_usd_per_run,
+                    },
+                    stopped_by_cap=stopped_by_cap,
+                    stop_reason=stop_reason,
+                    skipped_records=skipped_records,
+                    debug_notes=debug_notes,
+                    partial=True,
+                ),
+            )
+
     manual_run = score_records_manual_run(
         selected,
         scores_dir=scores_dir,
@@ -2721,24 +2829,58 @@ def score_records_api_run(
     )
 
 
-def write_llm_usage(path: Path, run: ApiLlmRun) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "calls": run.calls,
-        "input_tokens": run.input_tokens,
-        "output_tokens": run.output_tokens,
-        "total_tokens": run.tokens,
-        "estimated_usd": run.usd,
-        "caps": run.caps,
-        "stopped_by_cap": run.stopped_by_cap,
-        "stop_reason": run.stop_reason,
+def _llm_usage_payload(
+    *,
+    calls: int,
+    input_tokens: int,
+    output_tokens: int,
+    total_tokens: int,
+    usd: float,
+    caps: Dict[str, int | float],
+    stopped_by_cap: bool,
+    stop_reason: str,
+    skipped_records: List[ApiLlmSkip] | None,
+    debug_notes: List[str] | None,
+    partial: bool = False,
+) -> Dict[str, Any]:
+    return {
+        "calls": calls,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "estimated_usd": usd,
+        "caps": caps,
+        "stopped_by_cap": stopped_by_cap,
+        "stop_reason": stop_reason,
         "skipped_records": [
             {"lead_name": skipped.lead_name, "score_file": skipped.score_file, "reason": skipped.reason}
-            for skipped in (run.skipped_records or [])
+            for skipped in (skipped_records or [])
         ],
-        "debug_notes": run.debug_notes or [],
+        "debug_notes": debug_notes or [],
+        "partial": partial,
     }
+
+
+def _write_llm_usage_payload(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def write_llm_usage(path: Path, run: ApiLlmRun) -> None:
+    payload = _llm_usage_payload(
+        calls=run.calls,
+        input_tokens=run.input_tokens,
+        output_tokens=run.output_tokens,
+        total_tokens=run.tokens,
+        usd=run.usd,
+        caps=run.caps,
+        stopped_by_cap=run.stopped_by_cap,
+        stop_reason=run.stop_reason,
+        skipped_records=run.skipped_records,
+        debug_notes=run.debug_notes,
+        partial=False,
+    )
+    _write_llm_usage_payload(path, payload)
 
 
 def print_manual_only_scored_summary(run: ManualScoreRun) -> None:
@@ -2807,6 +2949,26 @@ def main() -> int:
         default="",
         help="Optional API LLM usage/cap metadata JSON output",
     )
+    parser.add_argument(
+        "--dry-run-llm-cost",
+        action="store_true",
+        help="API LLM mode: estimate batches/tokens/cost and exit before any Anthropic call",
+    )
+    parser.add_argument(
+        "--confirm-llm-spend",
+        action="store_true",
+        help="API LLM mode: confirm projected spend above the confirmation threshold",
+    )
+    parser.add_argument(
+        "--fresh-scores-dir",
+        action="store_true",
+        help="API LLM mode: clear old score JSON and _api_bundles under scores-dir before scoring",
+    )
+    parser.add_argument(
+        "--allow-stale-scores-dir",
+        action="store_true",
+        help="API LLM mode: allow scoring into a scores-dir that already has files with an empty output CSV",
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -2860,9 +3022,60 @@ def main() -> int:
         max_calls = getenv_int("MAX_LLM_CALLS_PER_RUN", DEFAULT_MAX_LLM_CALLS_PER_RUN)
         max_tokens_per_run = getenv_int("MAX_LLM_TOKENS_PER_RUN", DEFAULT_MAX_LLM_TOKENS_PER_RUN)
         max_usd_per_run = getenv_float("MAX_LLM_USD_PER_RUN", DEFAULT_MAX_LLM_USD_PER_RUN)
+
+        estimate = estimate_api_llm_cost(
+            records,
+            fallback_vertical=args.vertical,
+            batch_size=args.llm_batch_size,
+            max_tokens=args.llm_max_tokens,
+        )
+
+        print(
+            f"[LLM COST] records_selected={estimate.records_selected} "
+            f"batches={estimate.batches} "
+            f"prompt_tokens={estimate.prompt_tokens} "
+            f"max_output_tokens={estimate.max_output_tokens} "
+            f"projected_total_tokens={estimate.projected_total_tokens} "
+            f"projected_usd={estimate.projected_usd:.4f}"
+        )
+
+        if args.dry_run_llm_cost:
+            print("[DRY-RUN] No Anthropic call made.")
+            return 0
+
+        scores_dir_path = Path(args.scores_dir)
+        existing_csv_row_count = len(read_csv_rows(output_path)) if output_path.exists() else 0
+        if args.fresh_scores_dir:
+            clear_scores_dir(scores_dir_path)
+            print(f"[FRESH] Cleared score JSON and _api_bundles under {scores_dir_path}")
+        elif (
+            scores_dir_has_artifacts(scores_dir_path)
+            and existing_csv_row_count == 0
+            and not args.allow_stale_scores_dir
+        ):
+            print(
+                f"[REFUSE] {scores_dir_path} already contains score artifacts but the output CSV has 0 rows. "
+                "Re-run with --fresh-scores-dir to clear them or --allow-stale-scores-dir to keep them."
+            )
+            return 1
+
+        confirm_threshold = getenv_float("LLM_SPEND_CONFIRM_USD", DEFAULT_LLM_SPEND_CONFIRM_USD)
+        if max_usd_per_run > 0 and estimate.projected_usd > max_usd_per_run:
+            print(
+                f"[REFUSE] Projected LLM cost ${estimate.projected_usd:.4f} exceeds "
+                f"MAX_LLM_USD_PER_RUN=${max_usd_per_run:.2f}. Lower the batch/limit or raise the cap."
+            )
+            return 1
+        if estimate.projected_usd > confirm_threshold and not args.confirm_llm_spend:
+            print(
+                f"[REFUSE] Projected LLM cost ${estimate.projected_usd:.4f} exceeds "
+                f"${confirm_threshold:.2f}. Re-run with --confirm-llm-spend to proceed."
+            )
+            return 1
+
         api_run = score_records_api_run(
             records,
-            scores_dir=Path(args.scores_dir),
+            scores_dir=scores_dir_path,
             fallback_vertical=args.vertical,
             batch_size=args.llm_batch_size,
             model=(os.getenv("LLM_SCORING_MODEL") or DEFAULT_LLM_SCORING_MODEL).strip(),
@@ -2870,6 +3083,7 @@ def main() -> int:
             max_calls=max_calls,
             max_tokens_per_run=max_tokens_per_run,
             max_usd_per_run=max_usd_per_run,
+            usage_output_path=Path(args.llm_usage_output) if args.llm_usage_output else None,
         )
         scored = api_run.manual_run.rows
         print(f"[LLM] Calls: {api_run.calls}")
