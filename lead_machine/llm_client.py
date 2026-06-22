@@ -23,9 +23,10 @@ TRANSIENT_HTTP_STATUSES = {429, 500, 502, 503, 504}
 
 
 class InvalidLlmResponse(ValueError):
-    def __init__(self, message: str, *, raw_text: str) -> None:
+    def __init__(self, message: str, *, raw_text: str, parsed_json: Dict[str, Any] | None = None) -> None:
         super().__init__(message)
         self.raw_text = raw_text
+        self.parsed_json = parsed_json
 
 
 def _response_text(data: Dict[str, Any]) -> str:
@@ -49,7 +50,10 @@ def _parse_score_bundle(text: str) -> Dict[str, Any]:
         ) from exc
     if not isinstance(bundle, dict):
         raise ValueError("LLM score bundle must be one JSON object")
-    validate_bundle_scores(bundle)
+    try:
+        validate_bundle_scores(bundle)
+    except ValueError as exc:
+        raise InvalidLlmResponse(str(exc), raw_text=text, parsed_json=bundle) from exc
     return bundle
 
 

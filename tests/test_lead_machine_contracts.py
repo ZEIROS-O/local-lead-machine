@@ -2085,6 +2085,29 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(compact["visual_review"]["visual_review_needed"], "Yes")
         self.assertEqual(compact["visual_review"]["visual_quality_score"], "Weak")
 
+    def test_llm_scoring_record_always_includes_evidence_ref_options(self) -> None:
+        from score_leads import build_llm_scoring_record
+
+        record = {"google": {**self._google_fixture(), "website_url": ""}, "website": {}, "evidence": {}}
+
+        compact = build_llm_scoring_record(record, fallback_vertical="detailing")
+
+        options = compact["evidence_ref_options"]
+        self.assertTrue(options)
+        self.assertTrue(all(option.get("id") for option in options))
+        self.assertIn("google_profile", {option["id"] for option in options})
+
+    def test_api_llm_prompt_requires_non_empty_evidence_refs_from_options(self) -> None:
+        from score_leads import build_api_llm_scoring_prompt, build_llm_scoring_record
+
+        compact = build_llm_scoring_record(self._huge_detailing_record(), fallback_vertical="detailing")
+        prompt = build_api_llm_scoring_prompt([compact], batch_id="batch_001")
+
+        self.assertIn("evidence_refs is REQUIRED for every score", prompt)
+        self.assertIn("non-empty array of 1-3 strings", prompt)
+        self.assertIn("copied exactly from that lead's evidence_ref_options[].id", prompt)
+        self.assertIn("never output [] for evidence_refs", prompt)
+
     def test_api_llm_compact_prompt_for_ten_huge_leads_stays_under_run_token_cap(self) -> None:
         from score_leads import build_api_llm_scoring_prompt, build_llm_scoring_record, estimate_prompt_tokens
 
@@ -2237,6 +2260,156 @@ class LeadMachineContractsTest(unittest.TestCase):
             self.assertTrue(debug_path.exists())
             self.assertEqual(debug_path.read_text(encoding="utf-8"), raw_text)
             self.assertIn(str(debug_path), str(caught.exception))
+
+    def test_api_llm_validation_failure_repairs_with_evidence_ref_options(self) -> None:
+        from lead_machine.llm_client import InvalidLlmResponse
+        from score_leads import score_records_api_run
+
+        invalid_score = self._manual_score(total_score=75, grade="B", evidence_refs=[])
+        invalid_score["safe_outreach_claims"] = [
+            {"claim": "Your Google profile shows strong reviews.", "evidence_refs": ["E1"]}
+        ]
+        repaired_score = self._manual_score(total_score=75, grade="B", evidence_refs=["E1"])
+        invalid_bundle = {
+            "batch_id": "batch_001",
+            "scores": [{"score_file": "chij123.json", "score": invalid_score}],
+        }
+        repaired_bundle = {
+            "batch_id": "batch_001",
+            "scores": [{"score_file": "chij123.json", "score": repaired_score}],
+        }
+        raw_text = json.dumps(invalid_bundle)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            scores_dir = Path(tmp) / "scores"
+            with patch(
+                "score_leads.llm_client.score_batch",
+                side_effect=[
+                    InvalidLlmResponse(
+                        "Validation failures:\n- scores[0] (chij123.json): evidence_refs must be a non-empty list",
+                        raw_text=raw_text,
+                        parsed_json=invalid_bundle,
+                    ),
+                    {"bundle": repaired_bundle, "usage": {"input_tokens": 8, "output_tokens": 4, "total_tokens": 12}},
+                ],
+            ) as score_batch:
+                run = score_records_api_run(
+                    [self._huge_detailing_record()],
+                    scores_dir=scores_dir,
+                    fallback_vertical="detailing",
+                    batch_size=1,
+                    model="claude-sonnet-4-6",
+                    max_tokens=4096,
+                    max_calls=0,
+                    max_tokens_per_run=100_000,
+                    max_usd_per_run=0.0,
+                )
+
+        self.assertEqual(score_batch.call_count, 2)
+        repair_prompt = score_batch.call_args_list[1].kwargs.get("prompt") or score_batch.call_args_list[1].args[0]
+        self.assertIn("Validation failures:", repair_prompt)
+        self.assertIn(raw_text, repair_prompt)
+        self.assertIn("evidence_ref_options", repair_prompt)
+        self.assertEqual(run.manual_run.rows[0]["Evidence Refs"], json.dumps(["E1"]))
+
+    def test_api_llm_validation_failure_writes_raw_debug_output(self) -> None:
+        from lead_machine.llm_client import InvalidLlmResponse
+        from score_leads import score_records_api_run
+
+        invalid_score = self._manual_score(confidence="certain", evidence_refs=[])
+        invalid_bundle = {
+            "batch_id": "batch_001",
+            "scores": [{"score_file": "chij123.json", "score": invalid_score}],
+        }
+        raw_text = json.dumps(invalid_bundle)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            scores_dir = Path(tmp) / "scores"
+            with patch(
+                "score_leads.llm_client.score_batch",
+                side_effect=[
+                    InvalidLlmResponse(
+                        "Validation failures:\n- scores[0] (chij123.json): confidence must be low, medium, or high",
+                        raw_text=raw_text,
+                        parsed_json=invalid_bundle,
+                    ),
+                    InvalidLlmResponse(
+                        "Validation failures:\n- scores[0] (chij123.json): confidence must be low, medium, or high",
+                        raw_text=raw_text,
+                        parsed_json=invalid_bundle,
+                    ),
+                ],
+            ):
+                with self.assertRaises(RuntimeError) as caught:
+                    score_records_api_run(
+                        [self._huge_detailing_record()],
+                        scores_dir=scores_dir,
+                        fallback_vertical="detailing",
+                        batch_size=1,
+                        model="claude-sonnet-4-6",
+                        max_tokens=4096,
+                        max_calls=0,
+                        max_tokens_per_run=100_000,
+                        max_usd_per_run=0.0,
+                    )
+
+            debug_path = scores_dir / "_api_bundles" / "batch_001_validation_failed_attempt_1.json"
+            self.assertTrue(debug_path.exists())
+            self.assertEqual(debug_path.read_text(encoding="utf-8"), raw_text)
+            message = str(caught.exception)
+            self.assertIn("batch_001", message)
+            self.assertIn("confidence must be low, medium, or high", message)
+            self.assertIn(str(debug_path), message)
+
+    def test_api_llm_preserves_successful_first_batch_when_second_batch_validation_fails(self) -> None:
+        from lead_machine.llm_client import InvalidLlmResponse
+        from score_leads import score_records_api_run
+
+        first = self._huge_detailing_record(name="First Detail", place_id="ChIJ123")
+        second = self._huge_detailing_record(name="Second Detail", place_id="ChIJ456")
+        first_bundle = {
+            "batch_id": "batch_001",
+            "scores": [{"score_file": "chij123.json", "score": self._manual_score(total_score=75, grade="B")}],
+        }
+        invalid_bundle = {
+            "batch_id": "batch_002",
+            "scores": [{"score_file": "chij456.json", "score": self._manual_score(confidence="certain", evidence_refs=[])}],
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            scores_dir = Path(tmp) / "scores"
+            with patch(
+                "score_leads.llm_client.score_batch",
+                side_effect=[
+                    {"bundle": first_bundle, "usage": {"input_tokens": 5, "output_tokens": 5, "total_tokens": 10}},
+                    InvalidLlmResponse(
+                        "Validation failures:\n- scores[0] (chij456.json): confidence must be low, medium, or high",
+                        raw_text=json.dumps(invalid_bundle),
+                        parsed_json=invalid_bundle,
+                    ),
+                    InvalidLlmResponse(
+                        "Validation failures:\n- scores[0] (chij456.json): confidence must be low, medium, or high",
+                        raw_text=json.dumps(invalid_bundle),
+                        parsed_json=invalid_bundle,
+                    ),
+                ],
+            ):
+                with self.assertRaises(RuntimeError):
+                    score_records_api_run(
+                        [first, second],
+                        scores_dir=scores_dir,
+                        fallback_vertical="detailing",
+                        batch_size=1,
+                        model="claude-sonnet-4-6",
+                        max_tokens=4096,
+                        max_calls=0,
+                        max_tokens_per_run=100_000,
+                        max_usd_per_run=0.0,
+                    )
+
+            self.assertTrue((scores_dir / "_api_bundles" / "batch_001_response.json").exists())
+            self.assertTrue((scores_dir / "chij123.json").exists())
+            self.assertTrue((scores_dir / "_api_bundles" / "batch_002_validation_failed_attempt_1.json").exists())
 
     def test_manual_score_loader_accepts_new_schema_and_normalizes_mismatched_total(self) -> None:
         raw_score = self._manual_score(total_score=1, grade="Skip")

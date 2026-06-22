@@ -31,7 +31,7 @@ from typing import Any, Dict, List, Tuple
 
 from dotenv import load_dotenv
 
-from import_llm_score_bundle import import_score_bundle
+from import_llm_score_bundle import import_score_bundle, validate_bundle_scores
 from lead_machine.buyer_signals import (
     buyer_intent_summary,
     ensure_buyer_intent,
@@ -222,6 +222,7 @@ class ApiLlmRun:
     stopped_by_cap: bool
     stop_reason: str = ""
     skipped_records: List[ApiLlmSkip] | None = None
+    debug_notes: List[str] | None = None
 
 
 DEFAULT_LLM_SCORING_MODEL = "claude-sonnet-4-6"
@@ -1427,7 +1428,12 @@ def ensure_evidence(record: Dict[str, Any]) -> Dict[str, Any]:
 
 def evidence_ids(record: Dict[str, Any]) -> set[str]:
     evidence = record.get("evidence") or {}
-    return {str(item.get("id")) for item in evidence.get("evidence_items", []) if item.get("id")}
+    ids = {str(item.get("id")) for item in evidence.get("evidence_items", []) if item.get("id")}
+    for option in _build_evidence_ref_options(record):
+        option_id = option.get("id")
+        if option_id:
+            ids.add(str(option_id))
+    return ids
 
 
 def manual_score_candidates(record: Dict[str, Any], scores_dir: Path, fallback_vertical: str) -> Tuple[str, List[Path]]:
@@ -1634,6 +1640,158 @@ def _visual_review_capsule(evidence: Dict[str, Any], website: Dict[str, Any]) ->
     }
 
 
+def _short_snippet(value: Any, *, max_chars: int = 140) -> str:
+    if isinstance(value, (dict, list)):
+        text = json.dumps(value, ensure_ascii=False)
+    else:
+        text = str(value or "")
+    return _truncate_for_llm(text, max_chars=max_chars)
+
+
+def _append_evidence_ref_option(
+    options: List[Dict[str, str]],
+    seen_ids: set[str],
+    *,
+    option_id: str,
+    label: str,
+    snippet: Any = "",
+    source: str = "",
+) -> None:
+    cleaned_id = re.sub(r"[^A-Za-z0-9_.:-]+", "_", str(option_id or "").strip()).strip("_")
+    if not cleaned_id or cleaned_id in seen_ids:
+        return
+    option = {
+        "id": cleaned_id,
+        "label": _short_snippet(label, max_chars=80),
+    }
+    snippet_text = _short_snippet(snippet)
+    if snippet_text:
+        option["snippet"] = snippet_text
+    source_text = _short_snippet(source, max_chars=120)
+    if source_text:
+        option["source"] = source_text
+    options.append(option)
+    seen_ids.add(cleaned_id)
+
+
+def _build_evidence_ref_options(record: Dict[str, Any], *, lead: Any | None = None) -> List[Dict[str, str]]:
+    google = record.get("google", {}) if isinstance(record.get("google"), dict) else {}
+    website = record.get("website", {}) if isinstance(record.get("website"), dict) else {}
+    evidence = record.get("evidence", {}) if isinstance(record.get("evidence"), dict) else {}
+    buyer_intent = record.get("buyer_intent", {}) if isinstance(record.get("buyer_intent"), dict) else {}
+    options: List[Dict[str, str]] = []
+    seen_ids: set[str] = set()
+
+    rating = google.get("rating") or google.get("google_rating") or (getattr(lead, "google_rating", "") if lead else "")
+    reviews = google.get("reviews") or google.get("google_review_count") or (getattr(lead, "google_review_count", "") if lead else "")
+    google_bits = []
+    if rating not in ("", None):
+        google_bits.append(f"{rating} rating")
+    if reviews not in ("", None):
+        google_bits.append(f"{reviews} reviews")
+    if not google_bits and google.get("business_name"):
+        google_bits.append(str(google.get("business_name")))
+    _append_evidence_ref_option(
+        options,
+        seen_ids,
+        option_id="google_profile",
+        label="Google rating/reviews",
+        snippet=", ".join(google_bits),
+        source=google.get("google_maps_url") or google.get("maps_url") or "google",
+    )
+
+    site_status = evidence.get("site_status") or website.get("site_status") or ""
+    rendered_status = evidence.get("rendered_site_status") or website.get("rendered_site_status") or ""
+    website_url = google.get("website_url") or google.get("website") or website.get("final_url") or ""
+    if site_status or rendered_status or website_url:
+        _append_evidence_ref_option(
+            options,
+            seen_ids,
+            option_id="website_status",
+            label="Website detected",
+            snippet=", ".join(part for part in [str(site_status or "").strip(), str(rendered_status or "").strip()] if part),
+            source=website_url or "evidence.website_status",
+        )
+
+    services = website.get("high_ticket_terms") or evidence.get("services_detected") or []
+    if services:
+        _append_evidence_ref_option(
+            options,
+            seen_ids,
+            option_id="homepage_services",
+            label="High-ticket services",
+            snippet=" / ".join(str(item) for item in services[:6]),
+            source=website.get("final_url") or "website.high_ticket_terms",
+        )
+
+    form_bits = []
+    for label, value in (
+        ("contact_form", evidence.get("contact_form_detected") or website.get("contact_form_detected")),
+        ("estimate_form", evidence.get("estimate_form_detected") or website.get("estimate_form_detected")),
+        ("form_strength", evidence.get("form_strength") or website.get("form_strength")),
+        ("cta_strength", evidence.get("cta_strength") or website.get("cta_strength")),
+    ):
+        if value not in ("", None, [], {}):
+            form_bits.append(f"{label}={value}")
+    if form_bits:
+        _append_evidence_ref_option(
+            options,
+            seen_ids,
+            option_id="form_detection",
+            label="Form/booking evidence",
+            snippet=", ".join(form_bits),
+            source=evidence.get("form_detection_method") or website.get("form_detection_method") or "evidence.forms",
+        )
+
+    buyer_summary = buyer_intent_summary(record) if buyer_intent else ""
+    if buyer_summary:
+        _append_evidence_ref_option(
+            options,
+            seen_ids,
+            option_id="buyer_intent",
+            label="Buyer intent evidence",
+            snippet=buyer_summary,
+            source="buyer_intent",
+        )
+
+    source_query = google.get("source_query") or google.get("search_query") or google.get("category") or ""
+    if source_query:
+        _append_evidence_ref_option(
+            options,
+            seen_ids,
+            option_id="icp_source_query",
+            label="ICP source query",
+            snippet=source_query,
+            source="google.source_query",
+        )
+
+    for item in evidence.get("evidence_items", []) or []:
+        if not isinstance(item, dict):
+            continue
+        item_id = str(item.get("id") or "").strip()
+        if not item_id:
+            continue
+        _append_evidence_ref_option(
+            options,
+            seen_ids,
+            option_id=item_id,
+            label=str(item.get("field") or "Evidence item"),
+            snippet=item.get("value"),
+            source=item.get("source_url") or "evidence.evidence_items",
+        )
+
+    if not options:
+        _append_evidence_ref_option(
+            options,
+            seen_ids,
+            option_id="google_profile",
+            label="Google profile",
+            snippet=google.get("business_name") or source_query or "Lead source record",
+            source="google",
+        )
+    return options
+
+
 def build_llm_scoring_record(record: Dict[str, Any], *, fallback_vertical: str = "service") -> Dict[str, Any]:
     working = ensure_evidence(copy.deepcopy(record))
     google = working.get("google", {}) if isinstance(working.get("google"), dict) else {}
@@ -1710,6 +1868,7 @@ def build_llm_scoring_record(record: Dict[str, Any], *, fallback_vertical: str =
         },
         "visual_review": _visual_review_capsule(evidence, website),
         "selected_evidence_snippets": [*selected_text, *selected_items][:MAX_LLM_SCORING_SNIPPETS],
+        "evidence_ref_options": _build_evidence_ref_options(working, lead=lead),
     }
     return _truncate_for_llm(capsule)
 
@@ -1761,8 +1920,12 @@ Rules:
 - confidence must be one of low, medium, high.
 - safe_outreach_claims must be evidence-backed and safe to say.
 - safe_outreach_claims must be an array of objects with claim and evidence_refs.
-- evidence_refs should use valid IDs from selected_evidence_snippets where kind=evidence_item.
-- If an exact text snippet supports a claim but no evidence item ID directly supports it, lower evidence confidence instead of inventing an evidence ref.
+- evidence_refs is REQUIRED for every score.
+- evidence_refs must be a non-empty array of 1-3 strings; never output [] for evidence_refs.
+- Each evidence_refs value must be copied exactly from that lead's evidence_ref_options[].id.
+- If a lead is low quality, C, or Skip, still include evidence_refs explaining why.
+- safe_outreach_claims[].evidence_refs must also use IDs copied exactly from that lead's evidence_ref_options[].id.
+- If an exact text snippet supports a claim but no evidence_ref_options ID directly supports it, lower evidence confidence instead of inventing an evidence ref.
 - unsafe_claims must list tempting claims that the capsule does not prove.
 - Buyer intent is required for A/B quality: look for fixable gap times money signal, not just a bad website.
 - Bad site alone without buyer_intent.money_signal should not be an A lead.
@@ -1880,6 +2043,13 @@ def _write_invalid_llm_response(bundle_dir: Path, *, batch_id: str, attempt: int
     return debug_path
 
 
+def _write_validation_failed_llm_response(bundle_dir: Path, *, batch_id: str, attempt: int, raw_text: str) -> Path:
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    debug_path = bundle_dir / f"{batch_id}_validation_failed_attempt_{attempt}.json"
+    debug_path.write_text(raw_text, encoding="utf-8")
+    return debug_path
+
+
 def _looks_truncated_llm_response(exc: Exception) -> bool:
     message = str(exc).lower()
     return any(
@@ -1893,11 +2063,153 @@ def _looks_truncated_llm_response(exc: Exception) -> bool:
     )
 
 
+def _score_file_for_compact(compact_record: Dict[str, Any]) -> str:
+    return str(compact_record.get("score_file") or "").strip()
+
+
+def _affected_evidence_ref_options(
+    compact_records: List[Dict[str, Any]],
+    validation_message: str,
+) -> List[Dict[str, Any]]:
+    affected_indexes = {
+        int(match.group(1))
+        for match in re.finditer(r"scores\[(\d+)\]", validation_message)
+        if int(match.group(1)) < len(compact_records)
+    }
+    affected_files = set(re.findall(r"\(([^()]+\.json)\)", validation_message))
+    affected: List[Dict[str, Any]] = []
+
+    for index, compact in enumerate(compact_records):
+        score_file = _score_file_for_compact(compact)
+        if affected_indexes and index not in affected_indexes and score_file not in affected_files:
+            continue
+        if affected_files and not affected_indexes and score_file not in affected_files:
+            continue
+        affected.append(
+            {
+                "score_file": score_file,
+                "business_name": (compact.get("lead") or {}).get("business_name", ""),
+                "evidence_ref_options": compact.get("evidence_ref_options") or [],
+            }
+        )
+
+    if affected:
+        return affected
+    return [
+        {
+            "score_file": _score_file_for_compact(compact),
+            "business_name": (compact.get("lead") or {}).get("business_name", ""),
+            "evidence_ref_options": compact.get("evidence_ref_options") or [],
+        }
+        for compact in compact_records
+    ]
+
+
+def build_validation_repair_prompt(
+    *,
+    batch_id: str,
+    validation_failures: str,
+    invalid_bundle: Dict[str, Any],
+    invalid_json_text: str,
+    compact_records: List[Dict[str, Any]],
+) -> str:
+    affected_options = _affected_evidence_ref_options(compact_records, validation_failures)
+    original_json = invalid_json_text.strip() or json.dumps(invalid_bundle, ensure_ascii=False, indent=2)
+    return f"""# API LLM Score Bundle Schema Repair - {batch_id}
+
+The previous response parsed as JSON but failed schema validation.
+
+Validation failures:
+{validation_failures}
+
+Repair rules:
+- Return one valid JSON object only.
+- No markdown fences.
+- No prose or commentary.
+- Return the same score bundle with only schema repairs.
+- Do not change batch_id.
+- Do not change score_file values.
+- Do not add, remove, or reorder leads.
+- Do not rescore leads or change substantive scoring fields unless required for schema validity.
+- evidence_refs is REQUIRED for every score.
+- evidence_refs must be a non-empty array of 1-3 strings.
+- Each evidence_refs value must be copied exactly from that lead's evidence_ref_options[].id.
+- If the lead is low quality, C, or Skip, still include evidence_refs explaining why.
+- Never output [] for evidence_refs.
+
+Evidence ref options for affected leads:
+{json.dumps(affected_options, ensure_ascii=False, indent=2)}
+
+Original invalid JSON:
+{original_json}
+"""
+
+
+def _fallback_fill_empty_evidence_refs(
+    bundle: Dict[str, Any],
+    compact_records: List[Dict[str, Any]],
+) -> Tuple[Dict[str, Any] | None, str]:
+    fixed = copy.deepcopy(bundle)
+    compact_by_file = {
+        _score_file_for_compact(compact): compact
+        for compact in compact_records
+        if _score_file_for_compact(compact)
+    }
+    filled_files: List[str] = []
+
+    for index, item in enumerate(fixed.get("scores") or []):
+        if not isinstance(item, dict):
+            return None, ""
+        score = item.get("score")
+        if not isinstance(score, dict):
+            return None, ""
+        if score.get("evidence_refs"):
+            continue
+        score_file = str(item.get("score_file") or "").strip()
+        compact = compact_by_file.get(score_file)
+        if compact is None and index < len(compact_records):
+            compact = compact_records[index]
+        options = (compact or {}).get("evidence_ref_options") or []
+        fallback_refs = [str(option.get("id")) for option in options if option.get("id")][:3]
+        if not fallback_refs:
+            return None, ""
+        score["evidence_refs"] = fallback_refs
+        filled_files.append(score_file or f"scores[{index}]")
+
+    if not filled_files:
+        return None, ""
+
+    try:
+        validate_bundle_scores(fixed)
+    except ValueError:
+        return None, ""
+
+    return fixed, f"deterministic evidence_refs fallback filled {', '.join(filled_files)}"
+
+
+def _validation_failure_runtime_error(
+    *,
+    batch_id: str,
+    validation_failures: str,
+    raw_debug_path: Path,
+    repair_debug_path: Path | None = None,
+) -> RuntimeError:
+    parts = [
+        f"API LLM validation failed for {batch_id}",
+        f"validation_failures={validation_failures}",
+        f"raw_debug_path={raw_debug_path}",
+    ]
+    if repair_debug_path is not None:
+        parts.append(f"repair_debug_path={repair_debug_path}")
+    return RuntimeError("; ".join(parts))
+
+
 def _score_batch_with_debug(
     prompt: str,
     *,
     batch_id: str,
     bundle_dir: Path,
+    compact_records: List[Dict[str, Any]],
     model: str,
     max_tokens: int,
 ) -> Dict[str, Any]:
@@ -1907,6 +2219,56 @@ def _score_batch_with_debug(
         try:
             return llm_client.score_batch(prompt, model=model, max_tokens=current_max_tokens)
         except llm_client.InvalidLlmResponse as exc:
+            parsed_json = getattr(exc, "parsed_json", None)
+            if isinstance(parsed_json, dict):
+                validation_debug_path = _write_validation_failed_llm_response(
+                    bundle_dir,
+                    batch_id=batch_id,
+                    attempt=1,
+                    raw_text=exc.raw_text,
+                )
+                validation_failures = str(exc)
+                repair_prompt = build_validation_repair_prompt(
+                    batch_id=batch_id,
+                    validation_failures=validation_failures,
+                    invalid_bundle=parsed_json,
+                    invalid_json_text=exc.raw_text,
+                    compact_records=compact_records,
+                )
+                try:
+                    repaired = llm_client.score_batch(repair_prompt, model=model, max_tokens=current_max_tokens)
+                    repaired["call_count"] = 2
+                    repaired.setdefault("debug_notes", []).append(
+                        f"validation repair succeeded for {batch_id}; raw response saved to {validation_debug_path}"
+                    )
+                    return repaired
+                except llm_client.InvalidLlmResponse as repair_exc:
+                    repair_debug_path: Path | None = None
+                    repair_parsed_json = getattr(repair_exc, "parsed_json", None)
+                    if isinstance(repair_parsed_json, dict):
+                        repair_debug_path = _write_validation_failed_llm_response(
+                            bundle_dir,
+                            batch_id=batch_id,
+                            attempt=2,
+                            raw_text=repair_exc.raw_text,
+                        )
+                    fallback_bundle, fallback_note = _fallback_fill_empty_evidence_refs(parsed_json, compact_records)
+                    if fallback_bundle is not None:
+                        return {
+                            "bundle": fallback_bundle,
+                            "usage": {},
+                            "call_count": 2,
+                            "debug_notes": [
+                                f"{fallback_note}; raw response saved to {validation_debug_path}; repair failed"
+                            ],
+                        }
+                    raise _validation_failure_runtime_error(
+                        batch_id=batch_id,
+                        validation_failures=f"{validation_failures}\nRepair failures:\n{repair_exc}",
+                        raw_debug_path=validation_debug_path,
+                        repair_debug_path=repair_debug_path,
+                    ) from repair_exc
+
             debug_path = _write_invalid_llm_response(
                 bundle_dir,
                 batch_id=batch_id,
@@ -1943,6 +2305,7 @@ def score_records_api_run(
     stopped_by_cap = False
     stop_reason = ""
     skipped_records: List[ApiLlmSkip] = []
+    debug_notes: List[str] = []
     index = 0
     batch_index = 1
     configured_batch_size = max(1, batch_size)
@@ -2030,12 +2393,14 @@ def score_records_api_run(
             prompt,
             batch_id=batch_id,
             bundle_dir=bundle_dir,
+            compact_records=compact_records,
             model=model,
             max_tokens=max_tokens,
         )
         bundle = result["bundle"]
         usage = result.get("usage") or {}
-        calls += 1
+        calls += safe_int(result.get("call_count")) or 1
+        debug_notes.extend(str(note) for note in result.get("debug_notes") or [] if str(note))
         batch_input_tokens = safe_int(usage.get("input_tokens"))
         batch_output_tokens = safe_int(usage.get("output_tokens"))
         batch_total_tokens = safe_int(usage.get("total_tokens")) or batch_input_tokens + batch_output_tokens
@@ -2072,6 +2437,7 @@ def score_records_api_run(
         stopped_by_cap=stopped_by_cap,
         stop_reason=stop_reason,
         skipped_records=skipped_records,
+        debug_notes=debug_notes,
     )
 
 
@@ -2090,6 +2456,7 @@ def write_llm_usage(path: Path, run: ApiLlmRun) -> None:
             {"lead_name": skipped.lead_name, "score_file": skipped.score_file, "reason": skipped.reason}
             for skipped in (run.skipped_records or [])
         ],
+        "debug_notes": run.debug_notes or [],
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
