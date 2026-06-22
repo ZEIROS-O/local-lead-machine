@@ -77,7 +77,77 @@ class BuyerSignalsTest(unittest.TestCase):
         buyer_intent = build_buyer_intent(self._record(rating="4.8", reviews="120"), ads_check=False)
 
         self.assertIn(buyer_intent["review_velocity"]["velocity_band"], {"live", "steady"})
+        self.assertEqual(buyer_intent["review_demand_signal"]["demand_band"], "established")
+        self.assertFalse(buyer_intent["money_signal"])
+
+    def test_review_count_alone_does_not_create_money_signal(self) -> None:
+        from lead_machine.buyer_signals import build_buyer_intent
+
+        buyer_intent = build_buyer_intent(self._record(rating="5.0", reviews="100"), ads_check=False)
+
+        self.assertEqual(buyer_intent["review_profile"]["source"], "count_only")
+        self.assertEqual(buyer_intent["review_profile"]["demand_band"], "established")
+        self.assertFalse(buyer_intent["money_signal"])
+
+    def test_old_review_only_money_signal_is_rebuilt(self) -> None:
+        from lead_machine.buyer_signals import BUYER_INTENT_LOGIC_VERSION, ensure_buyer_intent
+
+        record = self._record(rating="4.8", reviews="120")
+        old_buyer_intent = {
+            "crm_booking_stack": {
+                "detected_tools": [],
+                "has_paid_crm": False,
+                "evidence": [],
+            },
+            "review_velocity": {
+                "velocity_band": "live",
+                "source": "count_only",
+                "evidence": ["120 Google reviews with 4.8 rating"],
+            },
+            "ads": {
+                "google_ad_transparency": "unknown",
+                "meta_ad_library": "unknown",
+                "lsa_badge": "unknown",
+                "errors": [],
+            },
+            "money_signal": True,
+            "evidence": ["120 Google reviews with 4.8 rating"],
+        }
+        record["buyer_intent"] = old_buyer_intent
+
+        buyer_intent = ensure_buyer_intent(record, ads_check=False)
+
+        self.assertIsNot(buyer_intent, old_buyer_intent)
+        self.assertEqual(buyer_intent["logic_version"], BUYER_INTENT_LOGIC_VERSION)
+        self.assertFalse(buyer_intent["money_signal"])
+        self.assertEqual(buyer_intent["review_velocity"]["velocity_band"], "live")
+        self.assertEqual(buyer_intent["review_demand_signal"]["demand_band"], "established")
+
+    def test_known_ad_yes_creates_money_signal(self) -> None:
+        from lead_machine.buyer_signals import build_buyer_intent
+
+        buyer_intent = build_buyer_intent(
+            self._record(text="Google Guaranteed local services ads"),
+            ads_check=True,
+        )
+
+        self.assertEqual(buyer_intent["ads"]["lsa_badge"], "yes")
         self.assertTrue(buyer_intent["money_signal"])
+
+    def test_detailing_review_demand_bands_are_vertical_specific(self) -> None:
+        from lead_machine.buyer_signals import build_buyer_intent
+
+        early = build_buyer_intent(
+            self._record(rating="4.7", reviews="20") | {"vertical": "detailing"},
+            ads_check=False,
+        )
+        mature = build_buyer_intent(
+            self._record(rating="4.9", reviews="401") | {"vertical": "detailing"},
+            ads_check=False,
+        )
+
+        self.assertEqual(early["review_demand_signal"]["demand_band"], "ideal_growth")
+        self.assertEqual(mature["review_demand_signal"]["demand_band"], "mature")
 
 
 if __name__ == "__main__":
