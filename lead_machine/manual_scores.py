@@ -224,8 +224,11 @@ def merge_manual_score(
     score: Dict[str, Any],
     *,
     fallback_vertical: str,
+    allowed_extra_evidence_ids: Set[str] | None = None,
 ) -> Dict[str, Any]:
     allowed = allowed_evidence_ids(enriched)
+    if allowed_extra_evidence_ids:
+        allowed.update(str(ref) for ref in allowed_extra_evidence_ids if str(ref).strip())
     validated = validate_manual_score(score, allowed_evidence_ids=allowed)
     google = enriched.get("google", {}) or {}
     website = enriched.get("website", {}) or {}
@@ -371,6 +374,13 @@ def merge_manual_score(
         "Packet Eligible": packet_eligible,
         "Packet Eligibility Reason": "Manual grade A/B" if packet_eligible else "Manual grade below B threshold",
     }
+    extra_refs_used = set(validated.get("evidence_refs") or []) - allowed_evidence_ids(enriched)
+    for claim in validated.get("safe_outreach_claims") or []:
+        extra_refs_used.update(set(claim.get("evidence_refs") or []) - allowed_evidence_ids(enriched))
+    if extra_refs_used:
+        sorted_allowed = sorted(allowed)
+        row["Known Evidence IDs"] = json.dumps(sorted_allowed, ensure_ascii=False)
+        row["known_evidence_ids"] = sorted_allowed
     base_alias_values = {
         "Business Name": row.get("Business Name", ""),
         "Phone": row.get("Phone", ""),

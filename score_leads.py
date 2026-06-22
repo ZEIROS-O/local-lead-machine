@@ -41,9 +41,10 @@ from lead_machine.evidence import build_evidence_profile
 from lead_machine.lead_card import build_lead_card
 from lead_machine import llm_client
 from lead_machine.llm_queue import safe_slug
+from lead_machine.manual_scores import allowed_evidence_ids as original_evidence_ids
 from lead_machine.manual_scores import load_manual_score, merge_manual_score
 from lead_machine.schema import normalize_lead
-from lead_machine.sendability import apply_sendability
+from lead_machine.sendability import apply_sendability, normalize_evidence_refs
 from lead_machine.verticals import VerticalProfile, resolve_profile
 from make_llm_batch import MANUAL_SCORE_SCHEMA, score_file_for_record
 
@@ -1436,6 +1437,67 @@ def evidence_ids(record: Dict[str, Any]) -> set[str]:
     return ids
 
 
+def lead_id_for_record(record: Dict[str, Any], *, fallback_vertical: str) -> str:
+    google = record.get("google", {}) or {}
+    lead = normalize_lead(google, fallback_vertical=fallback_vertical, source_batch=google.get("source_query", ""))
+    return lead.place_id_or_unique_key or score_file_for_record(record, fallback_vertical=fallback_vertical)
+
+
+def compact_evidence_ref_ids(compact_record: Dict[str, Any]) -> set[str]:
+    refs: set[str] = set()
+    for option in compact_record.get("evidence_ref_options") or []:
+        if not isinstance(option, dict):
+            continue
+        option_id = str(option.get("id") or "").strip()
+        if option_id:
+            refs.add(option_id)
+    return refs
+
+
+def _score_ref_debug_payload(
+    *,
+    lead_id: str,
+    score_path: Path,
+    allowed_refs: set[str],
+) -> Dict[str, Any]:
+    score_refs: List[str] = []
+    safe_claim_refs: List[str] = []
+    try:
+        score_data = json.loads(score_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        score_data = {}
+    if isinstance(score_data, dict):
+        score_refs = normalize_evidence_refs(score_data.get("evidence_refs"))
+        for claim in score_data.get("safe_outreach_claims") or []:
+            if isinstance(claim, dict):
+                safe_claim_refs.extend(normalize_evidence_refs(claim.get("evidence_refs")))
+    offending_refs = sorted((set(score_refs) | set(safe_claim_refs)) - allowed_refs)
+    return {
+        "lead_id": lead_id,
+        "score_path": str(score_path),
+        "offending_evidence_refs": offending_refs,
+        "evidence_refs": score_refs,
+        "safe_outreach_claim_evidence_refs": sorted(set(safe_claim_refs)),
+        "allowed_refs": sorted(allowed_refs),
+    }
+
+
+def _write_api_merge_validation_debug(
+    bundle_dir: Path,
+    *,
+    lead_id: str,
+    score_path: Path,
+    allowed_refs: set[str],
+    error: Exception,
+) -> Path:
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    debug_path = bundle_dir / f"merge_validation_failed_{safe_slug(lead_id)}.json"
+    payload = _score_ref_debug_payload(lead_id=lead_id, score_path=score_path, allowed_refs=allowed_refs)
+    payload["error"] = str(error)
+    debug_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return debug_path
+
+
 def manual_score_candidates(record: Dict[str, Any], scores_dir: Path, fallback_vertical: str) -> Tuple[str, List[Path]]:
     google = record.get("google", {}) or {}
     lead = normalize_lead(google, fallback_vertical=fallback_vertical, source_batch=google.get("source_query", ""))
@@ -1469,9 +1531,12 @@ def score_records_manual_run(
     scores_dir: Path,
     fallback_vertical: str,
     only_scored: bool = False,
+    api_evidence_ref_ids_by_lead_id: Dict[str, set[str]] | None = None,
+    api_merge_debug_dir: Path | None = None,
 ) -> ManualScoreRun:
     scored: List[Dict[str, Any]] = []
     missing_scores: List[MissingManualScore] = []
+    has_known_evidence_ids = False
     for record in records:
         record = ensure_evidence(record)
         lead_name, expected_paths = manual_score_candidates(record, scores_dir, fallback_vertical)
@@ -1482,8 +1547,37 @@ def score_records_manual_run(
                 continue
             raise FileNotFoundError(missing_manual_score_message(lead_name, expected_paths))
 
-        score = load_manual_score(score_path, allowed_evidence_ids=evidence_ids(record))
-        scored.append(merge_manual_score(record, score, fallback_vertical=fallback_vertical))
+        lead_id = lead_id_for_record(record, fallback_vertical=fallback_vertical)
+        api_refs = set((api_evidence_ref_ids_by_lead_id or {}).get(lead_id) or set())
+        allowed_for_api_merge = original_evidence_ids(record) | api_refs
+        allowed_for_load = evidence_ids(record) | api_refs
+        try:
+            score = load_manual_score(score_path, allowed_evidence_ids=allowed_for_load)
+            row = merge_manual_score(
+                record,
+                score,
+                fallback_vertical=fallback_vertical,
+                allowed_extra_evidence_ids=api_refs,
+            )
+        except ValueError as exc:
+            if api_merge_debug_dir is not None:
+                debug_path = _write_api_merge_validation_debug(
+                    api_merge_debug_dir,
+                    lead_id=lead_id,
+                    score_path=score_path,
+                    allowed_refs=allowed_for_api_merge,
+                    error=exc,
+                )
+                raise ValueError(f"{exc}; API merge validation debug written to {debug_path}") from exc
+            raise
+        if "Known Evidence IDs" in row or "known_evidence_ids" in row:
+            has_known_evidence_ids = True
+        scored.append(row)
+
+    if has_known_evidence_ids:
+        for row in scored:
+            row.setdefault("Known Evidence IDs", "")
+            row.setdefault("known_evidence_ids", [])
 
     return ManualScoreRun(rows=scored, missing_scores=missing_scores)
 
@@ -2306,6 +2400,7 @@ def score_records_api_run(
     stop_reason = ""
     skipped_records: List[ApiLlmSkip] = []
     debug_notes: List[str] = []
+    api_evidence_ref_ids_by_lead_id: Dict[str, set[str]] = {}
     index = 0
     batch_index = 1
     configured_batch_size = max(1, batch_size)
@@ -2334,6 +2429,9 @@ def score_records_api_run(
                 build_llm_scoring_record(record, fallback_vertical=fallback_vertical)
                 for record in chunk
             ]
+            for record, compact in zip(chunk, compact_records):
+                lead_id = lead_id_for_record(record, fallback_vertical=fallback_vertical)
+                api_evidence_ref_ids_by_lead_id[lead_id] = compact_evidence_ref_ids(compact)
             prompt = build_api_llm_scoring_prompt(compact_records, batch_id=batch_id)
             estimated_prompt_tokens = estimate_prompt_tokens(prompt)
             projected_total_tokens = estimated_prompt_tokens + max(0, max_tokens)
@@ -2421,6 +2519,8 @@ def score_records_api_run(
         scores_dir=scores_dir,
         fallback_vertical=fallback_vertical,
         only_scored=True,
+        api_evidence_ref_ids_by_lead_id=api_evidence_ref_ids_by_lead_id,
+        api_merge_debug_dir=bundle_dir,
     )
     return ApiLlmRun(
         manual_run=manual_run,

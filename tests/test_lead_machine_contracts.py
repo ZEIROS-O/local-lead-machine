@@ -2108,6 +2108,106 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertIn("copied exactly from that lead's evidence_ref_options[].id", prompt)
         self.assertIn("never output [] for evidence_refs", prompt)
 
+    def test_api_llm_merge_accepts_lead_compact_evidence_refs_only(self) -> None:
+        from score_leads import score_records_api_run
+
+        first = self._huge_detailing_record(name="Buyer Intent Detail", place_id="ChIJ123")
+        buyer_intent_score = self._manual_score(
+            total_score=75,
+            grade="B",
+            evidence_refs=["buyer_intent"],
+            safe_outreach_claims=[
+                {"claim": "Your buyer-intent signals show active demand.", "evidence_refs": ["buyer_intent"]}
+            ],
+        )
+        buyer_intent_bundle = {
+            "batch_id": "batch_001",
+            "scores": [{"score_file": "chij123.json", "score": buyer_intent_score}],
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            scores_dir = Path(tmp) / "scores"
+            with patch(
+                "score_leads.llm_client.score_batch",
+                return_value={
+                    "bundle": buyer_intent_bundle,
+                    "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                },
+            ):
+                run = score_records_api_run(
+                    [first],
+                    scores_dir=scores_dir,
+                    fallback_vertical="detailing",
+                    batch_size=1,
+                    model="claude-sonnet-4-6",
+                    max_tokens=4096,
+                    max_calls=0,
+                    max_tokens_per_run=100_000,
+                    max_usd_per_run=0.0,
+                )
+
+        self.assertEqual(run.manual_run.rows[0]["Evidence Refs"], json.dumps(["buyer_intent"]))
+        self.assertNotIn("Invalid evidence reference", run.manual_run.rows[0]["Send Blockers"])
+
+        second = self._huge_detailing_record(name="Fake Ref Detail", place_id="ChIJ456")
+        fake_ref_score = self._manual_score(
+            total_score=75,
+            grade="B",
+            evidence_refs=["fake_unknown_ref"],
+            safe_outreach_claims=[
+                {"claim": "Your buyer-intent signals show active demand.", "evidence_refs": ["fake_unknown_ref"]}
+            ],
+        )
+        valid_first_bundle = {
+            "batch_id": "batch_001",
+            "scores": [{"score_file": "chij123.json", "score": buyer_intent_score}],
+        }
+        fake_ref_bundle = {
+            "batch_id": "batch_002",
+            "scores": [{"score_file": "chij456.json", "score": fake_ref_score}],
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            scores_dir = Path(tmp) / "scores"
+            with patch(
+                "score_leads.llm_client.score_batch",
+                side_effect=[
+                    {
+                        "bundle": valid_first_bundle,
+                        "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                    },
+                    {
+                        "bundle": fake_ref_bundle,
+                        "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                    },
+                ],
+            ):
+                with self.assertRaises(ValueError) as caught:
+                    score_records_api_run(
+                        [first, second],
+                        scores_dir=scores_dir,
+                        fallback_vertical="detailing",
+                        batch_size=1,
+                        model="claude-sonnet-4-6",
+                        max_tokens=4096,
+                        max_calls=0,
+                        max_tokens_per_run=100_000,
+                        max_usd_per_run=0.0,
+                    )
+
+            self.assertTrue((scores_dir / "chij123.json").exists())
+            debug_path = scores_dir / "_api_bundles" / "merge_validation_failed_chij456.json"
+            self.assertTrue(debug_path.exists())
+            debug_payload = json.loads(debug_path.read_text(encoding="utf-8"))
+
+        message = str(caught.exception)
+        self.assertIn("Unknown evidence_refs: fake_unknown_ref", message)
+        self.assertIn("API merge validation debug written", message)
+        self.assertEqual(debug_payload["lead_id"], "ChIJ456")
+        self.assertEqual(debug_payload["offending_evidence_refs"], ["fake_unknown_ref"])
+        self.assertIn("buyer_intent", debug_payload["allowed_refs"])
+        self.assertNotIn("fake_unknown_ref", debug_payload["allowed_refs"])
+
     def test_api_llm_compact_prompt_for_ten_huge_leads_stays_under_run_token_cap(self) -> None:
         from score_leads import build_api_llm_scoring_prompt, build_llm_scoring_record, estimate_prompt_tokens
 
