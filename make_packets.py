@@ -88,6 +88,8 @@ EXTRA_FIELDS = [
     "Fit Flags",
     "Review Fit Band",
     "Review Demand Band",
+    "Packet Tier",
+    "Manual Review Reason",
     "Packet Eligible",
     "Packet Eligibility Reason",
     "Sendable",
@@ -202,6 +204,12 @@ def parse_raw_evidence(row: Dict[str, str]) -> Dict[str, Any]:
         return {}
 
 
+# Tiers that produce an actual packet on disk. Sendable packets are ready for
+# outreach; manual review packets are valid prospects that still need a
+# human visual/form review before they are safe to cold-send.
+PACKET_TIERS_WITH_PACKET = {"Sendable Packet", "Manual Review Packet"}
+
+
 def is_eligible(row: Dict[str, str], include_all: bool, priority_filter: Optional[str]) -> bool:
     if priority_filter and row.get("Lead Priority") != priority_filter:
         return False
@@ -209,6 +217,11 @@ def is_eligible(row: Dict[str, str], include_all: bool, priority_filter: Optiona
     if include_all:
         return True
 
+    tier = row.get("Packet Tier", "").strip()
+    if tier:
+        return tier in PACKET_TIERS_WITH_PACKET
+
+    # Fallback for rows scored before packet tiers existed.
     return row.get("Packet Eligible", "").strip().lower() == "yes" and row.get("Sendable", "").strip().lower() == "yes"
 
 
@@ -454,11 +467,18 @@ def packet_markdown(row: Dict[str, str]) -> str:
     row = sanitize_packet_row(row)
     evidence = parse_raw_evidence(row)
 
+    tier = row.get("Packet Tier", "").strip()
+
     lines: List[str] = []
     lines.append(f"# Lead Packet — {row.get('Business Name', '')}")
     lines.append("")
+    if tier == "Manual Review Packet":
+        lines.append("> ⚠️ **Not sendable yet — needs visual/form review before outreach.**")
+        lines.append("")
     lines.append("## Quick Verdict")
     lines.append("")
+    lines.append(f"- **Packet Tier:** {tier or 'No Packet'}")
+    lines.append(f"- **Manual Review Reason:** {row.get('Manual Review Reason', '') or 'none'}")
     lines.append(f"- **Priority:** {row.get('Lead Priority', '')}")
     lines.append(f"- **Packet Eligible:** {row.get('Packet Eligible', '') or 'No'}")
     lines.append(f"- **Packet Eligibility Reason:** {row.get('Packet Eligibility Reason', '') or 'none'}")
@@ -501,8 +521,12 @@ def write_packet(row: Dict[str, str], output_dir: Path, index: int) -> Path:
     priority = row.get("Lead Priority", "Unknown") or "Unknown"
     offer = row.get("Offer Fit", "Unknown") or "Unknown"
     business = row.get("Business Name", "lead") or "lead"
+    tier = row.get("Packet Tier", "").strip()
 
-    folder = output_dir / f"{priority}_{safe_slug(offer)}"
+    if tier == "Manual Review Packet":
+        folder = output_dir / "Manual_Review" / f"{priority}_{safe_slug(offer)}"
+    else:
+        folder = output_dir / f"{priority}_{safe_slug(offer)}"
     folder.mkdir(parents=True, exist_ok=True)
 
     filename = f"{index:03d}-{safe_slug(business)}.md"
@@ -536,6 +560,8 @@ def write_index(output_dir: Path, packet_rows: List[Dict[str, str]]) -> None:
         "Desktop Screenshot Path",
         "Mobile Screenshot Path",
         "Score Total",
+        "Packet Tier",
+        "Manual Review Reason",
         "Sendable",
         "Minimum Evidence Passed",
         "Packet Eligibility Reason",

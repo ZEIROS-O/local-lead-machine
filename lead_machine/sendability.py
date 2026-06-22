@@ -52,6 +52,52 @@ CONFIDENCE_VALUES = {
     "low": 0.5,
 }
 
+# --- Packet tiers ---------------------------------------------------------
+# Packet creation is split from sendability. A lead can be a valid manual
+# prospect (Manual Review Packet) even when it is not safe to cold-send yet.
+PACKET_TIER_SENDABLE = "Sendable Packet"
+PACKET_TIER_MANUAL = "Manual Review Packet"
+PACKET_TIER_WATCHLIST = "Watchlist"
+PACKET_TIER_NONE = "No Packet"
+
+PACKET_TIERS_WITH_PACKET = {PACKET_TIER_SENDABLE, PACKET_TIER_MANUAL}
+
+MANUAL_REVIEW_MIN_RATING = 4.5
+MANUAL_REVIEW_MIN_REVIEWS = 10
+MANUAL_REVIEW_MIN_PAIN_SCORE = 35
+MANUAL_REVIEW_BANDS = {"early_proof", "ideal_growth"}
+MANUAL_REVIEW_OFFERS = {"no-site launch", "website rebuild", "estimate funnel"}
+MANUAL_REVIEW_SITE_STATUSES = {
+    "missing",
+    "no website",
+    "no_website",
+    "weak",
+    "broken",
+    "broken website",
+    "broken_website",
+    "social only",
+    "social_only",
+}
+MANUAL_REVIEW_QUALITY = {"poor", "missing", "n/a"}
+MANUAL_REVIEW_PAIN_PATTERNS = [
+    "social-only",
+    "social only",
+    "facebook-only",
+    "facebook only",
+    "facebook profile",
+    "no standalone website",
+    "standalone website",
+    "no clear estimate cta",
+    "no estimate cta",
+    "no estimate form",
+    "no estimate funnel",
+    "estimate cta or form",
+    "phone hard to find",
+    "phone number hard to find",
+    "phone is hard to find",
+    "phone number is hard to find",
+]
+
 CONCRETE_SITE_STATUSES = {
     "missing",
     "no website",
@@ -379,6 +425,90 @@ def evaluate_sendability(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def manual_review_issue_indicators(row: Dict[str, Any]) -> List[str]:
+    """Concrete-enough issues that justify a human taking a manual look.
+
+    These are softer than the strict sendability gate: any one of them is enough
+    to make a valid business worth a manual review packet.
+    """
+    indicators: List[str] = []
+
+    status = _normalized_site_status(row)
+    if status in MANUAL_REVIEW_SITE_STATUSES:
+        indicators.append(f"site status {status}")
+
+    quality = _clean(_pick(row, "Current Website Quality")).lower()
+    if quality in MANUAL_REVIEW_QUALITY:
+        indicators.append(f"website quality {quality or 'missing'}")
+
+    pain_score = get_visible_pain_score(row)
+    if pain_score >= MANUAL_REVIEW_MIN_PAIN_SCORE:
+        indicators.append(f"visible pain score {pain_score}")
+
+    for reason in get_visible_pain_reasons(row):
+        cleaned = _clean(reason).lower()
+        if any(pattern in cleaned for pattern in MANUAL_REVIEW_PAIN_PATTERNS):
+            indicators.append(reason)
+
+    return indicators
+
+
+def manual_review_reason(row: Dict[str, Any], result: Dict[str, Any]) -> str:
+    """Return a non-empty reason string if the lead qualifies for a manual packet."""
+    if not result.get("minimum_evidence_passed"):
+        return ""
+    if _rating(row) < MANUAL_REVIEW_MIN_RATING:
+        return ""
+    if _review_count(row) < MANUAL_REVIEW_MIN_REVIEWS:
+        return ""
+    if _review_demand_band(row) not in MANUAL_REVIEW_BANDS:
+        return ""
+    if _best_angle(row).lower() not in MANUAL_REVIEW_OFFERS:
+        return ""
+
+    # Do not rescue strong-form / no-concrete-issue leads unless a real issue exists.
+    if has_strong_estimate_form(row) and not has_concrete_conversion_issue(row):
+        return ""
+
+    indicators = manual_review_issue_indicators(row)
+    if not indicators:
+        return ""
+    return "; ".join(indicators)
+
+
+def qualifies_for_watchlist(row: Dict[str, Any], result: Dict[str, Any]) -> bool:
+    """A valid business worth keeping an eye on, but with no concrete issue yet."""
+    if not result.get("minimum_evidence_passed"):
+        return False
+    if _rating(row) < MANUAL_REVIEW_MIN_RATING:
+        return False
+    if _review_count(row) < MANUAL_REVIEW_MIN_REVIEWS:
+        return False
+    if _review_demand_band(row) not in MANUAL_REVIEW_BANDS:
+        return False
+    if _best_angle(row).lower() not in MANUAL_REVIEW_OFFERS:
+        return False
+    return True
+
+
+def evaluate_packet_tier(row: Dict[str, Any], result: Dict[str, Any]) -> tuple[str, str]:
+    """Classify a scored lead into a packet tier, independent of sendability.
+
+    Returns (tier, manual_review_reason).
+    """
+    if result.get("sendable"):
+        return PACKET_TIER_SENDABLE, ""
+
+    reason = manual_review_reason(row, result)
+    if reason:
+        return PACKET_TIER_MANUAL, reason
+
+    if qualifies_for_watchlist(row, result):
+        return PACKET_TIER_WATCHLIST, ""
+
+    return PACKET_TIER_NONE, ""
+
+
 def apply_sendability(row: Dict[str, Any]) -> Dict[str, Any]:
     updated = dict(row)
     result = evaluate_sendability(updated)
@@ -402,9 +532,25 @@ def apply_sendability(row: Dict[str, Any]) -> Dict[str, Any]:
     updated["Buyer Intent Signals"] = result["buyer_intent_signals"]
     updated["buyer_intent_signals"] = result["buyer_intent_signals"]
 
-    if updated.get("Packet Eligible") == "Yes" and not result["sendable"]:
+    tier, review_reason = evaluate_packet_tier(updated, result)
+    updated["Packet Tier"] = tier
+    updated["Manual Review Reason"] = review_reason
+
+    if tier == PACKET_TIER_SENDABLE:
+        updated["Packet Eligible"] = "Yes"
+    elif tier == PACKET_TIER_MANUAL:
+        updated["Packet Eligible"] = "Yes"
+        updated["Packet Eligibility Reason"] = (
+            f"Manual Review Packet (not sendable yet): {review_reason}"
+        )
+    else:
+        if updated.get("Packet Eligible") == "Yes":
+            updated["Packet Eligibility Reason"] = f"Blocked by sendability: {blockers}"
         updated["Packet Eligible"] = ""
-        updated["Packet Eligibility Reason"] = f"Blocked by sendability: {blockers}"
+        if tier == PACKET_TIER_WATCHLIST and not updated.get("Packet Eligibility Reason"):
+            updated["Packet Eligibility Reason"] = (
+                "Watchlist: valid business, needs visual review before outreach"
+            )
 
     return updated
 

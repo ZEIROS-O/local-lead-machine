@@ -3663,6 +3663,240 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertFalse(is_eligible(row, include_all=False, priority_filter=None))
         self.assertTrue(is_eligible(row, include_all=True, priority_filter=None))
 
+    # --- Packet tier: split packet creation from sendability ----------------
+
+    def _facebook_only_evidence(self, *, reviews: str, reasons: list) -> dict:
+        return {
+            "google": {
+                **self._google_fixture(),
+                "business_name": "Facebook Only Detailing LLC",
+                "rating": "5.0",
+                "reviews": reviews,
+            },
+            "evidence": {
+                "site_status": "weak",
+                "visible_pain_score": 50,
+                "visible_pain_reasons": reasons,
+                "visible_pain_categories": ["no_site_or_social_only_pain", "estimate_path_pain"],
+                "send_trigger": "Social-only web presence",
+                "evidence_items": [
+                    {"id": "E1", "field": "google_rating", "value": f"5.0 stars / {reviews} reviews"},
+                    {"id": "E2", "field": "site_status", "value": "weak"},
+                    {"id": "E3", "field": "send_trigger", "value": "Social-only web presence"},
+                ],
+            },
+        }
+
+    def _facebook_only_score(self, **overrides: object) -> dict:
+        base = dict(
+            best_angle="No-Site Launch",
+            evidence_refs=["E1", "E2", "E3"],
+            visible_pain_score=50,
+            visible_pain_reasons=[
+                "No standalone website — business presence is Facebook-only",
+                "No clear estimate CTA detected",
+                "Phone number hard to find on the page",
+            ],
+            visible_pain_categories=["no_site_or_social_only_pain", "estimate_path_pain"],
+            send_trigger="Social-only web presence",
+            safe_outreach_claims=[
+                {"claim": "Your Google profile shows strong review proof.", "evidence_refs": ["E1"]},
+                {"claim": "The web presence relies on social pages, not an owned site.", "evidence_refs": ["E2", "E3"]},
+            ],
+            opener="Your reviews look strong, but I could not find a standalone website. Want me to send a direction?",
+        )
+        base.update(overrides)
+        return self._manual_score(**base)
+
+    def test_b_no_site_facebook_only_low_confidence_is_manual_review_packet(self) -> None:
+        enriched = self._facebook_only_evidence(
+            reviews="45",
+            reasons=[
+                "No standalone website — business presence is Facebook-only",
+                "No clear estimate CTA detected",
+                "Phone number hard to find on the page",
+            ],
+        )
+        raw_score = self._facebook_only_score(confidence="low")
+
+        row = merge_manual_score(enriched, raw_score, fallback_vertical="detailing")
+
+        self.assertEqual(row["Lead Priority"], "B")
+        self.assertEqual(row["Sendable"], "No")
+        self.assertEqual(row["Minimum Evidence Passed"], "Yes")
+        self.assertEqual(row["Packet Tier"], "Manual Review Packet")
+        self.assertEqual(row["Packet Eligible"], "Yes")
+        self.assertTrue(row["Manual Review Reason"])
+        self.assertTrue(is_eligible(row, include_all=False, priority_filter=None))
+
+    def test_c_no_site_facebook_only_below_b_is_manual_review_packet(self) -> None:
+        enriched = self._facebook_only_evidence(
+            reviews="24",
+            reasons=[
+                "Business uses a Facebook profile as its primary web presence — no standalone website",
+                "No estimate CTA or form detectable",
+            ],
+        )
+        raw_score = self._facebook_only_score(
+            subscores={
+                "icp_fit": 10,
+                "reputation_demand_proof": 10,
+                "web_conversion_pain": 12,
+                "mockup_leverage": 8,
+                "reachability": 6,
+                "offer_angle_clarity": 5,
+                "evidence_confidence": 4,
+            },
+            visible_pain_reasons=[
+                "Business uses a Facebook profile as its primary web presence — no standalone website",
+                "No estimate CTA or form detectable",
+            ],
+        )
+
+        row = merge_manual_score(enriched, raw_score, fallback_vertical="detailing")
+
+        self.assertEqual(row["Lead Priority"], "C")
+        self.assertEqual(row["Sendable"], "No")
+        self.assertIn("Score below B threshold", row["Send Blockers"])
+        self.assertEqual(row["Minimum Evidence Passed"], "Yes")
+        self.assertEqual(row["Packet Tier"], "Manual Review Packet")
+        self.assertEqual(row["Packet Eligible"], "Yes")
+
+    def test_c_estimate_funnel_strong_cta_low_visible_pain_is_not_manual_review(self) -> None:
+        enriched = {
+            "google": {
+                **self._google_fixture(),
+                "business_name": "Luminix Detailing and Ceramic Coating",
+                "rating": "5.0",
+                "reviews": "15",
+            },
+            "evidence": {
+                "site_status": "okay",
+                "contact_form_detected": "Yes",
+                "estimate_form_detected": "Yes",
+                "form_strength": "Basic",
+                "cta_strength": "Strong",
+                "visible_pain_score": 12,
+                "visible_pain_reasons": ["Basic estimate form only — no paid CRM or booking tool detected"],
+                "visible_pain_categories": ["estimate_path_pain"],
+                "send_trigger": "Basic estimate form only",
+                "evidence_items": [
+                    {"id": "E1", "field": "google_rating", "value": "5.0 stars / 15 reviews"},
+                    {"id": "E2", "field": "form_strength", "value": "Basic"},
+                    {"id": "E3", "field": "send_trigger", "value": "Basic estimate form only"},
+                ],
+            },
+        }
+        raw_score = self._manual_score(
+            best_angle="Estimate Funnel",
+            subscores={
+                "icp_fit": 11,
+                "reputation_demand_proof": 10,
+                "web_conversion_pain": 12,
+                "mockup_leverage": 8,
+                "reachability": 6,
+                "offer_angle_clarity": 5,
+                "evidence_confidence": 3,
+            },
+            evidence_refs=["E1", "E2", "E3"],
+            visible_pain_score=12,
+            visible_pain_reasons=["Basic estimate form only — no paid CRM or booking tool detected"],
+            visible_pain_categories=["estimate_path_pain"],
+            send_trigger="Basic estimate form only",
+            safe_outreach_claims=[
+                {"claim": "Your Google profile shows strong review proof.", "evidence_refs": ["E1"]},
+                {"claim": "The estimate form is basic for the demand signal.", "evidence_refs": ["E2", "E3"]},
+            ],
+            opener="Your reviews look strong; the estimate form looks basic for that demand.",
+        )
+
+        row = merge_manual_score(enriched, raw_score, fallback_vertical="detailing")
+
+        self.assertEqual(row["Lead Priority"], "C")
+        self.assertEqual(row["Sendable"], "No")
+        self.assertNotEqual(row["Packet Tier"], "Manual Review Packet")
+        self.assertEqual(row["Packet Eligible"], "")
+        self.assertFalse(is_eligible(row, include_all=False, priority_filter=None))
+
+    def test_advanced_optimization_strong_form_no_issue_is_no_packet(self) -> None:
+        enriched = {
+            "google": {
+                **self._google_fixture(),
+                "reviews": "40",
+            },
+            "evidence": {
+                "site_status": "okay",
+                "contact_form_detected": "Yes",
+                "estimate_form_detected": "Yes",
+                "form_strength": "Strong",
+                "cta_strength": "Strong",
+                "visible_pain_score": 0,
+                "visible_pain_reasons": [],
+                "send_trigger": "",
+                "evidence_items": [
+                    {"id": "E1", "field": "google_rating", "value": "4.9 stars / 40 reviews"},
+                    {"id": "E2", "field": "form_strength", "value": "Strong"},
+                ],
+            },
+        }
+        raw_score = self._manual_score(
+            best_angle="Advanced Optimization",
+            evidence_refs=["E1", "E2"],
+            safe_outreach_claims=[
+                {"claim": "Your Google profile shows strong reviews.", "evidence_refs": ["E1"]},
+                {"claim": "The site has a strong estimate form.", "evidence_refs": ["E2"]},
+            ],
+        )
+
+        row = merge_manual_score(enriched, raw_score, fallback_vertical="detailing")
+
+        self.assertEqual(row["Sendable"], "No")
+        self.assertEqual(row["Packet Tier"], "No Packet")
+        self.assertEqual(row["Packet Eligible"], "")
+        self.assertFalse(is_eligible(row, include_all=False, priority_filter=None))
+
+    def test_sendable_lead_is_sendable_packet(self) -> None:
+        enriched = {
+            "google": {
+                **self._google_fixture(),
+                "reviews": "18",
+            },
+            "buyer_intent": self._buyer_intent_fixture(),
+            "evidence": {
+                "site_status": "missing",
+                "visible_pain_score": 40,
+                "visible_pain_reasons": ["No owned website found"],
+                "visible_pain_categories": ["no_site_or_social_only_pain"],
+                "send_trigger": "No owned website found",
+                "evidence_items": [
+                    {"id": "E1", "field": "google_rating", "value": "4.9 stars / 18 reviews"},
+                    {"id": "E2", "field": "site_status", "value": "missing"},
+                    {"id": "E3", "field": "send_trigger", "value": "No owned website found"},
+                ],
+            },
+        }
+        raw_score = self._manual_score(
+            best_angle="Website Rebuild",
+            evidence_refs=["E1", "E2", "E3"],
+            visible_pain_score=40,
+            visible_pain_reasons=["No owned website found"],
+            visible_pain_categories=["no_site_or_social_only_pain"],
+            send_trigger="No owned website found",
+            safe_outreach_claims=[
+                {"claim": "No owned website is visible.", "evidence_refs": ["E2", "E3"]},
+                {"claim": "The Google profile has review proof.", "evidence_refs": ["E1"]},
+            ],
+            opener="I could not find an owned website, only the Google profile.",
+        )
+
+        row = merge_manual_score(enriched, raw_score, fallback_vertical="hardscaping")
+
+        self.assertEqual(row["Sendable"], "Yes")
+        self.assertEqual(row["Packet Tier"], "Sendable Packet")
+        self.assertEqual(row["Packet Eligible"], "Yes")
+        self.assertEqual(row["Manual Review Reason"], "")
+        self.assertTrue(is_eligible(row, include_all=False, priority_filter=None))
+
     def test_score_record_uses_record_vertical_profile_for_detailing_denylist(self) -> None:
         row = score_record(
             {
