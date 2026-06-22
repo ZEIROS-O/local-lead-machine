@@ -226,6 +226,8 @@ class ApiLlmRun:
     stop_reason: str = ""
     skipped_records: List[ApiLlmSkip] | None = None
     debug_notes: List[str] | None = None
+    skipped_already_scored: int = 0
+    new_records_selected: int = 0
 
 
 DEFAULT_LLM_SCORING_MODEL = "claude-sonnet-4-6"
@@ -1365,7 +1367,11 @@ def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
         path.write_text("", encoding="utf-8")
         return
 
-    fieldnames = list(rows[0].keys())
+    fieldnames: List[str] = []
+    for row in rows:
+        for key in row.keys():
+            if key not in fieldnames:
+                fieldnames.append(key)
 
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -1378,6 +1384,123 @@ def write_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def read_csv_rows(path: Path) -> List[Dict[str, str]]:
+    if not path.exists() or path.stat().st_size == 0:
+        return []
+    with path.open(newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def _stable_key_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip()).lower()
+
+
+def _phone_digits(value: Any) -> str:
+    return re.sub(r"\D+", "", str(value or ""))
+
+
+def _loads_dict(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    try:
+        loaded = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def stable_lead_keys_from_row(row: Dict[str, Any]) -> set[str]:
+    raw = _loads_dict(row.get("Raw Evidence") or row.get("raw_evidence"))
+    google = raw.get("google", {}) if isinstance(raw.get("google"), dict) else {}
+    keys: set[str] = set()
+
+    place_key = _stable_key_text(row.get("Place Key") or row.get("place_key"))
+    if place_key:
+        keys.add(f"place_key:{place_key}")
+        if place_key.startswith("chij"):
+            keys.add(f"place:{place_key}")
+
+    place_id = _stable_key_text(row.get("place_id") or row.get("Place ID") or google.get("place_id"))
+    if place_id:
+        keys.add(f"place:{place_id}")
+
+    maps_url = _stable_key_text(
+        row.get("Google Maps URL")
+        or row.get("google_maps_url")
+        or google.get("google_maps_url")
+        or google.get("maps_url")
+    )
+    if maps_url:
+        keys.add(f"maps:{maps_url}")
+
+    business_name = _stable_key_text(
+        row.get("Business Name")
+        or row.get("business_name")
+        or google.get("business_name")
+    )
+    phone = _phone_digits(row.get("Phone") or row.get("phone") or google.get("phone"))
+    if business_name and phone:
+        keys.add(f"name_phone:{business_name}|{phone}")
+
+    return keys
+
+
+def stable_lead_keys_from_record(record: Dict[str, Any], *, fallback_vertical: str) -> set[str]:
+    google = record.get("google", {}) if isinstance(record.get("google"), dict) else {}
+    lead = normalize_lead(google, fallback_vertical=fallback_vertical, source_batch=google.get("source_query", ""))
+    keys: set[str] = set()
+
+    place_key = _stable_key_text(lead.place_id_or_unique_key)
+    if place_key:
+        keys.add(f"place_key:{place_key}")
+        if place_key.startswith("chij"):
+            keys.add(f"place:{place_key}")
+
+    place_id = _stable_key_text(google.get("place_id"))
+    if place_id:
+        keys.add(f"place:{place_id}")
+
+    maps_url = _stable_key_text(lead.maps_url or google.get("google_maps_url") or google.get("maps_url"))
+    if maps_url:
+        keys.add(f"maps:{maps_url}")
+
+    business_name = _stable_key_text(lead.business_name or google.get("business_name"))
+    phone = _phone_digits(lead.phone or google.get("phone"))
+    if business_name and phone:
+        keys.add(f"name_phone:{business_name}|{phone}")
+
+    return keys
+
+
+def stable_lead_keys_from_rows(rows: List[Dict[str, Any]]) -> set[str]:
+    keys: set[str] = set()
+    for row in rows:
+        keys.update(stable_lead_keys_from_row(row))
+    return keys
+
+
+def filter_unscored_records(
+    records: List[Dict[str, Any]],
+    *,
+    existing_keys: set[str],
+    fallback_vertical: str,
+) -> Tuple[List[Dict[str, Any]], int]:
+    if not existing_keys:
+        return records, 0
+    existing_keys = {_stable_key_text(key) for key in existing_keys if _stable_key_text(key)}
+    selected: List[Dict[str, Any]] = []
+    skipped = 0
+    for record in records:
+        record_keys = stable_lead_keys_from_record(record, fallback_vertical=fallback_vertical)
+        if record_keys & existing_keys:
+            skipped += 1
+            continue
+        selected.append(record)
+    return selected, skipped
 
 
 CORE_EVIDENCE_FIELDS = ("visible_pain_score", "visible_pain_reasons", "send_trigger")
@@ -2390,8 +2513,14 @@ def score_records_api_run(
     max_calls: int = DEFAULT_MAX_LLM_CALLS_PER_RUN,
     max_tokens_per_run: int = DEFAULT_MAX_LLM_TOKENS_PER_RUN,
     max_usd_per_run: float = DEFAULT_MAX_LLM_USD_PER_RUN,
+    resume_scored_keys: set[str] | None = None,
 ) -> ApiLlmRun:
-    selected = [ensure_evidence(record) for record in records]
+    unscored_records, skipped_already_scored = filter_unscored_records(
+        records,
+        existing_keys=resume_scored_keys or set(),
+        fallback_vertical=fallback_vertical,
+    )
+    selected = [ensure_evidence(record) for record in unscored_records]
     bundle_dir = scores_dir / "_api_bundles"
     calls = 0
     input_tokens = 0
@@ -2540,6 +2669,8 @@ def score_records_api_run(
         stop_reason=stop_reason,
         skipped_records=skipped_records,
         debug_notes=debug_notes,
+        skipped_already_scored=skipped_already_scored,
+        new_records_selected=len(selected),
     )
 
 
@@ -2609,6 +2740,13 @@ def main() -> int:
         action="store_true",
         help="Manual LLM mode: skip enriched records without a matching score JSON",
     )
+    parser.add_argument(
+        "--resume-scored",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="API LLM mode: skip records already present in the output CSV (default: true for api-llm)",
+    )
+    parser.add_argument("--offset", type=int, default=0, help="Optional input record offset before scoring")
     parser.add_argument("--limit", type=int, default=0, help="Optional max records to score")
     parser.add_argument("--llm-batch-size", type=int, default=5, help="API LLM leads per batch")
     parser.add_argument(
@@ -2631,10 +2769,15 @@ def main() -> int:
         raise FileNotFoundError(input_path)
 
     records = [ensure_evidence(record) for record in read_jsonl(input_path)]
-    if args.limit > 0:
-        records = records[: args.limit]
+    if args.offset > 0:
+        records = records[args.offset :]
+
+    existing_scored_rows: List[Dict[str, Any]] = []
+    append_existing_scored_rows = False
 
     if args.mode == "manual-llm":
+        if args.limit > 0:
+            records = records[: args.limit]
         if not args.scores_dir:
             raise SystemExit("--scores-dir is required when --mode manual-llm")
         manual_run = score_records_manual_run(
@@ -2649,6 +2792,24 @@ def main() -> int:
     elif args.mode == "api-llm":
         if not args.scores_dir:
             raise SystemExit("--scores-dir is required when --mode api-llm")
+        resume_scored = True if args.resume_scored is None else bool(args.resume_scored)
+        existing_scored_keys: set[str] = set()
+        skipped_already_scored = 0
+        if resume_scored and output_path.exists():
+            existing_scored_rows = read_csv_rows(output_path)
+            existing_scored_keys = stable_lead_keys_from_rows(existing_scored_rows)
+            records, skipped_already_scored = filter_unscored_records(
+                records,
+                existing_keys=existing_scored_keys,
+                fallback_vertical=args.vertical,
+            )
+            append_existing_scored_rows = bool(existing_scored_rows)
+        if args.limit > 0:
+            records = records[: args.limit]
+        if resume_scored:
+            print(f"[RESUME] Existing scored rows: {len(existing_scored_rows)}")
+            print(f"[RESUME] Skipping already scored: {skipped_already_scored}")
+            print(f"[RESUME] New records selected: {len(records)}")
         max_calls = getenv_int("MAX_LLM_CALLS_PER_RUN", DEFAULT_MAX_LLM_CALLS_PER_RUN)
         max_tokens_per_run = getenv_int("MAX_LLM_TOKENS_PER_RUN", DEFAULT_MAX_LLM_TOKENS_PER_RUN)
         max_usd_per_run = getenv_float("MAX_LLM_USD_PER_RUN", DEFAULT_MAX_LLM_USD_PER_RUN)
@@ -2677,9 +2838,13 @@ def main() -> int:
             write_llm_usage(Path(args.llm_usage_output), api_run)
             print(f"[LLM] Usage metadata: {args.llm_usage_output}")
     else:
+        if args.limit > 0:
+            records = records[: args.limit]
         scored = [score_record(record, args.vertical) for record in records]
 
     scored.sort(key=sort_key)
+    if append_existing_scored_rows:
+        scored = [*existing_scored_rows, *scored]
 
     write_csv(output_path, scored)
 
@@ -2691,7 +2856,8 @@ def main() -> int:
     packets = 0
 
     for row in scored:
-        counts[row["Lead Priority"]] = counts.get(row["Lead Priority"], 0) + 1
+        priority = str(row.get("Lead Priority", ""))
+        counts[priority] = counts.get(priority, 0) + 1
         if row.get("Packet Eligible") == "Yes":
             packets += 1
 

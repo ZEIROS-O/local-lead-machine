@@ -2094,6 +2094,199 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(api_code, 0)
         self.assertEqual(api_bytes, manual_bytes)
 
+    def test_api_llm_resume_skips_existing_csv_rows_and_continues_from_same_input(self) -> None:
+        records = [
+            self._huge_detailing_record(name=f"Detailing {index}", place_id=f"ChIJ{index}")
+            for index in range(1, 5)
+        ]
+        for index, record in enumerate(records, start=1):
+            record["google"]["google_maps_url"] = f"https://maps.google.com/?cid={index}"
+
+        def fake_score_batch(prompt: str, *, model: str, max_tokens: int) -> dict:
+            score_files = sorted(set(re.findall(r'"score_file": "([^"]+\.json)"', prompt)))
+            return {
+                "bundle": {
+                    "batch_id": "batch_001",
+                    "scores": [
+                        {"score_file": score_file, "score": self._manual_score(total_score=75, grade="B")}
+                        for score_file in score_files
+                    ],
+                },
+                "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            input_path = tmp_path / "enriched.jsonl"
+            output_path = tmp_path / "scored.csv"
+            scores_dir = tmp_path / "scores"
+            input_path.write_text(
+                "".join(f"{json.dumps(record)}\n" for record in records),
+                encoding="utf-8",
+            )
+
+            first_argv = [
+                "score_leads.py",
+                "--input",
+                str(input_path),
+                "--output",
+                str(output_path),
+                "--vertical",
+                "detailing",
+                "--mode",
+                "api-llm",
+                "--scores-dir",
+                str(scores_dir),
+                "--llm-batch-size",
+                "1",
+                "--limit",
+                "2",
+            ]
+            with patch.dict(os.environ, {"MAX_LLM_CALLS_PER_RUN": "1", "MAX_LLM_TOKENS_PER_RUN": "0", "MAX_LLM_USD_PER_RUN": "0"}):
+                with patch("score_leads.llm_client.score_batch", side_effect=fake_score_batch):
+                    with patch("sys.argv", first_argv):
+                        first_code = score_leads_main()
+
+            with output_path.open(newline="", encoding="utf-8") as f:
+                first_rows = list(csv.DictReader(f))
+            self.assertEqual(first_code, 0)
+            self.assertEqual([row["Place Key"] for row in first_rows], ["ChIJ1"])
+
+            second_argv = list(first_argv)
+            with patch.dict(os.environ, {"MAX_LLM_CALLS_PER_RUN": "0", "MAX_LLM_TOKENS_PER_RUN": "0", "MAX_LLM_USD_PER_RUN": "0"}):
+                with patch("score_leads.llm_client.score_batch", side_effect=fake_score_batch) as score_batch:
+                    stdout = io.StringIO()
+                    with redirect_stdout(stdout):
+                        with patch("sys.argv", second_argv):
+                            second_code = score_leads_main()
+
+            with output_path.open(newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+            scored_files = [
+                sorted(set(re.findall(r'"score_file": "([^"]+\.json)"', call.args[0])))
+                for call in score_batch.call_args_list
+            ]
+
+        self.assertEqual(second_code, 0)
+        self.assertEqual(scored_files, [["chij2.json"], ["chij3.json"]])
+        self.assertEqual([row["Place Key"] for row in rows], ["ChIJ1", "ChIJ2", "ChIJ3"])
+        self.assertIn("[RESUME] Existing scored rows: 1", stdout.getvalue())
+        self.assertIn("[RESUME] Skipping already scored: 1", stdout.getvalue())
+        self.assertIn("[RESUME] New records selected: 2", stdout.getvalue())
+
+    def test_api_llm_resume_offset_selects_manual_chunk_after_skipping_scored_rows(self) -> None:
+        records = [
+            self._huge_detailing_record(name=f"Detailing {index}", place_id=f"ChIJ{index}")
+            for index in range(1, 5)
+        ]
+        for index, record in enumerate(records, start=1):
+            record["google"]["google_maps_url"] = f"https://maps.google.com/?cid={index}"
+
+        def fake_score_batch(prompt: str, *, model: str, max_tokens: int) -> dict:
+            score_files = sorted(set(re.findall(r'"score_file": "([^"]+\.json)"', prompt)))
+            return {
+                "bundle": {
+                    "batch_id": "batch_001",
+                    "scores": [
+                        {"score_file": score_file, "score": self._manual_score(total_score=75, grade="B")}
+                        for score_file in score_files
+                    ],
+                },
+                "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            input_path = tmp_path / "enriched.jsonl"
+            output_path = tmp_path / "scored.csv"
+            scores_dir = tmp_path / "scores"
+            input_path.write_text(
+                "".join(f"{json.dumps(record)}\n" for record in records),
+                encoding="utf-8",
+            )
+            write_csv(output_path, [{"Place Key": "ChIJ2", "Business Name": "Existing Detail"}])
+
+            argv = [
+                "score_leads.py",
+                "--input",
+                str(input_path),
+                "--output",
+                str(output_path),
+                "--vertical",
+                "detailing",
+                "--mode",
+                "api-llm",
+                "--scores-dir",
+                str(scores_dir),
+                "--llm-batch-size",
+                "1",
+                "--offset",
+                "1",
+                "--limit",
+                "1",
+            ]
+            with patch.dict(os.environ, {"MAX_LLM_CALLS_PER_RUN": "0", "MAX_LLM_TOKENS_PER_RUN": "0", "MAX_LLM_USD_PER_RUN": "0"}):
+                with patch("score_leads.llm_client.score_batch", side_effect=fake_score_batch) as score_batch:
+                    with patch("sys.argv", argv):
+                        code = score_leads_main()
+
+            with output_path.open(newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+            scored_files = [
+                sorted(set(re.findall(r'"score_file": "([^"]+\.json)"', call.args[0])))
+                for call in score_batch.call_args_list
+            ]
+
+        self.assertEqual(code, 0)
+        self.assertEqual(scored_files, [["chij3.json"]])
+        self.assertEqual([row["Place Key"] for row in rows], ["ChIJ2", "ChIJ3"])
+
+    def test_api_llm_resume_does_not_hide_unknown_refs_for_new_records(self) -> None:
+        first = self._huge_detailing_record(name="Already Scored Detail", place_id="ChIJ1")
+        second = self._huge_detailing_record(name="Bad Ref Detail", place_id="ChIJ2")
+        first["google"]["google_maps_url"] = "https://maps.google.com/?cid=1"
+        second["google"]["google_maps_url"] = "https://maps.google.com/?cid=2"
+        fake_ref_score = self._manual_score(
+            total_score=75,
+            grade="B",
+            evidence_refs=["fake_unknown_ref"],
+            safe_outreach_claims=[
+                {"claim": "Your buyer-intent signals show active demand.", "evidence_refs": ["fake_unknown_ref"]}
+            ],
+        )
+        fake_ref_bundle = {
+            "batch_id": "batch_001",
+            "scores": [{"score_file": "chij2.json", "score": fake_ref_score}],
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            scores_dir = Path(tmp) / "scores"
+            existing_keys = {"place:ChIJ1"}
+            with patch(
+                "score_leads.llm_client.score_batch",
+                return_value={
+                    "bundle": fake_ref_bundle,
+                    "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                },
+            ):
+                with self.assertRaises(ValueError) as caught:
+                    from score_leads import score_records_api_run
+
+                    score_records_api_run(
+                        [first, second],
+                        scores_dir=scores_dir,
+                        fallback_vertical="detailing",
+                        batch_size=1,
+                        model="claude-sonnet-4-6",
+                        max_tokens=4096,
+                        max_calls=0,
+                        max_tokens_per_run=100_000,
+                        max_usd_per_run=0.0,
+                        resume_scored_keys=existing_keys,
+                    )
+
+        self.assertIn("Unknown evidence_refs: fake_unknown_ref", str(caught.exception))
+
     def _huge_detailing_record(self, *, name: str = "A+ Detailing LLC", place_id: str = "ChIJ123") -> dict:
         giant_text = (
             "Ceramic coating packages include paint correction before installation. "
