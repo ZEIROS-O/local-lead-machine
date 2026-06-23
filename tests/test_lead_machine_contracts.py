@@ -4055,6 +4055,36 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(row["Packet Eligible"], "")
         self.assertFalse(is_eligible(row, include_all=False, priority_filter=None))
 
+    def test_skip_social_only_high_pain_becomes_watchlist_not_manual_review_packet(self) -> None:
+        # Skip grade (total < 50) + social-only pain: should land in Watchlist, never Manual Review Packet.
+        enriched = self._facebook_only_evidence(
+            reviews="45",
+            reasons=[
+                "No standalone website — business presence is Facebook-only",
+                "No clear estimate CTA detected",
+            ],
+        )
+        raw_score = self._facebook_only_score(
+            subscores={
+                "icp_fit": 8,
+                "reputation_demand_proof": 7,
+                "web_conversion_pain": 10,
+                "mockup_leverage": 6,
+                "reachability": 5,
+                "offer_angle_clarity": 5,
+                "evidence_confidence": 4,
+            },
+        )
+
+        row = merge_manual_score(enriched, raw_score, fallback_vertical="detailing")
+
+        self.assertEqual(row["Lead Priority"], "Skip")
+        self.assertEqual(row["Sendable"], "No")
+        self.assertNotEqual(row["Packet Tier"], "Manual Review Packet")
+        self.assertEqual(row["Packet Tier"], "Watchlist")
+        self.assertEqual(row["Packet Eligible"], "")
+        self.assertFalse(is_eligible(row, include_all=False, priority_filter=None))
+
     def test_advanced_optimization_strong_form_no_issue_is_no_packet(self) -> None:
         enriched = {
             "google": {

@@ -457,6 +457,8 @@ def manual_review_reason(row: Dict[str, Any], result: Dict[str, Any]) -> str:
     """Return a non-empty reason string if the lead qualifies for a manual packet."""
     if not result.get("minimum_evidence_passed"):
         return ""
+    if _pick(row, "Lead Priority", "grade") not in {"B", "C"}:
+        return ""
     if _rating(row) < MANUAL_REVIEW_MIN_RATING:
         return ""
     if _review_count(row) < MANUAL_REVIEW_MIN_REVIEWS:
