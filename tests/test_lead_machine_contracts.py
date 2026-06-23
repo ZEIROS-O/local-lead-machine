@@ -27,7 +27,7 @@ from make_packets import is_eligible, main as make_packets_main, packet_markdown
 from make_llm_batch import build_batch_prompt, write_llm_batches
 from import_llm_score_bundle import import_score_bundle
 from score_leads import main as score_leads_main
-from score_leads import score_record, score_records_manual, write_csv
+from score_leads import read_csv_rows, score_record, score_records_manual, write_csv
 
 
 AIRTABLE_ENV_VARS = (
@@ -2056,6 +2056,86 @@ class LeadMachineContractsTest(unittest.TestCase):
             self.assertIn("batches=1", stdout)
             self.assertIn("projected_usd=", stdout)
             self.assertIn("[DRY-RUN]", stdout)
+
+    def _write_large_evidence_scored_csv(self, path: Path) -> str:
+        """Write a scored CSV whose Raw Evidence field exceeds the 128 KB
+        default csv field-size limit, returning the giant value."""
+        huge_evidence = json.dumps({"blob": "x" * 200_000})
+        self.assertGreater(len(huge_evidence), 131072)
+        fieldnames = [
+            "Business Name",
+            "Phone",
+            "Sendable",
+            "Packet Eligible",
+            "Raw Evidence",
+        ]
+        row = {
+            "Business Name": "Big Evidence Co",
+            "Phone": "216-555-0100",
+            "Sendable": "Yes",
+            "Packet Eligible": "Yes",
+            "Raw Evidence": huge_evidence,
+        }
+        with path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerow(row)
+        return huge_evidence
+
+    @contextmanager
+    def _default_csv_field_limit(self):
+        """Force the stock 128 KB csv field-size limit so the regression
+        actually exercises the raise; restore the prior limit afterward."""
+        previous = csv.field_size_limit()
+        csv.field_size_limit(131072)
+        try:
+            yield
+        finally:
+            csv.field_size_limit(previous)
+
+    def test_read_csv_rows_handles_large_raw_evidence_field(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            scored_path = Path(tmp) / "scored.csv"
+            huge_evidence = self._write_large_evidence_scored_csv(scored_path)
+            with self._default_csv_field_limit():
+                rows = read_csv_rows(scored_path)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["Raw Evidence"], huge_evidence)
+
+    def test_dry_run_llm_cost_resume_reads_large_existing_scored_csv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            input_path = Path(tmp) / "enriched.jsonl"
+            output_path = Path(tmp) / "scored.csv"
+            self._write_enriched_jsonl(input_path)
+            self._write_large_evidence_scored_csv(output_path)
+            argv = [
+                "score_leads.py",
+                "--mode", "api-llm",
+                "--input", str(input_path),
+                "--output", str(output_path),
+                "--scores-dir", str(Path(tmp) / "scores"),
+                "--vertical", "hardscaping",
+                "--dry-run-llm-cost",
+            ]
+            with self._default_csv_field_limit():
+                with patch("score_leads.llm_client.score_batch") as score_batch:
+                    code, stdout, stderr = self._run_score_leads(argv)
+            self.assertEqual(code, 0, stderr)
+            score_batch.assert_not_called()
+            self.assertIn("[RESUME] Existing scored rows: 1", stdout)
+            self.assertIn("[DRY-RUN]", stdout)
+
+    def test_upload_airtable_reads_large_raw_evidence_csv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            scored_path = Path(tmp) / "scored.csv"
+            self._write_large_evidence_scored_csv(scored_path)
+            with self._default_csv_field_limit():
+                records = upload_airtable.read_csv_records(
+                    scored_path,
+                    only_sendable=False,
+                    packet_dir=Path(tmp),
+                )
+            self.assertEqual(len(records), 1)
 
     def test_projected_cost_over_threshold_refuses_without_confirm(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

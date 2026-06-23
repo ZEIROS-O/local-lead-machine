@@ -87,7 +87,15 @@ def run(cmd: list[str], *, capture: bool = False, check: bool = True) -> Any:
     if capture and result.stdout:
         print(result.stdout, end="" if result.stdout.endswith("\n") else "\n", flush=True)
     if check and result.returncode != 0:
-        raise PipelineRefusal(f"Command failed ({result.returncode}): {' '.join(cmd)}")
+        message = f"Command failed ({result.returncode}): {' '.join(cmd)}"
+        if capture:
+            # On a captured run the child's output was suppressed; surface both
+            # streams so the failure is diagnosable instead of silent.
+            message += (
+                f"\n[CHILD STDOUT]\n{result.stdout or ''}"
+                f"\n[CHILD STDERR]\n{result.stderr or ''}"
+            )
+        raise PipelineRefusal(message)
     return result
 
 

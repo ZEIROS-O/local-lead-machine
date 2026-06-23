@@ -297,6 +297,30 @@ class AgentPipelineTest(unittest.TestCase):
         )
         self.assertEqual(batch, "detailing_cleveland_medium_001")
 
+    def test_captured_child_failure_surfaces_stdout_and_stderr(self) -> None:
+        fake_result = types.SimpleNamespace(
+            returncode=1,
+            stdout="child progress line\n",
+            stderr="Traceback: boom in child\n",
+        )
+        with patch("run_agent_pipeline.subprocess.run", return_value=fake_result):
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaises(rap.PipelineRefusal) as ctx:
+                    rap.run(["python", "child.py"], capture=True)
+        message = str(ctx.exception)
+        self.assertIn("Command failed (1):", message)
+        self.assertIn("[CHILD STDOUT]", message)
+        self.assertIn("child progress line", message)
+        self.assertIn("[CHILD STDERR]", message)
+        self.assertIn("Traceback: boom in child", message)
+
+    def test_captured_child_success_returns_result(self) -> None:
+        fake_result = types.SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
+        with patch("run_agent_pipeline.subprocess.run", return_value=fake_result):
+            with redirect_stdout(io.StringIO()):
+                result = rap.run(["python", "child.py"], capture=True)
+        self.assertEqual(result.returncode, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

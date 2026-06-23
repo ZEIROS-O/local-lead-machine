@@ -262,7 +262,21 @@ def csv_row_to_record(row: Dict[str, str], packet_dir: Path) -> Dict[str, Any]:
     }
 
 
+def raise_csv_field_limit() -> None:
+    """Allow csv to read very large fields (e.g. the Raw Evidence JSON blob).
+
+    The default field-size limit is 128 KB; real scored/tiered CSVs routinely
+    exceed it, which would otherwise raise
+    `_csv.Error: field larger than field limit`.
+    """
+    try:
+        csv.field_size_limit(sys.maxsize)
+    except OverflowError:
+        csv.field_size_limit(2_147_483_647)
+
+
 def read_csv_records(path: Path, *, only_sendable: bool, packet_dir: Path) -> List[Dict[str, Any]]:
+    raise_csv_field_limit()
     with path.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         fieldnames = reader.fieldnames or []
@@ -391,6 +405,7 @@ def send_airtable_plan(base_id: str, table: str, token: str, planned: List[Dict[
 
 def main() -> int:
     load_dotenv()
+    raise_csv_field_limit()
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True, help="Scored CSV or lead cards JSONL")

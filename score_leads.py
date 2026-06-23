@@ -1398,9 +1398,22 @@ def write_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def raise_csv_field_limit() -> None:
+    """Allow csv to read very large fields (e.g. the Raw Evidence JSON blob).
+
+    The default field-size limit is 128 KB; real scored CSVs routinely exceed it,
+    which would otherwise raise `_csv.Error: field larger than field limit`.
+    """
+    try:
+        csv.field_size_limit(sys.maxsize)
+    except OverflowError:
+        csv.field_size_limit(2_147_483_647)
+
+
 def read_csv_rows(path: Path) -> List[Dict[str, str]]:
     if not path.exists() or path.stat().st_size == 0:
         return []
+    raise_csv_field_limit()
     with path.open(newline="", encoding="utf-8") as f:
         return list(csv.DictReader(f))
 
@@ -2917,6 +2930,7 @@ def sort_key(row: Dict[str, Any]) -> Tuple[int, int, int, int, int]:
 
 def main() -> int:
     load_dotenv()
+    raise_csv_field_limit()
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True, help="Input enriched JSONL")
     parser.add_argument("--output", required=True, help="Output scored CSV")
