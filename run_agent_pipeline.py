@@ -31,6 +31,7 @@ import os
 import re
 import subprocess
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -48,6 +49,13 @@ DEFAULT_LOCK_FILE = OUTPUT_DIR / ".agent_pipeline.lock"
 DEFAULT_MAX_LLM_USD = 1.00
 DEFAULT_LIMIT = 25
 DEFAULT_SPEND_CONFIRM_USD = 0.50
+DEFAULT_LLM_BATCH_SIZE = 5
+DEFAULT_LLM_MAX_TOKENS = 8192
+
+# Preference order for an *existing* scored CSV, most-derived first. The API
+# scoring stage writes scored_<batch>_api.csv; the tier refresh writes
+# scored_<batch>_api_tiered.csv; the legacy manual flow wrote scored_<batch>.csv.
+SCORED_SUFFIX_PREFERENCE = ("_api_tiered", "_api", "")
 
 PROJECTED_USD_RE = re.compile(r"projected_usd=([0-9]+(?:\.[0-9]+)?)")
 
@@ -224,6 +232,83 @@ def resolve_batch(
 
 
 # --------------------------------------------------------------------------- #
+# Scored-CSV path resolution
+# --------------------------------------------------------------------------- #
+@dataclass
+class PipelinePaths:
+    """Resolved file locations for a single pipeline run."""
+
+    enriched: Path
+    scored_csv: Optional[Path]  # existing scored CSV read for resume / packets input
+    scored_output: Path  # where API scoring writes (score modes)
+    tiered_csv: Path  # where refreshed packet tiers are written
+    packets: Path
+    report_csv: Path  # file whose rows are counted in the summary
+
+
+def best_existing_scored(batch: str, output_dir: Path = OUTPUT_DIR) -> Optional[Path]:
+    """Return the most-derived existing scored CSV for `batch`, or None."""
+    for suffix in SCORED_SUFFIX_PREFERENCE:
+        candidate = output_dir / f"scored_{batch}{suffix}.csv"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _tiered_default_for(source: Path, batch: str, output_dir: Path) -> Path:
+    """Default tier-refresh target for a given scored source.
+
+    An `*_api.csv` source refreshes into `scored_<batch>_api_tiered.csv`; an
+    already-tiered or legacy plain CSV is refreshed in place.
+    """
+    if source.name.endswith("_api.csv"):
+        return output_dir / f"scored_{batch}_api_tiered.csv"
+    return source
+
+
+def resolve_pipeline_paths(
+    *,
+    batch: str,
+    mode: str,
+    args: argparse.Namespace,
+    output_dir: Path = OUTPUT_DIR,
+) -> PipelinePaths:
+    enriched = output_dir / f"enriched_{batch}.jsonl"
+    default_api = output_dir / f"scored_{batch}_api.csv"
+    packets = Path(f"packets_{batch}")
+
+    if mode in SCORE_DRY_MODES:
+        # Scoring writes (and resumes from) the API CSV unless explicitly retargeted.
+        scored_output = Path(args.scored_output) if args.scored_output else default_api
+        source: Optional[Path] = scored_output
+    else:
+        # Non-scoring modes operate on an existing scored CSV.
+        if args.scored_csv:
+            source = Path(args.scored_csv)
+        else:
+            source = best_existing_scored(batch, output_dir)
+        scored_output = source if source is not None else default_api
+
+    if args.tiered_output:
+        tiered = Path(args.tiered_output)
+    elif source is not None:
+        tiered = _tiered_default_for(source, batch, output_dir)
+    else:
+        tiered = output_dir / f"scored_{batch}_api_tiered.csv"
+
+    report = tiered if mode in PACKET_MODES else (source if source is not None else default_api)
+
+    return PipelinePaths(
+        enriched=enriched,
+        scored_csv=source,
+        scored_output=scored_output,
+        tiered_csv=tiered,
+        packets=packets,
+        report_csv=report,
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Command builders (pure)
 # --------------------------------------------------------------------------- #
 def build_search_cmd(config_path: Path, batch: str) -> list[str]:
@@ -238,7 +323,14 @@ def build_search_cmd(config_path: Path, batch: str) -> list[str]:
 
 
 def _score_base_cmd(
-    *, enriched: Path, scored: Path, vertical: str, scores_dir: Path, limit: int
+    *,
+    enriched: Path,
+    scored: Path,
+    vertical: str,
+    scores_dir: Path,
+    limit: int,
+    llm_batch_size: int,
+    llm_max_tokens: int,
 ) -> list[str]:
     cmd = [
         sys.executable,
@@ -253,6 +345,10 @@ def _score_base_cmd(
         "api-llm",
         "--scores-dir",
         str(scores_dir),
+        "--llm-batch-size",
+        str(llm_batch_size),
+        "--llm-max-tokens",
+        str(llm_max_tokens),
     ]
     if limit > 0:
         cmd.extend(["--limit", str(limit)])
@@ -260,10 +356,18 @@ def _score_base_cmd(
 
 
 def build_dry_run_cmd(
-    *, enriched: Path, scored: Path, vertical: str, scores_dir: Path, limit: int
+    *,
+    enriched: Path,
+    scored: Path,
+    vertical: str,
+    scores_dir: Path,
+    limit: int,
+    llm_batch_size: int,
+    llm_max_tokens: int,
 ) -> list[str]:
     return _score_base_cmd(
-        enriched=enriched, scored=scored, vertical=vertical, scores_dir=scores_dir, limit=limit
+        enriched=enriched, scored=scored, vertical=vertical, scores_dir=scores_dir,
+        limit=limit, llm_batch_size=llm_batch_size, llm_max_tokens=llm_max_tokens,
     ) + ["--dry-run-llm-cost"]
 
 
@@ -276,9 +380,12 @@ def build_paid_score_cmd(
     limit: int,
     cards: Path,
     llm_usage: Path,
+    llm_batch_size: int,
+    llm_max_tokens: int,
 ) -> list[str]:
     return _score_base_cmd(
-        enriched=enriched, scored=scored, vertical=vertical, scores_dir=scores_dir, limit=limit
+        enriched=enriched, scored=scored, vertical=vertical, scores_dir=scores_dir,
+        limit=limit, llm_batch_size=llm_batch_size, llm_max_tokens=llm_max_tokens,
     ) + [
         "--confirm-llm-spend",
         "--fresh-scores-dir",
@@ -290,8 +397,11 @@ def build_paid_score_cmd(
     ]
 
 
-def build_refresh_cmd(scored: Path) -> list[str]:
-    return [sys.executable, "refresh_packet_tiers.py", str(scored)]
+def build_refresh_cmd(source: Path, output: Optional[Path] = None) -> list[str]:
+    cmd = [sys.executable, "refresh_packet_tiers.py", str(source)]
+    if output is not None and Path(output) != Path(source):
+        cmd.extend(["--output", str(output)])
+    return cmd
 
 
 def build_packets_cmd(scored: Path, packets: Path) -> list[str]:
@@ -333,11 +443,19 @@ def parse_projected_usd(text: str) -> Optional[float]:
 
 
 def estimate_llm_cost(
-    *, enriched: Path, scored: Path, vertical: str, scores_dir: Path, limit: int
+    *,
+    enriched: Path,
+    scored: Path,
+    vertical: str,
+    scores_dir: Path,
+    limit: int,
+    llm_batch_size: int,
+    llm_max_tokens: int,
 ) -> float:
     """Run the API-LLM dry-run and parse the projected USD. Never makes a paid call."""
     cmd = build_dry_run_cmd(
-        enriched=enriched, scored=scored, vertical=vertical, scores_dir=scores_dir, limit=limit
+        enriched=enriched, scored=scored, vertical=vertical, scores_dir=scores_dir,
+        limit=limit, llm_batch_size=llm_batch_size, llm_max_tokens=llm_max_tokens,
     )
     result = run(cmd, capture=True)
     projected = parse_projected_usd(getattr(result, "stdout", "") or "")
@@ -469,6 +587,19 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--max-llm-usd", type=float, default=DEFAULT_MAX_LLM_USD,
                         help="Hard ceiling on projected LLM spend; never overridden")
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT, help="Max records for API scoring")
+    parser.add_argument("--llm-batch-size", type=int, default=DEFAULT_LLM_BATCH_SIZE,
+                        help="Leads per API-LLM batch (passed to score_leads.py)")
+    parser.add_argument("--llm-max-tokens", type=int, default=DEFAULT_LLM_MAX_TOKENS,
+                        help="Max output tokens per API-LLM batch (passed to score_leads.py)")
+    parser.add_argument("--scored-csv", default="",
+                        help="Existing scored CSV to use (overrides default resolution)")
+    parser.add_argument("--scored-output", default="",
+                        help="Target scored CSV for API scoring (default scored_<batch>_api.csv)")
+    parser.add_argument("--tiered-output", default="",
+                        help="Target CSV for refreshed packet tiers "
+                             "(default scored_<batch>_api_tiered.csv when source is *_api.csv)")
+    parser.add_argument("--allow-empty-scored", action="store_true",
+                        help="Permit building packets from a 0-row scored CSV")
     parser.add_argument("--airtable-sendable-only", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--include-manual-review-airtable", action="store_true", default=False)
     parser.add_argument(
@@ -495,15 +626,19 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         mode=args.mode,
         overwrite=args.overwrite,
     )
-    enriched = OUTPUT_DIR / f"enriched_{batch}.jsonl"
-    scored = OUTPUT_DIR / f"scored_{batch}.csv"
+    paths = resolve_pipeline_paths(batch=batch, mode=args.mode, args=args)
+    enriched = paths.enriched
     cards = OUTPUT_DIR / f"lead_cards_{batch}.jsonl"
     llm_usage = OUTPUT_DIR / f"llm_usage_{batch}.json"
     scores_dir = Path(f"review_queue_{batch}") / "scores"
-    packets = Path(f"packets_{batch}")
+    packets = paths.packets
     summary_path = OUTPUT_DIR / f"agent_run_summary_{batch}.json"
 
     status("PIPELINE", f"batch={batch} config={config_path}")
+    status("PIPELINE", f"enriched_input={enriched}")
+    status("PIPELINE", f"scored_csv={paths.scored_csv if paths.scored_csv is not None else 'none'}")
+    status("PIPELINE", f"tiered_csv={paths.tiered_csv}")
+    status("PIPELINE", f"packets_dir={packets}")
 
     # ---- Search / enrich ------------------------------------------------- #
     if args.mode in SEARCH_MODES:
@@ -521,8 +656,9 @@ def _run_pipeline(args: argparse.Namespace) -> int:
 
         status("COST", "Estimating API-LLM cost (dry-run, no paid call)")
         projected = estimate_llm_cost(
-            enriched=enriched, scored=scored, vertical=args.vertical,
+            enriched=enriched, scored=paths.scored_output, vertical=args.vertical,
             scores_dir=scores_dir, limit=args.limit,
+            llm_batch_size=args.llm_batch_size, llm_max_tokens=args.llm_max_tokens,
         )
         status("COST", f"projected_usd={projected:.4f} max_llm_usd={args.max_llm_usd:.2f}")
 
@@ -542,46 +678,59 @@ def _run_pipeline(args: argparse.Namespace) -> int:
                     f"threshold ${confirm_threshold:.2f}. Re-run with --yes / --confirm-spend."
                 )
 
-            status("SCORING", f"Running paid API-LLM scoring (projected ${projected:.4f})")
+            status("SCORING", f"Running paid API-LLM scoring (projected ${projected:.4f}) -> {paths.scored_output}")
             os.environ["MAX_LLM_USD_PER_RUN"] = str(args.max_llm_usd)
             run(build_paid_score_cmd(
-                enriched=enriched, scored=scored, vertical=args.vertical,
+                enriched=enriched, scored=paths.scored_output, vertical=args.vertical,
                 scores_dir=scores_dir, limit=args.limit, cards=cards, llm_usage=llm_usage,
+                llm_batch_size=args.llm_batch_size, llm_max_tokens=args.llm_max_tokens,
             ))
     else:
         status("SCORING", "skipped (mode does not score)")
 
     # ---- Packet tiers + packets ------------------------------------------ #
     if args.mode in PACKET_MODES:
-        if not scored.exists():
-            raise PipelineRefusal(f"Scored CSV not found, cannot build packets: {scored}")
-        status("PACKETS", "Refreshing packet tiers")
-        run(build_refresh_cmd(scored))
+        source = paths.scored_csv
+        if source is None or not source.exists():
+            raise PipelineRefusal(
+                "No scored CSV found to build packets from. Tried (in order) "
+                f"{', '.join('scored_' + batch + s + '.csv' for s in SCORED_SUFFIX_PREFERENCE)}. "
+                "Run scoring first or pass --scored-csv."
+            )
+        existing_rows = read_csv_rows(source)
+        if not existing_rows and not args.allow_empty_scored:
+            raise PipelineRefusal(
+                f"Selected scored CSV has 0 rows: {source}. "
+                "Run scoring first or pass --allow-empty-scored to proceed anyway."
+            )
+        status("PACKETS", f"Refreshing packet tiers from {source} -> {paths.tiered_csv}")
+        run(build_refresh_cmd(source, paths.tiered_csv))
         status("PACKETS", f"Building packets -> {packets}")
-        run(build_packets_cmd(scored, packets))
+        run(build_packets_cmd(paths.tiered_csv, packets))
     else:
         status("PACKETS", "skipped (mode does not build packets)")
 
     # ---- Airtable -------------------------------------------------------- #
+    report_csv = paths.report_csv
     airtable_status = "skipped"
     sendable_only = args.airtable_sendable_only and not args.include_manual_review_airtable
     if args.airtable == "skip":
         status("AIRTABLE", "skipped (not requested)")
-    elif not scored.exists():
+    elif not report_csv.exists():
         status("AIRTABLE", "skipped (no scored CSV)")
     else:
         live = args.airtable == "live"
         airtable_status = "live" if live else "dry-run"
         scope = "sendable-only" if sendable_only else "sendable+manual-review"
         status("AIRTABLE", f"Syncing ({airtable_status}, {scope})")
-        run(build_airtable_cmd(scored=scored, packets=packets, sendable_only=sendable_only, live=live))
+        run(build_airtable_cmd(scored=report_csv, packets=packets, sendable_only=sendable_only, live=live))
 
     # ---- Summary --------------------------------------------------------- #
     summary = build_summary(
         batch=batch,
         mode=args.mode,
         enriched=enriched,
-        scored=scored,
+        scored=report_csv,
         packets=packets,
         airtable_status=airtable_status,
         airtable_sendable_only=sendable_only,

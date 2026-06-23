@@ -43,17 +43,23 @@ class AgentPipelineTest(unittest.TestCase):
         rows = [{"google": {"business_name": f"L{i}", "place_id": f"p{i}"}, "evidence": {}} for i in range(count)]
         path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
 
-    def _write_scored(self, batch: str) -> None:
-        path = self.root / "output" / f"scored_{batch}.csv"
-        rows = [
-            {"Business Name": "A", "Sendable": "Yes", "Packet Eligible": "Yes", "Packet Tier": rap.PACKET_TIER_SENDABLE},
-            {"Business Name": "B", "Sendable": "No", "Packet Eligible": "Yes", "Packet Tier": rap.PACKET_TIER_MANUAL},
-            {"Business Name": "C", "Sendable": "No", "Packet Eligible": "", "Packet Tier": rap.PACKET_TIER_WATCHLIST},
-        ]
+    def _write_scored(self, batch: str, suffix: str = "", *, rows: bool = True) -> Path:
+        path = self.root / "output" / f"scored_{batch}{suffix}.csv"
+        fieldnames = ["Business Name", "Sendable", "Packet Eligible", "Packet Tier"]
+        data = (
+            [
+                {"Business Name": "A", "Sendable": "Yes", "Packet Eligible": "Yes", "Packet Tier": rap.PACKET_TIER_SENDABLE},
+                {"Business Name": "B", "Sendable": "No", "Packet Eligible": "Yes", "Packet Tier": rap.PACKET_TIER_MANUAL},
+                {"Business Name": "C", "Sendable": "No", "Packet Eligible": "", "Packet Tier": rap.PACKET_TIER_WATCHLIST},
+            ]
+            if rows
+            else []
+        )
         with path.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
-            writer.writerows(rows)
+            writer.writerows(data)
+        return path
 
     def _fake_run(self, commands: list[list[str]], *, projected: float = 0.05):
         """Record commands; emit a dry-run cost line when capturing."""
@@ -110,7 +116,7 @@ class AgentPipelineTest(unittest.TestCase):
             if "--dry-run-llm-cost" in cmd:
                 return types.SimpleNamespace(returncode=0, stdout="projected_usd=0.7000\n")
             if "score_leads.py" in cmd and "--confirm-llm-spend" in cmd:
-                self._write_scored("detailing_cleveland_medium_001")
+                self._write_scored("detailing_cleveland_medium_001", "_api")
             return types.SimpleNamespace(returncode=0, stdout="")
 
         recorded: list[list[str]] = []
@@ -194,6 +200,93 @@ class AgentPipelineTest(unittest.TestCase):
         )
         self.assertEqual(batch, "detailing_cleveland_medium_002")
         self.assertTrue(config_path.exists())
+
+    def test_packets_only_prefers_api_csv_over_empty_plain(self) -> None:
+        self._write_config()
+        batch = "detailing_cleveland_medium_001"
+        # Empty legacy plain CSV plus a populated API CSV.
+        self._write_scored(batch, "", rows=False)
+        self._write_scored(batch, "_api")
+        api_csv = f"output/scored_{batch}_api.csv"
+        plain_csv = f"output/scored_{batch}.csv"
+        tiered_csv = f"output/scored_{batch}_api_tiered.csv"
+        commands: list[list[str]] = []
+        with patch.object(rap, "run", side_effect=self._fake_run(commands)), redirect_stdout(io.StringIO()):
+            code = rap.main(self._argv("packets-only"))
+        self.assertEqual(code, 0)
+        refresh = next(cmd for cmd in commands if "refresh_packet_tiers.py" in cmd)
+        self.assertIn(api_csv, refresh)
+        self.assertNotIn(plain_csv, refresh)
+        # Tiers refresh into the *_api_tiered.csv; packets build from it.
+        self.assertIn(tiered_csv, refresh)
+        packets = next(cmd for cmd in commands if "make_packets.py" in cmd)
+        self.assertIn(tiered_csv, packets)
+
+    def test_score_dry_run_resumes_from_api_csv_and_reports_existing_rows(self) -> None:
+        self._write_config()
+        batch = "detailing_cleveland_medium_001"
+        self._write_enriched(batch)
+        self._write_scored(batch, "_api")  # 3 existing scored rows
+        commands: list[list[str]] = []
+        with patch.object(rap, "run", side_effect=self._fake_run(commands)), redirect_stdout(io.StringIO()):
+            code = rap.main(self._argv("score-dry-run"))
+        self.assertEqual(code, 0)
+        dry = next(cmd for cmd in commands if "--dry-run-llm-cost" in cmd)
+        # The dry-run resumes from / projects against the API CSV, not the plain CSV.
+        out_idx = dry.index("--output") + 1
+        self.assertEqual(dry[out_idx], f"output/scored_{batch}_api.csv")
+        summary = json.loads(
+            (self.root / "output" / f"agent_run_summary_{batch}.json").read_text()
+        )
+        self.assertEqual(summary["counts"]["scored"], 3)
+
+    def test_packets_only_refuses_empty_scored_unless_allowed(self) -> None:
+        self._write_config()
+        batch = "detailing_cleveland_medium_001"
+        self._write_scored(batch, "_api", rows=False)  # 0 rows
+        # Refuses without the flag.
+        commands: list[list[str]] = []
+        out = io.StringIO()
+        with patch.object(rap, "run", side_effect=self._fake_run(commands)), redirect_stdout(out):
+            code = rap.main(self._argv("packets-only"))
+        self.assertEqual(code, 2)
+        self.assertIn("[REFUSE]", out.getvalue())
+        self.assertFalse(any("make_packets.py" in cmd for cmd in commands))
+        # Proceeds with --allow-empty-scored.
+        commands2: list[list[str]] = []
+        with patch.object(rap, "run", side_effect=self._fake_run(commands2)), redirect_stdout(io.StringIO()):
+            code2 = rap.main(self._argv("packets-only", allow_empty_scored=None))
+        self.assertEqual(code2, 0)
+        self.assertTrue(any("make_packets.py" in cmd for cmd in commands2))
+
+    def test_explicit_scored_csv_overrides_default_resolution(self) -> None:
+        self._write_config()
+        batch = "detailing_cleveland_medium_001"
+        self._write_scored(batch, "_api")  # would be picked by default
+        custom = self.root / "output" / "custom_scored.csv"
+        self._write_scored(batch, "")  # placeholder
+        (self.root / "output" / f"scored_{batch}.csv").replace(custom)
+        commands: list[list[str]] = []
+        with patch.object(rap, "run", side_effect=self._fake_run(commands)), redirect_stdout(io.StringIO()):
+            code = rap.main(self._argv("packets-only", scored_csv=str(custom)))
+        self.assertEqual(code, 0)
+        refresh = next(cmd for cmd in commands if "refresh_packet_tiers.py" in cmd)
+        self.assertIn(str(custom), refresh)
+        self.assertNotIn(str(self.root / "output" / f"scored_{batch}_api.csv"), refresh)
+
+    def test_wrapper_passes_llm_token_and_batch_size_to_score_leads(self) -> None:
+        self._write_config()
+        batch = "detailing_cleveland_medium_001"
+        self._write_enriched(batch)
+        commands: list[list[str]] = []
+        with patch.object(rap, "run", side_effect=self._fake_run(commands)), redirect_stdout(io.StringIO()):
+            code = rap.main(self._argv("score-dry-run"))
+        self.assertEqual(code, 0)
+        score = next(cmd for cmd in commands if "score_leads.py" in cmd)
+        self.assertIn("--llm-max-tokens", score)
+        self.assertEqual(score[score.index("--llm-max-tokens") + 1], "8192")
+        self.assertIn("--llm-batch-size", score)
+        self.assertEqual(score[score.index("--llm-batch-size") + 1], "5")
 
     def test_overwrite_reuses_existing_batch(self) -> None:
         self._write_config()
