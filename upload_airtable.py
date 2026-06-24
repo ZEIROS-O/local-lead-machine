@@ -32,6 +32,133 @@ from lead_machine.schema import normalize_phone
 _TIER_SENDABLE = "Sendable Packet"
 _TIER_MANUAL = "Manual Review Packet"
 
+# (field, airtable_type, notes)
+_FIELD_SCHEMA: List[tuple[str, str, str]] = [
+    ("Business Name",          "Single line text",   ""),
+    ("Owner Name",             "Single line text",   ""),
+    ("Vertical",               "Single select",      "e.g. detailing, pressure_washing, landscaping"),
+    ("City",                   "Single line text",   ""),
+    ("Phone",                  "Phone number",       ""),
+    ("Email",                  "Email",              ""),
+    ("Website URL",            "URL",                ""),
+    ("Google Maps URL",        "URL",                ""),
+    ("Reviews",                "Number",             "Integer; set field to 'Integer' precision"),
+    ("Rating",                 "Number",             "Decimal; set field to 2 decimal places"),
+    ("Current Website Quality","Single line text",   ""),
+    ("Best Service Angle",     "Single select",      "Options: No-Site Launch, Website Rebuild, Estimate Funnel, Automation / Follow-Up"),
+    ("Specific Observation",   "Long text",          ""),
+    ("Packet Eligible",        "Single select",      "Options: Yes, No"),
+    ("Sendable",               "Single select",      "Options: Yes, No"),
+    ("Lead Priority",          "Single select",      "Options: A, B, C (grade)"),
+    ("Offer Fit",              "Single select",      "Options: No-Site Launch, Website Rebuild, Estimate Funnel, Automation / Follow-Up"),
+    ("Site Status",            "Single select",      "Options: Missing, Broken, No Website, Loaded, Redirect Issue, Social Only, Unknown"),
+    ("Contact Form Detected",  "Single select",      "Options: Yes, No"),
+    ("Estimate Form Detected", "Single select",      "Options: Yes, No"),
+    ("Form Strength",          "Single line text",   ""),
+    ("Form Detection Method",  "Single line text",   ""),
+    ("CTA Strength",           "Single line text",   ""),
+    ("Visible Pain Score",     "Number",             "Integer 0–5"),
+    ("Visible Pain Reasons",   "Long text",          ""),
+    ("Send Trigger",           "Single line text",   ""),
+    ("Money Signal",           "Single line text",   ""),
+    ("Buyer Intent Signals",   "Long text",          "Comma-separated signals detected by LLM"),
+    ("Review Demand Band",     "Single line text",   ""),
+    ("AI Confidence",          "Single select",      "Options: low, medium, high"),
+    ("Score Total",            "Number",             "Integer"),
+    ("Opener",                 "Long text",          ""),
+    ("Recommended Action",     "Single line text",   ""),
+    ("Send Blockers",          "Long text",          ""),
+    ("Skip Reason",            "Single line text",   ""),
+    ("Place Key",              "Single line text",   "Used as upsert key; must be unique per business"),
+    ("Status",                 "Single select",      "Options: Mockup Needed, Manual Review, Sent, Follow-Up, Closed"),
+    ("Outreach Channel",       "Single select",      "Options: Google Maps, Email, Phone"),
+    ("Next Action",            "Single line text",   ""),
+    ("Last Contacted",         "Date",               ""),
+    ("Next Follow-Up",         "Date",               ""),
+    ("Assigned To",            "Single line text",   ""),
+    ("Mockup URL",             "URL",                ""),
+    ("Video URL",              "URL",                ""),
+    ("Packet Path",            "Single line text",   "Local file path to the packet markdown file"),
+]
+
+
+def build_schema_report(
+    existing_field_names: set[str] | None = None,
+) -> List[Dict[str, Any]]:
+    """Return a list of dicts describing every field the pipeline may write.
+
+    If *existing_field_names* is provided, the ``exists`` key reflects whether
+    the field is present in that set.  When ``None`` the field is unchecked and
+    ``exists`` is ``None``.
+    """
+    rows: List[Dict[str, Any]] = []
+    for field, atype, notes in _FIELD_SCHEMA:
+        if existing_field_names is None:
+            exists: bool | None = None
+        else:
+            exists = field in existing_field_names
+        rows.append({"field": field, "type": atype, "exists": exists, "notes": notes})
+    return rows
+
+
+def _exists_marker(exists: bool | None) -> str:
+    if exists is True:
+        return "YES"
+    if exists is False:
+        return "MISSING"
+    return "?"
+
+
+def print_schema_report(report: List[Dict[str, Any]], file: Any = None) -> None:
+    if file is None:
+        file = sys.stdout
+    col_field = max(len(r["field"]) for r in report) + 2
+    col_type = max(len(r["type"]) for r in report) + 2
+    header = f"{'Field':<{col_field}}{'Airtable Type':<{col_type}}{'Exists':<10}Notes"
+    print(header, file=file)
+    print("-" * len(header), file=file)
+    for row in report:
+        print(
+            f"{row['field']:<{col_field}}{row['type']:<{col_type}}"
+            f"{_exists_marker(row['exists']):<10}{row['notes']}",
+            file=file,
+        )
+
+
+def _write_schema_markdown(report: List[Dict[str, Any]], path: Path) -> None:
+    lines = [
+        "# Airtable Schema — Required Fields\n",
+        "| Field | Airtable Type | Exists | Notes |",
+        "|-------|--------------|--------|-------|",
+    ]
+    for row in report:
+        lines.append(
+            f"| {row['field']} | {row['type']} | {_exists_marker(row['exists'])} | {row['notes']} |"
+        )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _write_schema_csv(report: List[Dict[str, Any]], path: Path) -> None:
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["field", "type", "exists", "notes"])
+        writer.writeheader()
+        for row in report:
+            writer.writerow({
+                "field": row["field"],
+                "type": row["type"],
+                "exists": _exists_marker(row["exists"]),
+                "notes": row["notes"],
+            })
+
+
+def write_schema_report(report: List[Dict[str, Any]], path: Path) -> None:
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        _write_schema_csv(report, path)
+    else:
+        _write_schema_markdown(report, path)
+
+
 CSV_AIRTABLE_FIELDS = [
     "Business Name",
     "Owner Name",
@@ -438,7 +565,7 @@ def main() -> int:
     raise_csv_field_limit()
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", required=True, help="Scored CSV or lead cards JSONL")
+    parser.add_argument("--input", default="", help="Scored CSV or lead cards JSONL")
     parser.add_argument(
         "--only-sendable",
         action="store_true",
@@ -459,10 +586,37 @@ def main() -> int:
     parser.add_argument("--base-id", default=os.getenv("AIRTABLE_BASE_ID", ""))
     parser.add_argument("--table", default=os.getenv("AIRTABLE_PROSPECTS_TABLE", ""))
     parser.add_argument("--token", default=os.getenv("AIRTABLE_PAT", ""))
+    parser.add_argument(
+        "--schema-report", "--print-schema",
+        action="store_true",
+        dest="schema_report",
+        help="Print required Airtable fields and their recommended types; no sync is performed",
+    )
+    parser.add_argument(
+        "--schema-report-output",
+        default="",
+        metavar="PATH",
+        help="Write schema report to PATH (.md or .csv); implies --schema-report",
+    )
     args = parser.parse_args()
 
     if args.dry_run and args.live:
         parser.error("--dry-run cannot be combined with --live")
+
+    schema_mode = args.schema_report or bool(args.schema_report_output)
+
+    if schema_mode:
+        report = build_schema_report()
+        print_schema_report(report)
+        if args.schema_report_output:
+            out_path = Path(args.schema_report_output)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            write_schema_report(report, out_path)
+            print(f"[SCHEMA] Written to {out_path}")
+        return 0
+
+    if not args.input:
+        parser.error("--input is required (or use --schema-report to print the field schema)")
 
     input_path = Path(args.input)
     packet_dir = Path(args.packet_dir) if args.packet_dir else infer_packet_dir(input_path)
