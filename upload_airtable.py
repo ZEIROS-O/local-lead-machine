@@ -238,9 +238,8 @@ def csv_row_to_record(row: Dict[str, str], packet_dir: Path) -> Dict[str, Any]:
             fields["Next Action"] = "Build mockup"
             defaulted_fields.append("Next Action")
     elif clean_cell(row.get("Packet Tier", "")) == _TIER_MANUAL:
-        if not clean_cell(fields.get("Status")):
-            fields["Status"] = "Manual Review"
-            defaulted_fields.append("Status")
+        fields["Status"] = "Manual Review"
+        defaulted_fields.append("Status")
 
     # Filter platform/system emails before Airtable payload creation.
     if "Email" in fields:

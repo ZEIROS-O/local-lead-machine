@@ -578,6 +578,29 @@ class LeadMachineContractsTest(unittest.TestCase):
         fields = planned[0]["payload"]["fields"]
         self.assertEqual(fields.get("Status"), "Manual Review")
 
+    def test_airtable_manual_review_packet_overrides_csv_status_new(self) -> None:
+        """Manual Review Packet rows must get Status='Manual Review' even if CSV has Status='New'."""
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "scored.csv"
+            rows = [
+                self._airtable_csv_row(**{
+                    "Business Name": "Manual Co With Status",
+                    "Sendable": "No",
+                    "Packet Tier": "Manual Review Packet",
+                    "Place Key": "ChIJ9",
+                    "Status": "New",
+                }),
+            ]
+            self._write_airtable_csv(csv_path, rows)
+            code, stdout, stderr = self._run_upload(
+                ["upload_airtable.py", "--input", str(csv_path), "--include-manual-review"]
+            )
+        self.assertEqual(code, 0, stderr)
+        planned = self._dry_run_plan(stdout)
+        self.assertEqual(len(planned), 1)
+        fields = planned[0]["payload"]["fields"]
+        self.assertEqual(fields.get("Status"), "Manual Review")
+
     def test_airtable_platform_emails_removed_real_gmail_preserved(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             csv_path = Path(tmp) / "scored.csv"
