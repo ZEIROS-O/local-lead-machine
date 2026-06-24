@@ -540,6 +540,66 @@ class LeadMachineContractsTest(unittest.TestCase):
         fields = planned[0]["payload"]["fields"]  # type: ignore[index]
         self.assertEqual(fields["Business Name"], "A+ Landscaping LLC")
 
+    def test_airtable_include_manual_review_excludes_watchlist_and_no_packet(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "scored.csv"
+            rows = [
+                self._airtable_csv_row(**{"Business Name": "Sendable Co", "Packet Tier": "Sendable Packet", "Place Key": "ChIJ1"}),
+                self._airtable_csv_row(**{"Business Name": "Manual Co", "Sendable": "No", "Packet Tier": "Manual Review Packet", "Place Key": "ChIJ2"}),
+                self._airtable_csv_row(**{"Business Name": "Watchlist Co", "Sendable": "No", "Packet Eligible": "", "Packet Tier": "Watchlist", "Place Key": "ChIJ3"}),
+                self._airtable_csv_row(**{"Business Name": "No Packet Co", "Sendable": "No", "Packet Eligible": "No", "Packet Tier": "No Packet", "Place Key": "ChIJ4"}),
+            ]
+            self._write_airtable_csv(csv_path, rows)
+            code, stdout, stderr = self._run_upload(
+                ["upload_airtable.py", "--input", str(csv_path), "--include-manual-review"]
+            )
+        self.assertEqual(code, 0, stderr)
+        planned = self._dry_run_plan(stdout)
+        names = {p["payload"]["fields"]["Business Name"] for p in planned}
+        self.assertEqual(len(planned), 2)
+        self.assertIn("Sendable Co", names)
+        self.assertIn("Manual Co", names)
+        self.assertNotIn("Watchlist Co", names)
+        self.assertNotIn("No Packet Co", names)
+
+    def test_airtable_manual_review_packet_gets_status_manual_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "scored.csv"
+            rows = [
+                self._airtable_csv_row(**{"Business Name": "Manual Co", "Sendable": "No", "Packet Tier": "Manual Review Packet", "Place Key": "ChIJ2"}),
+            ]
+            self._write_airtable_csv(csv_path, rows)
+            code, stdout, stderr = self._run_upload(
+                ["upload_airtable.py", "--input", str(csv_path), "--include-manual-review"]
+            )
+        self.assertEqual(code, 0, stderr)
+        planned = self._dry_run_plan(stdout)
+        self.assertEqual(len(planned), 1)
+        fields = planned[0]["payload"]["fields"]
+        self.assertEqual(fields.get("Status"), "Manual Review")
+
+    def test_airtable_platform_emails_removed_real_gmail_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "scored.csv"
+            rows = [
+                self._airtable_csv_row(**{
+                    "Business Name": "Zimon Detailing",
+                    "Email": "errors@sentry.io, zimon@gmail.com",
+                    "Place Key": "ChIJ1",
+                }),
+                self._airtable_csv_row(**{
+                    "Business Name": "Haynes Auto",
+                    "Email": "support@webador.com",
+                    "Place Key": "ChIJ2",
+                }),
+            ]
+            self._write_airtable_csv(csv_path, rows)
+            records = upload_airtable.read_input_records(csv_path, only_sendable=False, packet_dir=Path(tmp))
+        zimon = next(r for r in records if r["business_name"] == "Zimon Detailing")
+        haynes = next(r for r in records if r["business_name"] == "Haynes Auto")
+        self.assertEqual(zimon["airtable_fields"].get("Email"), "zimon@gmail.com")
+        self.assertNotIn("Email", haynes["airtable_fields"])
+
     def test_airtable_csv_upsert_key_prefers_place_key_then_normalized_phone(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             csv_path = Path(tmp) / "scored.csv"

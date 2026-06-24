@@ -14,6 +14,8 @@ PLACEHOLDER_EMAILS = {
     "info@example.com",
 }
 SUPPRESSED_LOCAL_PARTS = {"noreply", "no-reply", "donotreply"}
+# Domains that are platform/SaaS tools, never a real business contact address.
+PLATFORM_DOMAINS = {"sentry.io", "webador.com", "wix.com", "squarespace.com"}
 
 
 def normalize_domain(value: Any) -> str:
@@ -77,6 +79,26 @@ def clean_emails(emails: Any, *, business_domain: Any = "") -> list[str]:
 
 def emails_text(emails: Any, *, business_domain: Any = "") -> str:
     return ", ".join(clean_emails(emails, business_domain=business_domain))
+
+
+def is_noisy_airtable_email(email: Any) -> bool:
+    """Return True if the email is a platform/system address that should not sync to Airtable."""
+    normalized = str(email or "").strip().lower()
+    if is_placeholder_email(normalized):
+        return True
+    _local, sep, domain = normalized.partition("@")
+    if not sep:
+        return True
+    base_domain = domain.split(".", 1)[-1] if domain.count(".") > 1 else domain
+    if domain in PLATFORM_DOMAINS or base_domain in PLATFORM_DOMAINS:
+        return True
+    return False
+
+
+def clean_airtable_email(value: Any) -> str:
+    """Filter noisy/platform emails; return comma-joined real addresses or empty string."""
+    real = [e for e in split_emails(value) if not is_noisy_airtable_email(e)]
+    return ", ".join(real)
 
 
 def sanitize_record_emails(record: dict[str, Any]) -> dict[str, Any]:

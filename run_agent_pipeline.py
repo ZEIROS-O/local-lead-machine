@@ -436,6 +436,8 @@ def build_airtable_cmd(
     ]
     if sendable_only:
         cmd.append("--only-sendable")
+    else:
+        cmd.append("--include-manual-review")
     cmd.append("--live" if live else "--dry-run")
     return cmd
 

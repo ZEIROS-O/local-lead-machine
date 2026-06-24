@@ -19,6 +19,7 @@ except ModuleNotFoundError:
     def load_dotenv() -> bool:
         return False
 
+from lead_machine.email_hygiene import clean_airtable_email
 from lead_machine.airtable_sync import (
     TYPED_AIRTABLE_FIELDS,
     build_airtable_payload,
@@ -27,6 +28,9 @@ from lead_machine.airtable_sync import (
 )
 from lead_machine.schema import normalize_phone
 
+
+_TIER_SENDABLE = "Sendable Packet"
+_TIER_MANUAL = "Manual Review Packet"
 
 CSV_AIRTABLE_FIELDS = [
     "Business Name",
@@ -233,6 +237,18 @@ def csv_row_to_record(row: Dict[str, str], packet_dir: Path) -> Dict[str, Any]:
         if not clean_cell(fields.get("Next Action")):
             fields["Next Action"] = "Build mockup"
             defaulted_fields.append("Next Action")
+    elif clean_cell(row.get("Packet Tier", "")) == _TIER_MANUAL:
+        if not clean_cell(fields.get("Status")):
+            fields["Status"] = "Manual Review"
+            defaulted_fields.append("Status")
+
+    # Filter platform/system emails before Airtable payload creation.
+    if "Email" in fields:
+        cleaned_email = clean_airtable_email(fields["Email"])
+        if cleaned_email:
+            fields["Email"] = cleaned_email
+        else:
+            del fields["Email"]
 
     if not clean_cell(fields.get("Outreach Channel")):
         fields["Outreach Channel"] = "Google Maps"
@@ -275,7 +291,9 @@ def raise_csv_field_limit() -> None:
         csv.field_size_limit(2_147_483_647)
 
 
-def read_csv_records(path: Path, *, only_sendable: bool, packet_dir: Path) -> List[Dict[str, Any]]:
+def read_csv_records(
+    path: Path, *, only_sendable: bool, include_manual_review: bool = False, packet_dir: Path
+) -> List[Dict[str, Any]]:
     raise_csv_field_limit()
     with path.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -290,17 +308,30 @@ def read_csv_records(path: Path, *, only_sendable: bool, packet_dir: Path) -> Li
                 truthy_yes(row.get("Sendable")) and truthy_yes(row.get("Packet Eligible"))
             ):
                 continue
+            if include_manual_review and not only_sendable:
+                tier = (row.get("Packet Tier") or "").strip()
+                if tier not in {_TIER_SENDABLE, _TIER_MANUAL}:
+                    continue
             records.append(csv_row_to_record(row, packet_dir))
         return records
 
 
-def read_input_records(path: Path, *, only_sendable: bool, packet_dir: Path) -> List[Dict[str, Any]]:
+def read_input_records(
+    path: Path, *, only_sendable: bool, include_manual_review: bool = False, packet_dir: Path
+) -> List[Dict[str, Any]]:
     if path.suffix.lower() == ".csv":
-        return read_csv_records(path, only_sendable=only_sendable, packet_dir=packet_dir)
+        return read_csv_records(
+            path, only_sendable=only_sendable, include_manual_review=include_manual_review, packet_dir=packet_dir
+        )
 
     cards = read_cards(path)
     if only_sendable:
         return [card for card in cards if is_sendable_record(card)]
+    if include_manual_review:
+        def _is_manual_review(card: Dict[str, Any]) -> bool:
+            fields = card.get("airtable_fields") or card
+            return str(fields.get("Packet Tier", "")).strip() == _TIER_MANUAL
+        return [card for card in cards if is_sendable_record(card) or _is_manual_review(card)]
     return cards
 
 
@@ -414,6 +445,11 @@ def main() -> int:
         action="store_true",
         help="Only upload Sendable = Yes and Packet Eligible = Yes rows",
     )
+    parser.add_argument(
+        "--include-manual-review",
+        action="store_true",
+        help="Upload Sendable Packet and Manual Review Packet rows; exclude Watchlist and No Packet",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print planned Airtable writes without sending")
     parser.add_argument("--live", action="store_true", help="Send planned writes to Airtable")
     parser.add_argument(
@@ -436,7 +472,12 @@ def main() -> int:
         if not input_path.exists():
             raise FileNotFoundError(input_path)
 
-        records = read_input_records(input_path, only_sendable=args.only_sendable, packet_dir=packet_dir)
+        records = read_input_records(
+            input_path,
+            only_sendable=args.only_sendable,
+            include_manual_review=args.include_manual_review,
+            packet_dir=packet_dir,
+        )
 
         if not args.live:
             planned = plan_airtable_sync(records, existing_records_by_key={})
