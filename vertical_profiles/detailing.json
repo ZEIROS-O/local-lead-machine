@@ -1,0 +1,26 @@
+{
+  "vertical": "detailing",
+  "display_name": "Car Detailing",
+  "airtable_vertical": "Car Detailing",
+  "search_terms": [
+    "ceramic coating",
+    "paint correction",
+    "ppf installer",
+    "mobile detailing",
+    "window tint",
+    "vehicle wrap"
+  ],
+  "high_intent_terms": [
+    "ceramic pro",
+    "xpel",
+    "gtechniq",
+    "paint protection film"
+  ],
+  "exclude_terms": [
+    "dealership service",
+    "dealer service"
+  ],
+  "min_rating": 4.3,
+  "min_reviews": 10,
+  "notes": "Target high-ticket ceramic/PPF/paint-correction detailers; deny express/tunnel/self-serve washes. Boost + base exclude terms come from lead_machine/verticals.py (canonical scoring layer); this profile only adds search-query phrasing, high-intent terms, and metadata."
+}

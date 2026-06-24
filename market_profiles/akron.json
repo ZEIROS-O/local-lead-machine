@@ -1,0 +1,39 @@
+{
+  "market": "akron",
+  "display_name": "Akron",
+  "state": "OH",
+  "geos": [
+    "Akron OH",
+    "Cuyahoga Falls OH",
+    "Stow OH",
+    "Hudson OH",
+    "Fairlawn OH",
+    "Green OH",
+    "Barberton OH",
+    "Tallmadge OH",
+    "Munroe Falls OH",
+    "Norton OH",
+    "Wadsworth OH",
+    "Medina OH"
+  ],
+  "sizes": {
+    "small": [
+      "Akron OH",
+      "Cuyahoga Falls OH",
+      "Stow OH",
+      "Hudson OH",
+      "Fairlawn OH"
+    ],
+    "medium": [
+      "Akron OH",
+      "Cuyahoga Falls OH",
+      "Stow OH",
+      "Hudson OH",
+      "Fairlawn OH",
+      "Green OH",
+      "Barberton OH",
+      "Tallmadge OH",
+      "Wadsworth OH"
+    ]
+  }
+}

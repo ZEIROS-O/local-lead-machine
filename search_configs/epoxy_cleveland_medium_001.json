@@ -1,0 +1,63 @@
+{
+  "batch": "epoxy_cleveland_medium_001",
+  "vertical": "epoxy",
+  "location": "Cleveland OH",
+  "limit_per_query": 10,
+  "queries": [
+    "epoxy flooring Cleveland OH",
+    "garage floor epoxy Cleveland OH",
+    "garage floor coating Cleveland OH",
+    "concrete floor coating Cleveland OH",
+    "polyaspartic floor coating Cleveland OH",
+    "polyurea floor coating Cleveland OH",
+    "epoxy floor contractor Cleveland OH",
+    "concrete coating contractor Cleveland OH",
+    "commercial epoxy flooring Cleveland OH",
+    "industrial floor coating Cleveland OH",
+    "decorative concrete coatings Cleveland OH",
+    "metallic epoxy flooring Cleveland OH"
+  ],
+  "geo_slices": [
+    "Cleveland OH",
+    "Cleveland east side OH",
+    "Cleveland west side OH",
+    "Lakewood OH",
+    "Rocky River OH",
+    "Westlake OH",
+    "Strongsville OH",
+    "Medina OH",
+    "Beachwood OH",
+    "Solon OH",
+    "Chagrin Falls OH",
+    "Mentor OH",
+    "Parma OH"
+  ],
+  "geo_slices_ref": "cleveland",
+  "min_rating": 4.3,
+  "min_reviews": 5,
+  "allow_missing_website": true,
+  "exclude_terms": [
+    "resin art",
+    "epoxy supplies",
+    "epoxy resin store",
+    "powder coating",
+    "auto ceramic coating",
+    "countertop epoxy",
+    "diy kit"
+  ],
+  "boost_terms": [
+    "epoxy flooring",
+    "garage floor epoxy",
+    "garage floor coating",
+    "concrete floor coating",
+    "polyaspartic floor coating",
+    "polyurea floor coating",
+    "epoxy floor contractor",
+    "concrete coating contractor",
+    "commercial epoxy flooring",
+    "industrial floor coating",
+    "decorative concrete coatings",
+    "metallic epoxy flooring"
+  ],
+  "airtable_vertical": "Epoxy Flooring"
+}

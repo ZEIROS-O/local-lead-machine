@@ -1,0 +1,51 @@
+{
+  "vertical": "epoxy",
+  "display_name": "Epoxy Flooring",
+  "airtable_vertical": "Epoxy Flooring",
+  "search_terms": [
+    "epoxy flooring",
+    "garage floor epoxy",
+    "garage floor coating",
+    "concrete floor coating",
+    "polyaspartic floor coating",
+    "polyurea floor coating",
+    "epoxy floor contractor",
+    "concrete coating contractor",
+    "commercial epoxy flooring",
+    "industrial floor coating",
+    "decorative concrete coatings",
+    "metallic epoxy flooring"
+  ],
+  "high_intent_terms": [
+    "garage floor coating",
+    "polyaspartic floor coating",
+    "commercial epoxy flooring",
+    "industrial floor coating"
+  ],
+  "boost_terms": [
+    "epoxy flooring",
+    "garage floor epoxy",
+    "garage floor coating",
+    "concrete floor coating",
+    "polyaspartic floor coating",
+    "polyurea floor coating",
+    "epoxy floor contractor",
+    "concrete coating contractor",
+    "commercial epoxy flooring",
+    "industrial floor coating",
+    "decorative concrete coatings",
+    "metallic epoxy flooring"
+  ],
+  "exclude_terms": [
+    "resin art",
+    "epoxy supplies",
+    "epoxy resin store",
+    "powder coating",
+    "auto ceramic coating",
+    "countertop epoxy",
+    "diy kit"
+  ],
+  "min_rating": 4.3,
+  "min_reviews": 5,
+  "notes": "Target high-ticket garage/commercial/industrial floor coating contractors; deny retail resin/supply/countertop/DIY noise. Not yet in lead_machine/verticals.py, so boost + exclude terms are sourced from this profile until a VerticalProfile is added there."
+}

@@ -1,0 +1,55 @@
+{
+  "market": "cleveland",
+  "display_name": "Cleveland",
+  "state": "OH",
+  "geos": [
+    "Cleveland OH",
+    "Cleveland east side OH",
+    "Cleveland west side OH",
+    "Lakewood OH",
+    "Rocky River OH",
+    "Westlake OH",
+    "Strongsville OH",
+    "Medina OH",
+    "Brunswick OH",
+    "Beachwood OH",
+    "Mayfield Heights OH",
+    "Solon OH",
+    "Twinsburg OH",
+    "Chagrin Falls OH",
+    "Mentor OH",
+    "Willoughby OH",
+    "Painesville OH",
+    "Parma OH",
+    "North Royalton OH",
+    "Berea OH",
+    "Independence OH",
+    "Akron OH",
+    "Stow OH",
+    "Cuyahoga Falls OH"
+  ],
+  "sizes": {
+    "small": [
+      "Cleveland OH",
+      "Cleveland east side OH",
+      "Cleveland west side OH",
+      "Lakewood OH",
+      "Beachwood OH"
+    ],
+    "medium": [
+      "Cleveland OH",
+      "Cleveland east side OH",
+      "Cleveland west side OH",
+      "Lakewood OH",
+      "Rocky River OH",
+      "Westlake OH",
+      "Strongsville OH",
+      "Medina OH",
+      "Beachwood OH",
+      "Solon OH",
+      "Chagrin Falls OH",
+      "Mentor OH",
+      "Parma OH"
+    ]
+  }
+}

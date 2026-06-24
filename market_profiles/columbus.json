@@ -1,0 +1,42 @@
+{
+  "market": "columbus",
+  "display_name": "Columbus",
+  "state": "OH",
+  "geos": [
+    "Columbus OH",
+    "Dublin OH",
+    "Westerville OH",
+    "Worthington OH",
+    "Upper Arlington OH",
+    "Hilliard OH",
+    "Grove City OH",
+    "Gahanna OH",
+    "Reynoldsburg OH",
+    "Pickerington OH",
+    "Powell OH",
+    "New Albany OH",
+    "Bexley OH",
+    "Grandview Heights OH"
+  ],
+  "sizes": {
+    "small": [
+      "Columbus OH",
+      "Dublin OH",
+      "Westerville OH",
+      "Upper Arlington OH",
+      "Worthington OH"
+    ],
+    "medium": [
+      "Columbus OH",
+      "Dublin OH",
+      "Westerville OH",
+      "Worthington OH",
+      "Upper Arlington OH",
+      "Hilliard OH",
+      "Grove City OH",
+      "Gahanna OH",
+      "Powell OH",
+      "New Albany OH"
+    ]
+  }
+}

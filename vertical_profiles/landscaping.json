@@ -1,0 +1,42 @@
+{
+  "vertical": "landscaping",
+  "display_name": "Landscaping & Hardscaping",
+  "airtable_vertical": "Landscaping",
+  "search_terms": [
+    "landscaping company",
+    "landscape design",
+    "hardscaping contractor",
+    "paver patio",
+    "retaining wall",
+    "outdoor living"
+  ],
+  "high_intent_terms": [
+    "landscape design build",
+    "paver patio",
+    "outdoor kitchen",
+    "outdoor living"
+  ],
+  "boost_terms": [
+    "hardscape",
+    "hardscaping",
+    "patio",
+    "paver",
+    "retaining wall",
+    "outdoor living",
+    "outdoor kitchen",
+    "fire pit",
+    "landscape design",
+    "design build"
+  ],
+  "exclude_terms": [
+    "lawn mowing",
+    "snow removal",
+    "garden center",
+    "nursery",
+    "tree service",
+    "junk removal"
+  ],
+  "min_rating": 4.3,
+  "min_reviews": 5,
+  "notes": "Target high-ticket design-build landscaping/hardscaping; deny mow-and-blow, snow, retail garden centers. Resolves to the hardscaping family in verticals.py for scoring; boost terms mirror that profile's high-ticket terms."
+}

@@ -1,0 +1,40 @@
+{
+  "vertical": "roofing",
+  "display_name": "Roofing",
+  "airtable_vertical": "Roofing",
+  "search_terms": [
+    "roofing contractor",
+    "roof replacement",
+    "roof repair",
+    "metal roofing",
+    "storm damage roof",
+    "commercial roofing"
+  ],
+  "high_intent_terms": [
+    "roof replacement",
+    "storm damage roof",
+    "insurance claim roof",
+    "commercial roofing"
+  ],
+  "boost_terms": [
+    "roofing",
+    "roof replacement",
+    "roof repair",
+    "metal roofing",
+    "storm damage",
+    "insurance claim",
+    "commercial roofing",
+    "siding",
+    "gutter"
+  ],
+  "exclude_terms": [
+    "roofing supplies",
+    "roofing wholesale",
+    "diy roofing",
+    "home depot",
+    "lowes"
+  ],
+  "min_rating": 4.3,
+  "min_reviews": 5,
+  "notes": "Target high-ticket replacement/storm/commercial roofers; deny supply houses and big-box retail. Boost terms mirror the hardscaping family's roofing high-ticket terms until a dedicated VerticalProfile is added to verticals.py."
+}

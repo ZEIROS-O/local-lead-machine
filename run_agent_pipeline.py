@@ -183,6 +183,28 @@ def _next_free_index(base: str, configs_dir: Path, output_dir: Path) -> int:
     return idx
 
 
+def _generate_config_or_refuse(
+    *, vertical: str, market: str, size: str, configs_dir: Path
+) -> None:
+    """Generate ``<vertical>_<market>_<size>_001.json`` from profiles.
+
+    Imported lazily so the wrapper has no hard dependency on the generator. A
+    missing vertical/market profile (or any generation error) is re-raised as a
+    PipelineRefusal carrying the generator's ``[REFUSE]`` message. Never makes a
+    paid call — config generation is pure file I/O.
+    """
+    try:
+        import generate_search_config as gsc
+    except ImportError as exc:  # pragma: no cover - generator ships with the repo
+        raise PipelineRefusal(f"Config generator unavailable: {exc}") from exc
+    try:
+        gsc.generate_config(
+            vertical=vertical, market=market, size=size, configs_dir=configs_dir
+        )
+    except gsc.ConfigGenError as exc:
+        raise PipelineRefusal(str(exc)) from exc
+
+
 def resolve_batch(
     *,
     vertical: str,
@@ -206,10 +228,19 @@ def resolve_batch(
     base = f"{vertical}_{market}_{size}"
     indexed = _existing_indexed_configs(base, configs_dir)
     if not indexed:
-        raise PipelineRefusal(
-            f"No search config found matching {base}_NNN.json under {configs_dir}/. "
-            "Create one (see the add-vertical / add-metro skills) or pass --batch."
+        # No existing config: try to generate one from vertical + market
+        # profiles (pure file I/O, never a paid call). Refuses with a clear
+        # [REFUSE] line if a profile is missing.
+        _generate_config_or_refuse(
+            vertical=vertical, market=market, size=size, configs_dir=configs_dir
         )
+        indexed = _existing_indexed_configs(base, configs_dir)
+        if not indexed:
+            raise PipelineRefusal(
+                f"No search config found matching {base}_NNN.json under {configs_dir}/ "
+                "and config generation produced nothing. Pass --batch or add profiles "
+                "(vertical_profiles/, market_profiles/)."
+            )
 
     template_idx, template_path = indexed[-1]
     current_batch = template_path.stem

@@ -312,6 +312,64 @@ class AgentPipelineTest(unittest.TestCase):
         self.assertIn("--llm-batch-size", score)
         self.assertEqual(score[score.index("--llm-batch-size") + 1], "5")
 
+    def _write_profiles(self, vertical: str = "epoxy", market: str = "cleveland") -> None:
+        (self.root / "vertical_profiles").mkdir(parents=True, exist_ok=True)
+        (self.root / "market_profiles").mkdir(parents=True, exist_ok=True)
+        (self.root / "vertical_profiles" / f"{vertical}.json").write_text(
+            json.dumps({
+                "vertical": vertical,
+                "display_name": vertical.title(),
+                "search_terms": ["alpha", "beta"],
+                "boost_terms": ["alpha", "beta"],
+                "exclude_terms": ["noise"],
+            }),
+            encoding="utf-8",
+        )
+        (self.root / "market_profiles" / f"{market}.json").write_text(
+            json.dumps({
+                "market": market,
+                "display_name": market.title(),
+                "state": "OH",
+                "geos": ["A OH", "B OH", "C OH"],
+            }),
+            encoding="utf-8",
+        )
+
+    def test_resolve_batch_auto_generates_config_when_profiles_exist(self) -> None:
+        # No search config, but vertical + market profiles are present.
+        self._write_profiles(vertical="epoxy", market="cleveland")
+        batch, config_path = rap.resolve_batch(
+            vertical="epoxy", market="cleveland", size="medium",
+            explicit_batch="", mode="full", overwrite=False,
+        )
+        self.assertEqual(batch, "epoxy_cleveland_medium_001")
+        self.assertTrue(config_path.exists())
+        cfg = json.loads(config_path.read_text(encoding="utf-8"))
+        self.assertEqual(cfg["vertical"], "epoxy")
+        self.assertIn("alpha Cleveland OH", cfg["queries"])
+        self.assertIn("A OH", cfg["geo_slices"])
+
+    def test_resolve_batch_refuses_when_vertical_profile_missing(self) -> None:
+        # Only the market profile exists.
+        self._write_profiles(vertical="epoxy", market="cleveland")
+        (self.root / "vertical_profiles" / "epoxy.json").unlink()
+        with self.assertRaises(rap.PipelineRefusal) as ctx:
+            rap.resolve_batch(
+                vertical="epoxy", market="cleveland", size="medium",
+                explicit_batch="", mode="full", overwrite=False,
+            )
+        self.assertIn("[REFUSE] Missing vertical profile", str(ctx.exception))
+
+    def test_resolve_batch_uses_existing_config_without_profiles(self) -> None:
+        # Existing config present, NO profiles -> must not attempt generation.
+        self._write_config("epoxy_cleveland_medium_001")
+        batch, config_path = rap.resolve_batch(
+            vertical="epoxy", market="cleveland", size="medium",
+            explicit_batch="", mode="packets-only", overwrite=False,
+        )
+        self.assertEqual(batch, "epoxy_cleveland_medium_001")
+        self.assertTrue(config_path.exists())
+
     def test_overwrite_reuses_existing_batch(self) -> None:
         self._write_config()
         self._write_enriched("detailing_cleveland_medium_001")
