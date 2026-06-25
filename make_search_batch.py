@@ -26,7 +26,7 @@ from enrich_leads import (
     enrich_row,
     format_elapsed,
 )
-from places_search import normalize_place, place_details, text_search
+from places_search import normalize_place, place_details, text_search_paged
 from lead_machine.schema import GENERIC_DOMAINS, normalize_domain, normalize_phone, slug
 
 
@@ -136,6 +136,9 @@ class SearchConfig:
     allow_missing_website: bool = True
     exclude_terms: List[str] = None  # type: ignore[assignment]
     boost_terms: List[str] = None  # type: ignore[assignment]
+    page_size: int = 0
+    max_pages_per_query: int = 1
+    max_results_per_query: Optional[int] = None
     source_path: Path = Path("")
 
     @classmethod
@@ -159,12 +162,37 @@ class SearchConfig:
             raise ValueError("Search config field limit_per_query must be an integer") from exc
         if limit_per_query <= 0:
             raise ValueError("Search config field limit_per_query must be greater than 0")
+        limit_per_query = min(limit_per_query, 20)
+
+        # page_size defaults to limit_per_query so legacy configs keep their per-call
+        # result count; capped at the API's 20-per-page ceiling.
+        if data.get("page_size") in ("", None):
+            page_size = limit_per_query
+        else:
+            try:
+                page_size = int(data.get("page_size"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Search config field page_size must be an integer") from exc
+        page_size = max(1, min(page_size, 20))
+
+        # max_pages_per_query defaults to 1 -> identical single-page behavior/cost for
+        # legacy configs that never declared it.
+        max_pages = _int_or_default(data.get("max_pages_per_query"), 1)
+        if max_pages <= 0:
+            max_pages = 1
+
+        if data.get("max_results_per_query") in ("", None):
+            max_results_per_query: Optional[int] = None
+        else:
+            max_results_per_query = _int_or_default(
+                data.get("max_results_per_query"), page_size * max_pages
+            )
 
         return cls(
             batch=str(data.get("batch") or "").strip(),
             vertical=str(data.get("vertical") or "").strip(),
             location=str(data.get("location") or "").strip(),
-            limit_per_query=min(limit_per_query, 20),
+            limit_per_query=limit_per_query,
             queries=queries,
             geo_slices=geo_slices,
             min_rating=_float_or_default(data.get("min_rating"), 0.0),
@@ -172,6 +200,9 @@ class SearchConfig:
             allow_missing_website=bool(data.get("allow_missing_website", True)),
             exclude_terms=_string_list(data.get("exclude_terms")),
             boost_terms=_string_list(data.get("boost_terms")),
+            page_size=page_size,
+            max_pages_per_query=max_pages,
+            max_results_per_query=max_results_per_query,
             source_path=source_path,
         )
 
@@ -188,7 +219,15 @@ class SearchConfig:
             "allow_missing_website": self.allow_missing_website,
             "exclude_terms": list(self.exclude_terms or []),
             "boost_terms": list(self.boost_terms or []),
+            "page_size": self.effective_page_size,
+            "max_pages_per_query": self.max_pages_per_query,
+            "max_results_per_query": self.max_results_per_query,
         }
+
+    @property
+    def effective_page_size(self) -> int:
+        """Per-call page size, falling back to limit_per_query for legacy configs."""
+        return self.page_size if self.page_size > 0 else min(self.limit_per_query, 20)
 
 
 @dataclass(frozen=True)
@@ -197,6 +236,20 @@ class ExpandedSearch:
     source_geo: str
     search_text: str
     max_results: int
+    page_size: int = 0
+    max_pages: int = 1
+    total_max_results: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class SearchEfficiency:
+    searches_run: int = 0
+    page_size: int = 0
+    max_pages_per_query: int = 1
+    pages_fetched: int = 0
+    total_places_returned: int = 0
+    unique_raw_count: int = 0
+    early_duplicate_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -227,6 +280,7 @@ class SearchRunResult:
     top_candidate_names: List[str]
     warnings: List[str]
     errors: List[str]
+    efficiency: SearchEfficiency = SearchEfficiency()
 
 
 def _string_list(value: Any) -> List[str]:
@@ -315,6 +369,9 @@ def replace_location(query: str, *, base_location: str, geo: str) -> str:
 
 
 def expand_searches(config: SearchConfig) -> List[ExpandedSearch]:
+    page_size = config.effective_page_size
+    max_pages = config.max_pages_per_query
+    total_max = config.max_results_per_query or page_size * max_pages
     expanded: List[ExpandedSearch] = []
     for query in config.queries:
         for geo in config.geo_slices:
@@ -324,6 +381,9 @@ def expand_searches(config: SearchConfig) -> List[ExpandedSearch]:
                     source_geo=geo,
                     search_text=replace_location(query, base_location=config.location, geo=geo),
                     max_results=config.limit_per_query,
+                    page_size=page_size,
+                    max_pages=max_pages,
+                    total_max_results=total_max,
                 )
             )
     return expanded
@@ -573,19 +633,25 @@ def collect_raw_rows(
     errors: List[str],
     max_searches: Optional[int] = None,
     max_details: Optional[int] = None,
-) -> Tuple[List[Dict[str, str]], List[str], Dict[str, int]]:
+) -> Tuple[List[Dict[str, str]], List[str], Dict[str, int], SearchEfficiency]:
     raw_rows: List[Dict[str, str]] = []
     queries_run: List[str] = []
     duplicate_reason_counts: Counter[str] = Counter()
     seen_place_ids: set[str] = set()
     details_count = 0
     details_cap_reported = False
+    pages_fetched_total = 0
+    total_places_returned = 0
 
     expanded_searches = expand_searches(config)
     searches = expanded_searches
     if max_searches is not None:
         searches = expanded_searches[:max_searches]
     _progress(f"Total query×geo searches: {len(expanded_searches)}")
+    _progress(
+        f"Search depth: page_size={config.effective_page_size} "
+        f"max_pages_per_query={config.max_pages_per_query}"
+    )
     if len(searches) != len(expanded_searches):
         _progress(f"Search cap active: running {len(searches)} of {len(expanded_searches)} searches")
 
@@ -593,12 +659,24 @@ def collect_raw_rows(
         queries_run.append(search.search_text)
         _progress(f"[SEARCH {search_index}/{len(searches)}] {search.search_text}")
         try:
-            places = text_search(api_key, search.search_text, search.max_results)
+            places, pages_fetched = text_search_paged(
+                api_key,
+                search.search_text,
+                page_size=search.page_size,
+                max_pages=search.max_pages,
+                max_results=search.total_max_results,
+                sleep_seconds=sleep_seconds,
+            )
         except Exception as exc:
             errors.append(f"Text search failed for {search.search_text!r}: {exc}")
             _progress(f"[SEARCH {search_index}/{len(searches)}] result count: 0")
             continue
-        _progress(f"[SEARCH {search_index}/{len(searches)}] result count: {len(places)}")
+        pages_fetched_total += pages_fetched
+        total_places_returned += len(places)
+        _progress(
+            f"[SEARCH {search_index}/{len(searches)}] result count: {len(places)} "
+            f"(pages={pages_fetched})"
+        )
 
         for place in places:
             place_id = _pick(place, "id", "place_id")
@@ -642,7 +720,16 @@ def collect_raw_rows(
         if sleep_seconds > 0:
             time.sleep(sleep_seconds)
 
-    return raw_rows, queries_run, dict(duplicate_reason_counts)
+    efficiency = SearchEfficiency(
+        searches_run=len(searches),
+        page_size=config.effective_page_size,
+        max_pages_per_query=config.max_pages_per_query,
+        pages_fetched=pages_fetched_total,
+        total_places_returned=total_places_returned,
+        unique_raw_count=len(seen_place_ids),
+        early_duplicate_count=duplicate_reason_counts.get("duplicate_place_id_early", 0),
+    )
+    return raw_rows, queries_run, dict(duplicate_reason_counts), efficiency
 
 
 def run_search_batch(
@@ -678,7 +765,7 @@ def run_search_batch(
 
     warnings: List[str] = []
     errors: List[str] = []
-    raw_rows, queries_run, early_duplicate_reason_counts = collect_raw_rows(
+    raw_rows, queries_run, early_duplicate_reason_counts, efficiency = collect_raw_rows(
         config,
         api_key=api_key,
         sleep_seconds=sleep_seconds,
@@ -782,6 +869,7 @@ def run_search_batch(
         top_candidate_names=top_candidate_names,
         warnings=warnings,
         errors=errors,
+        efficiency=efficiency,
     )
     write_search_report(result)
     _progress(f"Report: {result.report_path}")
@@ -835,6 +923,29 @@ def write_search_report(result: SearchRunResult) -> None:
     lines.extend(_count_lines(result.skip_reason_counts))
     lines.extend(["", "Duplicate reasons count:"])
     lines.extend(_count_lines(result.duplicate_reason_counts))
+
+    eff = result.efficiency
+    leads_per_search = result.enriched_count / eff.searches_run if eff.searches_run else 0.0
+    leads_per_page = result.enriched_count / eff.pages_fetched if eff.pages_fetched else 0.0
+    lines.extend(
+        [
+            "",
+            "## Search Efficiency",
+            "",
+            f"- Total query×geo searches: {eff.searches_run}",
+            f"- Configured page size: {eff.page_size}",
+            f"- Max pages per query: {eff.max_pages_per_query}",
+            f"- Pages actually fetched: {eff.pages_fetched}",
+            f"- Raw results: {eff.total_places_returned}",
+            f"- Unique raw results: {eff.unique_raw_count}",
+            f"- Deduped results: {result.deduped_count}",
+            f"- Early duplicate count: {eff.early_duplicate_count}",
+            f"- ICP pass count: {result.icp_pass_count}",
+            f"- Enriched count: {result.enriched_count}",
+            f"- Unique enriched leads per search: {leads_per_search:.2f}",
+            f"- Unique enriched leads per Places page: {leads_per_page:.2f}",
+        ]
+    )
     lines.extend(["", "## Top Candidates", ""])
     lines.extend(f"- {name}" for name in result.top_candidate_names[:10])
     if not result.top_candidate_names:
