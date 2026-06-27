@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, Iterable, List, Optional
+import re
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 
-from .schema import normalize_phone
+from .schema import GENERIC_DOMAINS, normalize_domain, normalize_phone
 
 
 AIRTABLE_ALLOWED_FIELDS = [
@@ -180,6 +181,43 @@ def card_place_key(card: Dict[str, Any]) -> str:
     return str(card.get("place_id_or_unique_key") or fields.get("Place Key") or "").strip()
 
 
+def _clean_text(value: Any) -> str:
+    return " ".join(str(value or "").strip().split())
+
+
+def normalize_business_name(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", _clean_text(value).casefold())
+
+
+def normalize_city(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", _clean_text(value).casefold())
+
+
+def card_phone_key(card: Dict[str, Any]) -> str:
+    fields = card.get("airtable_fields") or {}
+    phone = normalize_phone(str(card.get("phone") or fields.get("Phone") or ""))
+    return f"phone:{phone}" if phone else ""
+
+
+def card_domain_key(card: Dict[str, Any]) -> str:
+    fields = card.get("airtable_fields") or {}
+    domain = normalize_domain(str(card.get("website") or fields.get("Website URL") or ""))
+    if domain in GENERIC_DOMAINS:
+        return ""
+    return f"domain:{domain}" if domain else ""
+
+
+def card_business_city_key(card: Dict[str, Any]) -> str:
+    fields = card.get("airtable_fields") or {}
+    name = normalize_business_name(
+        card.get("business_name") or fields.get("Business Name") or card.get("name") or ""
+    )
+    city = normalize_city(card.get("city") or fields.get("City") or "")
+    if not name or not city:
+        return ""
+    return f"business_city:{name}|{city}"
+
+
 def card_upsert_key(card: Dict[str, Any]) -> str:
     explicit = str(card.get("upsert_key") or "").strip()
     if explicit:
@@ -189,18 +227,59 @@ def card_upsert_key(card: Dict[str, Any]) -> str:
     if place_key:
         return f"place:{place_key}"
 
-    fields = card.get("airtable_fields") or {}
-    phone = normalize_phone(str(card.get("phone") or fields.get("Phone") or ""))
-    if phone:
-        return f"phone:{phone}"
+    phone_key = card_phone_key(card)
+    if phone_key:
+        return phone_key
 
     return ""
+
+
+def _record_ids_for_key(existing: Mapping[str, Any], key: str) -> List[str]:
+    if not key:
+        return []
+    raw = existing.get(key)
+    if raw in ("", None):
+        return []
+    if isinstance(raw, (list, tuple, set)):
+        return sorted({str(item) for item in raw if str(item)})
+    return [str(raw)]
+
+
+def _resolve_existing_record(
+    card: Dict[str, Any],
+    existing: Mapping[str, Any],
+    upsert_key: str,
+    place_key: str,
+) -> tuple[str, str, str]:
+    candidates = [
+        ("exact", upsert_key),
+        ("exact", f"place:{place_key}" if place_key else ""),
+        ("exact", place_key),
+        ("phone", card_phone_key(card)),
+        ("domain", card_domain_key(card)),
+        ("business_city", card_business_city_key(card)),
+    ]
+    seen_keys: set[str] = set()
+    for reason, key in candidates:
+        if not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        record_ids = _record_ids_for_key(existing, key)
+        if not record_ids:
+            continue
+        if len(record_ids) > 1:
+            return "", reason, (
+                f"Ambiguous Airtable existing match for {upsert_key}: "
+                f"{key} matched {', '.join(record_ids)}"
+            )
+        return record_ids[0], "" if reason == "exact" else reason, ""
+    return "", "", ""
 
 
 def plan_airtable_sync(
     cards: Iterable[Dict[str, Any]],
     *,
-    existing_records_by_key: Optional[Dict[str, str]] = None,
+    existing_records_by_key: Optional[Mapping[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     existing = existing_records_by_key or {}
     planned: List[Dict[str, Any]] = []
@@ -213,19 +292,33 @@ def plan_airtable_sync(
         if upsert_key in seen_input_keys:
             raise ValueError(f"Duplicate Airtable upsert key in input: {upsert_key}")
         seen_input_keys.add(upsert_key)
-        record_id = existing.get(upsert_key) or existing.get(place_key)
+        record_id, match_reason, warning = _resolve_existing_record(card, existing, upsert_key, place_key)
         payload = build_airtable_payload(card)
+        if warning:
+            planned.append(
+                {
+                    "method": "SKIP",
+                    "record_id": "",
+                    "place_key": place_key,
+                    "upsert_key": upsert_key,
+                    "match_reason": match_reason,
+                    "warning": warning,
+                    "payload": payload,
+                }
+            )
+            continue
         if record_id:
             fields = payload.get("fields", {})
             for field in card.get("defaulted_airtable_fields") or []:
                 fields.pop(str(field), None)
-        planned.append(
-            {
-                "method": "PATCH" if record_id else "POST",
-                "record_id": record_id or "",
-                "place_key": place_key,
-                "upsert_key": upsert_key,
-                "payload": payload,
-            }
-        )
+        item = {
+            "method": "PATCH" if record_id else "POST",
+            "record_id": record_id or "",
+            "place_key": place_key,
+            "upsert_key": upsert_key,
+            "payload": payload,
+        }
+        if match_reason:
+            item["match_reason"] = match_reason
+        planned.append(item)
     return planned

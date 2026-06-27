@@ -79,7 +79,7 @@ inspect:
 	$(PY) -c 'import csv; from pathlib import Path; path=Path("$(SCORED_MANUAL)"); rows=list(csv.DictReader(path.open(newline="", encoding="utf-8"))); print("Rows:", len(rows)); [print(r.get("Lead Priority"), "| packet=", r.get("Packet Eligible"), "| sendable=", r.get("Sendable"), "|", r.get("Score Total"), "|", r.get("Business Name"), "|", r.get("Best Service Angle"), "| blockers:", r.get("Send Blockers")) for r in rows]'
 
 airtable-dry:
-	$(PY) upload_airtable.py --input $(SCORED_MANUAL) --only-sendable --packet-dir $(PACKETS_DIR)
+	$(PY) upload_airtable.py --input $(SCORED_MANUAL) --only-sendable --packet-dir $(PACKETS_DIR) --dry-run
 
 airtable-live:
 	$(PY) upload_airtable.py --input $(SCORED_MANUAL) --only-sendable --packet-dir $(PACKETS_DIR) --live

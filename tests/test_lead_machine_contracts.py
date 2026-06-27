@@ -660,6 +660,165 @@ class LeadMachineContractsTest(unittest.TestCase):
 
         self.assertIn("Duplicate Airtable upsert key in input: phone:4405550101", str(caught.exception))
 
+    def test_airtable_existing_phone_key_matches_incoming_place_key(self) -> None:
+        record = {
+            "upsert_key": "place:ChIJ-new",
+            "place_id_or_unique_key": "ChIJ-new",
+            "phone": "(440) 555-0101",
+            "airtable_fields": {
+                "Business Name": "Flawless Coating and Detailing",
+                "Place Key": "ChIJ-new",
+                "Phone": "(440) 555-0101",
+            },
+        }
+
+        planned = plan_airtable_sync([record], existing_records_by_key={"phone:4405550101": "rec-phone"})
+
+        self.assertEqual(planned[0]["method"], "PATCH")
+        self.assertEqual(planned[0]["record_id"], "rec-phone")
+        self.assertEqual(planned[0]["upsert_key"], "place:ChIJ-new")
+        self.assertEqual(planned[0]["match_reason"], "phone")
+        self.assertEqual(planned[0]["payload"]["fields"]["Place Key"], "ChIJ-new")
+
+    def test_airtable_existing_domain_key_matches_incoming_place_key(self) -> None:
+        record = {
+            "upsert_key": "place:ChIJ-new",
+            "place_id_or_unique_key": "ChIJ-new",
+            "airtable_fields": {
+                "Business Name": "Fresh Shine Detail",
+                "Place Key": "ChIJ-new",
+                "Website URL": "https://www.freshshinedetail.com/services",
+            },
+        }
+
+        planned = plan_airtable_sync([record], existing_records_by_key={"domain:freshshinedetail.com": "rec-domain"})
+
+        self.assertEqual(planned[0]["method"], "PATCH")
+        self.assertEqual(planned[0]["record_id"], "rec-domain")
+        self.assertEqual(planned[0]["match_reason"], "domain")
+
+    def test_airtable_generic_social_domain_does_not_match_existing_record(self) -> None:
+        record = {
+            "upsert_key": "place:ChIJ-new",
+            "place_id_or_unique_key": "ChIJ-new",
+            "airtable_fields": {
+                "Business Name": "Peach Drive Auto",
+                "Place Key": "ChIJ-new",
+                "Website URL": "https://www.instagram.com/peachdriveauto",
+            },
+        }
+
+        planned = plan_airtable_sync([record], existing_records_by_key={"domain:instagram.com": "rec-action-tint"})
+
+        self.assertEqual(planned[0]["method"], "POST")
+        self.assertNotIn("match_reason", planned[0])
+
+    def test_airtable_existing_business_city_key_matches_when_unique(self) -> None:
+        record = {
+            "upsert_key": "place:ChIJ-new",
+            "place_id_or_unique_key": "ChIJ-new",
+            "airtable_fields": {
+                "Business Name": "Fresh Shine Detail LLC",
+                "Place Key": "ChIJ-new",
+                "City": "Cleveland",
+            },
+        }
+
+        planned = plan_airtable_sync(
+            [record],
+            existing_records_by_key={"business_city:freshshinedetailllc|cleveland": "rec-name-city"},
+        )
+
+        self.assertEqual(planned[0]["method"], "PATCH")
+        self.assertEqual(planned[0]["record_id"], "rec-name-city")
+        self.assertEqual(planned[0]["match_reason"], "business_city")
+
+    def test_airtable_ambiguous_existing_fallback_match_skips(self) -> None:
+        record = {
+            "upsert_key": "place:ChIJ-new",
+            "place_id_or_unique_key": "ChIJ-new",
+            "phone": "(440) 555-0101",
+            "airtable_fields": {
+                "Business Name": "Fresh Shine Detail",
+                "Place Key": "ChIJ-new",
+                "Phone": "(440) 555-0101",
+                "Website URL": "freshshinedetail.com",
+            },
+        }
+
+        planned = plan_airtable_sync(
+            [record],
+            existing_records_by_key={"phone:4405550101": ["rec-one", "rec-two"]},
+        )
+
+        self.assertEqual(planned[0]["method"], "SKIP")
+        self.assertEqual(planned[0]["record_id"], "")
+        self.assertEqual(planned[0]["match_reason"], "phone")
+        self.assertIn("Ambiguous Airtable existing match", planned[0]["warning"])
+
+    def test_airtable_true_new_record_posts(self) -> None:
+        record = {
+            "upsert_key": "place:ChIJ-new",
+            "place_id_or_unique_key": "ChIJ-new",
+            "phone": "(440) 555-0101",
+            "airtable_fields": {
+                "Business Name": "Fresh Shine Detail",
+                "Place Key": "ChIJ-new",
+                "Phone": "(440) 555-0101",
+                "Website URL": "freshshinedetail.com",
+                "City": "Cleveland",
+            },
+        }
+
+        planned = plan_airtable_sync([record], existing_records_by_key={})
+
+        self.assertEqual(planned[0]["method"], "POST")
+        self.assertEqual(planned[0]["record_id"], "")
+        self.assertNotIn("match_reason", planned[0])
+
+    def test_airtable_dry_run_fetches_existing_records_when_env_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "scored.csv"
+            self._write_airtable_csv(csv_path, [self._airtable_csv_row()])
+
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "AIRTABLE_BASE_ID": "base123",
+                        "AIRTABLE_PROSPECTS_TABLE": "Prospects",
+                        "AIRTABLE_PAT": "token123",
+                    },
+                    clear=False,
+                ),
+                patch("upload_airtable.load_dotenv", return_value=False),
+                patch("upload_airtable.requests.get") as get,
+                patch("upload_airtable.requests.post") as post,
+                patch("upload_airtable.requests.patch") as patch_request,
+            ):
+                get.return_value.status_code = 200
+                get.return_value.json.return_value = {
+                    "records": [
+                        {
+                            "id": "rec-phone",
+                            "fields": {
+                                "Business Name": "A+ Landscaping LLC",
+                                "Phone": "(440) 637-5848",
+                            },
+                        }
+                    ]
+                }
+                code, stdout, stderr = self._run_upload(["upload_airtable.py", "--input", str(csv_path), "--dry-run"])
+
+        self.assertEqual(code, 0, stderr)
+        self.assertFalse(post.called)
+        self.assertFalse(patch_request.called)
+        planned = self._dry_run_plan(stdout)
+        self.assertEqual(planned[0]["method"], "PATCH")
+        self.assertEqual(planned[0]["record_id"], "rec-phone")
+        self.assertEqual(planned[0]["match_reason"], "phone")
+        self.assertIn("[MATCH] place:ChIJ123 -> PATCH rec-phone via phone", stderr)
+
     def test_airtable_live_mode_requires_env_vars_before_network(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             csv_path = Path(tmp) / "scored.csv"
