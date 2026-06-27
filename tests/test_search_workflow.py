@@ -198,6 +198,124 @@ class SearchWorkflowTest(unittest.TestCase):
         self.assertIn("data/raw/test_hardscaping_001.csv", report)
         self.assertIn("make batch BATCH=test_hardscaping_001 BATCH_SIZE=5 LIMIT=10", report)
 
+    def test_legacy_config_backfills_page_size_and_defaults_to_single_page(self) -> None:
+        # A config that only declares limit_per_query (no pagination fields) must keep
+        # current single-page behavior and cost.
+        config = _config()  # limit_per_query=5, no page_size/max_pages_per_query
+        self.assertEqual(config.page_size, 5)
+        self.assertEqual(config.effective_page_size, 5)
+        self.assertEqual(config.max_pages_per_query, 1)
+        self.assertIsNone(config.max_results_per_query)
+        first = make_search_batch.expand_searches(config)[0]
+        self.assertEqual(first.page_size, 5)
+        self.assertEqual(first.max_pages, 1)
+
+    def test_config_reads_explicit_page_size_and_max_pages(self) -> None:
+        config = _config(page_size=20, max_pages_per_query=3)
+        self.assertEqual(config.page_size, 20)
+        self.assertEqual(config.max_pages_per_query, 3)
+        first = make_search_batch.expand_searches(config)[0]
+        self.assertEqual(first.max_pages, 3)
+        self.assertEqual(first.total_max_results, 60)
+
+    def test_runner_threads_pages_fetched_into_efficiency_and_report(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "search_configs/test_hardscaping_001.json"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                json.dumps(_config(page_size=20, max_pages_per_query=2).to_dict()), encoding="utf-8"
+            )
+
+            def fake_paged(api_key, search_text, *, page_size, max_pages=1, max_results=None, sleep_seconds=0.0):
+                return [{"id": f"{search_text}-1"}], 2
+
+            def fake_details(api_key, place_id):
+                suffix = sum(ord(char) for char in place_id) % 10000
+                return {
+                    "id": place_id,
+                    "displayName": {"text": f"Patio Pros {suffix}"},
+                    "formattedAddress": f"{suffix} Main St, Cleveland, OH 44101, USA",
+                    "nationalPhoneNumber": f"(216) 555-{suffix:04d}",
+                    "websiteUri": f"https://patiopros{suffix}.example",
+                    "primaryType": "patio contractor",
+                    "rating": 4.8,
+                    "userRatingCount": 28,
+                }
+
+            def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False):
+                return {"google": row, "website": {"site_status": "No Website"}, "derived": {}, "screenshots": {}}
+
+            with patch("make_search_batch.text_search_paged", side_effect=fake_paged), patch(
+                "make_search_batch.place_details", side_effect=fake_details
+            ), patch("make_search_batch.enrich_row", side_effect=fake_enrich), redirect_stdout(io.StringIO()):
+                result = make_search_batch.run_search_batch(
+                    config_path=config_path,
+                    batch="test_hardscaping_001",
+                    root=root,
+                    api_key="test-key",
+                    no_screenshots=True,
+                    sleep_seconds=0,
+                )
+
+            report = result.report_path.read_text(encoding="utf-8")
+
+        # 2 queries x 2 geos = 4 searches, 2 pages each = 8 pages fetched.
+        self.assertEqual(result.efficiency.searches_run, 4)
+        self.assertEqual(result.efficiency.max_pages_per_query, 2)
+        self.assertEqual(result.efficiency.pages_fetched, 8)
+        self.assertEqual(result.efficiency.page_size, 20)
+        self.assertIn("Pages actually fetched: 8", report)
+        self.assertIn("Max pages per query: 2", report)
+
+    def test_report_includes_search_efficiency_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = make_search_batch.SearchRunResult(
+                batch="test_hardscaping_001",
+                vertical="hardscaping",
+                config_path=Path("search_configs/test_hardscaping_001.json"),
+                raw_path=root / "data/raw/test_hardscaping_001.csv",
+                deduped_path=root / "data/deduped/test_hardscaping_001.csv",
+                enriched_path=root / "output/enriched_test_hardscaping_001.jsonl",
+                report_path=root / "reports/search_test_hardscaping_001.md",
+                queries_run=["hardscaping Cleveland OH"],
+                geo_slices=["Cleveland OH"],
+                raw_count=30,
+                deduped_count=20,
+                icp_pass_count=12,
+                enriched_count=12,
+                skipped_count=8,
+                skip_reason_counts={"missing_phone": 8},
+                duplicate_reason_counts={"duplicate_place_id_early": 10},
+                top_candidate_names=["Patio Pros"],
+                warnings=[],
+                errors=[],
+                efficiency=make_search_batch.SearchEfficiency(
+                    searches_run=6,
+                    page_size=20,
+                    max_pages_per_query=2,
+                    pages_fetched=9,
+                    total_places_returned=40,
+                    unique_raw_count=30,
+                    early_duplicate_count=10,
+                ),
+            )
+
+            make_search_batch.write_search_report(result)
+            report = result.report_path.read_text(encoding="utf-8")
+
+        self.assertIn("## Search Efficiency", report)
+        self.assertIn("Total query×geo searches: 6", report)
+        self.assertIn("Configured page size: 20", report)
+        self.assertIn("Max pages per query: 2", report)
+        self.assertIn("Pages actually fetched: 9", report)
+        self.assertIn("Raw results: 40", report)
+        self.assertIn("Unique raw results: 30", report)
+        self.assertIn("Early duplicate count: 10", report)
+        self.assertIn("Unique enriched leads per search: 2.00", report)
+        self.assertIn("Unique enriched leads per Places page: 1.33", report)
+
     def test_runner_writes_raw_deduped_enriched_and_report_without_real_network(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -234,7 +352,7 @@ class SearchWorkflowTest(unittest.TestCase):
             def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False):
                 return {"google": row, "website": {"site_status": "No Website"}, "derived": {}, "screenshots": {}}
 
-            with patch("make_search_batch.text_search", return_value=text_results), patch(
+            with patch("make_search_batch.text_search_paged", return_value=(text_results, 1)), patch(
                 "make_search_batch.place_details", side_effect=lambda api_key, place_id: details[place_id]
             ), patch("make_search_batch.enrich_row", side_effect=fake_enrich), redirect_stdout(io.StringIO()):
                 result = make_search_batch.run_search_batch(
@@ -288,7 +406,7 @@ class SearchWorkflowTest(unittest.TestCase):
                 )
                 return {"google": row, "website": {"site_status": "Loaded"}, "derived": {}, "screenshots": {}}
 
-            with patch("make_search_batch.text_search", return_value=[{"id": "place-1"}]), patch(
+            with patch("make_search_batch.text_search_paged", return_value=([{"id": "place-1"}], 1)), patch(
                 "make_search_batch.place_details", return_value=details
             ), patch("make_search_batch.enrich_row", side_effect=fake_enrich), redirect_stdout(io.StringIO()):
                 make_search_batch.run_search_batch(
@@ -341,7 +459,7 @@ class SearchWorkflowTest(unittest.TestCase):
                 }
 
             stdout = io.StringIO()
-            with patch("make_search_batch.text_search", return_value=[{"id": "place-1"}]), patch(
+            with patch("make_search_batch.text_search_paged", return_value=([{"id": "place-1"}], 1)), patch(
                 "make_search_batch.place_details", return_value=details
             ), patch("make_search_batch.enrich_row", side_effect=fake_enrich), redirect_stdout(stdout):
                 make_search_batch.run_search_batch(
@@ -381,7 +499,7 @@ class SearchWorkflowTest(unittest.TestCase):
             def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False):
                 return {"google": row, "website": {"site_status": "No Website"}, "derived": {}, "screenshots": {}}
 
-            with patch("make_search_batch.text_search", return_value=text_results), patch(
+            with patch("make_search_batch.text_search_paged", return_value=(text_results, 1)), patch(
                 "make_search_batch.place_details", return_value=details
             ) as details_call, patch("make_search_batch.enrich_row", side_effect=fake_enrich), redirect_stdout(io.StringIO()):
                 result = make_search_batch.run_search_batch(
@@ -405,8 +523,8 @@ class SearchWorkflowTest(unittest.TestCase):
             config_path.parent.mkdir(parents=True)
             config_path.write_text(json.dumps(_config().to_dict()), encoding="utf-8")
 
-            def fake_text_search(api_key, search_text, max_results):
-                return [{"id": f"{search_text}-1"}, {"id": f"{search_text}-2"}]
+            def fake_text_search(api_key, search_text, *, page_size, max_pages=1, max_results=None, sleep_seconds=0.0):
+                return [{"id": f"{search_text}-1"}, {"id": f"{search_text}-2"}], 1
 
             def fake_details(api_key, place_id):
                 suffix = sum(ord(char) for char in place_id) % 10000
@@ -425,7 +543,7 @@ class SearchWorkflowTest(unittest.TestCase):
             def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False):
                 return {"google": row, "website": {"site_status": "No Website"}, "derived": {}, "screenshots": {}}
 
-            with patch("make_search_batch.text_search", side_effect=fake_text_search) as search_call, patch(
+            with patch("make_search_batch.text_search_paged", side_effect=fake_text_search) as search_call, patch(
                 "make_search_batch.place_details", side_effect=fake_details
             ) as details_call, patch("make_search_batch.enrich_row", side_effect=fake_enrich) as enrich_call, redirect_stdout(io.StringIO()):
                 result = make_search_batch.run_search_batch(
@@ -472,7 +590,7 @@ class SearchWorkflowTest(unittest.TestCase):
                 return {"google": row, "website": {"site_status": "No Website"}, "derived": {}, "screenshots": {}}
 
             progress = io.StringIO()
-            with patch("make_search_batch.text_search", return_value=text_results), patch(
+            with patch("make_search_batch.text_search_paged", return_value=(text_results, 1)), patch(
                 "make_search_batch.place_details", return_value=details
             ), patch("make_search_batch.enrich_row", side_effect=fake_enrich), redirect_stdout(progress):
                 result = make_search_batch.run_search_batch(

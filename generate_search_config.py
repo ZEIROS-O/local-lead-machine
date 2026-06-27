@@ -44,8 +44,14 @@ VALID_SIZES = ("small", "medium", "full")
 DEFAULT_LIMIT_PER_QUERY = 10
 DEFAULT_MIN_RATING = 4.3
 DEFAULT_MIN_REVIEWS = 5
+# Per-call result page size (API hard-caps at 20). Pagination depth carries volume.
+DEFAULT_PAGE_SIZE = 20
+# Size-based search depth: deeper paging where appropriate, single page for small.
+SIZE_MAX_PAGES = {"small": 1, "medium": 2, "full": 3}
 # Fallback geo-set sizes when a market profile omits an explicit "sizes" entry.
-FALLBACK_SIZE_COUNTS = {"small": 5, "medium": 12}
+# medium is trimmed to ~6 dense slices because pagination (2 pages) now carries depth
+# instead of geo spam.
+FALLBACK_SIZE_COUNTS = {"small": 5, "medium": 6}
 
 
 class ConfigGenError(Exception):
@@ -187,11 +193,21 @@ def generate_config(
     queries = build_queries(vertical_profile, location)
     boost, exclude, boost_source = resolve_boost_exclude(vertical, vertical_profile)
 
+    # page_size defaults to 20 (or a profile override / legacy limit_per_query); depth
+    # comes from size. limit_per_query mirrors page_size so legacy readers stay valid.
+    page_size = min(
+        int(vertical_profile.get("page_size", vertical_profile.get("limit_per_query", DEFAULT_PAGE_SIZE))),
+        DEFAULT_PAGE_SIZE,
+    )
+    max_pages = int(vertical_profile.get("max_pages_per_query", SIZE_MAX_PAGES.get(size, 1)))
+
     config = {
         "batch": batch_name,
         "vertical": vertical,
         "location": location,
-        "limit_per_query": int(vertical_profile.get("limit_per_query", DEFAULT_LIMIT_PER_QUERY)),
+        "limit_per_query": page_size,
+        "page_size": page_size,
+        "max_pages_per_query": max_pages,
         "queries": queries,
         "geo_slices": geos,
         "geo_slices_ref": market,
@@ -217,6 +233,7 @@ def generate_config(
 
     _status(f"[GEN] vertical={vertical} market={market} size={size} batch={batch_name}", quiet=quiet)
     _status(f"[GEN] location={location} queries={len(queries)} geo_slices={len(geos)}", quiet=quiet)
+    _status(f"[GEN] page_size={page_size} max_pages_per_query={max_pages} (size={size})", quiet=quiet)
     _status(f"[GEN] boost_terms={len(boost)} (source={boost_source}) exclude_terms={len(exclude)}", quiet=quiet)
     _status(f"[GEN] wrote {config_path}", quiet=quiet)
     _status(f"[GEN] refreshed {geo_file} ({len(full_geos)} geos)", quiet=quiet)

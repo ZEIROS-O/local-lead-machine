@@ -304,7 +304,13 @@ Rules:
 - Do not score A/sendable just because the business fits hardscaping.
 - The best lead is one where the website is visibly worse than the actual business.
 - Buyer intent is required for A/B quality: look for fixable gap times money signal, not just a bad website.
-- Use buyer_intent_summary as evidence for money/demand context. Paid CRM/booking tools, live review velocity, and known ad signals can support demand proof.
+- Use buyer_intent_summary as evidence for money/demand context.
+- Paid CRM/booking tools and known ad signals can support money intent.
+- Count-only review demand bands support reputation fit, not money intent by themselves.
+- ideal_growth should increase ICP/reputation fit.
+- established/mature is not bad by itself, but requires stronger concrete conversion pain to be sendable.
+- mature plus no concrete conversion pain should be blocked or manual-review, not packet eligible.
+- mature plus an obvious broken/missing estimate path can still be high value when backed by money intent or very strong conversion-pain evidence.
 - Bad site alone without buyer_intent.money_signal should not be an A lead.
 - No specific observation = no send.
 - More reviews require stronger proof of visible pain.

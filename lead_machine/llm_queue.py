@@ -57,10 +57,15 @@ Rules:
 - confidence must be one of low, medium, high.
 - Every scored claim must reference evidence IDs from the packet.
 - If there is no evidence for a claim, lower evidence confidence instead of inventing.
-- Missing site plus strong reviews can be an A lead.
+- Missing site plus strong reviews can be an A lead only when there is a concrete conversion gap and enough evidence.
 - Do not score A/sendable just because the business is reputable.
 - Do not score A/sendable just because the business fits hardscaping.
 - The best lead is one where the website is visibly worse than the actual business.
+- Count-only review demand supports reputation fit, not money intent by itself.
+- ideal_growth should increase ICP/reputation fit.
+- established/mature is not bad by itself, but requires stronger concrete conversion pain to be sendable.
+- mature plus no concrete conversion pain should be blocked or manual-review, not packet eligible.
+- mature plus an obvious broken/missing estimate path can still be high value when backed by money intent or very strong conversion-pain evidence.
 - No specific observation = no send.
 - More reviews require stronger proof of visible pain.
 - Do not infer missing forms if evidence is uncertain.

@@ -24,7 +24,7 @@ import sys
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
@@ -33,7 +33,8 @@ from dotenv import load_dotenv
 TEXT_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText"
 PLACE_DETAILS_URL = "https://places.googleapis.com/v1/places/{place_id}"
 
-# Search uses places.* field paths.
+# Search uses places.* field paths. "nextPageToken" is a top-level field (not
+# places.*) and must be in the mask to paginate; it does not raise the billing SKU.
 TEXT_SEARCH_FIELD_MASK = ",".join(
     [
         "places.id",
@@ -41,8 +42,12 @@ TEXT_SEARCH_FIELD_MASK = ",".join(
         "places.formattedAddress",
         "places.primaryType",
         "places.types",
+        "nextPageToken",
     ]
 )
+
+# Places API (New) Text Search hard-caps a page at 20 results.
+MAX_PAGE_SIZE = 20
 
 # Details does NOT use places.* prefixes.
 # Do not use "*". Keep this strict to avoid pulling unnecessary paid fields.
@@ -184,22 +189,89 @@ def request_json(method: str, url: str, *, headers: Dict[str, str], json_body: O
     return resp.json()
 
 
-def text_search(api_key: str, query: str, max_results: int) -> List[Dict[str, Any]]:
+def _text_search_page(
+    headers: Dict[str, str], body: Dict[str, Any], *, retries: int = 2, backoff: float = 1.5
+) -> Dict[str, Any]:
+    """POST one Text Search page, retrying transient errors (e.g. a not-yet-ready
+    pageToken) with linear backoff. Mocked request_json in tests never retries."""
+    last_exc: Optional[Exception] = None
+    for attempt in range(retries + 1):
+        try:
+            return request_json("POST", TEXT_SEARCH_URL, headers=headers, json_body=body)
+        except RuntimeError as exc:
+            last_exc = exc
+            if attempt < retries:
+                time.sleep(backoff * (attempt + 1))
+    raise last_exc  # type: ignore[misc]
+
+
+def text_search_paged(
+    api_key: str,
+    query: str,
+    *,
+    page_size: int,
+    max_pages: int = 1,
+    max_results: Optional[int] = None,
+    sleep_seconds: float = 0.0,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Paginated Places Text Search (New).
+
+    Returns ``(places, pages_fetched)``. Combines up to ``max_pages`` pages (the API
+    hard-caps at 60 results = 3 x 20), dedupes by place id within the call, and stops
+    early when the API returns no ``nextPageToken``, the page cap is reached, or
+    ``max_results`` places have been collected. Each page is a separate billable call.
+    """
+    page_size = max(1, min(int(page_size), MAX_PAGE_SIZE))
+    max_pages = max(1, int(max_pages))
+
     headers = {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": api_key,
         "X-Goog-FieldMask": TEXT_SEARCH_FIELD_MASK,
     }
-
-    body = {
+    # All paged requests must repeat the original params (textQuery, pageSize, ...).
+    base_body = {
         "textQuery": query,
-        "maxResultCount": max_results,
+        "pageSize": page_size,
         "languageCode": "en",
         "regionCode": "US",
     }
 
-    data = request_json("POST", TEXT_SEARCH_URL, headers=headers, json_body=body)
-    return data.get("places", []) or []
+    places: List[Dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    pages_fetched = 0
+    page_token = ""
+
+    while pages_fetched < max_pages:
+        body = dict(base_body)
+        if page_token:
+            body["pageToken"] = page_token
+        data = _text_search_page(headers, body)
+        pages_fetched += 1
+
+        for place in data.get("places", []) or []:
+            place_id = place.get("id") or ""
+            if place_id and place_id in seen_ids:
+                continue
+            if place_id:
+                seen_ids.add(place_id)
+            places.append(place)
+            if max_results is not None and len(places) >= max_results:
+                return places, pages_fetched
+
+        page_token = data.get("nextPageToken") or ""
+        if not page_token:
+            break
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
+
+    return places, pages_fetched
+
+
+def text_search(api_key: str, query: str, max_results: int) -> List[Dict[str, Any]]:
+    """Single-page Text Search (backward-compatible wrapper)."""
+    places, _ = text_search_paged(api_key, query, page_size=max_results, max_pages=1)
+    return places
 
 
 def place_details(api_key: str, place_id: str) -> Dict[str, Any]:

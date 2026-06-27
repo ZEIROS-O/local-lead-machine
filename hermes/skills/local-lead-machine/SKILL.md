@@ -1,86 +1,83 @@
 ---
 name: local-lead-machine
 description: >-
-  Drive the local-lead-machine pipeline from Telegram via five short commands
-  (/run, /confirm, /status, /create-vertical, /create-market, /help). Use this
-  whenever the user texts one of those commands to search for leads, confirm
-  paid scoring, check a batch, or add a vertical/market. This skill is a DUMB
-  ROUTER: it shells out to a deterministic in-repo Python module that owns all
-  grammar, validation, and money-safety, then relays that module's output
-  verbatim. It never constructs pipeline flags itself.
+  Drive the local-lead-machine pipeline from Telegram through the safe staged
+  Hermes operator commands (/run, /score-dry, /score, /score-rest, /packets,
+  /sync-dry, /sync-live, /status). This skill is a dumb router: it shells out
+  to the deterministic in-repo Python module and relays output verbatim.
 category: sales
 ---
 
 # local-lead-machine command router
 
-You are the transport between the user's Telegram messages and a deterministic,
-money-gated command module that lives in the repo. **You do not interpret,
-expand, "fix up", or reason about the commands** — you forward them and relay
-the result. The Python module (`lead_machine.hermes_commands`) and
-`run_agent_pipeline.py` are the only things allowed to know how to spend money.
+You are transport only. Do not interpret, expand, repair, or reconstruct lead
+pipeline commands. Forward the user's tokens to the deterministic command module
+and relay stdout verbatim.
 
-## The one shell contract
+## Shell Contract
 
-For every supported command, run exactly this (substitute the repo path if
-different) and relay stdout to the user **verbatim**:
+During the Hermes worktree phase, run exactly:
 
 ```bash
-cd ~/local-lead-machine && source .venv/bin/activate && \
-  python -m lead_machine.hermes_commands <verb> <args...> --execute
+cd ~/local-lead-machine-hermes
+source ~/local-lead-machine/.venv/bin/activate
+export LOCAL_LEAD_MACHINE_ROOT=~/local-lead-machine
+export LOCAL_LEAD_MACHINE_PYTHON=~/local-lead-machine/.venv/bin/python
+python -m lead_machine.hermes_commands <verb> <args...> --execute
 ```
 
-- `<verb>` is one of: `run`, `confirm`, `status`, `create-vertical`,
-  `create-market`, `help`.
-- Pass the user's tokens through unchanged. A leading slash (`/run`) is fine —
-  the module strips it.
-- `--execute` makes the action real. **Omit `--execute` to show a preview** (the
-  exact commands/JSON that would run, with no spend and no writes). When a user
-  asks "what would this do?" or you are unsure, run the preview first (no
-  `--execute`) and relay it.
-- `status` and `help` are read-only; `--execute` is harmless/ignored there.
+When this work is merged into `~/local-lead-machine`, the `cd` path can move back
+to the main repo.
 
-## What each command does (for the user, not for you to re-implement)
+Example:
 
-- `/run <vertical> <market> <size>` — searches (Places spend only, **never**
-  LLM) and previews the projected scoring cost. Replies with a batch id.
-  `size` ∈ {small, medium, full}.
-- `/confirm <batch>` — pays to score, builds packets, and syncs sendable leads
-  to Airtable (live). This is the only command that spends LLM money.
-- `/status <batch>` — reports pipeline stages and packet-tier counts. No spend,
-  no network.
-- `/create-vertical <slug> --terms "a; b" [...]` — writes a vertical profile.
-- `/create-market <slug> --small "…" --medium "…" [...]` — writes a market profile.
-- `/help` — lists the commands.
+```bash
+cd ~/local-lead-machine-hermes
+source ~/local-lead-machine/.venv/bin/activate
+LOCAL_LEAD_MACHINE_ROOT=~/local-lead-machine \
+LOCAL_LEAD_MACHINE_PYTHON=~/local-lead-machine/.venv/bin/python \
+python -m lead_machine.hermes_commands status detailing_cleveland_medium_001
+```
 
-## Hard rules (do not violate)
+Supported verbs:
 
-1. **Never add `--yes`, `--confirm-spend`, or `--airtable live` yourself.** Only
-   `/confirm` (inside the module) is allowed to authorize spend, and it adds
-   those flags itself.
-2. **Never raise `--max-llm-usd`** or pass it at all. The default ceiling is the
-   safety limit.
-3. **Never call `run_agent_pipeline.py`, `score_leads.py`, `upload_airtable.py`,
-   `make_search_batch.py`, or any other script directly.** The only entrypoint
-   you may invoke is `python -m lead_machine.hermes_commands`.
-4. **Never pass `--include-manual-review-airtable`** or any flag the user did not
-   type. Forward only the verb + the user's own tokens (+ `--execute`).
-5. **If the module refuses** (output starts with `[REFUSE]` or `failed:`), relay
-   the refusal as-is. Do **not** retry with different flags, do not "work
-   around" it, and do not escalate. A refusal is the safety system working.
-6. **Relay output verbatim and in full** (it is already Telegram-sized). Do not
-   summarize, embellish, or add flags you think are missing.
+- `run`
+- `score-dry`
+- `score`
+- `score-rest`
+- `packets`
+- `sync-dry`
+- `sync-live`
+- `status`
+- `confirm` (deprecated/refusal-only)
+- `create-vertical`
+- `create-market`
+- `help`
 
-## Why this design
+Pass user tokens unchanged. A leading slash is fine; the module strips it.
 
-The pipeline spends real money (Places API, the LLM, live Airtable writes). An
-LLM router that constructs those commands could spend unboundedly on a
-hallucinated flag. So all grammar, validation, batch-name parsing, and command
-construction are deterministic and unit-tested inside the repo. Your judgment is
-deliberately removed from the money path — your job is faithful relay.
+## Command Semantics
 
-## Registration
+- `/run <vertical> <market> <size>` searches/enriches only. It never scores and
+  never touches Airtable.
+- `/score-dry <batch>` estimates cost only with no Anthropic call.
+- `/score <batch> --limit N --timeout MINUTES` runs paid scoring only.
+- `/score-rest <batch>` chunks remaining paid scoring.
+- `/packets <batch>` deterministically refreshes tiers and builds packets.
+- `/sync-dry <batch> [--include-manual]` runs Airtable dry-run only and records
+  the input hash.
+- `/sync-live <batch> [--include-manual]` is the only live Airtable command and
+  refuses unless the latest dry-run is clean and hash-matched.
+- `/status <batch>` reads local files only.
+- `/confirm <batch>` refuses and tells the user to use staged commands.
 
-This skill ships in the repo and is loaded by adding the repo path to
-`skills.external_dirs` in `~/.hermes/config.yaml` (see `docs/hermes-commands.md`).
-It is **not** copied into `~/.hermes/skills/`, so it versions with the code it
-drives.
+## Hard Rules
+
+1. Never call pipeline scripts directly. The only entrypoint is
+   `python -m lead_machine.hermes_commands`.
+2. Never add flags the user did not type, except the required trailing
+   `--execute`.
+3. Never add `--live` except by forwarding `/sync-live`.
+4. Never retry a refusal with different flags.
+5. Relay `[REFUSE]` output exactly.
+6. Do not summarize command output; it is already bounded for Telegram.

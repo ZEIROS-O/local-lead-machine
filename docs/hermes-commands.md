@@ -1,110 +1,93 @@
 # Hermes / Telegram command layer
 
-Drive the lead pipeline from your phone with five short commands, without ever
-letting a non-deterministic LLM construct a money-spending command.
+Hermes is a safe operator layer for the local lead machine. It routes short
+commands to deterministic Python code in this repo and keeps paid scoring,
+packet generation, and Airtable live sync as separate stages.
 
-- **Telegram ⇄ Hermes** is the transport (the external Nous Research Hermes Agent
-  at `~/.hermes`, already wired to your DM).
-- **`hermes/skills/local-lead-machine/SKILL.md`** is a dumb router: it shells out
-  to the deterministic module below and relays its output verbatim.
-- **`lead_machine/hermes_commands.py`** is the deterministic core. It owns all
-  grammar, validation, batch-name parsing, and command construction, and forwards
-  to `run_agent_pipeline.py` — the single money-safety boundary. It never
-  re-implements cost estimation, batch forking, or Airtable logic.
+## Workflow
 
-## The commands
+```text
+/run -> /score-dry -> /score or /score-rest -> /packets -> /sync-dry -> /sync-live -> /status
+```
 
-All are invoked as `python -m lead_machine.hermes_commands <verb> … [--execute]`.
-Without `--execute`, every mutating verb **previews** (prints the exact
-command(s) / JSON it would run) and changes nothing. `status` and `help` are
-read-only.
+`/confirm` is deprecated and refusal-only. It never scores, builds packets, or
+syncs Airtable.
 
-| Command | What it does | Spend |
-| --- | --- | --- |
-| `run <vertical> <market> <size>` | Search + enrich, then dry-run the scoring cost. Reports the resolved batch id. | Places only, **never LLM** |
-| `confirm <batch>` | Paid scoring → packets → **live Airtable (sendable-only)**. | LLM + Airtable |
-| `status <batch>` | Pipeline stages + packet-tier counts. | none |
-| `create-vertical <slug> --terms "a; b" […]` | Write `vertical_profiles/<slug>.json`. | none |
-| `create-market <slug> --small "…" --medium "…" […]` | Write `market_profiles/<slug>.json`. | none |
-| `help` | List the commands. | none |
+## Commands
 
-`size` ∈ {`small`, `medium`, `full`}. Slugs must match `^[a-z][a-z0-9_]*$`.
-
-### Two-step money safety for `/run` → `/confirm`
-
-`/run` deliberately uses `search-only` then `score-dry-run`, which spend Places
-budget but **guarantee zero LLM spend** (there is no flag to lower the pipeline's
-$0.50 confirmation threshold, so the only safe preview is a dry run). It reports
-the projected scoring cost and the batch id. `/confirm` is the *only* path that
-adds `--yes` and `--airtable live`, and it runs the in-pipeline hard-ceiling
-check first — a projected cost above `--max-llm-usd` (default $1.00) refuses even
-with `--yes`.
-
-### Examples
+All commands are invoked as:
 
 ```bash
-# Preview (no spend, no writes):
-python -m lead_machine.hermes_commands run epoxy cleveland medium
-python -m lead_machine.hermes_commands confirm epoxy_cleveland_medium_001
-python -m lead_machine.hermes_commands create-vertical pool_builders \
-  --display "Pool Builders" --airtable "Pool Builders" \
-  --terms "pool builder; inground pool contractor"
-python -m lead_machine.hermes_commands create-market pittsburgh \
-  --display "Pittsburgh" --state PA \
-  --small "Pittsburgh PA" --medium "Pittsburgh PA; Mt Lebanon PA"
-
-# Read-only:
-python -m lead_machine.hermes_commands status epoxy_cleveland_medium_001
-python -m lead_machine.hermes_commands help
-
-# Real action (spends / writes):
-python -m lead_machine.hermes_commands run epoxy cleveland medium --execute
-python -m lead_machine.hermes_commands confirm epoxy_cleveland_medium_001 --execute
+python -m lead_machine.hermes_commands <verb> ... [--execute]
 ```
 
-### Batch names
+Without `--execute`, mutating commands preview the command they would run.
 
-The layer supports only the new `<vertical>_<market>_<size>_NNN` form. Parsing is
-profile-aware: it strips the trailing `_NNN` and `_<size>`, then matches the
-remainder against existing `vertical_profiles/` + `market_profiles/` stems, so
-multi-word slugs (`pool_builders`) work. Legacy market-first config names
-(`cleveland_hardscaping_vpain_*`) are not supported.
+| Command | What it does | External spend/write |
+| --- | --- | --- |
+| `/run <vertical> <market> <size>` | Search/enrich only through `run_agent_pipeline.py --mode search-only`. | Google Places/search only |
+| `/score-dry <batch> [--limit N] [--budget USD] [--batch-size N] [--max-tokens N]` | API-LLM cost estimate with `--dry-run-llm-cost`. | none |
+| `/score <batch> --limit N --timeout MINUTES [...]` | Paid API-LLM scoring only, with resume and budget env caps. | Anthropic only |
+| `/score-rest <batch> [...]` | Scores remaining rows in chunks and stops on no progress or budget exhaustion. | Anthropic only |
+| `/packets <batch>` | Refreshes `output/scored_<batch>_api_tiered.csv` from canonical `_api.csv`, then builds `packets_<batch>`. | none |
+| `/sync-dry <batch> [--include-manual]` | Airtable dry-run only; records POST/PATCH/SKIP counts and input hash. | Airtable read only when credentials are present |
+| `/sync-live <batch> [--include-manual]` | Live Airtable sync only after a fresh clean matching dry-run hash. | Airtable write |
+| `/status <batch>` | Local status only. | none |
 
-## Wiring it into Hermes (one-line user config)
+Defaults:
 
-The skill ships in this repo and is loaded by pointing Hermes at it — **not** by
-copying it into the external `~/.hermes/` tree. Add the repo's `hermes/skills`
-path to `skills.external_dirs` in `~/.hermes/config.yaml`:
+- score dry-run limit: `25`
+- budget: `$2.00`
+- LLM batch size: `3`
+- LLM max tokens: `4096`
+- score-rest chunk size: `9`
 
-```yaml
-skills:
-  external_dirs:
-    - /home/you/local-lead-machine/hermes/skills
+## Safety Model
+
+- `/run` never scores and never touches Airtable.
+- `/score-dry` includes `--dry-run-llm-cost` and no paid flags.
+- `/score` requires explicit `--limit` and `--timeout`, and sets
+  `MAX_LLM_USD_PER_RUN`, `MAX_LLM_CALLS_PER_RUN`, and
+  `MAX_LLM_TOKENS_PER_RUN`.
+- `/packets` always uses `output/scored_<batch>_api.csv` as the source and
+  regenerates `output/scored_<batch>_api_tiered.csv`.
+- `/sync-live` refuses unless `/sync-dry` recorded a clean hash for the same
+  include-manual mode and the packet/scored inputs have not changed.
+- No command except `/sync-live` builds `upload_airtable.py --live`.
+
+## Run State
+
+Hermes writes local metadata to `run_state/<batch>.json`:
+
+- batch identity and stage counts
+- score dry-run timestamp and projected cost
+- paid scoring timestamp
+- packet build timestamp
+- Airtable dry-run/live timestamps
+- dry-run/live POST/PATCH/SKIP counts
+- dry-run warnings and include-manual mode
+- input hash for live sync verification
+- next recommended command
+
+`run_state/` is ignored by git.
+
+## Hermes Skill Path
+
+During this worktree phase, the router must shell into the Hermes worktree:
+
+```bash
+cd ~/local-lead-machine-hermes && source ~/local-lead-machine/.venv/bin/activate && \
+  python -m lead_machine.hermes_commands <verb> <args...> --execute
 ```
 
-Then restart / reload Hermes so it picks up the `local-lead-machine` skill. The
-skill documents the exact shell contract and the prohibitions (never add `--yes`,
-never raise the cap, never call the scripts directly, relay refusals as-is).
-
-## Safety model (what stops a bad spend)
-
-- **Determinism:** the LLM never builds pipeline flags; the Python module does.
-- **Preview-by-default:** nothing spends or writes without `--execute`.
-- **Single boundary:** `run_agent_pipeline.py` does the cost estimate, hard
-  ceiling, lockfile, and Airtable filtering; this layer only forwards to it.
-- **Sendable-only Airtable:** `/confirm` never passes
-  `--include-manual-review-airtable`.
-- **Residual risk:** a misbehaving Hermes agent could ignore the skill and call
-  scripts directly. The skill states the prohibitions explicitly, but the real
-  guard is that the deterministic module is the only thing that knows how to
-  build correct, safe commands.
+When Hermes is merged into `~/local-lead-machine`, update the path back to the
+main repo.
 
 ## Tests
 
-`tests/test_hermes_commands.py` covers the whole layer offline — no subprocess,
-network, LLM, or Airtable. Run:
+Offline validation:
 
 ```bash
-python -m unittest tests.test_hermes_commands
-python -m unittest discover tests   # full regression
+python -m unittest tests.test_hermes_commands tests.test_hermes_safe_operator
+python -m unittest discover -s tests -p 'test*.py'
 ```

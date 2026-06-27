@@ -49,8 +49,8 @@ class GenerateSearchConfigTest(unittest.TestCase):
         # Queries are search terms appended with the primary location.
         self.assertIn("epoxy flooring Cleveland OH", cfg["queries"])
         self.assertIn("garage floor epoxy Cleveland OH", cfg["queries"])
-        # Medium geo subset (13 slices for cleveland), inlined for self-containment.
-        self.assertEqual(len(cfg["geo_slices"]), 13)
+        # Medium geo subset trimmed to ~6 dense slices (pagination carries depth).
+        self.assertEqual(len(cfg["geo_slices"]), 6)
         self.assertIn("Cleveland OH", cfg["geo_slices"])
         self.assertNotIn("Akron OH", cfg["geo_slices"])  # full-only slice excluded
         # epoxy is not in verticals.py -> boost/exclude come from the JSON profile.
@@ -58,7 +58,20 @@ class GenerateSearchConfigTest(unittest.TestCase):
         self.assertIn("resin art", cfg["exclude_terms"])
         self.assertEqual(cfg["min_rating"], 4.3)
         self.assertEqual(cfg["min_reviews"], 5)
-        self.assertEqual(cfg["limit_per_query"], 10)
+        # page_size defaults to 20; limit_per_query mirrors it for legacy readers;
+        # medium depth = 2 pages per query.
+        self.assertEqual(cfg["page_size"], 20)
+        self.assertEqual(cfg["limit_per_query"], 20)
+        self.assertEqual(cfg["max_pages_per_query"], 2)
+
+    def test_size_based_search_depth(self) -> None:
+        for size, expected_pages in (("small", 1), ("medium", 2), ("full", 3)):
+            path = self._generate(
+                vertical="epoxy", market="cleveland", size=size, overwrite=True
+            )
+            cfg = self._load(path)
+            self.assertEqual(cfg["page_size"], 20, size)
+            self.assertEqual(cfg["max_pages_per_query"], expected_pages, size)
 
     def test_full_size_uses_all_geos(self) -> None:
         path = self._generate(vertical="epoxy", market="cleveland", size="full")

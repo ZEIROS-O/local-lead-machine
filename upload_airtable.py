@@ -23,10 +23,12 @@ from lead_machine.email_hygiene import clean_airtable_email
 from lead_machine.airtable_sync import (
     TYPED_AIRTABLE_FIELDS,
     build_airtable_payload,
+    normalize_business_name,
+    normalize_city,
     normalize_airtable_value,
     plan_airtable_sync,
 )
-from lead_machine.schema import normalize_phone
+from lead_machine.schema import GENERIC_DOMAINS, normalize_domain, normalize_phone
 
 
 _TIER_SENDABLE = "Sendable Packet"
@@ -511,11 +513,26 @@ def payload_field_names(records: Iterable[Dict[str, Any]]) -> List[str]:
     return sorted(field_names)
 
 
-def fetch_existing_records(base_id: str, table: str, token: str) -> Dict[str, str]:
+def _add_existing_key(existing: Dict[str, Any], key: str, record_id: str) -> None:
+    if not key or not record_id:
+        return
+    current = existing.get(key)
+    if current is None:
+        existing[key] = record_id
+        return
+    if isinstance(current, list):
+        if record_id not in current:
+            current.append(record_id)
+        return
+    if current != record_id:
+        existing[key] = [current, record_id]
+
+
+def fetch_existing_records(base_id: str, table: str, token: str) -> Dict[str, Any]:
     url = airtable_base_url(base_id, table)
     headers = {"Authorization": f"Bearer {token}"}
-    params = request_params_for_fields(["Place Key", "Phone"])
-    existing: Dict[str, str] = {}
+    params: List[tuple[str, str]] = []
+    existing: Dict[str, Any] = {}
 
     while True:
         resp = requests.get(url, headers=headers, params=params, timeout=30)
@@ -527,18 +544,43 @@ def fetch_existing_records(base_id: str, table: str, token: str) -> Dict[str, st
             record_id = record.get("id", "")
             place_key = clean_cell(fields.get("Place Key"))
             if place_key:
-                existing[f"place:{place_key}"] = record_id
-                existing[place_key] = record_id
+                _add_existing_key(existing, f"place:{place_key}", record_id)
+                _add_existing_key(existing, place_key, record_id)
+            google_place_id = clean_cell(fields.get("Google Place ID"))
+            if google_place_id:
+                _add_existing_key(existing, f"place:{google_place_id}", record_id)
+                _add_existing_key(existing, google_place_id, record_id)
             phone = normalize_phone(fields.get("Phone", ""))
             if phone:
-                existing[f"phone:{phone}"] = record_id
+                _add_existing_key(existing, f"phone:{phone}", record_id)
+            domain = normalize_domain(fields.get("Website URL", ""))
+            if domain and domain not in GENERIC_DOMAINS:
+                _add_existing_key(existing, f"domain:{domain}", record_id)
+            business_name = normalize_business_name(fields.get("Business Name"))
+            city = normalize_city(fields.get("City"))
+            if business_name and city:
+                _add_existing_key(existing, f"business_city:{business_name}|{city}", record_id)
         offset = data.get("offset")
         if not offset:
             break
-        params = request_params_for_fields(["Place Key", "Phone"])
+        params = []
         params.append(("offset", offset))
 
     return existing
+
+
+def print_plan_diagnostics(planned: Iterable[Dict[str, Any]]) -> None:
+    for item in planned:
+        warning = item.get("warning")
+        if warning:
+            print(f"[WARN] {warning}", file=sys.stderr)
+            continue
+        reason = item.get("match_reason")
+        if reason and item.get("method") == "PATCH":
+            print(
+                f"[MATCH] {item.get('upsert_key')} -> PATCH {item.get('record_id')} via {reason}",
+                file=sys.stderr,
+            )
 
 
 def send_airtable_plan(base_id: str, table: str, token: str, planned: List[Dict[str, Any]]) -> None:
@@ -546,6 +588,9 @@ def send_airtable_plan(base_id: str, table: str, token: str, planned: List[Dict[
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
     for item in planned:
+        if item["method"] == "SKIP":
+            print(f"[SKIP] {item.get('upsert_key')}: {item.get('warning', 'manual review required')}")
+            continue
         if item["method"] == "PATCH":
             url = f"{base_url}/{item['record_id']}"
             resp = requests.patch(url, headers=headers, json=item["payload"], timeout=30)
@@ -633,7 +678,11 @@ def main() -> int:
         )
 
         if not args.live:
-            planned = plan_airtable_sync(records, existing_records_by_key={})
+            existing = {}
+            if args.dry_run and args.base_id and args.table and args.token:
+                existing = fetch_existing_records(args.base_id, args.table, args.token)
+            planned = plan_airtable_sync(records, existing_records_by_key=existing)
+            print_plan_diagnostics(planned)
             print(f"[DRY-RUN] Records: {len(records)}")
             print(json.dumps(planned, ensure_ascii=False, indent=2))
             return 0
@@ -657,6 +706,7 @@ def main() -> int:
 
         existing = fetch_existing_records(args.base_id, args.table, args.token)
         planned = plan_airtable_sync(records, existing_records_by_key=existing)
+        print_plan_diagnostics(planned)
         send_airtable_plan(args.base_id, args.table, args.token, planned)
         print(f"[DONE] Synced records: {len(planned)}")
         return 0

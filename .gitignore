@@ -22,6 +22,7 @@ __pycache__/
 
 # Generated pipeline outputs
 output/
+run_state/
 cards_*/
 review_queue_*/
 reports/
