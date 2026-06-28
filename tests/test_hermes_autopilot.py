@@ -47,6 +47,35 @@ def write_csv(path: Path, rows: list[dict[str, str]]) -> None:
         writer.writerows(rows)
 
 
+def seed_existing_batch(root: Path, batch: str = "epoxy_cleveland_medium_001") -> BatchPaths:
+    paths = BatchPaths.for_batch(batch, root=root)
+    paths.enriched.parent.mkdir(parents=True, exist_ok=True)
+    paths.enriched.write_text("\n".join("{}" for _ in range(95)) + "\n", encoding="utf-8")
+    write_csv(
+        paths.scored_csv,
+        [{"Business Name": f"Lead {i}", "Packet Tier": "Sendable Packet"} for i in range(26)],
+    )
+    write_csv(
+        paths.tiered_csv,
+        [
+            {
+                "Business Name": f"Lead {i}",
+                "Packet Tier": "Manual Review Packet" if i == 2 else "Sendable Packet",
+            }
+            for i in range(26)
+        ],
+    )
+    paths.packets_dir.mkdir(parents=True, exist_ok=True)
+    paths.packet_index.write_text(
+        "Business Name,Packet Tier\n"
+        "Lead 0,Sendable Packet\n"
+        "Lead 1,Sendable Packet\n"
+        "Lead 2,Manual Review Packet\n",
+        encoding="utf-8",
+    )
+    return paths
+
+
 def run_cli(root: Path, argv: list[str]) -> tuple[int, str]:
     buf = io.StringIO()
     with redirect_stdout(buf):
@@ -130,6 +159,138 @@ class HermesAutopilotTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("preview /run --auto", out)
 
+    def test_run_auto_detects_existing_batch_and_prompts_instead_of_search(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            make_repo_root(root)
+            paths = seed_existing_batch(root)
+
+            with patch.object(hc, "run_streaming") as run:
+                rc, out = run_cli(
+                    root,
+                    [
+                        "run",
+                        "epoxy",
+                        "cleveland",
+                        "medium",
+                        "--auto",
+                        "--score-budget",
+                        "5",
+                        "--include-manual",
+                        "--execute",
+                    ],
+                )
+
+            self.assertEqual(rc, 0)
+            run.assert_not_called()
+            self.assertIn("Found existing batch epoxy_cleveland_medium_001", out)
+            self.assertIn("95 enriched", out)
+            self.assertIn("26 scored", out)
+            self.assertIn("3 packets", out)
+            self.assertIn("Continue this batch instead of starting a fresh search? Reply yes/no.", out)
+            self.assertEqual(load_run_state(paths)["pending_approval"]["stage"], "existing_batch")
+
+    def test_run_auto_use_existing_skips_prompt_and_continues_to_score_dry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            make_repo_root(root)
+            paths = seed_existing_batch(root)
+
+            def fake_run(cmd: list[str], **_: object) -> StreamResult:
+                self.assertNotIn("run_agent_pipeline.py", cmd)
+                if "score_leads.py" in cmd and "--dry-run-llm-cost" in cmd:
+                    return StreamResult(0, False, ["projected_usd=0.87"])
+                raise AssertionError(cmd)
+
+            with patch.object(hc, "run_streaming", side_effect=fake_run) as run:
+                rc, out = run_cli(
+                    root,
+                    [
+                        "run",
+                        "epoxy",
+                        "cleveland",
+                        "medium",
+                        "--auto",
+                        "--use-existing",
+                        "--score-budget",
+                        "5",
+                        "--include-manual",
+                        "--execute",
+                    ],
+                )
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(run.call_count, 1)
+            self.assertIn("Continuing existing batch epoxy_cleveland_medium_001", out)
+            self.assertIn("Scoring dry-run complete", out)
+            self.assertEqual(load_run_state(paths)["pending_approval"]["stage"], "score")
+
+    def test_run_specific_batch_auto_continues_that_batch_directly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            make_repo_root(root)
+            seed_existing_batch(root)
+
+            def fake_run(cmd: list[str], **_: object) -> StreamResult:
+                self.assertNotIn("run_agent_pipeline.py", cmd)
+                if "score_leads.py" in cmd and "--dry-run-llm-cost" in cmd:
+                    return StreamResult(0, False, ["projected_usd=0.42"])
+                raise AssertionError(cmd)
+
+            with patch.object(hc, "run_streaming", side_effect=fake_run) as run:
+                rc, out = run_cli(
+                    root,
+                    [
+                        "run",
+                        "epoxy_cleveland_medium_001",
+                        "--auto",
+                        "--score-budget",
+                        "5",
+                        "--include-manual",
+                        "--execute",
+                    ],
+                )
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(run.call_count, 1)
+            self.assertIn("Continuing existing batch epoxy_cleveland_medium_001", out)
+
+    def test_run_auto_fresh_starts_search_even_when_existing_batch_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            make_repo_root(root)
+            seed_existing_batch(root)
+            fresh_paths = BatchPaths.for_batch("epoxy_cleveland_medium_002", root=root)
+
+            def fake_run(cmd: list[str], **_: object) -> StreamResult:
+                if "run_agent_pipeline.py" in cmd:
+                    fresh_paths.enriched.write_text("{}\n", encoding="utf-8")
+                    return StreamResult(0, False, ["[PIPELINE] batch=epoxy_cleveland_medium_002"])
+                if "score_leads.py" in cmd and "--dry-run-llm-cost" in cmd:
+                    return StreamResult(0, False, ["projected_usd=0.25"])
+                raise AssertionError(cmd)
+
+            with patch.object(hc, "run_streaming", side_effect=fake_run) as run:
+                rc, out = run_cli(
+                    root,
+                    [
+                        "run",
+                        "epoxy",
+                        "cleveland",
+                        "medium",
+                        "--auto",
+                        "--fresh",
+                        "--score-budget",
+                        "5",
+                        "--execute",
+                    ],
+                )
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(run.call_count, 2)
+            self.assertIn("Search/enrich complete", out)
+            self.assertTrue(any("run_agent_pipeline.py" in call.args[0] for call in run.call_args_list))
+
     def test_autopilot_runs_search_status_score_dry_then_pending_score(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -157,6 +318,69 @@ class HermesAutopilotTest(unittest.TestCase):
             state = load_run_state(paths)
             self.assertEqual(state["pending_approval"]["stage"], "score")
             self.assertEqual(state["pending_approval"]["projected_score_cost"], 0.87)
+
+    def test_yes_to_existing_batch_approval_continues_to_score_dry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            make_repo_root(root)
+            paths = seed_existing_batch(root)
+            rc, out = run_cli(
+                root,
+                [
+                    "run",
+                    "epoxy",
+                    "cleveland",
+                    "medium",
+                    "--auto",
+                    "--score-budget",
+                    "5",
+                    "--include-manual",
+                    "--execute",
+                ],
+            )
+            self.assertEqual(rc, 0)
+            self.assertIn("Reply yes/no", out)
+
+            def fake_run(cmd: list[str], **_: object) -> StreamResult:
+                self.assertNotIn("run_agent_pipeline.py", cmd)
+                if "score_leads.py" in cmd and "--dry-run-llm-cost" in cmd:
+                    return StreamResult(0, False, ["projected_usd=0.87"])
+                raise AssertionError(cmd)
+
+            with patch.object(hc, "run_streaming", side_effect=fake_run) as run:
+                rc, out = run_cli(root, ["yes"])
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(run.call_count, 1)
+            self.assertIn("Continuing existing batch epoxy_cleveland_medium_001", out)
+            self.assertIn("Continue paid scoring? Reply yes/no.", out)
+            self.assertEqual(load_run_state(paths)["pending_approval"]["stage"], "score")
+
+    def test_no_to_existing_batch_approval_prints_fresh_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            make_repo_root(root)
+            paths = seed_existing_batch(root)
+            run_cli(
+                root,
+                [
+                    "run",
+                    "epoxy",
+                    "cleveland",
+                    "medium",
+                    "--auto",
+                    "--score-budget",
+                    "5",
+                    "--include-manual",
+                    "--execute",
+                ],
+            )
+            rc, out = run_cli(root, ["no"])
+
+        self.assertEqual(rc, 0)
+        self.assertIn("Autopilot stopped.", out)
+        self.assertIn("/run epoxy cleveland medium --auto --fresh --score-budget 5.00 --include-manual", out)
+        self.assertIsNone(load_run_state(paths).get("pending_approval"))
 
     def test_yes_to_score_runs_score_rest_packets_sync_dry_and_pending_live(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -416,7 +640,18 @@ class HermesAutopilotTest(unittest.TestCase):
             with patch.object(hc, "run_streaming", side_effect=fake_run) as run:
                 rc, out = run_cli(
                     root,
-                    ["run", "epoxy", "cleveland", "medium", "--auto", "--score-budget", "5", "--yes-all", "--execute"],
+                    [
+                        "run",
+                        "epoxy",
+                        "cleveland",
+                        "medium",
+                        "--auto",
+                        "--fresh",
+                        "--score-budget",
+                        "5",
+                        "--yes-all",
+                        "--execute",
+                    ],
                 )
         self.assertEqual(rc, 0)
         self.assertIn("Live sync complete", out)

@@ -63,6 +63,17 @@ class CommandResult:
 
 
 @dataclass(frozen=True)
+class ExistingBatch:
+    paths: BatchPaths
+    enriched_rows: int
+    scored_rows: int
+    packet_count: int
+    sendable_count: int
+    manual_review_count: int
+    newest_mtime: float
+
+
+@dataclass(frozen=True)
 class TelegramRoute:
     argv: list[str]
     command: list[str]
@@ -429,11 +440,38 @@ def _find_pending_approval(
     raise CommandError("No pending approval found.")
 
 
-def _original_auto_command(vertical: str, market: str, size: str, *, budget: float, include_manual: bool) -> str:
-    cmd = f"/run {vertical} {market} {size} --auto --score-budget {_fmt_usd(budget)}"
+def _original_auto_command(
+    vertical: str,
+    market: str,
+    size: str,
+    *,
+    budget: float,
+    include_manual: bool,
+    fresh: bool = False,
+    use_existing: bool = False,
+    batch: str = "",
+) -> str:
+    target = batch or f"{vertical} {market} {size}"
+    cmd = f"/run {target} --auto"
+    if fresh:
+        cmd += " --fresh"
+    if use_existing:
+        cmd += " --use-existing"
+    cmd += f" --score-budget {_fmt_usd(budget)}"
     if include_manual:
         cmd += " --include-manual"
     return cmd
+
+
+def _fresh_auto_command(vertical: str, market: str, size: str, *, budget: float, include_manual: bool) -> str:
+    return _original_auto_command(
+        vertical,
+        market,
+        size,
+        budget=budget,
+        include_manual=include_manual,
+        fresh=True,
+    )
 
 
 def _score_resume_command(batch: str, *, budget: float, include_manual: bool) -> str:
@@ -586,6 +624,130 @@ def _approval_prompt_score(
     )
 
 
+def _batch_names_for_prefix(root: Path, prefix: str) -> set[str]:
+    names: set[str] = set()
+    for path in (root / "output").glob(f"enriched_{prefix}_*.jsonl"):
+        names.add(path.name.removeprefix("enriched_").removesuffix(".jsonl"))
+    for path in (root / "output").glob(f"scored_{prefix}_*_api.csv"):
+        names.add(path.name.removeprefix("scored_").removesuffix("_api.csv"))
+    for path in (root / "output").glob(f"scored_{prefix}_*_api_tiered.csv"):
+        names.add(path.name.removeprefix("scored_").removesuffix("_api_tiered.csv"))
+    for path in root.glob(f"packets_{prefix}_*/packet_index.csv"):
+        names.add(path.parent.name.removeprefix("packets_"))
+    for path in (root / "run_state").glob(f"{prefix}_*.json"):
+        names.add(path.stem)
+    return names
+
+
+def _existing_batch(paths: BatchPaths) -> ExistingBatch | None:
+    enriched_rows = _count_jsonl(paths.enriched)
+    if enriched_rows <= 0:
+        return None
+    scored_rows = len(_read_csv_rows(paths.scored_csv))
+    packet_rows = _read_csv_rows(paths.packet_index)
+    tier_rows = _read_csv_rows(paths.tiered_csv) or packet_rows
+    tiers = _tier_counts(tier_rows)
+    artifacts = [
+        paths.enriched,
+        paths.scored_csv,
+        paths.tiered_csv,
+        paths.packet_index,
+        paths.state_json,
+    ]
+    newest_mtime = max((p.stat().st_mtime for p in artifacts if p.exists()), default=0.0)
+    return ExistingBatch(
+        paths=paths,
+        enriched_rows=enriched_rows,
+        scored_rows=scored_rows,
+        packet_count=len(packet_rows),
+        sendable_count=tiers[PACKET_TIER_SENDABLE],
+        manual_review_count=tiers[PACKET_TIER_MANUAL],
+        newest_mtime=newest_mtime,
+    )
+
+
+def _find_existing_batches(vertical: str, market: str, size: str, *, root: Path) -> list[ExistingBatch]:
+    prefix = f"{vertical}_{market}_{size}"
+    batches: list[ExistingBatch] = []
+    for name in _batch_names_for_prefix(root, prefix):
+        try:
+            paths = _resolve(name, root=root)
+        except CommandError:
+            continue
+        existing = _existing_batch(paths)
+        if existing is not None:
+            batches.append(existing)
+    return sorted(batches, key=lambda b: (b.newest_mtime, b.paths.batch), reverse=True)
+
+
+def _format_existing_batch(existing: ExistingBatch) -> str:
+    return (
+        f"Found existing batch {existing.paths.batch} with {existing.enriched_rows} enriched, "
+        f"{existing.scored_rows} scored, {existing.packet_count} packets"
+    )
+
+
+def _continue_existing_batch(
+    existing: ExistingBatch,
+    *,
+    budget: float,
+    include_manual: bool,
+    yes_score: bool,
+    yes_live: bool,
+    yes_all: bool,
+    root: Path,
+    python_path: Path | str | None,
+    original_command: str,
+    execute: bool,
+    chat_id: str = "",
+    user_id: str = "",
+) -> CommandResult:
+    paths = existing.paths
+    if not execute:
+        return CommandResult(
+            f"repo_root: {root}\n"
+            f"{_format_existing_batch(existing)}. Would continue this batch.\n"
+            "Stages: /status -> /score-dry -> approval -> /score-rest -> /packets -> /sync-dry -> approval -> /sync-live"
+        )
+
+    status = cmd_status(paths.batch, root=root).message
+    dry = cmd_score_dry(
+        paths.batch,
+        limit=DEFAULT_AUTO_CHUNK_SIZE,
+        budget=budget,
+        batch_size=DEFAULT_BATCH_SIZE,
+        max_tokens=DEFAULT_MAX_TOKENS,
+        execute=True,
+        root=root,
+        python_path=python_path,
+    )
+    approval = _approval_prompt_score(
+        paths,
+        budget=budget,
+        selected=DEFAULT_AUTO_CHUNK_SIZE,
+        include_manual=include_manual,
+        original_command=original_command,
+        chat_id=chat_id,
+        user_id=user_id,
+    )
+    prefix = f"Continuing existing batch {paths.batch}. Status: {status}\n"
+    if load_run_state(paths).get("pending_approval") is None:
+        return CommandResult(f"{prefix}{dry.message}\n{approval.message}")
+    if not (yes_score or yes_all):
+        return CommandResult(f"{prefix}{approval.message}")
+    return _continue_after_scoring(
+        paths,
+        budget=budget,
+        include_manual=include_manual,
+        yes_live=bool(yes_live or yes_all),
+        root=root,
+        python_path=python_path,
+        original_command=original_command,
+        chat_id=chat_id,
+        user_id=user_id,
+    )
+
+
 def _continue_after_scoring(
     paths: BatchPaths,
     *,
@@ -725,6 +887,24 @@ def cmd_approval_reply(
             python_path=python_path,
             original_command=str(approval.get("original_command") or ""),
         )
+    if stage == "existing_batch":
+        existing = _existing_batch(paths)
+        if existing is None:
+            raise CommandError(f"Existing batch is no longer usable: {paths.batch}")
+        return _continue_existing_batch(
+            existing,
+            budget=float(approval.get("score_budget") or DEFAULT_BUDGET),
+            include_manual=bool(approval.get("include_manual")),
+            yes_score=False,
+            yes_live=False,
+            yes_all=False,
+            root=root_path,
+            python_path=python_path,
+            original_command=str(approval.get("original_command") or ""),
+            execute=True,
+            chat_id=chat_id,
+            user_id=user_id,
+        )
     if stage == "live":
         return _continue_live_approval(paths, approval, root=root_path, python_path=python_path)
     raise CommandError(f"Refusing unknown approval stage: {stage}")
@@ -736,6 +916,9 @@ def cmd_run(
     size: str,
     *,
     auto: bool = False,
+    fresh: bool = False,
+    use_existing: bool = False,
+    batch: str = "",
     score_budget: float = DEFAULT_BUDGET,
     include_manual: bool = False,
     yes_score: bool = False,
@@ -747,10 +930,88 @@ def cmd_run(
     timeout_minutes: int = 60,
     root: Path | str = Path("."),
     python_path: Path | str | None = None,
+    resume_hint: str = "",
 ) -> CommandResult:
     root_path = _absolute(root)
+    if fresh and use_existing:
+        raise CommandError("Choose only one of --fresh or --use-existing.")
     if auto:
-        original = _original_auto_command(vertical, market, size, budget=score_budget, include_manual=include_manual)
+        original = _original_auto_command(
+            vertical,
+            market,
+            size,
+            budget=score_budget,
+            include_manual=include_manual,
+            fresh=fresh,
+            use_existing=use_existing,
+            batch=batch,
+        )
+        if batch:
+            existing = _existing_batch(_resolve(batch, root=root_path))
+            if existing is None:
+                raise CommandError(f"Batch {batch} is not usable yet: enriched JSONL is missing or empty.")
+            return _continue_existing_batch(
+                existing,
+                budget=score_budget,
+                include_manual=include_manual,
+                yes_score=yes_score,
+                yes_live=yes_live,
+                yes_all=yes_all,
+                root=root_path,
+                python_path=python_path,
+                original_command=original,
+                execute=execute,
+                chat_id=chat_id,
+                user_id=user_id,
+            )
+
+        existing_batches = [] if fresh else _find_existing_batches(vertical, market, size, root=root_path)
+        existing = existing_batches[0] if existing_batches else None
+        if existing is not None and not use_existing:
+            fresh_command = _fresh_auto_command(
+                vertical,
+                market,
+                size,
+                budget=score_budget,
+                include_manual=include_manual,
+            )
+            prompt = (
+                f"{_format_existing_batch(existing)}. Continue this batch instead of starting a fresh search? "
+                "Reply yes/no. To force a fresh run, use --fresh."
+            )
+            if not execute:
+                return CommandResult(f"repo_root: {root_path}\nWould ask: {prompt}")
+            create_pending_approval(
+                existing.paths,
+                stage="existing_batch",
+                original_command=original,
+                next_command=fresh_command,
+                include_manual=include_manual,
+                score_budget=score_budget,
+                chat_id=chat_id,
+                user_id=user_id,
+            )
+            return CommandResult(prompt)
+
+        if existing is not None and use_existing:
+            return _continue_existing_batch(
+                existing,
+                budget=score_budget,
+                include_manual=include_manual,
+                yes_score=yes_score,
+                yes_live=yes_live,
+                yes_all=yes_all,
+                root=root_path,
+                python_path=python_path,
+                original_command=original,
+                execute=execute,
+                chat_id=chat_id,
+                user_id=user_id,
+            )
+
+        if use_existing:
+            raise CommandError(f"No usable existing batch found for {vertical}_{market}_{size}_*.")
+
         if not execute:
             return CommandResult(
                 f"repo_root: {root_path}\n"
@@ -765,6 +1026,13 @@ def cmd_run(
             timeout_minutes=timeout_minutes,
             root=root_path,
             python_path=python_path,
+            resume_hint=_fresh_auto_command(
+                vertical,
+                market,
+                size,
+                budget=score_budget,
+                include_manual=include_manual,
+            ),
         )
         match = re.search(r"Batch:\s*(\S+)", run_result.message)
         batch = match.group(1) if match else ""
@@ -811,7 +1079,8 @@ def cmd_run(
     cmd = build_run_command(vertical, market, size, python_path=python_path)
     if not execute:
         return CommandResult(f"{_preview('/run', cmd, root=root_path)}\nNext: /score-dry <batch>")
-    result = run_streaming(cmd, timeout_seconds=timeout_minutes * 60, cwd=root_path)
+    hint = resume_hint or f"/run {vertical} {market} {size}"
+    result = run_streaming(cmd, timeout_seconds=timeout_minutes * 60, cwd=root_path, resume_hint=hint)
     _ensure_ok(result, action="/run")
     batch = ""
     for line in result.tail_lines:
@@ -1207,7 +1476,8 @@ def cmd_help() -> CommandResult:
         _truncate(
             "Lead-machine commands:\n"
             "/run <vertical> <market> <size> - search/enrich only\n"
-            "/run <vertical> <market> <size> --auto [--score-budget USD] [--include-manual] - guided autopilot\n"
+            "/run <vertical> <market> <size> --auto [--use-existing|--fresh] [--score-budget USD] [--include-manual] - guided autopilot\n"
+            "/run <batch> --auto - continue a specific existing batch\n"
             "/score-dry <batch> [--limit N] [--budget USD] - cost estimate only\n"
             "/score <batch> --limit N [--timeout MINUTES] - paid scoring only\n"
             "/score-rest <batch> - chunk remaining scoring\n"
@@ -1230,10 +1500,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="verb", required=True)
     for name in ("run", "pipeline", "auto-run"):
         p = sub.add_parser(name, parents=[runtime])
-        p.add_argument("vertical")
-        p.add_argument("market")
-        p.add_argument("size")
+        p.add_argument("target", nargs="+")
         p.add_argument("--auto", action="store_true", default=(name in {"pipeline", "auto-run"}))
+        p.add_argument("--fresh", action="store_true")
+        p.add_argument("--use-existing", action="store_true")
+        p.add_argument("--batch", default="")
         p.add_argument("--score-budget", type=float, default=DEFAULT_BUDGET)
         p.add_argument("--include-manual", action="store_true")
         p.add_argument("--yes-score", action="store_true")
@@ -1306,15 +1577,51 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _parse_run_target(
+    target: list[str],
+    *,
+    batch: str,
+    root: Path,
+) -> tuple[str, str, str, str]:
+    if batch:
+        paths = _resolve(batch, root=root)
+        if len(target) == 3:
+            vertical, market, size = target
+            validate_slug(vertical)
+            validate_slug(market)
+            validate_size(size)
+            if (paths.vertical, paths.market, paths.size) != (vertical, market, size):
+                raise CommandError(
+                    f"--batch {paths.batch} does not match {vertical} {market} {size}."
+                )
+            return vertical, market, size, paths.batch
+        if len(target) == 1 and target[0] == paths.batch:
+            return paths.vertical, paths.market, paths.size, paths.batch
+        if len(target) == 0:
+            return paths.vertical, paths.market, paths.size, paths.batch
+        raise CommandError("--batch can be used with <vertical> <market> <size> or the same batch name.")
+    if len(target) == 1:
+        paths = _resolve(target[0], root=root)
+        return paths.vertical, paths.market, paths.size, paths.batch
+    if len(target) == 3:
+        vertical, market, size = target
+        return validate_slug(vertical), validate_slug(market), validate_size(size), ""
+    raise CommandError("Use /run <vertical> <market> <size> or /run <batch>.")
+
+
 def dispatch(args: argparse.Namespace) -> CommandResult:
     repo_root = resolve_repo_root(getattr(args, "repo_root", None))
     python_path = resolve_python(getattr(args, "python_path", None), repo_root=repo_root)
     if args.verb in {"run", "pipeline", "auto-run"}:
+        vertical, market, size, batch = _parse_run_target(args.target, batch=args.batch, root=repo_root)
         return cmd_run(
-            args.vertical,
-            args.market,
-            args.size,
+            vertical,
+            market,
+            size,
             auto=args.auto,
+            fresh=args.fresh,
+            use_existing=args.use_existing,
+            batch=batch,
             score_budget=args.score_budget,
             include_manual=args.include_manual,
             yes_score=args.yes_score,
