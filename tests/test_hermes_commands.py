@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from lead_machine import hermes_commands as hc
 
@@ -89,6 +91,89 @@ class HelpAndDispatchTest(unittest.TestCase):
     def test_score_parser_requires_limit(self) -> None:
         with self.assertRaises(SystemExit):
             hc.build_parser().parse_args(["score", "detailing_cleveland_medium_001", "--timeout", "20"])
+
+
+class TelegramRouterTest(unittest.TestCase):
+    def test_run_slash_run_routes_to_hermes_autopilot_execute(self) -> None:
+        routed = hc.route_telegram_message(
+            "run /run epoxy cleveland medium --auto --score-budget 5 --include-manual"
+        )
+
+        self.assertIsNotNone(routed)
+        assert routed is not None
+        self.assertEqual(
+            routed.argv,
+            ["run", "epoxy", "cleveland", "medium", "--auto", "--score-budget", "5", "--include-manual", "--execute"],
+        )
+        self.assertEqual(routed.cwd, Path("~/local-lead-machine-hermes").expanduser())
+        self.assertEqual(routed.env["LOCAL_LEAD_MACHINE_ROOT"], str(Path("~/local-lead-machine").expanduser()))
+        self.assertEqual(
+            routed.env["LOCAL_LEAD_MACHINE_PYTHON"],
+            str(Path("~/local-lead-machine/.venv/bin/python").expanduser()),
+        )
+        self.assertEqual(
+            routed.command,
+            [
+                str(Path("~/local-lead-machine/.venv/bin/python").expanduser()),
+                "-m",
+                "lead_machine.hermes_commands",
+                "run",
+                "epoxy",
+                "cleveland",
+                "medium",
+                "--auto",
+                "--score-budget",
+                "5",
+                "--include-manual",
+                "--execute",
+            ],
+        )
+        self.assertNotIn("run_agent_pipeline.py", " ".join(routed.command))
+
+    def test_run_score_dry_routes_to_hermes_cli(self) -> None:
+        routed = hc.route_telegram_message("run /score-dry epoxy_cleveland_medium_001 --limit 25 --budget 2")
+
+        self.assertIsNotNone(routed)
+        assert routed is not None
+        self.assertEqual(
+            routed.argv,
+            ["score-dry", "epoxy_cleveland_medium_001", "--limit", "25", "--budget", "2", "--execute"],
+        )
+
+    def test_raw_slash_score_dry_may_route_to_hermes_cli(self) -> None:
+        routed = hc.route_telegram_message("/score-dry epoxy_cleveland_medium_001 --limit 25 --budget 2")
+
+        self.assertIsNotNone(routed)
+        assert routed is not None
+        self.assertEqual(routed.argv[0], "score-dry")
+
+    def test_yes_and_no_route_to_pending_approval_continuation(self) -> None:
+        yes = hc.route_telegram_message("yes")
+        no = hc.route_telegram_message("no")
+
+        self.assertIsNotNone(yes)
+        self.assertIsNotNone(no)
+        assert yes is not None
+        assert no is not None
+        self.assertEqual(yes.argv, ["yes"])
+        self.assertEqual(no.argv, ["no"])
+
+    def test_unknown_message_not_intercepted(self) -> None:
+        self.assertIsNone(hc.route_telegram_message("run the detailing batch"))
+
+    def test_router_preview_does_not_execute(self) -> None:
+        routed = hc.route_telegram_message(
+            "run /run epoxy cleveland medium --auto --score-budget 5 --include-manual"
+        )
+        assert routed is not None
+
+        with patch("subprocess.run") as run:
+            preview = routed.preview()
+
+        run.assert_not_called()
+        self.assertIn("cd ", preview)
+        self.assertIn("python -m lead_machine.hermes_commands run epoxy cleveland medium", preview)
+        self.assertEqual(os.fspath(routed.cwd), str(Path("~/local-lead-machine-hermes").expanduser()))
 
 
 if __name__ == "__main__":
