@@ -14,7 +14,7 @@ from import_llm_score_bundle import validate_bundle_scores
 
 ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
-DEFAULT_LLM_SCORING_MODEL = "claude-sonnet-4-6"
+DEFAULT_LLM_SCORING_MODEL = "claude-sonnet-5"
 DEFAULT_ANTHROPIC_CONNECT_TIMEOUT_SECONDS = 15
 DEFAULT_ANTHROPIC_READ_TIMEOUT_SECONDS = 180
 DEFAULT_ANTHROPIC_MAX_RETRIES = 2

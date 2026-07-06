@@ -241,7 +241,7 @@ class LlmCostEstimate:
     projected_usd: float
 
 
-DEFAULT_LLM_SCORING_MODEL = "claude-sonnet-4-6"
+DEFAULT_LLM_SCORING_MODEL = "claude-sonnet-5"
 DEFAULT_LLM_MAX_TOKENS = 4096
 DEFAULT_MAX_LLM_CALLS_PER_RUN = 5
 DEFAULT_MAX_LLM_TOKENS_PER_RUN = 100_000

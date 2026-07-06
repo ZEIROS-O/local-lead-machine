@@ -1942,7 +1942,7 @@ class LeadMachineContractsTest(unittest.TestCase):
 
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}, clear=False):
             with patch("lead_machine.llm_client.requests.post", return_value=FakeResponse()) as post:
-                result = score_batch("score this batch", model="claude-sonnet-4-6", max_tokens=4096)
+                result = score_batch("score this batch", model="claude-sonnet-5", max_tokens=4096)
 
         self.assertEqual(result["bundle"]["batch_id"], "batch_001")
         self.assertEqual(result["bundle"]["scores"][0]["score_file"], "chij123.json")
@@ -1952,7 +1952,7 @@ class LeadMachineContractsTest(unittest.TestCase):
         _, kwargs = post.call_args
         self.assertEqual(kwargs["headers"]["x-api-key"], "test-key")
         self.assertEqual(kwargs["headers"]["anthropic-version"], "2023-06-01")
-        self.assertEqual(kwargs["json"]["model"], "claude-sonnet-4-6")
+        self.assertEqual(kwargs["json"]["model"], "claude-sonnet-5")
         self.assertEqual(kwargs["json"]["max_tokens"], 4096)
         self.assertEqual(kwargs["json"]["messages"][0]["content"], "score this batch")
 
@@ -1979,7 +1979,7 @@ class LeadMachineContractsTest(unittest.TestCase):
         }
         with patch.dict(os.environ, env, clear=False):
             with patch("lead_machine.llm_client.requests.post", return_value=FakeResponse()) as post:
-                score_batch("score this batch", model="claude-sonnet-4-6", max_tokens=4096)
+                score_batch("score this batch", model="claude-sonnet-5", max_tokens=4096)
 
         _, kwargs = post.call_args
         self.assertEqual(kwargs["timeout"], (7, 88))
@@ -2012,7 +2012,7 @@ class LeadMachineContractsTest(unittest.TestCase):
                 side_effect=[requests.exceptions.ReadTimeout("read timed out"), requests.exceptions.Timeout("timed out"), FakeResponse()],
             ) as post:
                 with patch("time.sleep") as sleep:
-                    result = score_batch("score this batch", model="claude-sonnet-4-6", max_tokens=4096)
+                    result = score_batch("score this batch", model="claude-sonnet-5", max_tokens=4096)
 
         self.assertEqual(result["bundle"]["batch_id"], "batch_001")
         self.assertEqual(post.call_count, 3)
@@ -2047,7 +2047,7 @@ class LeadMachineContractsTest(unittest.TestCase):
                 side_effect=[FakeResponse(500), FakeResponse(503), FakeResponse(200, success)],
             ) as post:
                 with patch("time.sleep") as sleep:
-                    result = score_batch("score this batch", model="claude-sonnet-4-6", max_tokens=4096)
+                    result = score_batch("score this batch", model="claude-sonnet-5", max_tokens=4096)
 
         self.assertEqual(result["bundle"]["batch_id"], "batch_001")
         self.assertEqual(post.call_count, 3)
@@ -2064,7 +2064,7 @@ class LeadMachineContractsTest(unittest.TestCase):
             with patch("lead_machine.llm_client.requests.post", return_value=FakeResponse()) as post:
                 with patch("time.sleep") as sleep:
                     with self.assertRaises(RuntimeError) as caught:
-                        score_batch("score this batch", model="claude-sonnet-4-6", max_tokens=4096)
+                        score_batch("score this batch", model="claude-sonnet-5", max_tokens=4096)
 
         self.assertEqual(post.call_count, 1)
         sleep.assert_not_called()
@@ -2088,11 +2088,11 @@ class LeadMachineContractsTest(unittest.TestCase):
             ) as post:
                 with patch("time.sleep"):
                     with self.assertRaises(RuntimeError) as caught:
-                        score_batch("score this batch", model="claude-sonnet-4-6", max_tokens=4096)
+                        score_batch("score this batch", model="claude-sonnet-5", max_tokens=4096)
 
         message = str(caught.exception)
         self.assertEqual(post.call_count, 3)
-        self.assertIn("model=claude-sonnet-4-6", message)
+        self.assertIn("model=claude-sonnet-5", message)
         self.assertIn("connect_timeout=15", message)
         self.assertIn("read_timeout=180", message)
         self.assertIn("attempts=3", message)
@@ -2128,7 +2128,7 @@ class LeadMachineContractsTest(unittest.TestCase):
                     scores_dir=Path(tmp) / "scores",
                     fallback_vertical="hardscaping",
                     batch_size=1,
-                    model="claude-sonnet-4-6",
+                    model="claude-sonnet-5",
                     max_tokens=4096,
                     max_calls=1,
                     max_tokens_per_run=0,
@@ -2178,7 +2178,7 @@ class LeadMachineContractsTest(unittest.TestCase):
                     scores_dir=Path(tmp) / "scores",
                     fallback_vertical="hardscaping",
                     batch_size=1,
-                    model="claude-sonnet-4-6",
+                    model="claude-sonnet-5",
                     max_tokens=20,
                     max_calls=0,
                     max_tokens_per_run=projected_tokens + 4,
@@ -2232,7 +2232,7 @@ class LeadMachineContractsTest(unittest.TestCase):
                     scores_dir=Path(tmp) / "scores",
                     fallback_vertical="hardscaping",
                     batch_size=1,
-                    model="claude-sonnet-4-6",
+                    model="claude-sonnet-5",
                     max_tokens=20,
                     max_calls=0,
                     max_tokens_per_run=0,
@@ -2507,7 +2507,7 @@ class LeadMachineContractsTest(unittest.TestCase):
                             scores_dir=Path(tmp) / "scores",
                             fallback_vertical="hardscaping",
                             batch_size=1,
-                            model="claude-sonnet-4-6",
+                            model="claude-sonnet-5",
                             max_tokens=4096,
                             max_calls=0,
                             max_tokens_per_run=0,
@@ -2794,7 +2794,7 @@ class LeadMachineContractsTest(unittest.TestCase):
                         scores_dir=scores_dir,
                         fallback_vertical="detailing",
                         batch_size=1,
-                        model="claude-sonnet-4-6",
+                        model="claude-sonnet-5",
                         max_tokens=4096,
                         max_calls=0,
                         max_tokens_per_run=100_000,
@@ -2945,7 +2945,7 @@ class LeadMachineContractsTest(unittest.TestCase):
                     scores_dir=scores_dir,
                     fallback_vertical="detailing",
                     batch_size=1,
-                    model="claude-sonnet-4-6",
+                    model="claude-sonnet-5",
                     max_tokens=4096,
                     max_calls=0,
                     max_tokens_per_run=100_000,
@@ -2994,7 +2994,7 @@ class LeadMachineContractsTest(unittest.TestCase):
                         scores_dir=scores_dir,
                         fallback_vertical="detailing",
                         batch_size=1,
-                        model="claude-sonnet-4-6",
+                        model="claude-sonnet-5",
                         max_tokens=4096,
                         max_calls=0,
                         max_tokens_per_run=100_000,
@@ -3064,7 +3064,7 @@ class LeadMachineContractsTest(unittest.TestCase):
                     scores_dir=scores_dir,
                     fallback_vertical="detailing",
                     batch_size=1,
-                    model="claude-sonnet-4-6",
+                    model="claude-sonnet-5",
                     max_tokens=4096,
                     max_calls=0,
                     max_tokens_per_run=100_000,
@@ -3091,7 +3091,7 @@ class LeadMachineContractsTest(unittest.TestCase):
                         scores_dir=scores_dir,
                         fallback_vertical="detailing",
                         batch_size=1,
-                        model="claude-sonnet-4-6",
+                        model="claude-sonnet-5",
                         max_tokens=4096,
                         max_calls=0,
                         max_tokens_per_run=100_000,
@@ -3142,7 +3142,7 @@ class LeadMachineContractsTest(unittest.TestCase):
                     scores_dir=Path(tmp) / "scores",
                     fallback_vertical="detailing",
                     batch_size=5,
-                    model="claude-sonnet-4-6",
+                    model="claude-sonnet-5",
                     max_tokens=4096,
                     max_calls=0,
                     max_tokens_per_run=100_000,
@@ -3191,7 +3191,7 @@ class LeadMachineContractsTest(unittest.TestCase):
                     scores_dir=Path(tmp) / "scores",
                     fallback_vertical="detailing",
                     batch_size=2,
-                    model="claude-sonnet-4-6",
+                    model="claude-sonnet-5",
                     max_tokens=20,
                     max_calls=0,
                     max_tokens_per_run=run_cap,
@@ -3212,7 +3212,7 @@ class LeadMachineContractsTest(unittest.TestCase):
                     scores_dir=Path(tmp) / "scores",
                     fallback_vertical="detailing",
                     batch_size=1,
-                    model="claude-sonnet-4-6",
+                    model="claude-sonnet-5",
                     max_tokens=20,
                     max_calls=0,
                     max_tokens_per_run=10,
@@ -3241,7 +3241,7 @@ class LeadMachineContractsTest(unittest.TestCase):
                         scores_dir=scores_dir,
                         fallback_vertical="detailing",
                         batch_size=1,
-                        model="claude-sonnet-4-6",
+                        model="claude-sonnet-5",
                         max_tokens=8192,
                         max_calls=0,
                         max_tokens_per_run=100_000,
@@ -3290,7 +3290,7 @@ class LeadMachineContractsTest(unittest.TestCase):
                     scores_dir=scores_dir,
                     fallback_vertical="detailing",
                     batch_size=1,
-                    model="claude-sonnet-4-6",
+                    model="claude-sonnet-5",
                     max_tokens=4096,
                     max_calls=0,
                     max_tokens_per_run=100_000,
@@ -3338,7 +3338,7 @@ class LeadMachineContractsTest(unittest.TestCase):
                         scores_dir=scores_dir,
                         fallback_vertical="detailing",
                         batch_size=1,
-                        model="claude-sonnet-4-6",
+                        model="claude-sonnet-5",
                         max_tokens=4096,
                         max_calls=0,
                         max_tokens_per_run=100_000,
@@ -3392,7 +3392,7 @@ class LeadMachineContractsTest(unittest.TestCase):
                         scores_dir=scores_dir,
                         fallback_vertical="detailing",
                         batch_size=1,
-                        model="claude-sonnet-4-6",
+                        model="claude-sonnet-5",
                         max_tokens=4096,
                         max_calls=0,
                         max_tokens_per_run=100_000,

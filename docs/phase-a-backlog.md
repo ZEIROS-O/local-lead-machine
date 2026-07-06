@@ -30,7 +30,7 @@ axis, and run the whole thing as one capped command with a per-run summary.
   configs must be **metro-parameterized**.
 - **Buyer signal:** **reliable-first** — CRM-stack + review-velocity are solid axes now; ads-scraping
   is best-effort and must **degrade gracefully** (never break the pipeline).
-- **LLM:** **Claude Sonnet 4.6** (`claude-sonnet-4-6`), set via `.env` `LLM_SCORING_MODEL` (swappable).
+- **LLM:** **Claude Sonnet 4.6** (`claude-sonnet-5`), set via `.env` `LLM_SCORING_MODEL` (swappable).
 - **API key:** `ANTHROPIC_API_KEY` lives in `.env`.
 
 ## Architecture note — two scoring systems, reconciled
@@ -68,7 +68,7 @@ a loop. Purely additive (new mode) → lowest regression risk.
   build packets + `build_batch_prompt()` verbatim → `llm_client.score_batch()` (cap-gated) → write
   bundle through existing `import_score_bundle()` (`import_llm_score_bundle.py:119`, schema/validation
   unchanged) → fall through to existing `score_records_manual_run()` read/merge → identical CSV.
-- [x] **`.env`** — add `ANTHROPIC_API_KEY`, `LLM_SCORING_MODEL=claude-sonnet-4-6`, the three `MAX_LLM_*` caps.
+- [x] **`.env`** — add `ANTHROPIC_API_KEY`, `LLM_SCORING_MODEL=claude-sonnet-5`, the three `MAX_LLM_*` caps.
 
 **Done when:** `score_leads.py --mode api-llm` yields the **same scored CSV** as the manual path, zero
 copy-paste; `--mode manual-llm` still works as fallback.
