@@ -47,6 +47,7 @@ from lead_machine.llm_queue import safe_slug
 from lead_machine.manual_scores import allowed_evidence_ids as original_evidence_ids
 from lead_machine.manual_scores import load_manual_score, merge_manual_score
 from lead_machine.schema import normalize_lead
+from lead_machine.scoring_rules import SHARED_SENDABILITY_RULES
 from lead_machine.sendability import apply_sendability, normalize_evidence_refs
 from lead_machine.verticals import VerticalProfile, resolve_profile
 from make_llm_batch import MANUAL_SCORE_SCHEMA, score_file_for_record
@@ -2212,13 +2213,9 @@ Rules:
 - safe_outreach_claims[].evidence_refs must also use IDs copied exactly from that lead's evidence_ref_options[].id.
 - If an exact text snippet supports a claim but no evidence_ref_options ID directly supports it, lower evidence confidence instead of inventing an evidence ref.
 - unsafe_claims must list tempting claims that the capsule does not prove.
+{SHARED_SENDABILITY_RULES}
 - Buyer intent is required for A/B quality: look for fixable gap times money signal, not just a bad website.
 - Paid CRM/booking tools and known ad signals can support money intent.
-- Count-only review demand bands support reputation fit, not money intent by themselves.
-- ideal_growth should increase ICP/reputation fit.
-- established/mature is not bad by itself, but requires stronger concrete conversion pain to be sendable.
-- mature plus no concrete conversion pain should be blocked or manual-review, not packet eligible.
-- mature plus an obvious broken/missing estimate path can still be high value when backed by money intent or very strong conversion-pain evidence.
 - Bad site alone without buyer_intent.money_signal should not be an A lead.
 - Visual claims require screenshot paths, visual-review flags, rendered browser evidence, DOM evidence, or explicit manual review notes in the capsule.
 - Do not infer missing forms if evidence is uncertain.

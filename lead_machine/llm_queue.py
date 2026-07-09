@@ -5,7 +5,9 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
+from .buyer_signals import buyer_intent_summary, review_demand_band
 from .schema import normalize_lead
+from .scoring_rules import SHARED_SENDABILITY_RULES
 
 
 def safe_slug(text: str, fallback: str = "lead") -> str:
@@ -23,6 +25,8 @@ def build_llm_prompt(enriched: Dict[str, Any], *, fallback_vertical: str) -> str
     packet = {
         "lead": lead.to_dict(),
         "evidence": evidence,
+        "buyer_intent_summary": buyer_intent_summary(enriched),
+        "review_demand_band": review_demand_band(enriched),
         "website_text": (enriched.get("website", {}) or {}).get("combined_text", "")[:18000],
     }
 
@@ -57,12 +61,9 @@ Rules:
 - confidence must be one of low, medium, high.
 - Every scored claim must reference evidence IDs from the packet.
 - If there is no evidence for a claim, lower evidence confidence instead of inventing.
-- Missing site plus strong reviews can be an A lead.
-- Do not score A/sendable just because the business is reputable.
+{SHARED_SENDABILITY_RULES}
 - Do not score A/sendable just because the business fits hardscaping.
 - The best lead is one where the website is visibly worse than the actual business.
-- No specific observation = no send.
-- More reviews require stronger proof of visible pain.
 - Do not infer missing forms if evidence is uncertain.
 - Static fetch failure alone does not prove the website is broken.
 - If rendered_site_status is Loaded, do not claim the website is broken.

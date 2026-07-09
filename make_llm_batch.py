@@ -13,6 +13,7 @@ from lead_machine.icp import hard_icp_gate
 from lead_machine.icp_lanes import SELECTABLE_LANES, classify_icp_lane, lane_sort_key
 from lead_machine.llm_queue import safe_slug
 from lead_machine.schema import normalize_lead
+from lead_machine.scoring_rules import SHARED_SENDABILITY_RULES
 
 
 WEBSITE_TEXT_LIMIT = 12000
@@ -299,15 +300,13 @@ Rules:
 - confidence must be one of low, medium, high.
 - Every scored claim must reference evidence IDs from that lead packet.
 - If there is no evidence for a claim, lower evidence confidence instead of inventing.
-- Missing site plus strong reviews can be an A lead.
-- Do not score A/sendable just because the business is reputable.
+{SHARED_SENDABILITY_RULES}
 - Do not score A/sendable just because the business fits hardscaping.
 - The best lead is one where the website is visibly worse than the actual business.
 - Buyer intent is required for A/B quality: look for fixable gap times money signal, not just a bad website.
-- Use buyer_intent_summary as evidence for money/demand context. Paid CRM/booking tools, live review velocity, and known ad signals can support demand proof.
+- Use buyer_intent_summary as evidence for money/demand context.
+- Paid CRM/booking tools and known ad signals can support money intent.
 - Bad site alone without buyer_intent.money_signal should not be an A lead.
-- No specific observation = no send.
-- More reviews require stronger proof of visible pain.
 - Do not infer missing forms if evidence is uncertain.
 - Static fetch failure alone does not prove the website is broken.
 - If rendered_site_status is Loaded, do not claim the website is broken.

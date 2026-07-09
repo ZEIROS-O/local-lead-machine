@@ -1713,8 +1713,16 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertIn("total_score must equal the sum of all subscores.", prompt)
         self.assertIn("A = 80-100", prompt)
         self.assertIn("confidence must be one of low, medium, high.", prompt)
+        self.assertIn(
+            "Missing site plus strong reviews can be an A lead only when there is a concrete conversion gap and enough evidence.",
+            prompt,
+        )
         self.assertIn("No specific observation = no send.", prompt)
         self.assertIn("Do not score A/sendable just because the business is reputable.", prompt)
+        self.assertIn(
+            "mature plus an obvious broken/missing estimate path can still be high value when backed by money intent or very strong conversion-pain evidence.",
+            prompt,
+        )
         self.assertIn("A strong estimate form does not globally disqualify a lead.", prompt)
         self.assertIn("It only blocks missing-form, no-contact-path, and no-estimate-path claims.", prompt)
         self.assertIn("Do not use Estimate Funnel if the form is strong unless the actual estimate path is still visibly weak.", prompt)
@@ -1732,6 +1740,7 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertIn("Build/send a no-site launch mockup", prompt)
         self.assertIn("Must mention at least one specific evidence-backed observation.", prompt)
         self.assertIn('"vertical": "hardscaping"', prompt)
+        self.assertIn('"review_demand_band":', prompt)
         self.assertIn("ev-google-rating", prompt)
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -1791,7 +1800,16 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertIn("A+ Landscaping LLC", prompt)
         self.assertIn("Barski Hardscaping", prompt)
         self.assertIn("ICP Fit / 20", prompt)
+        self.assertIn(
+            "Missing site plus strong reviews can be an A lead only when there is a concrete conversion gap and enough evidence.",
+            prompt,
+        )
         self.assertIn("No specific observation = no send.", prompt)
+        self.assertIn("Do not score A/sendable just because the business is reputable.", prompt)
+        self.assertIn(
+            "mature plus an obvious broken/missing estimate path can still be high value when backed by money intent or very strong conversion-pain evidence.",
+            prompt,
+        )
         self.assertIn("A strong estimate form does not globally disqualify a lead.", prompt)
         self.assertIn("Static fetch failure alone does not prove the website is broken.", prompt)
         self.assertIn("If rendered_site_status is Loaded, do not claim the website is broken.", prompt)
@@ -3014,6 +3032,22 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertIn("non-empty array of 1-3 strings", prompt)
         self.assertIn("copied exactly from that lead's evidence_ref_options[].id", prompt)
         self.assertIn("never output [] for evidence_refs", prompt)
+
+    def test_api_llm_prompt_uses_shared_sendability_rules(self) -> None:
+        from score_leads import build_api_llm_scoring_prompt, build_llm_scoring_record
+
+        compact = build_llm_scoring_record(self._huge_detailing_record(), fallback_vertical="detailing")
+        prompt = build_api_llm_scoring_prompt([compact], batch_id="batch_001")
+
+        self.assertIn(
+            "Missing site plus strong reviews can be an A lead only when there is a concrete conversion gap and enough evidence.",
+            prompt,
+        )
+        self.assertIn("Do not score A/sendable just because the business is reputable.", prompt)
+        self.assertIn(
+            "mature plus an obvious broken/missing estimate path can still be high value when backed by money intent or very strong conversion-pain evidence.",
+            prompt,
+        )
 
     def test_api_llm_merge_accepts_lead_compact_evidence_refs_only(self) -> None:
         from score_leads import score_records_api_run
