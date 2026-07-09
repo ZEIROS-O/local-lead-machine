@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Set
 
-from .buyer_signals import buyer_intent_summary, ensure_buyer_intent, has_money_signal
+from .buyer_signals import buyer_intent_summary, ensure_buyer_intent, has_money_signal, review_demand_band
 from .email_hygiene import emails_text
 from .schema import normalize_lead
 from .sendability import apply_sendability, normalize_evidence_refs, normalize_safe_outreach_claims, normalize_unsafe_claims
@@ -284,6 +284,8 @@ def merge_manual_score(
         )
 
     packet_eligible = "Yes" if validated["grade"] in {"A", "B"} else ""
+    buyer_intent_signals = buyer_intent_summary(enriched)
+    demand_band = review_demand_band(enriched)
     row = {
         "Business Name": lead.business_name,
         "Owner Name": "",
@@ -352,8 +354,10 @@ def merge_manual_score(
         "send_trigger": send_trigger,
         "Money Signal": "Yes" if has_money_signal(enriched) else "No",
         "money_signal": "Yes" if has_money_signal(enriched) else "No",
-        "Buyer Intent Signals": buyer_intent_summary(enriched),
-        "buyer_intent_signals": buyer_intent_summary(enriched),
+        "Buyer Intent Signals": buyer_intent_signals,
+        "buyer_intent_signals": buyer_intent_signals,
+        "Review Fit Band": demand_band,
+        "Review Demand Band": demand_band,
         "Evidence Notes": "; ".join(str(ref) for ref in validated.get("evidence_refs", [])),
         "AI Confidence": validated["confidence"],
         "Manual Reviewed": "",
