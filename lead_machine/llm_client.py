@@ -23,10 +23,20 @@ TRANSIENT_HTTP_STATUSES = {429, 500, 502, 503, 504}
 
 
 class InvalidLlmResponse(ValueError):
-    def __init__(self, message: str, *, raw_text: str, parsed_json: Dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        raw_text: str,
+        parsed_json: Dict[str, Any] | None = None,
+        usage: Dict[str, int] | None = None,
+    ) -> None:
         super().__init__(message)
         self.raw_text = raw_text
         self.parsed_json = parsed_json
+        # Usage for the failed attempt, so callers can still charge it against
+        # per-run token/USD caps even though the response never validated.
+        self.usage = usage or {}
 
 
 def _response_text(data: Dict[str, Any]) -> str:
@@ -36,7 +46,10 @@ def _response_text(data: Dict[str, Any]) -> str:
             parts.append(str(item.get("text") or ""))
     text = "\n".join(part for part in parts if part).strip()
     if not text:
-        raise RuntimeError("Anthropic response did not include text content")
+        raise InvalidLlmResponse(
+            "Anthropic response did not include text content",
+            raw_text=json.dumps(data, ensure_ascii=False, indent=2),
+        )
     return text
 
 
@@ -210,9 +223,15 @@ def score_batch(prompt: str, *, model: str | None = None, max_tokens: int) -> Di
             continue
 
         data = response.json()
-        text = _response_text(data)
-        bundle = _parse_score_bundle(text)
         usage = _usage(data)
+        try:
+            text = _response_text(data)
+            bundle = _parse_score_bundle(text)
+        except InvalidLlmResponse as exc:
+            # Preserve the paid usage from this attempt so token/USD caps and
+            # cost dashboards see it even when the response is unusable.
+            exc.usage = usage
+            raise
         print(
             f"[LLM REQUEST OK] attempt={attempt} "
             f"input_tokens={usage['input_tokens']} output_tokens={usage['output_tokens']}"

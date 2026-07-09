@@ -2365,6 +2365,7 @@ def _looks_truncated_llm_response(exc: Exception) -> bool:
         marker in message
         for marker in (
             "unterminated string",
+            "did not include text content",
             "expecting value",
             "expecting ',' delimiter",
             "expecting property name enclosed in double quotes",
@@ -2513,6 +2514,17 @@ def _validation_failure_runtime_error(
     return RuntimeError("; ".join(parts))
 
 
+def _accumulate_usage(base: Dict[str, Any] | None, extra: Dict[str, Any] | None) -> Dict[str, int]:
+    """Sum two usage dicts so failed attempts are not dropped from cap accounting."""
+    input_tokens = safe_int((base or {}).get("input_tokens")) + safe_int((extra or {}).get("input_tokens"))
+    output_tokens = safe_int((base or {}).get("output_tokens")) + safe_int((extra or {}).get("output_tokens"))
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+    }
+
+
 def _score_batch_with_debug(
     prompt: str,
     *,
@@ -2524,10 +2536,15 @@ def _score_batch_with_debug(
 ) -> Dict[str, Any]:
     attempt = 1
     current_max_tokens = max_tokens
+    # Track usage/calls from attempts that raised so they still count toward caps.
+    failed_usage: Dict[str, int] = {}
+    calls_made = 0
     while True:
         try:
-            return llm_client.score_batch(prompt, model=model, max_tokens=current_max_tokens)
+            calls_made += 1
+            result = llm_client.score_batch(prompt, model=model, max_tokens=current_max_tokens)
         except llm_client.InvalidLlmResponse as exc:
+            failed_usage = _accumulate_usage(failed_usage, getattr(exc, "usage", None))
             parsed_json = getattr(exc, "parsed_json", None)
             if isinstance(parsed_json, dict):
                 validation_debug_path = _write_validation_failed_llm_response(
@@ -2545,13 +2562,16 @@ def _score_batch_with_debug(
                     compact_records=compact_records,
                 )
                 try:
+                    calls_made += 1
                     repaired = llm_client.score_batch(repair_prompt, model=model, max_tokens=current_max_tokens)
-                    repaired["call_count"] = 2
+                    repaired["usage"] = _accumulate_usage(failed_usage, repaired.get("usage"))
+                    repaired["call_count"] = calls_made
                     repaired.setdefault("debug_notes", []).append(
                         f"validation repair succeeded for {batch_id}; raw response saved to {validation_debug_path}"
                     )
                     return repaired
                 except llm_client.InvalidLlmResponse as repair_exc:
+                    failed_usage = _accumulate_usage(failed_usage, getattr(repair_exc, "usage", None))
                     repair_debug_path: Path | None = None
                     repair_parsed_json = getattr(repair_exc, "parsed_json", None)
                     if isinstance(repair_parsed_json, dict):
@@ -2565,18 +2585,21 @@ def _score_batch_with_debug(
                     if fallback_bundle is not None:
                         return {
                             "bundle": fallback_bundle,
-                            "usage": {},
-                            "call_count": 2,
+                            "usage": failed_usage,
+                            "call_count": calls_made,
                             "debug_notes": [
                                 f"{fallback_note}; raw response saved to {validation_debug_path}; repair failed"
                             ],
                         }
-                    raise _validation_failure_runtime_error(
+                    err = _validation_failure_runtime_error(
                         batch_id=batch_id,
                         validation_failures=f"{validation_failures}\nRepair failures:\n{repair_exc}",
                         raw_debug_path=validation_debug_path,
                         repair_debug_path=repair_debug_path,
-                    ) from repair_exc
+                    )
+                    err.usage = failed_usage
+                    err.call_count = calls_made
+                    raise err from repair_exc
 
             debug_path = _write_invalid_llm_response(
                 bundle_dir,
@@ -2589,7 +2612,15 @@ def _score_batch_with_debug(
                 current_max_tokens = max(8192, current_max_tokens * 2)
                 print(f"[LLM RETRY] Invalid/truncated JSON; raw response saved to {debug_path}; retrying with max_tokens={current_max_tokens}")
                 continue
-            raise ValueError(f"{exc}; raw LLM response saved to {debug_path}") from exc
+            err = ValueError(f"{exc}; raw LLM response saved to {debug_path}")
+            err.usage = failed_usage
+            err.call_count = calls_made
+            raise err from exc
+        else:
+            if failed_usage:
+                result["usage"] = _accumulate_usage(failed_usage, result.get("usage"))
+            result["call_count"] = calls_made
+            return result
 
 
 def estimate_api_llm_cost(
@@ -2780,14 +2811,47 @@ def score_records_api_run(
         if not prompt:
             continue
 
-        result = _score_batch_with_debug(
-            prompt,
-            batch_id=batch_id,
-            bundle_dir=bundle_dir,
-            compact_records=compact_records,
-            model=model,
-            max_tokens=max_tokens,
-        )
+        try:
+            result = _score_batch_with_debug(
+                prompt,
+                batch_id=batch_id,
+                bundle_dir=bundle_dir,
+                compact_records=compact_records,
+                model=model,
+                max_tokens=max_tokens,
+            )
+        except Exception as exc:
+            usage = getattr(exc, "usage", None) or {}
+            calls += safe_int(getattr(exc, "call_count", 0))
+            batch_input_tokens = safe_int(usage.get("input_tokens"))
+            batch_output_tokens = safe_int(usage.get("output_tokens"))
+            batch_total_tokens = safe_int(usage.get("total_tokens")) or batch_input_tokens + batch_output_tokens
+            input_tokens += batch_input_tokens
+            output_tokens += batch_output_tokens
+            tokens += batch_total_tokens
+            usd += estimate_llm_usd(usage)
+            if usage_output_path is not None:
+                _write_llm_usage_payload(
+                    usage_output_path,
+                    _llm_usage_payload(
+                        calls=calls,
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        total_tokens=tokens,
+                        usd=usd,
+                        caps={
+                            "MAX_LLM_CALLS_PER_RUN": max_calls,
+                            "MAX_LLM_TOKENS_PER_RUN": max_tokens_per_run,
+                            "MAX_LLM_USD_PER_RUN": max_usd_per_run,
+                        },
+                        stopped_by_cap=stopped_by_cap,
+                        stop_reason=stop_reason,
+                        skipped_records=skipped_records,
+                        debug_notes=debug_notes,
+                        partial=True,
+                    ),
+                )
+            raise
         bundle = result["bundle"]
         usage = result.get("usage") or {}
         calls += safe_int(result.get("call_count")) or 1

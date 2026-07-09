@@ -3110,6 +3110,87 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertLessEqual(records_block.strip().count("\n"), 1)
         self.assertNotIn(': "', records_block)  # compact separators drop the ": " spacing
 
+    def test_score_batch_with_debug_charges_failed_attempt_usage(self) -> None:
+        # A validation-failed first attempt is a real paid call; its usage must be
+        # added to the repaired result so token/USD caps see the true spend.
+        import score_leads
+        from lead_machine import llm_client
+
+        compact_records = [
+            {"score_file": "phone-123.json", "lead": {"business_name": "X"},
+             "evidence_ref_options": [{"id": "google_profile", "label": "Google profile"}]}
+        ]
+        failed = llm_client.InvalidLlmResponse(
+            "validation failed",
+            raw_text="{}",
+            parsed_json={"batch_id": "b", "scores": []},
+            usage={"input_tokens": 1000, "output_tokens": 200, "total_tokens": 1200},
+        )
+        repaired = {"bundle": {"batch_id": "b", "scores": []},
+                    "usage": {"input_tokens": 800, "output_tokens": 150, "total_tokens": 950}}
+
+        calls = {"n": 0}
+
+        def fake_score_batch(prompt, *, model, max_tokens):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise failed
+            return dict(repaired)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(score_leads.llm_client, "score_batch", side_effect=fake_score_batch), \
+                 patch.object(score_leads, "build_validation_repair_prompt", return_value="repair"), \
+                 patch.object(score_leads, "_write_validation_failed_llm_response", return_value=Path(tmp) / "dbg.json"):
+                result = score_leads._score_batch_with_debug(
+                    "prompt", batch_id="b", bundle_dir=Path(tmp),
+                    compact_records=compact_records, model="m", max_tokens=4096,
+                )
+
+        self.assertEqual(
+            result["usage"],
+            {"input_tokens": 1800, "output_tokens": 350, "total_tokens": 2150},
+        )
+        self.assertEqual(result["call_count"], 2)
+
+    def test_score_batch_with_debug_counts_usage_when_repair_also_fails(self) -> None:
+        # Fallback path previously reported usage={} - hiding two real paid calls.
+        import score_leads
+        from lead_machine import llm_client
+
+        compact_records = [{"score_file": "phone-123.json", "lead": {"business_name": "X"},
+                            "evidence_ref_options": [{"id": "google_profile", "label": "Google profile"}]}]
+        failed = llm_client.InvalidLlmResponse(
+            "validation failed", raw_text="{}", parsed_json={"batch_id": "b", "scores": []},
+            usage={"input_tokens": 1000, "output_tokens": 200, "total_tokens": 1200},
+        )
+        repair_failed = llm_client.InvalidLlmResponse(
+            "still bad", raw_text="{}", parsed_json={"batch_id": "b", "scores": []},
+            usage={"input_tokens": 700, "output_tokens": 100, "total_tokens": 800},
+        )
+
+        calls = {"n": 0}
+
+        def fake_score_batch(prompt, *, model, max_tokens):
+            calls["n"] += 1
+            raise failed if calls["n"] == 1 else repair_failed
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(score_leads.llm_client, "score_batch", side_effect=fake_score_batch), \
+                 patch.object(score_leads, "build_validation_repair_prompt", return_value="repair"), \
+                 patch.object(score_leads, "_write_validation_failed_llm_response", return_value=Path(tmp) / "dbg.json"), \
+                 patch.object(score_leads, "_fallback_fill_empty_evidence_refs",
+                              return_value=({"batch_id": "b", "scores": []}, "filled")):
+                result = score_leads._score_batch_with_debug(
+                    "prompt", batch_id="b", bundle_dir=Path(tmp),
+                    compact_records=compact_records, model="m", max_tokens=4096,
+                )
+
+        self.assertEqual(
+            result["usage"],
+            {"input_tokens": 1700, "output_tokens": 300, "total_tokens": 2000},
+        )
+        self.assertEqual(result["call_count"], 2)
+
     def test_api_llm_prompt_requires_non_empty_evidence_refs_from_options(self) -> None:
         from score_leads import build_api_llm_scoring_prompt, build_llm_scoring_record
 
@@ -3475,6 +3556,94 @@ class LeadMachineContractsTest(unittest.TestCase):
             self.assertTrue(debug_path.exists())
             self.assertEqual(debug_path.read_text(encoding="utf-8"), raw_text)
             self.assertIn(str(debug_path), str(caught.exception))
+
+    def test_api_llm_terminal_failure_writes_partial_usage_output(self) -> None:
+        from lead_machine.llm_client import InvalidLlmResponse
+        from score_leads import score_records_api_run
+
+        usage = {"input_tokens": 1000, "output_tokens": 200, "total_tokens": 1200}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            scores_dir = Path(tmp) / "scores"
+            usage_path = Path(tmp) / "usage.json"
+            with patch(
+                "score_leads.llm_client.score_batch",
+                side_effect=InvalidLlmResponse(
+                    "terminal non-repairable error",
+                    raw_text='{"bad": true}',
+                    usage=usage,
+                ),
+            ):
+                with self.assertRaises(ValueError):
+                    score_records_api_run(
+                        [self._huge_detailing_record()],
+                        scores_dir=scores_dir,
+                        fallback_vertical="detailing",
+                        batch_size=1,
+                        model="claude-sonnet-5",
+                        max_tokens=4096,
+                        max_calls=0,
+                        max_tokens_per_run=100_000,
+                        max_usd_per_run=0.0,
+                        usage_output_path=usage_path,
+                    )
+
+            payload = json.loads(usage_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["calls"], 1)
+            self.assertEqual(payload["input_tokens"], 1000)
+            self.assertEqual(payload["output_tokens"], 200)
+            self.assertEqual(payload["total_tokens"], 1200)
+            self.assertTrue(payload["partial"])
+
+    def test_api_llm_no_text_response_retries_with_larger_token_cap(self) -> None:
+        from lead_machine.llm_client import InvalidLlmResponse
+        from score_leads import score_records_api_run
+
+        raw_text = json.dumps({"content": [{"type": "thinking", "thinking": "no final text yet"}]})
+
+        calls = 0
+
+        def fake_score_batch(prompt: str, *, model: str, max_tokens: int) -> dict:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise InvalidLlmResponse("Anthropic response did not include text content", raw_text=raw_text)
+            score_files = sorted(set(re.findall(r'"score_file": "([^"]+\.json)"', prompt)))
+            return {
+                "bundle": {
+                    "batch_id": "batch_001",
+                    "scores": [
+                        {"score_file": score_file, "score": self._manual_score(total_score=75, grade="B")}
+                        for score_file in score_files
+                    ],
+                },
+                "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            scores_dir = Path(tmp) / "scores"
+            with patch(
+                "score_leads.llm_client.score_batch",
+                side_effect=fake_score_batch,
+            ) as score_batch:
+                run = score_records_api_run(
+                    [self._huge_detailing_record()],
+                    scores_dir=scores_dir,
+                    fallback_vertical="detailing",
+                    batch_size=1,
+                    model="claude-sonnet-5",
+                    max_tokens=4096,
+                    max_calls=0,
+                    max_tokens_per_run=100_000,
+                    max_usd_per_run=0.0,
+                )
+
+            debug_path = scores_dir / "_api_bundles" / "batch_001_invalid_response_attempt_1.txt"
+            self.assertTrue(debug_path.exists())
+            self.assertEqual(debug_path.read_text(encoding="utf-8"), raw_text)
+            self.assertEqual(score_batch.call_count, 2)
+            self.assertEqual(score_batch.call_args_list[1].kwargs["max_tokens"], 8192)
+            self.assertEqual(len(run.manual_run.rows), 1)
 
     def test_api_llm_validation_failure_repairs_with_evidence_ref_options(self) -> None:
         from lead_machine.llm_client import InvalidLlmResponse
