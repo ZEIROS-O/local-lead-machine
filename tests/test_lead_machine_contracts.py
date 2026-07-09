@@ -1091,6 +1091,22 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(row["Review Demand Band"], "ideal_growth")
         self.assertEqual(row["Review Fit Band"], "ideal_growth")
 
+    def test_prompts_treat_review_velocity_as_traction_not_money_intent(self) -> None:
+        from score_leads import build_api_llm_scoring_prompt, build_llm_scoring_record
+
+        rule = (
+            "Live review velocity is traction evidence: it shows the business is active and "
+            "supports demand/reputation fit, but it does not count as money intent."
+        )
+
+        compact = build_llm_scoring_record(self._huge_detailing_record(), fallback_vertical="detailing")
+        self.assertIn(rule, build_api_llm_scoring_prompt([compact], batch_id="batch_001"))
+        self.assertIn(rule, build_batch_prompt([], batch_id="batch_test"))
+        self.assertIn(
+            rule,
+            build_llm_prompt({"google": self._google_fixture()}, fallback_vertical="detailing"),
+        )
+
     def test_evidence_profile_exposes_required_fields_and_evidence_items(self) -> None:
         enriched = {
             "google": {
