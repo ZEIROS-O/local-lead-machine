@@ -1,0 +1,41 @@
+{
+  "vertical": "garage_doors",
+  "display_name": "Garage Doors",
+  "airtable_vertical": "Garage Doors",
+  "search_terms": [
+    "garage door repair",
+    "garage door installation",
+    "garage door service",
+    "overhead door repair",
+    "garage door opener repair",
+    "garage door spring repair",
+    "emergency garage door repair",
+    "commercial overhead door"
+  ],
+  "high_intent_terms": [
+    "garage door opener installation",
+    "broken garage door spring",
+    "rolling steel door"
+  ],
+  "exclude_terms": [
+    "garage floor epoxy",
+    "garage floor coating",
+    "garage cabinets",
+    "garage storage",
+    "garage organization",
+    "garage builder",
+    "pole barn",
+    "shed",
+    "parking garage",
+    "self storage",
+    "home depot",
+    "lowe's",
+    "lowes",
+    "menards",
+    "ace hardware",
+    "wayne dalton dealer"
+  ],
+  "min_rating": 4.3,
+  "min_reviews": 10,
+  "notes": "Target independent residential and commercial garage-door repair, installation, opener, spring, emergency, and overhead-door contractors. Deny garage-floor, storage/organization, builder, parking garage, self-storage, hardware retail, and big-box noise."
+}

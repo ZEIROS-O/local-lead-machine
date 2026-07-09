@@ -970,6 +970,63 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertIn("franchise_or_chain", hard_icp_gate(franchise).reasons)
         self.assertFalse(hard_icp_gate(no_site).should_skip)
 
+    def test_hard_icp_gate_uses_per_vertical_review_bounds(self) -> None:
+        low_review_with_site = normalize_lead(
+            {
+                "business_name": "Five Star Detailing",
+                "city": "Cleveland",
+                "rating": "4.9",
+                "reviews": "5",
+                "website_url": "https://example.com",
+            },
+            fallback_vertical="detailing",
+            source_batch="round1",
+        )
+        low_review_no_site = normalize_lead(
+            {
+                "business_name": "No Site Detailing",
+                "city": "Cleveland",
+                "rating": "4.9",
+                "reviews": "5",
+                "website_url": "",
+            },
+            fallback_vertical="detailing",
+            source_batch="round1",
+        )
+        mature_garage_doors = normalize_lead(
+            {
+                "business_name": "Lake County Garage Door Repair",
+                "city": "Cleveland",
+                "rating": "4.9",
+                "reviews": "200",
+                "website_url": "https://example.com",
+                "source_query": "garage door repair Cleveland OH",
+            },
+            fallback_vertical="garage_doors",
+            source_batch="round1",
+        )
+        mature_detailing = normalize_lead(
+            {
+                "business_name": "Cleveland Ceramic Coating",
+                "city": "Cleveland",
+                "rating": "4.9",
+                "reviews": "200",
+                "website_url": "https://example.com",
+            },
+            fallback_vertical="detailing",
+            source_batch="round1",
+        )
+
+        with_site_gate = hard_icp_gate(low_review_with_site)
+        self.assertTrue(with_site_gate.should_skip)
+        self.assertIn("too_few_reviews", with_site_gate.reasons)
+        self.assertFalse(hard_icp_gate(low_review_no_site).should_skip)
+        self.assertFalse(hard_icp_gate(mature_garage_doors).should_skip)
+
+        detailing_gate = hard_icp_gate(mature_detailing)
+        self.assertTrue(detailing_gate.should_skip)
+        self.assertIn("high_review_count", detailing_gate.reasons)
+
     def test_evidence_profile_exposes_required_fields_and_evidence_items(self) -> None:
         enriched = {
             "google": {

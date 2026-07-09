@@ -1,0 +1,36 @@
+{
+  "market": "springfield",
+  "display_name": "Springfield",
+  "state": "OH",
+  "geos": [
+    "Springfield OH",
+    "Urbana OH",
+    "Enon OH",
+    "New Carlisle OH",
+    "Tremont City OH",
+    "Yellow Springs OH",
+    "Fairborn OH",
+    "Dayton OH",
+    "London OH",
+    "South Charleston OH"
+  ],
+  "sizes": {
+    "small": [
+      "Springfield OH",
+      "Urbana OH",
+      "Enon OH",
+      "New Carlisle OH",
+      "Tremont City OH"
+    ],
+    "medium": [
+      "Springfield OH",
+      "Urbana OH",
+      "Enon OH",
+      "New Carlisle OH",
+      "Tremont City OH",
+      "Yellow Springs OH",
+      "Fairborn OH",
+      "London OH"
+    ]
+  }
+}

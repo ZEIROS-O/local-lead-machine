@@ -1,0 +1,36 @@
+{
+  "market": "elyria",
+  "display_name": "Elyria",
+  "state": "OH",
+  "geos": [
+    "Elyria OH",
+    "North Ridgeville OH",
+    "Avon OH",
+    "Avon Lake OH",
+    "Sheffield OH",
+    "Sheffield Lake OH",
+    "Amherst OH",
+    "Oberlin OH",
+    "Grafton OH",
+    "LaGrange OH"
+  ],
+  "sizes": {
+    "small": [
+      "Elyria OH",
+      "North Ridgeville OH",
+      "Avon OH",
+      "Sheffield OH",
+      "Amherst OH"
+    ],
+    "medium": [
+      "Elyria OH",
+      "North Ridgeville OH",
+      "Avon OH",
+      "Avon Lake OH",
+      "Sheffield OH",
+      "Sheffield Lake OH",
+      "Amherst OH",
+      "Oberlin OH"
+    ]
+  }
+}

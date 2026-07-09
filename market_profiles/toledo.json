@@ -1,0 +1,39 @@
+{
+  "market": "toledo",
+  "display_name": "Toledo",
+  "state": "OH",
+  "geos": [
+    "Toledo OH",
+    "Sylvania OH",
+    "Maumee OH",
+    "Perrysburg OH",
+    "Oregon OH",
+    "Holland OH",
+    "Rossford OH",
+    "Waterville OH",
+    "Whitehouse OH",
+    "Bowling Green OH",
+    "Monroe MI",
+    "Temperance MI"
+  ],
+  "sizes": {
+    "small": [
+      "Toledo OH",
+      "Sylvania OH",
+      "Maumee OH",
+      "Perrysburg OH",
+      "Oregon OH"
+    ],
+    "medium": [
+      "Toledo OH",
+      "Sylvania OH",
+      "Maumee OH",
+      "Perrysburg OH",
+      "Oregon OH",
+      "Holland OH",
+      "Rossford OH",
+      "Waterville OH",
+      "Bowling Green OH"
+    ]
+  }
+}

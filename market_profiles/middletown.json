@@ -1,0 +1,36 @@
+{
+  "market": "middletown",
+  "display_name": "Middletown",
+  "state": "OH",
+  "geos": [
+    "Middletown OH",
+    "Franklin OH",
+    "Monroe OH",
+    "Trenton OH",
+    "Springboro OH",
+    "Lebanon OH",
+    "Mason OH",
+    "West Chester OH",
+    "Hamilton OH",
+    "Dayton OH"
+  ],
+  "sizes": {
+    "small": [
+      "Middletown OH",
+      "Franklin OH",
+      "Monroe OH",
+      "Trenton OH",
+      "Springboro OH"
+    ],
+    "medium": [
+      "Middletown OH",
+      "Franklin OH",
+      "Monroe OH",
+      "Trenton OH",
+      "Springboro OH",
+      "Lebanon OH",
+      "Mason OH",
+      "West Chester OH"
+    ]
+  }
+}

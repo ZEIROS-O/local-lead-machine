@@ -2,7 +2,9 @@
   "batch": "epoxy_cleveland_medium_001",
   "vertical": "epoxy",
   "location": "Cleveland OH",
-  "limit_per_query": 10,
+  "limit_per_query": 20,
+  "page_size": 20,
+  "max_pages_per_query": 2,
   "queries": [
     "epoxy flooring Cleveland OH",
     "garage floor epoxy Cleveland OH",
@@ -22,19 +24,12 @@
     "Cleveland east side OH",
     "Cleveland west side OH",
     "Lakewood OH",
-    "Rocky River OH",
-    "Westlake OH",
-    "Strongsville OH",
-    "Medina OH",
-    "Beachwood OH",
-    "Solon OH",
-    "Chagrin Falls OH",
-    "Mentor OH",
-    "Parma OH"
+    "Parma OH",
+    "Strongsville OH"
   ],
   "geo_slices_ref": "cleveland",
   "min_rating": 4.3,
-  "min_reviews": 5,
+  "min_reviews": 10,
   "allow_missing_website": true,
   "exclude_terms": [
     "resin art",

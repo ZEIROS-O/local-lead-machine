@@ -1,0 +1,39 @@
+{
+  "market": "parma",
+  "display_name": "Parma",
+  "state": "OH",
+  "geos": [
+    "Parma OH",
+    "Parma Heights OH",
+    "Brooklyn OH",
+    "Brook Park OH",
+    "Middleburg Heights OH",
+    "Seven Hills OH",
+    "Independence OH",
+    "Brecksville OH",
+    "North Royalton OH",
+    "Broadview Heights OH",
+    "Strongsville OH",
+    "Cleveland west side OH"
+  ],
+  "sizes": {
+    "small": [
+      "Parma OH",
+      "Parma Heights OH",
+      "Brooklyn OH",
+      "Brook Park OH",
+      "Middleburg Heights OH"
+    ],
+    "medium": [
+      "Parma OH",
+      "Parma Heights OH",
+      "Brooklyn OH",
+      "Brook Park OH",
+      "Middleburg Heights OH",
+      "Seven Hills OH",
+      "Independence OH",
+      "North Royalton OH",
+      "Strongsville OH"
+    ]
+  }
+}

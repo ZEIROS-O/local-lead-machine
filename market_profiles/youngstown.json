@@ -1,0 +1,36 @@
+{
+  "market": "youngstown",
+  "display_name": "Youngstown",
+  "state": "OH",
+  "geos": [
+    "Youngstown OH",
+    "Boardman OH",
+    "Austintown OH",
+    "Canfield OH",
+    "Niles OH",
+    "Warren OH",
+    "Girard OH",
+    "Struthers OH",
+    "Poland OH",
+    "Salem OH"
+  ],
+  "sizes": {
+    "small": [
+      "Youngstown OH",
+      "Boardman OH",
+      "Austintown OH",
+      "Canfield OH",
+      "Niles OH"
+    ],
+    "medium": [
+      "Youngstown OH",
+      "Boardman OH",
+      "Austintown OH",
+      "Canfield OH",
+      "Niles OH",
+      "Warren OH",
+      "Girard OH",
+      "Struthers OH"
+    ]
+  }
+}

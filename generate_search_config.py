@@ -43,7 +43,7 @@ CONFIGS_DIR = Path("search_configs")
 VALID_SIZES = ("small", "medium", "full")
 DEFAULT_LIMIT_PER_QUERY = 10
 DEFAULT_MIN_RATING = 4.3
-DEFAULT_MIN_REVIEWS = 5
+DEFAULT_MIN_REVIEWS = 10
 # Per-call result page size (API hard-caps at 20). Pagination depth carries volume.
 DEFAULT_PAGE_SIZE = 20
 # Size-based search depth: deeper paging where appropriate, single page for small.

@@ -18,6 +18,8 @@ class VerticalProfile:
     exclude_terms: tuple[str, ...]
     geo_terms: tuple[str, ...]
     aliases: tuple[str, ...] = ()
+    min_reviews: int = 10
+    max_reviews: int | None = None
 
 
 HARDSCAPE_BATCH_TERMS = (
@@ -262,6 +264,8 @@ VERTICAL_PROFILES: Mapping[str, VerticalProfile] = {
         franchise_denylist=HARDSCAPE_FRANCHISE_DENYLIST,
         exclude_terms=(),
         geo_terms=CLEVELAND_METRO_TERMS,
+        min_reviews=10,
+        max_reviews=None,
     ),
     "detailing": VerticalProfile(
         key="detailing",
@@ -276,6 +280,8 @@ VERTICAL_PROFILES: Mapping[str, VerticalProfile] = {
         exclude_terms=(),
         geo_terms=CLEVELAND_METRO_TERMS,
         aliases=("car detailing", "auto detailing", "mobile detailing", "detailing", "detailer"),
+        min_reviews=10,
+        max_reviews=130,
     ),
     "water_restoration": VerticalProfile(
         key="water_restoration",
@@ -299,6 +305,8 @@ VERTICAL_PROFILES: Mapping[str, VerticalProfile] = {
             "flood cleanup",
             "restoration",
         ),
+        min_reviews=10,
+        max_reviews=None,
     ),
     "garage_doors": VerticalProfile(
         key="garage_doors",
@@ -321,6 +329,8 @@ VERTICAL_PROFILES: Mapping[str, VerticalProfile] = {
             "overhead doors",
             "overhead door",
         ),
+        min_reviews=10,
+        max_reviews=None,
     ),
 }
 

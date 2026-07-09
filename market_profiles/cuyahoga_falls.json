@@ -1,0 +1,36 @@
+{
+  "market": "cuyahoga_falls",
+  "display_name": "Cuyahoga Falls",
+  "state": "OH",
+  "geos": [
+    "Cuyahoga Falls OH",
+    "Stow OH",
+    "Munroe Falls OH",
+    "Tallmadge OH",
+    "Akron OH",
+    "Hudson OH",
+    "Silver Lake OH",
+    "Fairlawn OH",
+    "Bath OH",
+    "Kent OH"
+  ],
+  "sizes": {
+    "small": [
+      "Cuyahoga Falls OH",
+      "Stow OH",
+      "Munroe Falls OH",
+      "Tallmadge OH",
+      "Akron OH"
+    ],
+    "medium": [
+      "Cuyahoga Falls OH",
+      "Stow OH",
+      "Munroe Falls OH",
+      "Tallmadge OH",
+      "Akron OH",
+      "Hudson OH",
+      "Silver Lake OH",
+      "Fairlawn OH"
+    ]
+  }
+}

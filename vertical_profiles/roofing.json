@@ -35,6 +35,6 @@
     "lowes"
   ],
   "min_rating": 4.3,
-  "min_reviews": 5,
+  "min_reviews": 10,
   "notes": "Target high-ticket replacement/storm/commercial roofers; deny supply houses and big-box retail. Boost terms mirror the hardscaping family's roofing high-ticket terms until a dedicated VerticalProfile is added to verticals.py."
 }

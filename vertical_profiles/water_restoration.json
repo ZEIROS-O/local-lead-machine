@@ -1,0 +1,50 @@
+{
+  "vertical": "water_restoration",
+  "display_name": "Water Restoration",
+  "airtable_vertical": "Water Restoration",
+  "search_terms": [
+    "water damage restoration",
+    "water restoration",
+    "flood damage restoration",
+    "emergency water extraction",
+    "water mitigation",
+    "flood cleanup",
+    "mold remediation",
+    "fire and water restoration"
+  ],
+  "high_intent_terms": [
+    "emergency water extraction",
+    "water mitigation",
+    "sewage cleanup",
+    "disaster restoration"
+  ],
+  "exclude_terms": [
+    "carpet cleaner",
+    "rug cleaning",
+    "duct cleaning",
+    "dryer vent cleaning",
+    "pressure washing",
+    "janitorial services",
+    "maid service",
+    "house cleaning",
+    "plumbing company",
+    "basement waterproofing",
+    "foundation repair",
+    "pool service",
+    "water softener",
+    "bottled water",
+    "servpro",
+    "servicemaster",
+    "service master",
+    "paul davis",
+    "puroclean",
+    "rainbow restoration",
+    "1-800 water damage",
+    "1800 water damage",
+    "advantaclean",
+    "belfor"
+  ],
+  "min_rating": 4.3,
+  "min_reviews": 10,
+  "notes": "Target independent emergency water-damage, mitigation, flood-cleanup, sewage-cleanup, mold-remediation, and fire/water restoration contractors. Deny carpet-cleaning-only, duct-cleaning-only, janitorial, plumbing, waterproofing, pool, bottled-water, and large franchise restoration chains."
+}

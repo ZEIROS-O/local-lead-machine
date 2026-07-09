@@ -54,6 +54,20 @@ def hard_icp_gate(lead: CanonicalLead, *, enforce_target_geo: bool = False) -> G
     if lead.google_rating is not None and lead.google_rating < 4.3:
         reasons.append("weak_reputation")
 
+    if (
+        lead.website
+        and lead.google_review_count is not None
+        and lead.google_review_count < profile.min_reviews
+    ):
+        reasons.append("too_few_reviews")
+
+    if (
+        profile.max_reviews is not None
+        and lead.google_review_count is not None
+        and lead.google_review_count > profile.max_reviews
+    ):
+        reasons.append("high_review_count")
+
     if enforce_target_geo and not any(term in text for term in profile.geo_terms):
         reasons.append("outside_target_geo")
 

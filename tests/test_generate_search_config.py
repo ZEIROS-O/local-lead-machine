@@ -57,7 +57,7 @@ class GenerateSearchConfigTest(unittest.TestCase):
         self.assertIn("metallic epoxy flooring", cfg["boost_terms"])
         self.assertIn("resin art", cfg["exclude_terms"])
         self.assertEqual(cfg["min_rating"], 4.3)
-        self.assertEqual(cfg["min_reviews"], 5)
+        self.assertEqual(cfg["min_reviews"], 10)
         # page_size defaults to 20; limit_per_query mirrors it for legacy readers;
         # medium depth = 2 pages per query.
         self.assertEqual(cfg["page_size"], 20)
@@ -89,6 +89,96 @@ class GenerateSearchConfigTest(unittest.TestCase):
         # Canonical deny terms are merged with the profile's extra noise terms.
         self.assertIn("express wash", cfg["exclude_terms"])
         self.assertIn("dealership service", cfg["exclude_terms"])
+
+    def test_generate_water_restoration_medium_configs_for_initial_ohio_metros(self) -> None:
+        expected_geos = {
+            "cleveland": "Cleveland OH",
+            "cincinnati": "Cincinnati OH",
+            "columbus": "Columbus OH",
+        }
+
+        for market, primary_geo in expected_geos.items():
+            path = self._generate(
+                vertical="water_restoration",
+                market=market,
+                size="medium",
+            )
+            self.assertEqual(path.name, f"water_restoration_{market}_medium_001.json")
+            cfg = self._load(path)
+            self.assertEqual(cfg["vertical"], "water_restoration")
+            self.assertEqual(cfg["airtable_vertical"], "Water Restoration")
+            self.assertIn(f"water damage restoration {cfg['location']}", cfg["queries"])
+            self.assertIn(primary_geo, cfg["geo_slices"])
+            self.assertEqual(cfg["min_rating"], 4.3)
+            self.assertEqual(cfg["min_reviews"], 10)
+
+            canonical = list(VERTICAL_PROFILES["water_restoration"].high_ticket_terms)
+            self.assertEqual(cfg["boost_terms"], canonical)
+            self.assertIn("carpet cleaning", cfg["exclude_terms"])
+            self.assertIn("servpro", cfg["exclude_terms"])
+
+    def test_generate_water_restoration_medium_configs_for_additional_ohio_metros(self) -> None:
+        expected_geos = {
+            "toledo": "Toledo OH",
+            "akron": "Akron OH",
+            "parma": "Parma OH",
+            "hamilton": "Hamilton OH",
+        }
+
+        for market, primary_geo in expected_geos.items():
+            path = self._generate(
+                vertical="water_restoration",
+                market=market,
+                size="medium",
+            )
+            self.assertEqual(path.name, f"water_restoration_{market}_medium_001.json")
+            cfg = self._load(path)
+            self.assertEqual(cfg["vertical"], "water_restoration")
+            self.assertEqual(cfg["airtable_vertical"], "Water Restoration")
+            self.assertIn(f"water damage restoration {cfg['location']}", cfg["queries"])
+            self.assertIn(primary_geo, cfg["geo_slices"])
+            self.assertEqual(cfg["min_rating"], 4.3)
+            self.assertEqual(cfg["min_reviews"], 10)
+
+            canonical = list(VERTICAL_PROFILES["water_restoration"].high_ticket_terms)
+            self.assertEqual(cfg["boost_terms"], canonical)
+            self.assertIn("carpet cleaning", cfg["exclude_terms"])
+            self.assertIn("servpro", cfg["exclude_terms"])
+
+    def test_generate_garage_doors_medium_configs_for_ohio_secondary_cities(self) -> None:
+        expected_geos = {
+            "elyria": "Elyria OH",
+            "lorain": "Lorain OH",
+            "cuyahoga_falls": "Cuyahoga Falls OH",
+            "kettering": "Kettering OH",
+            "springfield": "Springfield OH",
+            "newark": "Newark OH",
+            "middletown": "Middletown OH",
+            "youngstown": "Youngstown OH",
+            "cleveland": "Cleveland OH",
+            "columbus": "Columbus OH",
+            "cincinnati": "Cincinnati OH",
+        }
+
+        for market, primary_geo in expected_geos.items():
+            path = self._generate(
+                vertical="garage_doors",
+                market=market,
+                size="medium",
+            )
+            self.assertEqual(path.name, f"garage_doors_{market}_medium_001.json")
+            cfg = self._load(path)
+            self.assertEqual(cfg["vertical"], "garage_doors")
+            self.assertEqual(cfg["airtable_vertical"], "Garage Doors")
+            self.assertIn(f"garage door repair {cfg['location']}", cfg["queries"])
+            self.assertIn(primary_geo, cfg["geo_slices"])
+            self.assertEqual(cfg["min_rating"], 4.3)
+            self.assertEqual(cfg["min_reviews"], 10)
+
+            canonical = list(VERTICAL_PROFILES["garage_doors"].high_ticket_terms)
+            self.assertEqual(cfg["boost_terms"], canonical)
+            self.assertIn("garage floor epoxy", cfg["exclude_terms"])
+            self.assertIn("home depot", cfg["exclude_terms"])
 
     def test_refreshes_geo_slices_file(self) -> None:
         self._generate(vertical="epoxy", market="cleveland", size="small")

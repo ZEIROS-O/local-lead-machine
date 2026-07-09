@@ -21,7 +21,7 @@ def _config(**overrides):
         "queries": ["hardscaping Cleveland OH", "patio contractor Cleveland OH"],
         "geo_slices": ["Cleveland OH", "Lakewood OH"],
         "min_rating": 4.0,
-        "min_reviews": 5,
+        "min_reviews": 10,
         "allow_missing_website": True,
         "exclude_terms": ["garden center", "nursery", "tree service", "snow removal only"],
         "boost_terms": ["patio", "pavers", "retaining wall", "masonry", "hardscape", "concrete"],

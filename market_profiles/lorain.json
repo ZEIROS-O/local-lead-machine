@@ -1,0 +1,36 @@
+{
+  "market": "lorain",
+  "display_name": "Lorain",
+  "state": "OH",
+  "geos": [
+    "Lorain OH",
+    "Amherst OH",
+    "Sheffield Lake OH",
+    "Sheffield OH",
+    "Vermilion OH",
+    "Elyria OH",
+    "Avon Lake OH",
+    "Avon OH",
+    "North Ridgeville OH",
+    "Oberlin OH"
+  ],
+  "sizes": {
+    "small": [
+      "Lorain OH",
+      "Amherst OH",
+      "Sheffield Lake OH",
+      "Sheffield OH",
+      "Vermilion OH"
+    ],
+    "medium": [
+      "Lorain OH",
+      "Amherst OH",
+      "Sheffield Lake OH",
+      "Sheffield OH",
+      "Vermilion OH",
+      "Elyria OH",
+      "Avon Lake OH",
+      "Avon OH"
+    ]
+  }
+}

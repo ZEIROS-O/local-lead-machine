@@ -1,0 +1,36 @@
+{
+  "market": "kettering",
+  "display_name": "Kettering",
+  "state": "OH",
+  "geos": [
+    "Kettering OH",
+    "Dayton OH",
+    "Centerville OH",
+    "Beavercreek OH",
+    "Oakwood OH",
+    "Moraine OH",
+    "Miamisburg OH",
+    "West Carrollton OH",
+    "Springboro OH",
+    "Huber Heights OH"
+  ],
+  "sizes": {
+    "small": [
+      "Kettering OH",
+      "Dayton OH",
+      "Centerville OH",
+      "Beavercreek OH",
+      "Oakwood OH"
+    ],
+    "medium": [
+      "Kettering OH",
+      "Dayton OH",
+      "Centerville OH",
+      "Beavercreek OH",
+      "Oakwood OH",
+      "Moraine OH",
+      "Miamisburg OH",
+      "West Carrollton OH"
+    ]
+  }
+}

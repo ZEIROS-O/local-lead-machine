@@ -1,0 +1,36 @@
+{
+  "market": "newark",
+  "display_name": "Newark",
+  "state": "OH",
+  "geos": [
+    "Newark OH",
+    "Heath OH",
+    "Granville OH",
+    "Pataskala OH",
+    "Hebron OH",
+    "Johnstown OH",
+    "Alexandria OH",
+    "Buckeye Lake OH",
+    "Utica OH",
+    "Zanesville OH"
+  ],
+  "sizes": {
+    "small": [
+      "Newark OH",
+      "Heath OH",
+      "Granville OH",
+      "Pataskala OH",
+      "Hebron OH"
+    ],
+    "medium": [
+      "Newark OH",
+      "Heath OH",
+      "Granville OH",
+      "Pataskala OH",
+      "Hebron OH",
+      "Johnstown OH",
+      "Alexandria OH",
+      "Buckeye Lake OH"
+    ]
+  }
+}

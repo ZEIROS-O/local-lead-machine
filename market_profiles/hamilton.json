@@ -1,0 +1,39 @@
+{
+  "market": "hamilton",
+  "display_name": "Hamilton",
+  "state": "OH",
+  "geos": [
+    "Hamilton OH",
+    "Fairfield OH",
+    "West Chester OH",
+    "Liberty Township OH",
+    "Trenton OH",
+    "Middletown OH",
+    "Oxford OH",
+    "Monroe OH",
+    "Mason OH",
+    "Springdale OH",
+    "Forest Park OH",
+    "Cincinnati north OH"
+  ],
+  "sizes": {
+    "small": [
+      "Hamilton OH",
+      "Fairfield OH",
+      "West Chester OH",
+      "Liberty Township OH",
+      "Trenton OH"
+    ],
+    "medium": [
+      "Hamilton OH",
+      "Fairfield OH",
+      "West Chester OH",
+      "Liberty Township OH",
+      "Trenton OH",
+      "Middletown OH",
+      "Oxford OH",
+      "Monroe OH",
+      "Mason OH"
+    ]
+  }
+}

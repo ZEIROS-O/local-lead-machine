@@ -1,0 +1,43 @@
+{
+  "market": "cincinnati",
+  "display_name": "Cincinnati",
+  "state": "OH",
+  "geos": [
+    "Cincinnati OH",
+    "Cincinnati east side OH",
+    "Cincinnati west side OH",
+    "Norwood OH",
+    "Blue Ash OH",
+    "Mason OH",
+    "West Chester OH",
+    "Loveland OH",
+    "Milford OH",
+    "Fairfield OH",
+    "Hamilton OH",
+    "Lebanon OH",
+    "Florence KY",
+    "Covington KY",
+    "Newport KY"
+  ],
+  "sizes": {
+    "small": [
+      "Cincinnati OH",
+      "Cincinnati east side OH",
+      "Cincinnati west side OH",
+      "Blue Ash OH",
+      "Mason OH"
+    ],
+    "medium": [
+      "Cincinnati OH",
+      "Cincinnati east side OH",
+      "Cincinnati west side OH",
+      "Norwood OH",
+      "Blue Ash OH",
+      "Mason OH",
+      "West Chester OH",
+      "Loveland OH",
+      "Florence KY",
+      "Covington KY"
+    ]
+  }
+}

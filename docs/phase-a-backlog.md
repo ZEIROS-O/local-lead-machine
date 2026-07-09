@@ -112,7 +112,8 @@ epoxy) is a data change. **Highest regression risk** — guard with existing tes
 - [ ] **Multi-metro configs** (`search_configs/`) — naming `<vertical>_<metro>_<size>.json`
   (`detailing_cleveland_full_001.json`, `detailing_cleveland_medium_001.json`). High-ticket queries;
   `exclude_terms` strip express/tunnel washes + lube + dealer service depts; `boost_terms` =
-  high-ticket terms; `min_rating: 4.3` (match gate `icp.py:88`), `min_reviews: 5`. **Metro expansion:**
+  high-ticket terms; `min_rating: 4.3` (match gate `icp.py:88`), `min_reviews` comes from
+  `VerticalProfile`/profile JSON (default 10; detailing max-review cap = 130). **Metro expansion:**
   optional `geo_slices_ref` key in `make_search_batch.SearchConfig.from_dict` (117) loading
   `search_configs/geo_slices/<metro>.json` (shared array); inline `geo_slices` keeps working.
 
