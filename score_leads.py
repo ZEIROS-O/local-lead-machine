@@ -1894,23 +1894,11 @@ def _append_evidence_ref_option(
     *,
     option_id: str,
     label: str,
-    snippet: Any = "",
-    source: str = "",
 ) -> None:
     cleaned_id = re.sub(r"[^A-Za-z0-9_.:-]+", "_", str(option_id or "").strip()).strip("_")
     if not cleaned_id or cleaned_id in seen_ids:
         return
-    option = {
-        "id": cleaned_id,
-        "label": _short_snippet(label, max_chars=80),
-    }
-    snippet_text = _short_snippet(snippet)
-    if snippet_text:
-        option["snippet"] = snippet_text
-    source_text = _short_snippet(source, max_chars=120)
-    if source_text:
-        option["source"] = source_text
-    options.append(option)
+    options.append({"id": cleaned_id, "label": _short_snippet(label, max_chars=80)})
     seen_ids.add(cleaned_id)
 
 
@@ -1952,12 +1940,15 @@ def _add_prompt_visible_ev_ref_options(capsule: Dict[str, Any]) -> None:
                 seen_ids,
                 option_id=match.group(0),
                 label="Prompt-visible evidence ref",
-                snippet=_snippet_around(text, match.start(), max_chars=140),
-                source="compact_record",
             )
 
 
-def _build_evidence_ref_options(record: Dict[str, Any], *, lead: Any | None = None) -> List[Dict[str, str]]:
+def _build_evidence_ref_options(
+    record: Dict[str, Any],
+    *,
+    lead: Any | None = None,
+    selected_evidence_item_ids: set[str] | None = None,
+) -> List[Dict[str, str]]:
     google = record.get("google", {}) if isinstance(record.get("google"), dict) else {}
     website = record.get("website", {}) if isinstance(record.get("website"), dict) else {}
     evidence = record.get("evidence", {}) if isinstance(record.get("evidence"), dict) else {}
@@ -1979,8 +1970,6 @@ def _build_evidence_ref_options(record: Dict[str, Any], *, lead: Any | None = No
         seen_ids,
         option_id="google_profile",
         label="Google rating/reviews",
-        snippet=", ".join(google_bits),
-        source=google.get("google_maps_url") or google.get("maps_url") or "google",
     )
 
     site_status = evidence.get("site_status") or website.get("site_status") or ""
@@ -1992,8 +1981,6 @@ def _build_evidence_ref_options(record: Dict[str, Any], *, lead: Any | None = No
             seen_ids,
             option_id="website_status",
             label="Website detected",
-            snippet=", ".join(part for part in [str(site_status or "").strip(), str(rendered_status or "").strip()] if part),
-            source=website_url or "evidence.website_status",
         )
 
     services = website.get("high_ticket_terms") or evidence.get("services_detected") or []
@@ -2003,8 +1990,6 @@ def _build_evidence_ref_options(record: Dict[str, Any], *, lead: Any | None = No
             seen_ids,
             option_id="homepage_services",
             label="High-ticket services",
-            snippet=" / ".join(str(item) for item in services[:6]),
-            source=website.get("final_url") or "website.high_ticket_terms",
         )
 
     form_bits = []
@@ -2022,19 +2007,14 @@ def _build_evidence_ref_options(record: Dict[str, Any], *, lead: Any | None = No
             seen_ids,
             option_id="form_detection",
             label="Form/booking evidence",
-            snippet=", ".join(form_bits),
-            source=evidence.get("form_detection_method") or website.get("form_detection_method") or "evidence.forms",
         )
 
-    buyer_summary = buyer_intent_summary(record) if buyer_intent else ""
-    if buyer_summary:
+    if buyer_intent:
         _append_evidence_ref_option(
             options,
             seen_ids,
             option_id="buyer_intent",
             label="Buyer intent evidence",
-            snippet=buyer_summary,
-            source="buyer_intent",
         )
 
     source_query = google.get("source_query") or google.get("search_query") or google.get("category") or ""
@@ -2044,23 +2024,20 @@ def _build_evidence_ref_options(record: Dict[str, Any], *, lead: Any | None = No
             seen_ids,
             option_id="icp_source_query",
             label="ICP source query",
-            snippet=source_query,
-            source="google.source_query",
         )
 
+    selected_evidence_item_ids = selected_evidence_item_ids or set()
     for item in evidence.get("evidence_items", []) or []:
         if not isinstance(item, dict):
             continue
         item_id = str(item.get("id") or "").strip()
-        if not item_id:
+        if not item_id or item_id not in selected_evidence_item_ids:
             continue
         _append_evidence_ref_option(
             options,
             seen_ids,
             option_id=item_id,
             label=str(item.get("field") or "Evidence item"),
-            snippet=item.get("value"),
-            source=item.get("source_url") or "evidence.evidence_items",
         )
 
     if not options:
@@ -2069,10 +2046,45 @@ def _build_evidence_ref_options(record: Dict[str, Any], *, lead: Any | None = No
             seen_ids,
             option_id="google_profile",
             label="Google profile",
-            snippet=google.get("business_name") or source_query or "Lead source record",
-            source="google",
         )
     return options
+
+
+def _compact_buyer_intent(buyer_intent: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep only the decision-relevant buyer-intent signals for the prompt.
+
+    The raw ``buyer_intent`` object carries verbose proof arrays and error blobs
+    that duplicate ``buyer_intent_summary``, the top-level ``money_signal`` flag,
+    and ``provider_evidence.crm_booking_stack``. This keeps the structured money
+    and demand signals the rubric leans on without re-sending that overlap.
+    """
+    if not isinstance(buyer_intent, dict):
+        return {}
+    compact: Dict[str, Any] = {}
+
+    money_signal = buyer_intent.get("money_signal")
+    if money_signal not in (None, "", {}, []):
+        compact["money_signal"] = money_signal
+
+    ads = buyer_intent.get("ads")
+    if isinstance(ads, dict):
+        known_ads = {
+            key: value
+            for key, value in ads.items()
+            if key != "errors" and str(value or "").strip().lower() in {"yes", "no"}
+        }
+        if known_ads:
+            compact["ads"] = known_ads
+
+    for key in ("review_demand_signal", "review_profile", "review_velocity"):
+        value = buyer_intent.get(key)
+        if isinstance(value, dict):
+            band = value.get("demand_band") or value.get("velocity_band")
+            if band:
+                compact["review_demand_band"] = band
+            break
+
+    return compact
 
 
 def build_llm_scoring_record(record: Dict[str, Any], *, fallback_vertical: str = "service") -> Dict[str, Any]:
@@ -2085,6 +2097,11 @@ def build_llm_scoring_record(record: Dict[str, Any], *, fallback_vertical: str =
     screenshots = working.get("screenshots") or website.get("screenshots") or evidence.get("screenshots") or {}
     selected_text = _selected_text_snippets(working)
     selected_items = _selected_evidence_item_snippets(working, max_snippets=max(0, MAX_LLM_SCORING_SNIPPETS - len(selected_text)))
+    selected_evidence_item_ids = {
+        str(item.get("id") or "").strip()
+        for item in selected_items
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    }
 
     capsule = {
         "score_file": score_file_for_record(working, fallback_vertical=fallback_vertical),
@@ -2132,7 +2149,7 @@ def build_llm_scoring_record(record: Dict[str, Any], *, fallback_vertical: str =
             "services_detected": evidence.get("services_detected") or [],
             "trust_signals": evidence.get("trust_signals") or [],
         },
-        "buyer_intent": buyer_intent,
+        "buyer_intent": _compact_buyer_intent(buyer_intent),
         "buyer_intent_summary": buyer_intent_summary(working),
         "money_signal": "Yes" if has_money_signal(working) else "No",
         "safe_outreach_claims": working.get("safe_outreach_claims") or evidence.get("safe_outreach_claims") or [],
@@ -2151,7 +2168,11 @@ def build_llm_scoring_record(record: Dict[str, Any], *, fallback_vertical: str =
         },
         "visual_review": _visual_review_capsule(evidence, website),
         "selected_evidence_snippets": [*selected_text, *selected_items][:MAX_LLM_SCORING_SNIPPETS],
-        "evidence_ref_options": _build_evidence_ref_options(working, lead=lead),
+        "evidence_ref_options": _build_evidence_ref_options(
+            working,
+            lead=lead,
+            selected_evidence_item_ids=selected_evidence_item_ids,
+        ),
     }
     compact = _truncate_for_llm(capsule)
     if isinstance(compact, dict):
@@ -2244,7 +2265,7 @@ Required response format:
 {json.dumps(response_example, ensure_ascii=False, indent=2)}
 
 compact_records:
-{json.dumps(compact_records, ensure_ascii=False, indent=2)}
+{json.dumps(compact_records, ensure_ascii=False, separators=(",", ":"))}
 """
 
 

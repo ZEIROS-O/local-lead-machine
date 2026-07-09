@@ -3022,6 +3022,94 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertTrue(all(option.get("id") for option in options))
         self.assertIn("google_profile", {option["id"] for option in options})
 
+    def test_evidence_ref_options_carry_only_id_and_label(self) -> None:
+        # Slim the prompt: evidence_ref_options exist only so the LLM can copy an
+        # id into evidence_refs. The proof text lives in selected_evidence_snippets
+        # and the capsule fields, so snippet/source here are redundant tokens.
+        from score_leads import build_llm_scoring_record, compact_evidence_ref_ids
+
+        compact = build_llm_scoring_record(self._huge_detailing_record(), fallback_vertical="detailing")
+
+        options = compact["evidence_ref_options"]
+        self.assertTrue(options)
+        for option in options:
+            self.assertLessEqual(set(option.keys()), {"id", "label"})
+            self.assertNotIn("snippet", option)
+            self.assertNotIn("source", option)
+        # ids are preserved so downstream evidence_ref validation still works
+        self.assertTrue(compact_evidence_ref_ids(compact))
+
+    def test_evidence_item_ref_options_only_include_selected_snippets(self) -> None:
+        from score_leads import MAX_LLM_SCORING_SNIPPETS, build_llm_scoring_record
+
+        record = {
+            "google": {
+                **self._google_fixture(),
+                "business_name": "Evidence Heavy Detailer",
+                "place_id": "ChIJEVIDENCE",
+                "category": "auto_detailing",
+            },
+            "website": {"combined_text": ""},
+            "evidence": self._evidence_fixture(
+                site_status="weak",
+                evidence_items=[
+                    {
+                        "id": f"E{i}",
+                        "field": "cta_strength",
+                        "value": f"Weak CTA proof {i}",
+                        "source_url": f"https://example.com/{i}",
+                    }
+                    for i in range(MAX_LLM_SCORING_SNIPPETS + 3)
+                ],
+            ),
+        }
+
+        compact = build_llm_scoring_record(record, fallback_vertical="detailing")
+
+        selected_ids = {
+            item["id"]
+            for item in compact["selected_evidence_snippets"]
+            if item.get("kind") == "evidence_item"
+        }
+        offered_evidence_ids = {
+            option["id"]
+            for option in compact["evidence_ref_options"]
+            if option["id"].startswith("E")
+        }
+        self.assertEqual(len(selected_ids), MAX_LLM_SCORING_SNIPPETS)
+        self.assertEqual(offered_evidence_ids, selected_ids)
+        self.assertNotIn(f"E{MAX_LLM_SCORING_SNIPPETS}", offered_evidence_ids)
+
+    def test_buyer_intent_capsule_is_compacted_without_dropping_money_signal(self) -> None:
+        # Raw buyer_intent duplicates buyer_intent_summary, the money_signal flag,
+        # and provider_evidence.crm_booking_stack. Keep only the selected signals.
+        from score_leads import build_llm_scoring_record
+
+        compact = build_llm_scoring_record(self._huge_detailing_record(), fallback_vertical="detailing")
+
+        buyer_intent = compact["buyer_intent"]
+        self.assertNotIn("evidence", buyer_intent)
+        self.assertNotIn("crm_booking_stack", buyer_intent)
+        # money and demand signals still available to the scorer
+        self.assertEqual(buyer_intent.get("money_signal"), True)
+        self.assertEqual(compact["money_signal"], "Yes")
+        self.assertTrue(compact["buyer_intent_summary"])
+        self.assertEqual(
+            compact["provider_evidence"]["crm_booking_stack"].get("detected_tools"),
+            ["ServiceTitan"],
+        )
+
+    def test_api_llm_prompt_serializes_compact_records_minified(self) -> None:
+        from score_leads import build_api_llm_scoring_prompt, build_llm_scoring_record
+
+        compact = build_llm_scoring_record(self._huge_detailing_record(), fallback_vertical="detailing")
+        prompt = build_api_llm_scoring_prompt([compact], batch_id="batch_001")
+
+        records_block = prompt.split("compact_records:\n", 1)[1]
+        # Minified JSON keeps the whole array on one line (no indent newlines).
+        self.assertLessEqual(records_block.strip().count("\n"), 1)
+        self.assertNotIn(': "', records_block)  # compact separators drop the ": " spacing
+
     def test_api_llm_prompt_requires_non_empty_evidence_refs_from_options(self) -> None:
         from score_leads import build_api_llm_scoring_prompt, build_llm_scoring_record
 
