@@ -17,6 +17,7 @@ class VerticalProfile:
     franchise_denylist: tuple[str, ...]
     exclude_terms: tuple[str, ...]
     geo_terms: tuple[str, ...]
+    aliases: tuple[str, ...] = ()
 
 
 HARDSCAPE_BATCH_TERMS = (
@@ -163,6 +164,90 @@ DETAILING_FRANCHISE_DENYLIST = (
     "delta sonic",
 )
 
+WATER_RESTORATION_TERMS = (
+    "water damage restoration",
+    "water restoration",
+    "flood damage restoration",
+    "emergency water extraction",
+    "water mitigation",
+    "flood cleanup",
+    "storm damage cleanup",
+    "sewage cleanup",
+    "mold remediation",
+    "fire and water restoration",
+    "disaster restoration",
+)
+
+WATER_RESTORATION_DENY_TERMS = (
+    "carpet cleaning",
+    "air duct cleaning",
+    "dryer vent cleaning",
+    "pressure washing",
+    "janitorial",
+    "maid service",
+    "house cleaning",
+    "plumber",
+    "plumbing",
+    "basement waterproofing",
+    "waterproofing",
+    "pool service",
+    "bottled water",
+    "water softener",
+)
+
+WATER_RESTORATION_FRANCHISE_DENYLIST = (
+    "servpro",
+    "servicemaster",
+    "service master",
+    "paul davis",
+    "puroclean",
+    "rainbow restoration",
+    "1-800 water damage",
+    "1800 water damage",
+    "advantaclean",
+    "belfor",
+)
+
+GARAGE_DOOR_TERMS = (
+    "garage door repair",
+    "garage door installation",
+    "garage door service",
+    "overhead door repair",
+    "garage door opener repair",
+    "garage door opener installation",
+    "garage door spring repair",
+    "broken garage door spring",
+    "emergency garage door repair",
+    "commercial overhead door",
+    "rolling steel door",
+)
+
+GARAGE_DOOR_DENY_TERMS = (
+    "garage floor epoxy",
+    "garage floor coating",
+    "garage cabinets",
+    "garage storage",
+    "garage organization",
+    "garage builder",
+    "pole barn",
+    "shed",
+    "parking garage",
+    "self storage",
+    "home depot",
+    "lowe's",
+    "lowes",
+    "menards",
+    "ace hardware",
+)
+
+GARAGE_DOOR_FRANCHISE_DENYLIST = (
+    "precision garage door",
+    "precision door",
+    "a1 garage door service",
+    "overhead door company",
+    "wayne dalton",
+)
+
 
 VERTICAL_PROFILES: Mapping[str, VerticalProfile] = {
     "hardscaping": VerticalProfile(
@@ -190,7 +275,65 @@ VERTICAL_PROFILES: Mapping[str, VerticalProfile] = {
         franchise_denylist=DETAILING_FRANCHISE_DENYLIST,
         exclude_terms=(),
         geo_terms=CLEVELAND_METRO_TERMS,
+        aliases=("car detailing", "auto detailing", "mobile detailing", "detailing", "detailer"),
     ),
+    "water_restoration": VerticalProfile(
+        key="water_restoration",
+        label="Water Restoration",
+        family="water_restoration",
+        batch_terms=WATER_RESTORATION_TERMS,
+        service_terms=WATER_RESTORATION_TERMS,
+        high_ticket_terms=WATER_RESTORATION_TERMS,
+        deny_terms=WATER_RESTORATION_DENY_TERMS,
+        low_ticket_terms=WATER_RESTORATION_DENY_TERMS,
+        franchise_denylist=WATER_RESTORATION_FRANCHISE_DENYLIST,
+        exclude_terms=(),
+        geo_terms=CLEVELAND_METRO_TERMS,
+        aliases=(
+            "water restoration",
+            "water damage restoration",
+            "water damage",
+            "water mitigation",
+            "flood restoration",
+            "flood damage restoration",
+            "flood cleanup",
+            "restoration",
+        ),
+    ),
+    "garage_doors": VerticalProfile(
+        key="garage_doors",
+        label="Garage Doors",
+        family="garage_doors",
+        batch_terms=GARAGE_DOOR_TERMS,
+        service_terms=GARAGE_DOOR_TERMS,
+        high_ticket_terms=GARAGE_DOOR_TERMS,
+        deny_terms=GARAGE_DOOR_DENY_TERMS,
+        low_ticket_terms=GARAGE_DOOR_DENY_TERMS,
+        franchise_denylist=GARAGE_DOOR_FRANCHISE_DENYLIST,
+        exclude_terms=(),
+        geo_terms=CLEVELAND_METRO_TERMS,
+        aliases=(
+            "garage doors",
+            "garage door",
+            "garage door repair",
+            "garage door installation",
+            "garage door service",
+            "overhead doors",
+            "overhead door",
+        ),
+    ),
+}
+
+
+def _clean_vertical_label(value: str) -> str:
+    return " ".join(str(value or "").strip().lower().replace("_", " ").replace("-", " ").split())
+
+
+PROFILE_ALIAS_TO_KEY: Mapping[str, str] = {
+    alias: profile.key
+    for profile in VERTICAL_PROFILES.values()
+    for alias in {_clean_vertical_label(profile.key), _clean_vertical_label(profile.label), *profile.aliases}
+    if alias
 }
 
 
@@ -202,12 +345,12 @@ def resolve_profile(vertical: str, *, source_query: str = "", fallback: str = "h
 
 
 def _normalize_key(value: str) -> str:
-    cleaned = str(value or "").strip().lower().replace("_", " ").replace("-", " ")
-    cleaned = " ".join(cleaned.split())
+    cleaned = _clean_vertical_label(value)
     if not cleaned:
         return ""
-    if cleaned in {"car detailing", "auto detailing", "mobile detailing", "detailing", "detailer"}:
-        return "detailing"
+    resolved = PROFILE_ALIAS_TO_KEY.get(cleaned)
+    if resolved:
+        return resolved
     if any(
         term in cleaned
         for term in (
@@ -233,6 +376,10 @@ def _infer_profile_key(source_query: str) -> str:
         return ""
     if any(term in text for term in DETAILING_TERMS):
         return "detailing"
+    if any(term in text for term in WATER_RESTORATION_TERMS):
+        return "water_restoration"
+    if any(term in text for term in GARAGE_DOOR_TERMS):
+        return "garage_doors"
     if any(term in text for term in HARDSCAPE_BATCH_TERMS + HARDSCAPE_SERVICE_TERMS):
         return "hardscaping"
     return ""

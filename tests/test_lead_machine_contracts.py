@@ -319,6 +319,50 @@ class LeadMachineContractsTest(unittest.TestCase):
                 self.assertEqual(fields["Send Trigger"], f"Internal lane: {lane}")
                 self.assertEqual(fields["Opener"], f"Internal lane: {lane}")
 
+    def test_airtable_payload_omits_unsupported_vertical_select_values(self) -> None:
+        unsupported_card = {
+            "place_id_or_unique_key": "ChIJ123",
+            "airtable_fields": {
+                "Business Name": "Tint Shop",
+                "Vertical": "window tinting",
+                "Phone": "(614) 555-0101",
+            },
+        }
+
+        fields = build_airtable_payload(unsupported_card)["fields"]
+
+        self.assertNotIn("Vertical", fields)
+        self.assertEqual(fields["Business Name"], "Tint Shop")
+
+        for vertical in ("water restoration", "water_restoration"):
+            card = {
+                "place_id_or_unique_key": "ChIJ456",
+                "airtable_fields": {
+                    "Business Name": "Columbus Restoration",
+                    "Vertical": vertical,
+                    "Phone": "(614) 555-0102",
+                },
+            }
+
+            fields = build_airtable_payload(card)["fields"]
+
+            self.assertEqual(fields["Vertical"], "water_restoration")
+
+    def test_airtable_plan_reports_dropped_unsupported_vertical_values(self) -> None:
+        card = {
+            "place_id_or_unique_key": "ChIJ123",
+            "airtable_fields": {
+                "Business Name": "Tint Shop",
+                "Vertical": "window tinting",
+                "Phone": "(614) 555-0101",
+            },
+        }
+
+        planned = plan_airtable_sync([card])
+
+        self.assertEqual(planned[0]["dropped_fields"], [{"field": "Vertical", "value": "window tinting"}])
+        self.assertNotIn("Vertical", planned[0]["payload"]["fields"])
+
     def test_airtable_csv_dry_run_accepts_sparse_scored_row_and_upserts_by_phone(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             csv_path = Path(tmp) / "scored.csv"

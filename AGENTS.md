@@ -45,8 +45,9 @@ Key in-flight facts (2026-06-20):
 - Config/secrets via `.env` (`python-dotenv`); env vars include `GOOGLE_PLACES_API_KEY`, `AIRTABLE_*`,
   and (new) `ANTHROPIC_API_KEY`, `LLM_SCORING_MODEL`, `MAX_LLM_*` caps.
 - HTTP via `requests` (see `places_search.py:170` `request_json`). No new heavy deps without reason.
-- Tests are stdlib `unittest` in `tests/`. Run `python -m unittest` (esp.
-  `tests.test_icp_lanes` + `tests.test_lead_machine_contracts`) after changes to scoring/ICP/enrichment.
+- Tests are stdlib `unittest` in `tests/`. Run `python -m unittest discover -s tests`
+  (bare `python -m unittest` discovers 0 tests here; esp. cover `tests.test_icp_lanes` +
+  `tests.test_lead_machine_contracts`) after changes to scoring/ICP/enrichment.
 - Per-run caps follow the `getenv_int(...)` + `[STOP] Hit MAX_*` pattern in `places_search.py`.
 
 ## Skills

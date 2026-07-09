@@ -5,6 +5,7 @@ import re
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from .schema import GENERIC_DOMAINS, normalize_domain, normalize_phone
+from .verticals import VERTICAL_PROFILES
 
 
 AIRTABLE_ALLOWED_FIELDS = [
@@ -59,6 +60,13 @@ INTEGER_FIELDS = {"Reviews", "Score Total", "Visible Pain Score"}
 FLOAT_FIELDS = {"Rating"}
 AI_CONFIDENCE_FIELD = "AI Confidence"
 AI_CONFIDENCE_LABELS = {"low", "medium", "high"}
+VERTICAL_FIELD = "Vertical"
+IDENTITY_VERTICAL_SELECT_ALIASES = {
+    "epoxy": ("epoxy", "epoxy flooring", "garage floor coating"),
+    "landscaping": ("landscaping", "landscape"),
+    "pressure_washing": ("pressure washing", "pressure_washing"),
+    "roofing": ("roofing", "roof replacement", "roof repair"),
+}
 SITE_STATUS_FIELD = "Site Status"
 SITE_STATUS_LABELS = {
     "missing": "Missing",
@@ -91,7 +99,7 @@ SERVICE_ANGLE_LABELS = {
     "automation/follow-up": "Automation / Follow-Up",
 }
 TYPED_AIRTABLE_FIELDS = (
-    INTEGER_FIELDS | FLOAT_FIELDS | {AI_CONFIDENCE_FIELD, SITE_STATUS_FIELD} | SERVICE_ANGLE_FIELDS
+    INTEGER_FIELDS | FLOAT_FIELDS | {AI_CONFIDENCE_FIELD, VERTICAL_FIELD, SITE_STATUS_FIELD} | SERVICE_ANGLE_FIELDS
 )
 
 
@@ -113,6 +121,49 @@ def _parse_finite_float(value: Any) -> Optional[float]:
     return number
 
 
+def _clean_label(value: Any) -> str:
+    return " ".join(str(value or "").strip().casefold().replace("_", " ").split())
+
+
+def _vertical_label_lookup() -> Dict[str, str]:
+    labels: Dict[str, str] = {}
+    for profile in VERTICAL_PROFILES.values():
+        aliases = {_clean_label(profile.key), _clean_label(profile.label), *profile.aliases}
+        for alias in aliases:
+            cleaned = _clean_label(alias)
+            if cleaned:
+                labels[cleaned] = profile.key
+    for key, aliases in IDENTITY_VERTICAL_SELECT_ALIASES.items():
+        labels[_clean_label(key)] = key
+        for alias in aliases:
+            cleaned = _clean_label(alias)
+            if cleaned:
+                labels[cleaned] = key
+    return labels
+
+
+VERTICAL_LABELS = _vertical_label_lookup()
+
+
+def resolve_vertical_label(value: str) -> str:
+    """Resolve any human phrase or slug to the Airtable Vertical slug.
+
+    Used by the read side (query_ready_to_send.py) so `--vertical "water restoration"`
+    and `--vertical water_restoration` return the same filter. Unlike the write-path
+    lookup in normalize_airtable_value, this never returns empty on an unrecognized
+    niche — it falls back to a slugified guess so a brand-new vertical (one added to
+    VerticalProfile/VERTICAL_LABELS after this was written, or simply not aliased yet)
+    still produces a usable filter value instead of matching nothing silently.
+    """
+    label = _clean_label(value)
+    if not label:
+        return ""
+    resolved = VERTICAL_LABELS.get(label)
+    if resolved:
+        return resolved
+    return label.replace(" ", "_")
+
+
 def normalize_airtable_value(field: str, value: Any) -> Any:
     if field == AI_CONFIDENCE_FIELD:
         label = str(value or "").strip().casefold()
@@ -126,6 +177,9 @@ def normalize_airtable_value(field: str, value: Any) -> Any:
         if number >= 0.55:
             return "medium"
         return "low"
+
+    if field == VERTICAL_FIELD:
+        return VERTICAL_LABELS.get(_clean_label(value))
 
     if field == SITE_STATUS_FIELD:
         label = " ".join(str(value or "").strip().casefold().replace("_", " ").split())
@@ -154,7 +208,7 @@ def _first_non_blank(*values: Any) -> Any:
     return ""
 
 
-def build_airtable_payload(card: Dict[str, Any]) -> Dict[str, Any]:
+def build_airtable_payload_with_drops(card: Dict[str, Any]) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
     fields = dict(card.get("airtable_fields") or {})
     fields["Place Key"] = card.get("place_id_or_unique_key") or fields.get("Place Key", "")
     fields["Lead Priority"] = card.get("grade", fields.get("Lead Priority", ""))
@@ -164,16 +218,22 @@ def build_airtable_payload(card: Dict[str, Any]) -> Dict[str, Any]:
     fields["Opener"] = card.get("opener", fields.get("Opener", ""))
     allowed = set(AIRTABLE_ALLOWED_FIELDS)
     payload_fields: Dict[str, Any] = {}
+    dropped_fields: List[Dict[str, Any]] = []
     for key, value in fields.items():
         if key not in allowed:
             continue
         normalized_value = normalize_airtable_value(key, value)
         if normalized_value in ("", None, [], {}):
+            if key in TYPED_AIRTABLE_FIELDS and value not in ("", None, [], {}):
+                dropped_fields.append({"field": key, "value": value})
             continue
         payload_fields[key] = normalized_value
-    return {
-        "fields": payload_fields
-    }
+    return {"fields": payload_fields}, dropped_fields
+
+
+def build_airtable_payload(card: Dict[str, Any]) -> Dict[str, Any]:
+    payload, _dropped_fields = build_airtable_payload_with_drops(card)
+    return payload
 
 
 def card_place_key(card: Dict[str, Any]) -> str:
@@ -293,7 +353,7 @@ def plan_airtable_sync(
             raise ValueError(f"Duplicate Airtable upsert key in input: {upsert_key}")
         seen_input_keys.add(upsert_key)
         record_id, match_reason, warning = _resolve_existing_record(card, existing, upsert_key, place_key)
-        payload = build_airtable_payload(card)
+        payload, dropped_fields = build_airtable_payload_with_drops(card)
         if warning:
             planned.append(
                 {
@@ -306,6 +366,8 @@ def plan_airtable_sync(
                     "payload": payload,
                 }
             )
+            if dropped_fields:
+                planned[-1]["dropped_fields"] = dropped_fields
             continue
         if record_id:
             fields = payload.get("fields", {})
@@ -320,5 +382,7 @@ def plan_airtable_sync(
         }
         if match_reason:
             item["match_reason"] = match_reason
+        if dropped_fields:
+            item["dropped_fields"] = dropped_fields
         planned.append(item)
     return planned

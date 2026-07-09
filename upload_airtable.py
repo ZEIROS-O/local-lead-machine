@@ -38,7 +38,7 @@ _TIER_MANUAL = "Manual Review Packet"
 _FIELD_SCHEMA: List[tuple[str, str, str]] = [
     ("Business Name",          "Single line text",   ""),
     ("Owner Name",             "Single line text",   ""),
-    ("Vertical",               "Single select",      "e.g. detailing, pressure_washing, landscaping"),
+    ("Vertical",               "Single select",      "Options: detailing, epoxy, garage_doors, hardscaping, landscaping, pressure_washing, roofing, water_restoration"),
     ("City",                   "Single line text",   ""),
     ("Phone",                  "Phone number",       ""),
     ("Email",                  "Email",              ""),
@@ -350,6 +350,11 @@ def csv_row_to_record(row: Dict[str, str], packet_dir: Path) -> Dict[str, Any]:
     fields: Dict[str, Any] = {}
     defaulted_fields: List[str] = []
     for field in CSV_AIRTABLE_FIELDS:
+        if field == "Vertical":
+            value = clean_cell(row.get(field, ""))
+            if value:
+                fields[field] = value
+            continue
         value = coerce_airtable_value(field, row.get(field, ""))
         if value != "":
             fields[field] = value
@@ -571,6 +576,16 @@ def fetch_existing_records(base_id: str, table: str, token: str) -> Dict[str, An
 
 def print_plan_diagnostics(planned: Iterable[Dict[str, Any]]) -> None:
     for item in planned:
+        dropped_fields = item.get("dropped_fields") or []
+        if dropped_fields:
+            dropped = ", ".join(
+                f"{field.get('field')}={field.get('value')!r}"
+                for field in dropped_fields
+            )
+            print(
+                f"[WARN] Dropped unsupported Airtable field values for {item.get('upsert_key')}: {dropped}",
+                file=sys.stderr,
+            )
         warning = item.get("warning")
         if warning:
             print(f"[WARN] {warning}", file=sys.stderr)
