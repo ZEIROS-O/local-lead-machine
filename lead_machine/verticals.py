@@ -335,14 +335,14 @@ VERTICAL_PROFILES: Mapping[str, VerticalProfile] = {
 }
 
 
-def _clean_vertical_label(value: str) -> str:
+def clean_vertical_label(value: str) -> str:
     return " ".join(str(value or "").strip().lower().replace("_", " ").replace("-", " ").split())
 
 
 PROFILE_ALIAS_TO_KEY: Mapping[str, str] = {
     alias: profile.key
     for profile in VERTICAL_PROFILES.values()
-    for alias in {_clean_vertical_label(profile.key), _clean_vertical_label(profile.label), *profile.aliases}
+    for alias in {clean_vertical_label(profile.key), clean_vertical_label(profile.label), *profile.aliases}
     if alias
 }
 
@@ -355,7 +355,7 @@ def resolve_profile(vertical: str, *, source_query: str = "", fallback: str = "h
 
 
 def _normalize_key(value: str) -> str:
-    cleaned = _clean_vertical_label(value)
+    cleaned = clean_vertical_label(value)
     if not cleaned:
         return ""
     resolved = PROFILE_ALIAS_TO_KEY.get(cleaned)

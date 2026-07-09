@@ -285,7 +285,7 @@ def merge_manual_score(
 
     packet_eligible = "Yes" if validated["grade"] in {"A", "B"} else ""
     buyer_intent_signals = buyer_intent_summary(enriched)
-    demand_band = review_demand_band(enriched)
+    demand_band = review_demand_band(enriched, vertical=lead.vertical)
     row = {
         "Business Name": lead.business_name,
         "Owner Name": "",

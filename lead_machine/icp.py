@@ -62,7 +62,8 @@ def hard_icp_gate(lead: CanonicalLead, *, enforce_target_geo: bool = False) -> G
         reasons.append("too_few_reviews")
 
     if (
-        profile.max_reviews is not None
+        lead.website
+        and profile.max_reviews is not None
         and lead.google_review_count is not None
         and lead.google_review_count > profile.max_reviews
     ):

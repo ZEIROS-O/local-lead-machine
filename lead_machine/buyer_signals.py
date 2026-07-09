@@ -217,8 +217,16 @@ def _record_text(record: Dict[str, Any]) -> str:
     return " ".join(str(part or "") for part in parts)
 
 
-def review_demand_band(record: Dict[str, Any]) -> str:
-    return str(_review_profile(record).get("demand_band") or "thin")
+def review_demand_band(record: Dict[str, Any], *, vertical: str = "") -> str:
+    working = record
+    if vertical:
+        google = record.get("google", {}) if isinstance(record.get("google"), dict) else {}
+        if not google.get("vertical"):
+            working = dict(record)
+            google = dict(google)
+            google["vertical"] = vertical
+            working["google"] = google
+    return str(_review_profile(working).get("demand_band") or "thin")
 
 
 def _review_profile(record: Dict[str, Any]) -> Dict[str, Any]:

@@ -1027,6 +1027,70 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertTrue(detailing_gate.should_skip)
         self.assertIn("high_review_count", detailing_gate.reasons)
 
+    def test_hard_icp_gate_keeps_no_site_lead_over_max_reviews(self) -> None:
+        mature_no_site = normalize_lead(
+            {
+                "business_name": "No Site Ceramic Coating",
+                "city": "Cleveland",
+                "rating": "4.9",
+                "reviews": "200",
+                "website_url": "",
+            },
+            fallback_vertical="detailing",
+            source_batch="round1",
+        )
+
+        gate = hard_icp_gate(mature_no_site)
+
+        self.assertFalse(gate.should_skip)
+        self.assertNotIn("high_review_count", gate.reasons)
+
+    def test_airtable_vertical_select_accepts_hyphenated_slugs(self) -> None:
+        from lead_machine.airtable_sync import normalize_airtable_value, resolve_vertical_label
+
+        for value, expected in (
+            ("garage-doors", "garage_doors"),
+            ("water-restoration", "water_restoration"),
+        ):
+            self.assertEqual(normalize_airtable_value("Vertical", value), expected)
+
+        self.assertEqual(resolve_vertical_label("water-restoration"), "water_restoration")
+
+    def test_manual_score_bands_reviews_with_vertical_thresholds(self) -> None:
+        enriched = {
+            "google": {
+                "business_name": "Shine Auto Spa",
+                "city": "Cleveland",
+                "phone": "(216) 555-0100",
+                "website_url": "https://example.com",
+                "rating": "4.8",
+                "reviews": "100",
+                "place_id": "ChIJ999",
+            },
+            "evidence": {
+                "site_status": "okay",
+                "evidence_items": [
+                    {"id": "E1", "field": "google_rating", "value": "4.8 stars / 100 reviews"},
+                ],
+            },
+        }
+        raw_score = self._manual_score(
+            total_score=75,
+            grade="B",
+            evidence_refs=["E1"],
+            safe_outreach_claims=[
+                {"claim": "Your Google profile shows strong reviews.", "evidence_refs": ["E1"]}
+            ],
+        )
+
+        row = merge_manual_score(enriched, raw_score, fallback_vertical="detailing")
+
+        # 100 reviews is ideal_growth under detailing thresholds (15-125) but
+        # established under default thresholds (76+): the manual path must band
+        # with the lead's vertical like the API path does.
+        self.assertEqual(row["Review Demand Band"], "ideal_growth")
+        self.assertEqual(row["Review Fit Band"], "ideal_growth")
+
     def test_evidence_profile_exposes_required_fields_and_evidence_items(self) -> None:
         enriched = {
             "google": {

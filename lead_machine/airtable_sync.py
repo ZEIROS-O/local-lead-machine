@@ -5,7 +5,7 @@ import re
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from .schema import GENERIC_DOMAINS, normalize_domain, normalize_phone
-from .verticals import VERTICAL_PROFILES
+from .verticals import VERTICAL_PROFILES, clean_vertical_label
 
 
 AIRTABLE_ALLOWED_FIELDS = [
@@ -126,17 +126,19 @@ def _clean_label(value: Any) -> str:
 
 
 def _vertical_label_lookup() -> Dict[str, str]:
+    # Keyed with the same cleaner verticals.resolve_profile uses so the write
+    # path and profile resolution never disagree on a spelling.
     labels: Dict[str, str] = {}
     for profile in VERTICAL_PROFILES.values():
-        aliases = {_clean_label(profile.key), _clean_label(profile.label), *profile.aliases}
+        aliases = {clean_vertical_label(profile.key), clean_vertical_label(profile.label), *profile.aliases}
         for alias in aliases:
-            cleaned = _clean_label(alias)
+            cleaned = clean_vertical_label(alias)
             if cleaned:
                 labels[cleaned] = profile.key
     for key, aliases in IDENTITY_VERTICAL_SELECT_ALIASES.items():
-        labels[_clean_label(key)] = key
+        labels[clean_vertical_label(key)] = key
         for alias in aliases:
-            cleaned = _clean_label(alias)
+            cleaned = clean_vertical_label(alias)
             if cleaned:
                 labels[cleaned] = key
     return labels
@@ -155,7 +157,7 @@ def resolve_vertical_label(value: str) -> str:
     VerticalProfile/VERTICAL_LABELS after this was written, or simply not aliased yet)
     still produces a usable filter value instead of matching nothing silently.
     """
-    label = _clean_label(value)
+    label = clean_vertical_label(value)
     if not label:
         return ""
     resolved = VERTICAL_LABELS.get(label)
@@ -179,7 +181,7 @@ def normalize_airtable_value(field: str, value: Any) -> Any:
         return "low"
 
     if field == VERTICAL_FIELD:
-        return VERTICAL_LABELS.get(_clean_label(value))
+        return VERTICAL_LABELS.get(clean_vertical_label(value))
 
     if field == SITE_STATUS_FIELD:
         return SITE_STATUS_LABELS.get(_clean_label(value))

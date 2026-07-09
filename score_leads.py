@@ -1176,12 +1176,7 @@ def deterministic_opener(record: Dict[str, Any], offer_fit: str) -> str:
 
 
 def review_fit_band(record: Dict[str, Any], vertical: str) -> str:
-    working = dict(record)
-    google = dict(working.get("google", {}) or {})
-    if vertical and not google.get("vertical"):
-        google["vertical"] = vertical
-        working["google"] = google
-    return buyer_review_demand_band(working)
+    return buyer_review_demand_band(record, vertical=vertical)
 
 
 def score_record(record: Dict[str, Any], fallback_vertical: str) -> Dict[str, Any]:
