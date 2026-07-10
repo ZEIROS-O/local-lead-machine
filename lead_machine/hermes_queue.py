@@ -58,6 +58,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "queue_overflow_cap": 40,
     "topup_enabled": False,
     "topup_verticals": [],
+    # Fresh searches hit the Places API for real — spend morning_budget_usd does NOT
+    # cover — so the fresh retry always runs at topup_fresh_size, never the vertical's
+    # configured size ("small" = 1 page/query over the smallest geo set).
+    "topup_fresh_enabled": True,
+    "topup_fresh_size": "small",
     "outcomes_jsonl": "",
 }
 
@@ -311,11 +316,18 @@ def cmd_queue_topup(
         verticals = ", ".join(
             f"{e.get('vertical')} {e.get('market')} {e.get('size')}" for e in config.get("topup_verticals") or []
         )
+        if config.get("topup_fresh_enabled", True):
+            fresh_note = (
+                "no existing batch → ONE fresh search at capped size "
+                f"'{validate_size(str(config.get('topup_fresh_size') or 'small'))}'"
+            )
+        else:
+            fresh_note = "no existing batch → stop with outcome no-existing-batch (fresh search disabled)"
         return CommandResult(
             f"repo_root: {root_path}\n"
             f"preview /queue-topup: query pooled sendable; if < {resolved_target}, autopilot ONE vertical "
             f"(lowest sendable of: {verticals or 'none configured'}) with score budget ${resolved_budget:.2f}; "
-            f"writes {outcome_path}. No prospect contact ever."
+            f"{fresh_note}; writes {outcome_path}. No prospect contact ever."
         )
 
     generated_at = _local_now().isoformat()
@@ -357,15 +369,27 @@ def cmd_queue_topup(
     )
     outcome = "failed"
     detail = ""
+    size_used = pick["size"]
     try:
         try:
-            result = cmd_run(pick["vertical"], pick["market"], pick["size"], use_existing=True, **run_kwargs)
+            result: CommandResult | None = cmd_run(
+                pick["vertical"], pick["market"], pick["size"], use_existing=True, **run_kwargs
+            )
         except CommandError as exc:
             if not NO_EXISTING_BATCH_RE.search(str(exc)):
                 raise
-            result = cmd_run(pick["vertical"], pick["market"], pick["size"], fresh=True, **run_kwargs)
-        detail = result.message
-        outcome = _classify_topup_outcome(result.message)
+            if not config.get("topup_fresh_enabled", True):
+                result = None
+                detail = str(exc)
+                outcome = "no-existing-batch"
+            else:
+                # Fresh search is the expensive path (real Places calls, not gated by
+                # morning_budget_usd) — always run it at the capped fresh size.
+                size_used = validate_size(str(config.get("topup_fresh_size") or "small"))
+                result = cmd_run(pick["vertical"], pick["market"], size_used, fresh=True, **run_kwargs)
+        if result is not None:
+            detail = result.message
+            outcome = _classify_topup_outcome(result.message)
     except CommandError as exc:
         detail = str(exc)
         outcome = "failed"
@@ -375,7 +399,7 @@ def cmd_queue_topup(
         "ran": True,
         "vertical": pick["vertical"],
         "market": pick["market"],
-        "size": pick["size"],
+        "size": size_used,
         "batch": _parse_batch(detail),
         "outcome": outcome,
         "detail": detail,

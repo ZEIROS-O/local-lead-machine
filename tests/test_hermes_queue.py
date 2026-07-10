@@ -139,13 +139,13 @@ class QueueTopupTest(unittest.TestCase):
             self.assertEqual(outcome["outcome"], "stopped-over-budget")
             self.assertIn("stopped-over-budget", res.message)
 
-    def test_no_existing_batch_retries_fresh_once(self) -> None:
+    def test_no_existing_batch_retries_fresh_once_at_capped_size(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = make_root(tmp)
-            calls: list[dict] = []
+            calls: list[tuple[tuple, dict]] = []
 
             def fake_run(vertical, market, size, **kwargs):
-                calls.append(kwargs)
+                calls.append(((vertical, market, size), kwargs))
                 if kwargs.get("use_existing"):
                     raise CommandError("No usable existing batch found for epoxy_cleveland_medium_*.")
                 return completed_run()
@@ -153,10 +153,45 @@ class QueueTopupTest(unittest.TestCase):
             with patch.object(hq, "fetch_pooled_records", return_value=[]), patch.object(hq, "cmd_run", fake_run):
                 hq.cmd_queue_topup(execute=True, root=root)
             self.assertEqual(len(calls), 2)
-            self.assertTrue(calls[0].get("use_existing"))
-            self.assertTrue(calls[1].get("fresh"))
+            self.assertTrue(calls[0][1].get("use_existing"))
+            self.assertEqual(calls[0][0][2], "medium")
+            self.assertTrue(calls[1][1].get("fresh"))
+            self.assertEqual(calls[1][0][2], "small")  # fresh always capped, not the vertical's size
             outcome = json.loads(hq.topup_file_path(root, hq._today()).read_text(encoding="utf-8"))
             self.assertEqual(outcome["outcome"], "completed")
+            self.assertEqual(outcome["size"], "small")
+
+    def test_fresh_size_configurable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp, config={"topup_fresh_size": "medium"})
+            calls: list[tuple] = []
+
+            def fake_run(vertical, market, size, **kwargs):
+                calls.append((size, kwargs))
+                if kwargs.get("use_existing"):
+                    raise CommandError("No usable existing batch found.")
+                return completed_run()
+
+            with patch.object(hq, "fetch_pooled_records", return_value=[]), patch.object(hq, "cmd_run", fake_run):
+                hq.cmd_queue_topup(execute=True, root=root)
+            self.assertEqual(calls[1][0], "medium")
+
+    def test_fresh_disabled_records_no_existing_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp, config={"topup_fresh_enabled": False})
+            calls: list[dict] = []
+
+            def fake_run(vertical, market, size, **kwargs):
+                calls.append(kwargs)
+                raise CommandError("No usable existing batch found for epoxy_cleveland_medium_*.")
+
+            with patch.object(hq, "fetch_pooled_records", return_value=[]), patch.object(hq, "cmd_run", fake_run):
+                res = hq.cmd_queue_topup(execute=True, root=root)
+            self.assertEqual(len(calls), 1)  # no fresh retry
+            outcome = json.loads(hq.topup_file_path(root, hq._today()).read_text(encoding="utf-8"))
+            self.assertEqual(outcome["outcome"], "no-existing-batch")
+            self.assertEqual(outcome["spend_usd"], 0.0)
+            self.assertIn("no-existing-batch", res.message)
 
     def test_command_error_recorded_as_failed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
