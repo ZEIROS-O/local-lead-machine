@@ -1725,33 +1725,40 @@ def dispatch(args: argparse.Namespace) -> CommandResult:
         # CommandResult, and cmd_run, so a top-level import would be circular.
         from lead_machine import hermes_queue
 
-        if args.verb == "queue-status":
-            return hermes_queue.cmd_queue_status(execute=args.execute, root=repo_root, python_path=python_path)
-        if args.verb == "queue-topup":
-            return hermes_queue.cmd_queue_topup(
-                budget=args.budget,
-                target=args.target,
-                execute=args.execute,
-                root=repo_root,
-                python_path=python_path,
-            )
-        if args.verb == "morning-queue":
-            return hermes_queue.cmd_morning_queue(
-                target=args.target,
+        # Under `python -m lead_machine.hermes_commands` this file runs as
+        # __main__ while hermes_queue raises the canonical module's
+        # CommandError — a different class object that main()'s except would
+        # miss. Re-raise as the local class so refusals stay [REFUSE].
+        try:
+            if args.verb == "queue-status":
+                return hermes_queue.cmd_queue_status(execute=args.execute, root=repo_root, python_path=python_path)
+            if args.verb == "queue-topup":
+                return hermes_queue.cmd_queue_topup(
+                    budget=args.budget,
+                    target=args.target,
+                    execute=args.execute,
+                    root=repo_root,
+                    python_path=python_path,
+                )
+            if args.verb == "morning-queue":
+                return hermes_queue.cmd_morning_queue(
+                    target=args.target,
+                    date=args.date,
+                    execute=args.execute,
+                    root=repo_root,
+                    python_path=python_path,
+                )
+            return hermes_queue.cmd_mark_sent(
+                args.items,
+                channel=args.channel,
                 date=args.date,
+                dry_run=args.dry_run,
                 execute=args.execute,
                 root=repo_root,
                 python_path=python_path,
             )
-        return hermes_queue.cmd_mark_sent(
-            args.items,
-            channel=args.channel,
-            date=args.date,
-            dry_run=args.dry_run,
-            execute=args.execute,
-            root=repo_root,
-            python_path=python_path,
-        )
+        except hermes_queue.CommandError as exc:
+            raise CommandError(str(exc)) from exc
     if args.verb == "help":
         return cmd_help()
     if args.verb in {"yes", "no"}:

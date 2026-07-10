@@ -386,6 +386,27 @@ class ParserDispatchTest(unittest.TestCase):
         self.assertIsNotNone(route)
         self.assertIn("--execute", route.argv)
 
+    def test_refusal_prints_refuse_under_python_dash_m(self) -> None:
+        # Regression: under `python -m lead_machine.hermes_commands` the module
+        # runs as __main__ while hermes_queue raises the canonical module's
+        # CommandError; without the dispatch re-raise this escaped as a
+        # traceback instead of [REFUSE].
+        import sys as _sys
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp)
+            result = subprocess.run(
+                [_sys.executable, "-m", "lead_machine.hermes_commands", "mark-sent", "1", "--execute"],
+                cwd=Path(__file__).resolve().parent.parent,
+                env={**__import__("os").environ, "LOCAL_LEAD_MACHINE_ROOT": str(root)},
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        self.assertEqual(result.returncode, 2, msg=result.stderr)
+        self.assertIn("[REFUSE]", result.stdout)
+        self.assertNotIn("Traceback", result.stderr)
+
     def test_help_mentions_queue_verbs(self) -> None:
         from lead_machine import hermes_commands as hc
 
