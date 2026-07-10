@@ -622,15 +622,19 @@ def cmd_mark_sent(
         item["sent_at"] = sent_at
         item["sent_channel"] = channel_label
         changed = True
+        # Row shape follows the SKILLS/send-queue log-step contract so
+        # outreach Loop D can join feedback on record_id.
         outcome_note = _append_outcome_row(
             config,
             {
-                "type": "send",
                 "record_id": record_id,
-                "business": item.get("business") or "",
+                "business": "lpm",
                 "vertical": item.get("vertical") or "",
+                "contact": item.get("business") or "",
                 "channel": channel_label,
                 "date": str(data.get("date") or _today()),
+                "event": "sent",
+                "result": None,
                 "sent_at": sent_at,
                 "source": "hermes mark-sent",
             },
