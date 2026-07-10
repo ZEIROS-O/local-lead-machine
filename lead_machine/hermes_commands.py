@@ -1485,7 +1485,12 @@ def cmd_help() -> CommandResult:
             "/sync-dry <batch> [--include-manual] - Airtable dry-run\n"
             "/sync-live <batch> [--include-manual] - live only after clean dry-run\n"
             "/status <batch> - local status\n"
-            "/confirm - deprecated/refusal-only"
+            "/confirm - deprecated/refusal-only\n"
+            "Morning queue:\n"
+            "/queue-status - pooled sendable counts (read-only)\n"
+            "/queue-topup [--budget USD] [--target N] - top up ONE deficit vertical under budget\n"
+            "/morning-queue [--target N] [--date YYYY-MM-DD] - write the canonical queue file\n"
+            "/mark-sent <numbers|rec ids> [--channel sms] [--date YYYY-MM-DD] [--dry-run] - record Lou's sends"
         )
     )
 
@@ -1565,6 +1570,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--medium", default="")
     p.add_argument("--full", default="")
     p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--execute", action="store_true")
+
+    p = sub.add_parser("queue-status", parents=[runtime])
+    p.add_argument("--execute", action="store_true")
+
+    p = sub.add_parser("queue-topup", parents=[runtime])
+    p.add_argument("--budget", type=float, default=None)
+    p.add_argument("--target", type=int, default=None)
+    p.add_argument("--execute", action="store_true")
+
+    p = sub.add_parser("morning-queue", parents=[runtime])
+    p.add_argument("--target", type=int, default=None)
+    p.add_argument("--date", default="")
+    p.add_argument("--execute", action="store_true")
+
+    p = sub.add_parser("mark-sent", parents=[runtime])
+    p.add_argument("items", nargs="+")
+    p.add_argument("--channel", default="sms")
+    p.add_argument("--date", default="")
+    p.add_argument("--dry-run", action="store_true")
     p.add_argument("--execute", action="store_true")
 
     p = sub.add_parser("help", parents=[runtime])
@@ -1695,6 +1720,38 @@ def dispatch(args: argparse.Namespace) -> CommandResult:
         return cmd_create_vertical(args.slug, display=args.display, airtable=args.airtable, terms=args.terms, overwrite=args.overwrite, execute=args.execute)
     if args.verb == "create-market":
         return cmd_create_market(args.slug, display=args.display, state=args.state, small=args.small, medium=args.medium, full=args.full, overwrite=args.overwrite, execute=args.execute)
+    if args.verb in {"queue-status", "queue-topup", "morning-queue", "mark-sent"}:
+        # Imported lazily: hermes_queue imports this module for CommandError,
+        # CommandResult, and cmd_run, so a top-level import would be circular.
+        from lead_machine import hermes_queue
+
+        if args.verb == "queue-status":
+            return hermes_queue.cmd_queue_status(execute=args.execute, root=repo_root, python_path=python_path)
+        if args.verb == "queue-topup":
+            return hermes_queue.cmd_queue_topup(
+                budget=args.budget,
+                target=args.target,
+                execute=args.execute,
+                root=repo_root,
+                python_path=python_path,
+            )
+        if args.verb == "morning-queue":
+            return hermes_queue.cmd_morning_queue(
+                target=args.target,
+                date=args.date,
+                execute=args.execute,
+                root=repo_root,
+                python_path=python_path,
+            )
+        return hermes_queue.cmd_mark_sent(
+            args.items,
+            channel=args.channel,
+            date=args.date,
+            dry_run=args.dry_run,
+            execute=args.execute,
+            root=repo_root,
+            python_path=python_path,
+        )
     if args.verb == "help":
         return cmd_help()
     if args.verb in {"yes", "no"}:
@@ -1735,6 +1792,10 @@ TELEGRAM_HERMES_COMMANDS = {
     "sync-live",
     "pipeline",
     "auto-run",
+    "queue-status",
+    "queue-topup",
+    "morning-queue",
+    "mark-sent",
 }
 TELEGRAM_APPROVAL_REPLIES = {"yes", "no"}
 TELEGRAM_HERMES_WORKTREE = Path("~/local-lead-machine-hermes").expanduser()
