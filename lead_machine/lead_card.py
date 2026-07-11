@@ -35,6 +35,7 @@ AIRTABLE_CARD_FIELDS = [
     "Send Trigger",
     "Money Signal",
     "Buyer Intent Signals",
+    "Review Demand Band",
     "Evidence Notes",
     "AI Confidence",
     "Skip Reason",
