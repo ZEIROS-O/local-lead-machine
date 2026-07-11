@@ -36,6 +36,10 @@ packets/
 lead_packets/
 packets_*/
 
+# Local runtime state (queue history, manual lead inbox) — never commit lead contents
+run_state/
+manual_leads/
+
 # Local lead/prospect data dumps
 data/
 *.csv
