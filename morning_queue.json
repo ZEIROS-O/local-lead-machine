@@ -1,0 +1,15 @@
+{
+  "target_queue_size": 30,
+  "morning_budget_usd": 1.00,
+  "queue_overflow_cap": 40,
+  "topup_enabled": false,
+  "topup_fresh_enabled": true,
+  "topup_fresh_size": "small",
+  "topup_verticals": [
+    {"vertical": "water_restoration", "market": "cleveland", "size": "medium"},
+    {"vertical": "garage_doors", "market": "columbus", "size": "medium"},
+    {"vertical": "epoxy", "market": "cleveland", "size": "medium"},
+    {"vertical": "detailing", "market": "cleveland", "size": "medium"}
+  ],
+  "outcomes_jsonl": "/home/lucascoh/operator-agent/STATE/outcomes.jsonl"
+}
