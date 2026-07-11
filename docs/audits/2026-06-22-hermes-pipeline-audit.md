@@ -1,5 +1,10 @@
 # Hermes/Telegram-safe Pipeline Audit
 
+> **Stale snapshot — historical record only (banner added 2026-07-11).** Point-in-time audit of
+> `phase-a-g1-api-llm` at 186 tests. Its P0/P1 findings (csv field-size-limit crashes, Airtable
+> tier/email gaps) were fixed on the Phase A line the following week; the suite is now 256 tests.
+> Do not act on findings below without re-verifying against current code.
+
 **Date:** 2026-06-22
 **Branch audited:** phase-a-g1-api-llm
 **Scope:** read-only audit of the Hermes/Telegram lead pipeline (`/run detailing cleveland medium`) against the desired end state. No files modified.

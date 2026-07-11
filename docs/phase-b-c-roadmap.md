@@ -1,5 +1,15 @@
 # Local Lead Machine — Phase B & C Roadmap
 
+> **Status note (2026-07-11, reconciliation):** this doc was drafted when Phase A was declared
+> complete on 2026-06-20. Since then the Phase A line continued hardening through 2026-07-09
+> (scoring batches 1–8, ICP lane recalibration, Places pagination, manual-score merging; suite is
+> 256 tests). Live lanes are now **detailing / epoxy (Cleveland), garage doors (Columbus), water
+> restoration (Cleveland)** — not detailing-only as stated below. A manual morning send-queue layer
+> (`query_ready_to_send.py`, `mark_sent.py`, `morning_queue.json`, Hermes queue verbs) now exists;
+> it anticipates B4's approval-queue concept but **sends nothing** — Gate 0 is unchanged and still
+> governs. Treat Phase B/C content below as the build order; treat Phase A status claims as
+> superseded by [phase-a-backlog.md](phase-a-backlog.md) and the git log.
+
 ## Context
 
 Phase A (G1–G4) is **fully complete** as of 2026-06-20. The pipeline runs without manual steps:
