@@ -250,14 +250,72 @@ class MorningQueueTest(unittest.TestCase):
             today = hq._today()
             hq.queue_file_path(root, today).write_text('{"manual_rehearsal": true}', encoding="utf-8")
             hq.topup_file_path(root, today).write_text(
-                json.dumps({"ran": True, "outcome": "completed", "spend_usd": 0.3}), encoding="utf-8"
+                json.dumps(
+                    {
+                        "date": today,
+                        "generated_at": "2026-07-09T06:30:00-04:00",
+                        "target": 5,
+                        "budget_usd": 2.0,
+                        "ran": True,
+                        "outcome": "completed",
+                        "vertical": "epoxy",
+                        "market": "cleveland",
+                        "size": "small",
+                        "detail": "Live sync complete",
+                        "spend_usd": 0.3,
+                    }
+                ),
+                encoding="utf-8",
             )
             with patch.object(hq, "fetch_pooled_records", return_value=[make_record(1)]):
                 res = hq.cmd_morning_queue(execute=True, root=root)
             data = json.loads(hq.queue_file_path(root, today).read_text(encoding="utf-8"))
             self.assertNotIn("manual_rehearsal", data)
             self.assertEqual(data["topup"]["outcome"], "completed")
-            self.assertIn("top-up: completed", res.message)
+            self.assertIn("outcome: completed", res.message)
+
+    def test_missing_topup_report_emits_exact_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp, config={"topup_enabled": False})
+            with patch.object(hq, "fetch_pooled_records", return_value=[make_record(1)]):
+                res = hq.cmd_morning_queue(execute=True, root=root)
+            data = json.loads(hq.queue_file_path(root, hq._today()).read_text(encoding="utf-8"))
+            self.assertEqual(data["topup_report"]["status"], "missing")
+            self.assertFalse(data["topup_report"]["produced"])
+            self.assertEqual(data["topup_report"]["message"], hq.TOPUP_REPORT_MISSING)
+            self.assertIn(hq.TOPUP_REPORT_MISSING, res.message)
+
+    def test_malformed_topup_report_emits_exact_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp, config={"topup_enabled": False})
+            hq.topup_file_path(root, hq._today()).write_text("{bad json", encoding="utf-8")
+            with patch.object(hq, "fetch_pooled_records", return_value=[make_record(1)]):
+                hq.cmd_morning_queue(execute=True, root=root)
+            data = json.loads(hq.queue_file_path(root, hq._today()).read_text(encoding="utf-8"))
+            self.assertEqual(data["topup_report"]["message"], hq.TOPUP_REPORT_MISSING)
+
+    def test_disabled_topup_report_is_present_and_zero_spend(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp, config={"topup_enabled": False})
+            hq.cmd_queue_topup(execute=True, root=root)
+            with patch.object(hq, "fetch_pooled_records", return_value=[make_record(1)]):
+                res = hq.cmd_morning_queue(execute=True, root=root)
+            data = json.loads(hq.queue_file_path(root, hq._today()).read_text(encoding="utf-8"))
+            self.assertEqual(data["topup_report"]["status"], "present")
+            self.assertTrue(data["topup_report"]["produced"])
+            self.assertIn("topup disabled in config", data["topup_report"]["message"])
+            self.assertIn("spend: $0.00", res.message)
+
+    def test_v1b_target_met_report_is_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp, config={"topup_enabled": True})
+            records = [make_record(i) for i in range(6)]
+            with patch.object(hq, "fetch_pooled_records", return_value=records):
+                hq.cmd_queue_topup(execute=True, root=root)
+                hq.cmd_morning_queue(execute=True, root=root)
+            data = json.loads(hq.queue_file_path(root, hq._today()).read_text(encoding="utf-8"))
+            self.assertEqual(data["topup_report"]["status"], "present")
+            self.assertIn("reason: target met", data["topup_report"]["message"])
 
     def test_degraded_write_on_airtable_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

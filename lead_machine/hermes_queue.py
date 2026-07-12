@@ -51,6 +51,9 @@ CONFIG_FILENAME = "morning_queue.json"
 QUERY_TIMEOUT_SECONDS = 120
 MARK_SENT_TIMEOUT_SECONDS = 60
 TOPUP_TIMEOUT_MINUTES = 60
+TOPUP_REPORT_MISSING = (
+    "TOP-UP REPORT MISSING — the 06:30 job did not prove execution; existing pool only."
+)
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "target_queue_size": 30,
@@ -446,6 +449,82 @@ def _load_topup_telemetry(root: Path, date: str) -> dict[str, Any] | None:
     return loaded if isinstance(loaded, dict) else None
 
 
+def _topup_report(
+    telemetry: dict[str, Any] | None,
+    *,
+    queue_date: str,
+    topup_enabled: bool,
+) -> dict[str, Any]:
+    """Classify today's 06:30 telemetry before the digest agent sees it.
+
+    Missing, malformed, stale, or stage-invalid telemetry intentionally collapse
+    to one fail-closed warning. A present report is evidence of execution only;
+    it is never permission to replenish.
+    """
+    stage = "v1b" if topup_enabled else "v1a"
+    missing = {
+        "status": "missing",
+        "stage": stage,
+        "produced": False,
+        "message": TOPUP_REPORT_MISSING,
+    }
+    if not isinstance(telemetry, dict):
+        return missing
+    if telemetry.get("date") != queue_date:
+        return missing
+    if not isinstance(telemetry.get("generated_at"), str) or not telemetry["generated_at"].strip():
+        return missing
+    if type(telemetry.get("ran")) is not bool:
+        return missing
+    if type(telemetry.get("target")) is not int or telemetry["target"] <= 0:
+        return missing
+    budget = telemetry.get("budget_usd")
+    if isinstance(budget, bool) or not isinstance(budget, (int, float)) or budget < 0:
+        return missing
+
+    if not topup_enabled:
+        if telemetry["ran"] is not False or telemetry.get("reason") != "topup disabled in config":
+            return missing
+        return {
+            "status": "present",
+            "stage": stage,
+            "produced": True,
+            "message": "06:30 top-up telemetry present — ran: false; reason: topup disabled in config; spend: $0.00.",
+        }
+
+    if telemetry["ran"] is False:
+        if telemetry.get("reason") != "target met":
+            return missing
+        pooled = telemetry.get("pooled_sendable_before")
+        if type(pooled) is not int or pooled < telemetry["target"]:
+            return missing
+        return {
+            "status": "present",
+            "stage": stage,
+            "produced": True,
+            "message": "06:30 top-up telemetry present — ran: false; reason: target met; spend: $0.00.",
+        }
+
+    required_run_fields = ("outcome", "vertical", "market", "size", "detail", "spend_usd")
+    if any(field not in telemetry for field in required_run_fields):
+        return missing
+    spend = telemetry.get("spend_usd")
+    if isinstance(spend, bool) or not isinstance(spend, (int, float)) or spend < 0:
+        return missing
+    if any(not str(telemetry.get(field) or "").strip() for field in required_run_fields[:-1]):
+        return missing
+    return {
+        "status": "present",
+        "stage": stage,
+        "produced": True,
+        "message": (
+            "06:30 top-up telemetry present — "
+            f"ran: true; outcome: {telemetry['outcome']}; vertical: {telemetry['vertical']}; "
+            f"size: {telemetry['size']}; spend: ${float(spend):.2f}."
+        ),
+    }
+
+
 def cmd_morning_queue(
     *,
     target: int | None = None,
@@ -470,6 +549,12 @@ def cmd_morning_queue(
             f"{overflow_cap} -> atomic-write {path} (overwrites any manual file for {queue_date})."
         )
 
+    topup = _load_topup_telemetry(root_path, queue_date)
+    topup_report = _topup_report(
+        topup,
+        queue_date=queue_date,
+        topup_enabled=bool(config.get("topup_enabled")),
+    )
     payload: dict[str, Any] = {
         "schema_version": QUEUE_SCHEMA_VERSION,
         "date": queue_date,
@@ -477,7 +562,8 @@ def cmd_morning_queue(
         "target": resolved_target,
         "pooled_sendable": 0,
         "per_vertical": {},
-        "topup": _load_topup_telemetry(root_path, queue_date),
+        "topup": topup,
+        "topup_report": topup_report,
         "error": None,
         "items": [],
     }
@@ -496,12 +582,11 @@ def cmd_morning_queue(
     payload["per_vertical"] = per_vertical_counts(records)
     payload["items"] = _build_queue_items(records, target=resolved_target, overflow_cap=overflow_cap)
     _atomic_write_json(path, payload)
-    topup = payload["topup"] or {}
-    topup_text = topup.get("outcome") or topup.get("reason") or "no top-up telemetry"
     return CommandResult(
         f"morning-queue written: {path}\n"
         f"pooled {payload['pooled_sendable']}; queued {len(payload['items'])} "
-        f"(target {resolved_target}, cap {overflow_cap}); top-up: {topup_text}."
+        f"(target {resolved_target}, cap {overflow_cap}).\n"
+        f"top-up report: {topup_report['message']}"
     )
 
 
