@@ -5,12 +5,20 @@ import re
 from typing import Any, Dict, Iterable, List, Sequence, Set
 
 from .buyer_signals import buyer_intent_summary, has_money_signal as buyer_has_money_signal, review_demand_band
+from .score_schema import (
+    ASSET_STATES,
+    COMMERCIAL_FIT_STATES,
+    CONTACT_ELIGIBILITY_STATES,
+    PROMISE_STATES,
+)
 
 
 MIN_SENDABLE_SCORE = 65
 MIN_SENDABLE_CONFIDENCE = 0.75
 
 SCORE_BLOCKER = "Score below B threshold"
+GRADE_BLOCKER = "Lead grade below sendable threshold"
+HARD_DISQUALIFIER_BLOCKER = "Hard disqualifier present"
 CONVERSION_ISSUE_BLOCKER = "Missing concrete conversion issue"
 SEND_TRIGGER_BLOCKER = "Missing concrete send trigger"
 DEMAND_BLOCKER = "Missing proof-of-demand signal"
@@ -29,8 +37,11 @@ CONFIDENCE_BLOCKER = "Low confidence"
 NO_SAFE_CLAIM_BLOCKER = "No safe outreach claim"
 SAFE_CLAIM_REF_BLOCKER = "Safe outreach claim missing evidence reference"
 INVALID_REF_BLOCKER = "Invalid evidence reference"
+COMMERCIAL_FIT_BLOCKER = "Commercial fit gate failed"
+CONTACT_ELIGIBILITY_BLOCKER = "Contact eligibility is not contact-now"
 
 EVIDENCE_BLOCKERS = {
+    HARD_DISQUALIFIER_BLOCKER,
     CONVERSION_ISSUE_BLOCKER,
     SEND_TRIGGER_BLOCKER,
     VISIBLE_PAIN_BLOCKER,
@@ -44,8 +55,20 @@ EVIDENCE_BLOCKERS = {
     NO_SAFE_CLAIM_BLOCKER,
     SAFE_CLAIM_REF_BLOCKER,
     INVALID_REF_BLOCKER,
+    COMMERCIAL_FIT_BLOCKER,
 }
 
+COMMERCIAL_DIMENSION_FIELDS = {
+    "commercial_materiality": ("Commercial Materiality", "commercial_materiality"),
+    "recurring_consequence": ("Recurring Consequence", "recurring_consequence"),
+    "root_cause_confidence": ("Root Cause Confidence", "root_cause_confidence"),
+    "offer_component": ("LPM Offer Component", "offer_component"),
+    "packageable_solution": ("Packageable Solution", "packageable_solution"),
+    "value_mechanism": ("Value Mechanism", "value_mechanism"),
+    "beyond_free_fix": ("Beyond Free Fix", "beyond_free_fix"),
+    "self_fix_risk": ("Self Fix Risk", "self_fix_risk"),
+    "intentionality": ("Intentionality", "intentionality"),
+}
 CONFIDENCE_VALUES = {
     "high": 1.0,
     "medium": 0.75,
@@ -335,9 +358,24 @@ def evaluate_sendability(row: Dict[str, Any]) -> Dict[str, Any]:
     evidence_refs = normalize_evidence_refs(row)
     safe_claims = normalize_safe_outreach_claims(row)
     known_refs = known_evidence_ids(row)
+    commercial_fit = evaluate_commercial_fit(row)
 
     if total_score < MIN_SENDABLE_SCORE:
         blockers.append(SCORE_BLOCKER)
+
+    grade = _pick(row, "Lead Priority", "grade", "Grade").strip().upper()
+    if grade not in {"A", "B"}:
+        blockers.append(GRADE_BLOCKER)
+
+    if has_hard_disqualifier(row):
+        blockers.append(HARD_DISQUALIFIER_BLOCKER)
+
+    if commercial_fit["commercial_fit_state"] != "commercially-sendable":
+        blockers.append(f"{COMMERCIAL_FIT_BLOCKER}: {commercial_fit['commercial_fit_state']}")
+    if commercial_fit["contact_eligibility"] != "contact-now":
+        blockers.append(CONTACT_ELIGIBILITY_BLOCKER)
+    if commercial_fit["state_errors"]:
+        blockers.extend(f"{COMMERCIAL_FIT_BLOCKER}: {error}" for error in commercial_fit["state_errors"])
 
     concrete_issue = has_concrete_conversion_issue(row)
     strong_estimate_form = has_strong_estimate_form(row)
@@ -407,7 +445,10 @@ def evaluate_sendability(row: Dict[str, Any]) -> Dict[str, Any]:
     if has_invalid_refs(evidence_refs, safe_claims, known_refs):
         blockers.append(INVALID_REF_BLOCKER)
 
-    minimum_evidence_passed = not any(blocker in EVIDENCE_BLOCKERS for blocker in blockers)
+    minimum_evidence_passed = not any(
+        blocker in EVIDENCE_BLOCKERS or blocker.startswith(f"{COMMERCIAL_FIT_BLOCKER}:")
+        for blocker in blockers
+    )
 
     return {
         "sendable": not blockers,
@@ -422,7 +463,75 @@ def evaluate_sendability(row: Dict[str, Any]) -> Dict[str, Any]:
         "visible_pain_reasons": visible_pain_reasons,
         "money_signal": money_signal,
         "buyer_intent_signals": buyer_intent_summary(row),
+        **commercial_fit,
     }
+
+
+def evaluate_commercial_fit(row: Dict[str, Any]) -> Dict[str, Any]:
+    raw_state = _pick(row, "Commercial Fit State", "commercial_fit_state").strip().lower()
+    state = raw_state if raw_state in COMMERCIAL_FIT_STATES else "unverified"
+    dimensions = {
+        name: _pick(row, *fields).strip()
+        for name, fields in COMMERCIAL_DIMENSION_FIELDS.items()
+    }
+    state_errors: List[str] = []
+    if raw_state not in COMMERCIAL_FIT_STATES:
+        state_errors.append(f"invalid commercial_fit_state {raw_state or '<missing>'}")
+    if state == "commercially-sendable":
+        missing = [name for name, value in dimensions.items() if not value]
+        if missing:
+            state = "unverified"
+            state_errors.append("missing dimensions " + ",".join(missing))
+
+    raw_contact = _pick(row, "Contact Eligibility", "contact_eligibility").strip().lower()
+    raw_asset = _pick(row, "Asset State", "asset_state").strip().lower()
+    raw_promise = _pick(row, "Promise State", "promise_state").strip().lower()
+    contact = raw_contact if raw_contact in CONTACT_ELIGIBILITY_STATES else "hold-commercial-case"
+    asset = raw_asset if raw_asset in ASSET_STATES else "none"
+    promise = raw_promise if raw_promise in PROMISE_STATES else "asset-free"
+    if raw_contact not in CONTACT_ELIGIBILITY_STATES:
+        state_errors.append(f"invalid contact_eligibility {raw_contact or '<missing>'}; held")
+    if raw_asset not in ASSET_STATES:
+        state_errors.append(f"invalid asset_state {raw_asset or '<missing>'}")
+    if raw_promise not in PROMISE_STATES:
+        state_errors.append(f"invalid promise_state {raw_promise or '<missing>'}")
+    if contact == "contact-now" and state != "commercially-sendable":
+        state_errors.append("contact-now requires commercially-sendable")
+    asset_id = _pick(row, "Asset ID", "asset_id").strip()
+    asset_verifier_verdict = _pick(row, "Asset Verifier Verdict", "asset_verifier_verdict").strip()
+    if asset == "verified-existing" and (not asset_id or asset_verifier_verdict != "PASS"):
+        state_errors.append("verified-existing asset lacks a PASS artifact receipt")
+    if promise == "existing-verified-asset":
+        if asset != "verified-existing":
+            state_errors.append("existing asset promise conflicts with asset_state")
+        if not asset_id or asset_verifier_verdict != "PASS":
+            state_errors.append("existing asset promise lacks a PASS artifact receipt")
+    if contact == "contact-after-asset" and asset == "verified-existing":
+        state_errors.append("contact-after-asset conflicts with verified-existing asset")
+    return {
+        "commercial_fit_state": state,
+        "commercial_dimensions": dimensions,
+        "contact_eligibility": contact,
+        "asset_state": asset,
+        "promise_state": promise,
+        "asset_id": asset_id,
+        "asset_verifier_verdict": asset_verifier_verdict,
+        "state_errors": state_errors,
+    }
+
+
+def has_hard_disqualifier(row: Dict[str, Any]) -> bool:
+    for key in ("hard_disqualifiers", "Hard Disqualifiers", "Skip Reason"):
+        value = _loads_json_if_possible(row.get(key))
+        if value in ("", None, [], {}):
+            continue
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            if any(str(item).strip() for item in value):
+                return True
+            continue
+        if str(value).strip():
+            return True
+    return False
 
 
 def manual_review_issue_indicators(row: Dict[str, Any]) -> List[str]:
@@ -533,6 +642,20 @@ def apply_sendability(row: Dict[str, Any]) -> Dict[str, Any]:
     updated["money_signal"] = updated["Money Signal"]
     updated["Buyer Intent Signals"] = result["buyer_intent_signals"]
     updated["buyer_intent_signals"] = result["buyer_intent_signals"]
+    updated["Commercial Fit State"] = result["commercial_fit_state"]
+    updated["commercial_fit_state"] = result["commercial_fit_state"]
+    for name, value in result["commercial_dimensions"].items():
+        updated[name] = value
+    updated["Contact Eligibility"] = result["contact_eligibility"]
+    updated["contact_eligibility"] = result["contact_eligibility"]
+    updated["Asset State"] = result["asset_state"]
+    updated["asset_state"] = result["asset_state"]
+    updated["Promise State"] = result["promise_state"]
+    updated["promise_state"] = result["promise_state"]
+    updated["Asset ID"] = result["asset_id"]
+    updated["asset_id"] = result["asset_id"]
+    updated["Asset Verifier Verdict"] = result["asset_verifier_verdict"]
+    updated["asset_verifier_verdict"] = result["asset_verifier_verdict"]
 
     tier, review_reason = evaluate_packet_tier(updated, result)
     updated["Packet Tier"] = tier

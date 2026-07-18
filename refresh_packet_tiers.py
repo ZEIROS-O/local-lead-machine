@@ -10,6 +10,8 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Iterable
 
+from lead_machine.commercial_backfill import COMMERCIAL_FIELD_ALIASES, backfill_legacy_commercial_fit
+from lead_machine.score_schema import SCORE_SCHEMA_VERSION
 from lead_machine.sendability import apply_sendability
 
 
@@ -19,6 +21,35 @@ PACKET_FIELDS = [
     "Packet Eligible",
     "Packet Eligibility Reason",
 ]
+
+SCHEMA_FIELDS = [
+    "Score Schema Version",
+    "score_schema_version",
+    "Commercial Fit Source",
+    "commercial_fit_source",
+]
+COMMERCIAL_FIELDS = [
+    "Commercial Fit State",
+    "commercial_fit_state",
+    *[field for pair in ((title, key) for key, title in COMMERCIAL_FIELD_ALIASES.items()) for field in pair],
+    "Contact Eligibility",
+    "contact_eligibility",
+    "Asset State",
+    "asset_state",
+    "Promise State",
+    "promise_state",
+    "Asset ID",
+    "asset_id",
+    "Asset Verifier Verdict",
+    "asset_verifier_verdict",
+]
+SENDABILITY_FIELDS = [
+    "Sendable",
+    "Minimum Evidence Passed",
+    "Send Blockers",
+    "Sendability Blockers",
+]
+REFRESH_FIELDS = [*SCHEMA_FIELDS, *COMMERCIAL_FIELDS, *SENDABILITY_FIELDS, *PACKET_FIELDS]
 
 
 def raise_csv_limit() -> None:
@@ -30,16 +61,18 @@ def raise_csv_limit() -> None:
 
 def output_fieldnames(existing: Iterable[str]) -> list[str]:
     fieldnames = list(existing)
-    for field in PACKET_FIELDS:
+    for field in REFRESH_FIELDS:
         if field not in fieldnames:
             fieldnames.append(field)
     return fieldnames
 
 
 def refresh_row(row: dict[str, Any]) -> dict[str, Any]:
-    refreshed = apply_sendability(row)
+    raw_version = str(row.get("Score Schema Version") or row.get("score_schema_version") or "").strip()
+    migrated = row if raw_version == str(SCORE_SCHEMA_VERSION) else backfill_legacy_commercial_fit(row)
+    refreshed = apply_sendability(migrated)
     updated = dict(row)
-    for field in PACKET_FIELDS:
+    for field in REFRESH_FIELDS:
         updated[field] = refreshed.get(field, "")
     return updated
 

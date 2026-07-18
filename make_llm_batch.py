@@ -12,41 +12,12 @@ from lead_machine.evidence import build_evidence_profile
 from lead_machine.icp import hard_icp_gate
 from lead_machine.icp_lanes import SELECTABLE_LANES, classify_icp_lane, lane_sort_key
 from lead_machine.llm_queue import safe_slug
+from lead_machine.score_schema import MANUAL_SCORE_SCHEMA, SHARED_COMMERCIAL_SCORING_RULES
 from lead_machine.schema import normalize_lead
 from lead_machine.scoring_rules import SHARED_SENDABILITY_RULES
 
 
 WEBSITE_TEXT_LIMIT = 12000
-
-MANUAL_SCORE_SCHEMA: Dict[str, Any] = {
-    "subscores": {
-        "icp_fit": 0,
-        "reputation_demand_proof": 0,
-        "web_conversion_pain": 0,
-        "mockup_leverage": 0,
-        "reachability": 0,
-        "offer_angle_clarity": 0,
-        "evidence_confidence": 0,
-    },
-    "total_score": 0,
-    "grade": "A|B|C|Skip",
-    "confidence": "low|medium|high",
-    "hard_disqualifiers": [],
-    "best_angle": "",
-    "visible_pain_score": 0,
-    "visible_pain_reasons": [],
-    "visible_pain_categories": [],
-    "send_trigger": "",
-    "recommended_action": "",
-    "why_this_lead": [],
-    "why_this_might_be_wrong": [],
-    "opener": "",
-    "evidence_refs": [],
-    "safe_outreach_claims": [{"claim": "", "evidence_refs": []}],
-    "unsafe_claims": [],
-    "airtable_fields": {},
-}
-
 
 @dataclass(frozen=True)
 class BatchWrite:
@@ -301,6 +272,7 @@ Rules:
 - Every scored claim must reference evidence IDs from that lead packet.
 - If there is no evidence for a claim, lower evidence confidence instead of inventing.
 {SHARED_SENDABILITY_RULES}
+{SHARED_COMMERCIAL_SCORING_RULES}
 - Do not score A/sendable just because the business fits hardscaping.
 - The best lead is one where the website is visibly worse than the actual business.
 - Buyer intent is required for A/B quality: look for fixable gap times money signal, not just a bad website.
@@ -333,6 +305,10 @@ Rules:
 - Every opener must reference a real observable issue.
 - opener must not make fake money claims, guarantee results, or make unsupported competitor claims.
 - opener must not say "you are losing jobs" unless directly proven by packet evidence.
+- opener must select a governed relevance move from channel, severity, commercial materiality,
+  buyer sophistication, available credibility, relationship warmth, evidence strength, asset state,
+  and desired next step.
+- Never open with "you don't know me", "this isn't a customer call", or a bad-time permission frame.
 
 Allowed best_angle values:
 - Website Rebuild

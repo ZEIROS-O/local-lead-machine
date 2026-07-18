@@ -650,6 +650,8 @@ class SearchWorkflowTest(unittest.TestCase):
         self.assertEqual(fields["Business Name"], "A+ Landscaping")
         self.assertEqual(fields["Recommended Action"], "Build mockup")
         self.assertEqual(fields["Site Status"], "Broken")
+        self.assertEqual(fields["Evidence Refs"], '["ev-google"]')
+        self.assertEqual(fields["Safe Outreach Claims"], "claim")
         for internal_field in make_search_batch.INTERNAL_AIRTABLE_FIELDS:
             self.assertNotIn(internal_field, fields)
         self.assertNotIn("Rendered Site Status", fields)

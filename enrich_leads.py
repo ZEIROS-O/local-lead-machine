@@ -25,6 +25,7 @@ import re
 import sys
 import time
 import warnings
+import datetime as dt
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 from urllib.parse import urljoin, urlparse
@@ -891,6 +892,7 @@ def scrape_site(
     started_at: float | None = None,
     per_lead_timeout: float = PER_LEAD_ENRICH_TIMEOUT_SECONDS,
 ) -> Dict[str, Any]:
+    retrieved_at = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
     started_at = time.monotonic() if started_at is None else started_at
     url = normalize_url(website_url)
     high_ticket_terms = high_ticket_terms or HIGH_TICKET_TERMS
@@ -1007,6 +1009,10 @@ def scrape_site(
         generic_copy = sorted(set(generic_copy + detect_terms(page_text, GENERIC_COPY_TERMS)))
 
         page_name = _candidate_page_name(page_url, pages, default_page_name)
+        page_links = extract_links(result.get("final_url") or page_url, page_html) if page_html else {
+            "internal_links": [], "external_links": [], "social_links": []
+        }
+        page_soup = BeautifulSoup(page_html, "html.parser") if page_html else BeautifulSoup("", "html.parser")
         pages[page_name] = {
             "url": page_url,
             "ok": result.get("ok"),
@@ -1018,6 +1024,19 @@ def scrape_site(
             "estimate_form_detected": page_form_signals.get("estimate_form_detected", "No"),
             "form_strength": page_form_signals.get("form_strength", "None"),
             "form_detection_method": page_form_signals.get("form_detection_method", "none"),
+            "verification_snapshot": {
+                "page_role": default_page_name,
+                "requested_url": page_url,
+                "final_url": result.get("final_url") or page_url,
+                "retrieved_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+                "response_status": result.get("status_code"),
+                "title": page_title,
+                "visible_text": clean_text(page_text, 6000),
+                "visible_links": page_links.get("all_links", []),
+                "form_count": len(page_soup.find_all("form")),
+                "control_count": len(page_soup.find_all(["input", "textarea", "select", "button"])),
+                "render_outcome": "loaded" if result.get("ok") and page_text.strip() else "blank" if result.get("ok") else "connection_error",
+            },
         }
 
         time.sleep(0.1)
@@ -1082,7 +1101,24 @@ def scrape_site(
         "high_ticket_terms": high_ticket,
         "generic_copy_terms": generic_copy,
         "combined_text": combined_text,
+        "verification_snapshot": {
+            "page_role": "homepage",
+            "requested_url": url,
+            "final_url": final_url,
+            "retrieved_at": retrieved_at,
+            "response_status": home.get("status_code"),
+            "title": title,
+            "visible_text": clean_text(text, 9000),
+            "visible_links": links.get("all_links", []),
+            "form_count": len(BeautifulSoup(html, "html.parser").find_all("form")),
+            "control_count": len(BeautifulSoup(html, "html.parser").find_all(["input", "textarea", "select", "button"])),
+            "render_outcome": "loaded" if text.strip() else "blank",
+        },
+        "verification_snapshots": [],
     }
+    result["verification_snapshots"] = [result["verification_snapshot"]] + [
+        page["verification_snapshot"] for page in pages.values() if page.get("verification_snapshot")
+    ]
     result.update(_empty_visual_audit_fields())
     elapsed = elapsed_seconds(started_at)
     result["enrichment_elapsed_seconds"] = round(elapsed, 1)

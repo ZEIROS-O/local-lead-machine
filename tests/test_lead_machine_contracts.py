@@ -21,13 +21,15 @@ from lead_machine.icp import hard_icp_gate
 from lead_machine.lead_card import build_lead_card
 from lead_machine.llm_queue import build_llm_prompt, write_review_queue
 from lead_machine.manual_scores import load_manual_score, merge_manual_score
+from lead_machine.score_schema import V2_SCORE_FIELDS
 from lead_machine.schema import normalize_lead, row_dedupe_keys
-from lead_machine.sendability import flatten_safe_outreach_claims, normalize_evidence_refs
+from lead_machine.sendability import apply_sendability, flatten_safe_outreach_claims, normalize_evidence_refs
 from make_packets import is_eligible, main as make_packets_main, packet_markdown
 from make_llm_batch import build_batch_prompt, write_llm_batches
 from import_llm_score_bundle import import_score_bundle
+from refresh_packet_tiers import refresh_row
 from score_leads import main as score_leads_main
-from score_leads import read_csv_rows, score_record, score_records_manual, write_csv
+from score_leads import governed_opener, read_csv_rows, score_record, score_records_manual, write_csv
 
 
 AIRTABLE_ENV_VARS = (
@@ -42,6 +44,39 @@ AIRTABLE_ENV_VARS = (
 
 
 class LeadMachineContractsTest(unittest.TestCase):
+    def test_governed_openers_render_actual_copy_across_channels_and_asset_states(self) -> None:
+        record = {
+            "google": {"business_name": "Davis Roofing"},
+            "evidence": {"send_trigger": "the mobile estimate CTA is buried below the service copy"},
+        }
+        forbidden = ("you don't know me", "this isn't a customer call", "bad time")
+
+        sms = governed_opener(record, "Estimate Funnel", channel="sms", asset_state="none")
+        email = governed_opener(record, "Estimate Funnel", channel="email", asset_state="planned")
+        phone = governed_opener(record, "Estimate Funnel", channel="phone", asset_state="none")
+        existing = governed_opener(
+            record,
+            "Estimate Funnel",
+            channel="sms",
+            asset_state="verified-existing",
+            asset_id="asset-davis-1",
+            asset_verifier_verdict="PASS",
+        )
+
+        for draft in (sms, email, phone, existing):
+            self.assertIn("Davis Roofing", draft)
+            self.assertIn("mobile estimate CTA", draft)
+            self.assertFalse(any(phrase in draft.lower() for phrase in forbidden))
+        self.assertIn("I can show you what I mean", sms)
+        self.assertNotIn("I built", sms)
+        self.assertIn("I can build the example", email)
+        self.assertNotIn("I built", email)
+        self.assertNotIn("I can show", phone)
+        self.assertIn("I built a verified example (asset-davis-1)", existing)
+
+        with self.assertRaisesRegex(ValueError, "requires asset_id"):
+            governed_opener(record, "Estimate Funnel", asset_state="verified-existing")
+
     def _airtable_csv_row(self, **overrides: str) -> dict[str, str]:
         row = {
             "Business Name": "A+ Landscaping LLC",
@@ -147,7 +182,7 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(fields["Best Service Angle"], "Website Rebuild")
         self.assertEqual(fields["Status"], "Mockup Needed")
         self.assertEqual(fields["Next Action"], "Build mockup")
-        self.assertEqual(fields["Outreach Channel"], "Google Maps")
+        self.assertEqual(fields["Outreach Channel"], "Phone")
         self.assertEqual(fields["Packet Eligible"], "Yes")
         self.assertEqual(fields["Sendable"], "Yes")
         self.assertEqual(fields["Contact Form Detected"], "No")
@@ -1235,6 +1270,14 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(site["form_detection_method"], "candidate_page")
         self.assertNotIn("no_form_detected", site["site_issue_flags"])
         self.assertIn("estimate", site["pages"])
+        snapshots = site["verification_snapshots"]
+        self.assertEqual(snapshots[0]["page_role"], "homepage")
+        self.assertEqual(snapshots[0]["response_status"], 200)
+        self.assertEqual(snapshots[0]["render_outcome"], "loaded")
+        estimate_snapshot = next(value for value in snapshots if value["requested_url"].endswith("request-estimate"))
+        self.assertEqual(estimate_snapshot["form_count"], 1)
+        self.assertGreaterEqual(estimate_snapshot["control_count"], 8)
+        self.assertEqual(estimate_snapshot["render_outcome"], "loaded")
 
     def test_scrape_site_stops_deeper_probing_after_per_lead_ceiling(self) -> None:
         homepage = """
@@ -1689,6 +1732,7 @@ class LeadMachineContractsTest(unittest.TestCase):
             },
         }
         raw_score = {
+            "score_schema_version": 2,
             "subscores": {
                 "icp_fit": 18,
                 "reputation_demand_proof": 14,
@@ -1701,6 +1745,21 @@ class LeadMachineContractsTest(unittest.TestCase):
             "confidence": "medium",
             "hard_disqualifiers": [],
             "best_angle": "Social/Jobber Escape",
+            "commercial_fit_state": "commercially-sendable",
+            "commercial_materiality": "The owned conversion path is absent behind the visible Jobber route.",
+            "recurring_consequence": "Each premium visitor reaches the same constrained path.",
+            "root_cause_confidence": "Fresh structured evidence resolves the visible route through Jobber.",
+            "offer_component": "Get the Lead",
+            "packageable_solution": "Build an owned estimate path that routes into the existing workflow.",
+            "value_mechanism": "Reduce friction on existing demand without replacing the operating system.",
+            "beyond_free_fix": "The owned page, trust proof, CTA, and routing are a coordinated system.",
+            "self_fix_risk": "The missing owned path is broader than changing the visible Jobber link.",
+            "intentionality": "The premium service and strong demand evidence support an owned conversion path.",
+            "contact_eligibility": "contact-now",
+            "asset_state": "none",
+            "promise_state": "asset-free",
+            "asset_id": "",
+            "asset_verifier_verdict": "",
             "recommended_action": "Build mockup then SMS owner",
             "why_this_lead": ["Strong reviews", "Jobber-only presence"],
             "why_this_might_be_wrong": ["Owner may be referral-driven"],
@@ -3889,6 +3948,8 @@ class LeadMachineContractsTest(unittest.TestCase):
 
     def test_manual_score_loader_still_accepts_old_schema_without_total_or_grade(self) -> None:
         raw_score = self._manual_score()
+        for field in V2_SCORE_FIELDS:
+            raw_score.pop(field, None)
         raw_score.pop("total_score", None)
         raw_score.pop("grade", None)
 
@@ -3899,6 +3960,99 @@ class LeadMachineContractsTest(unittest.TestCase):
 
         self.assertEqual(validated["total_score"], 75)
         self.assertEqual(validated["grade"], "B")
+
+    def test_partially_populated_unversioned_score_is_rejected(self) -> None:
+        raw_score = self._manual_score()
+        raw_score.pop("score_schema_version")
+        with tempfile.TemporaryDirectory() as tmp:
+            score_path = Path(tmp) / "lead.json"
+            score_path.write_text(json.dumps(raw_score), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "partially populates"):
+                load_manual_score(score_path, allowed_evidence_ids={"E1", "E2"})
+
+    def test_legacy_structural_score_backfills_v2_and_retains_commercial_eligibility(self) -> None:
+        legacy = self._manual_score(best_angle="No-Site Launch")
+        for field in V2_SCORE_FIELDS:
+            legacy.pop(field, None)
+        enriched = {
+            "google": {**self._google_fixture(), "reviews": "18", "website_url": ""},
+            "buyer_intent": self._buyer_intent_fixture(),
+            "evidence": self._evidence_fixture(site_status="missing"),
+        }
+        row = merge_manual_score(enriched, legacy, fallback_vertical="hardscaping")
+        self.assertEqual(row["Score Schema Version"], 2)
+        self.assertEqual(row["Commercial Fit Source"], "deterministic-backfill-v2")
+        self.assertEqual(row["Commercial Fit State"], "commercially-sendable")
+        self.assertEqual(row["Contact Eligibility"], "contact-now")
+
+    def test_legacy_isolated_fix_holds_and_non_sendable_rows_never_upgrade(self) -> None:
+        isolated = refresh_row(
+            {
+                "Sendable": "Yes",
+                "Site Status": "Loaded",
+                "Form Strength": "Basic",
+                "Send Trigger": "Basic form only",
+                "Best Service Angle": "Estimate Funnel",
+            }
+        )
+        self.assertEqual(isolated["Commercial Fit State"], "minor-fix/nurture")
+        self.assertEqual(isolated["Contact Eligibility"], "hold-commercial-case")
+
+        monotonic = refresh_row(
+            {
+                "Sendable": "No",
+                "Site Status": "Missing",
+                "Send Trigger": "No owned website found",
+                "Best Service Angle": "No-Site Launch",
+            }
+        )
+        self.assertNotEqual(monotonic["Commercial Fit State"], "commercially-sendable")
+        self.assertEqual(monotonic["Sendable"], "No")
+
+    def test_missing_or_misspelled_contact_eligibility_holds_with_state_error(self) -> None:
+        enriched = {
+            "google": {**self._google_fixture(), "reviews": "18"},
+            "buyer_intent": self._buyer_intent_fixture(),
+            "evidence": self._evidence_fixture(site_status="weak"),
+        }
+        row = merge_manual_score(enriched, self._manual_score(), fallback_vertical="hardscaping")
+        row["Contact Eligibility"] = ""
+        row["contact_eligibility"] = "contact-no"
+        held = apply_sendability(row)
+        self.assertEqual(held["Contact Eligibility"], "hold-commercial-case")
+        self.assertEqual(held["Sendable"], "No")
+        self.assertIn("invalid contact_eligibility contact-no; held", held["Send Blockers"])
+
+    def test_pass_asset_receipt_propagates_to_both_aliases(self) -> None:
+        enriched = {
+            "google": {**self._google_fixture(), "reviews": "18"},
+            "buyer_intent": self._buyer_intent_fixture(),
+            "evidence": self._evidence_fixture(site_status="weak"),
+        }
+        row = merge_manual_score(
+            enriched,
+            self._manual_score(
+                asset_state="verified-existing",
+                promise_state="existing-verified-asset",
+                asset_id="asset-verified-1",
+                asset_verifier_verdict="PASS",
+            ),
+            fallback_vertical="hardscaping",
+        )
+        self.assertEqual(row["Asset ID"], "asset-verified-1")
+        self.assertEqual(row["asset_id"], "asset-verified-1")
+        self.assertEqual(row["Asset Verifier Verdict"], "PASS")
+        self.assertEqual(row["asset_verifier_verdict"], "PASS")
+
+    def test_single_lead_prompt_uses_shared_v2_commercial_schema(self) -> None:
+        prompt = build_llm_prompt(
+            {"google": self._google_fixture(), "evidence": self._evidence_fixture(site_status="weak")},
+            fallback_vertical="hardscaping",
+        )
+        self.assertIn('"score_schema_version": 2', prompt)
+        self.assertIn('"asset_id": ""', prompt)
+        self.assertIn('"asset_verifier_verdict": ""', prompt)
+        self.assertIn("all nine commercial dimensions", prompt)
 
     def test_manual_llm_csv_outputs_user_facing_score_columns(self) -> None:
         raw_score = self._manual_score(
@@ -4321,6 +4475,116 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(row["Sendable"], "No")
         self.assertIn("Missing concrete conversion issue", row["Send Blockers"])
         self.assertEqual(row["Packet Eligible"], "")
+
+    def test_sendability_rejects_skip_grade_even_when_other_gates_pass(self) -> None:
+        enriched = {
+            "google": {
+                **self._google_fixture(),
+                "reviews": "18",
+            },
+            "buyer_intent": self._buyer_intent_fixture(),
+            "evidence": self._evidence_fixture(site_status="weak"),
+        }
+        sendable = merge_manual_score(enriched, self._manual_score(), fallback_vertical="hardscaping")
+        self.assertEqual(sendable["Sendable"], "Yes")
+
+        sendable["Lead Priority"] = "Skip"
+        sendable["grade"] = "Skip"
+        blocked = apply_sendability(sendable)
+
+        self.assertEqual(blocked["Sendable"], "No")
+        self.assertIn("Lead grade below sendable threshold", blocked["Send Blockers"])
+        self.assertNotEqual(blocked["Packet Tier"], "Sendable Packet")
+        self.assertEqual(blocked["Packet Eligible"], "")
+
+    def test_hard_disqualified_manual_score_is_no_packet_even_with_high_total(self) -> None:
+        enriched = {
+            "google": {
+                **self._google_fixture(),
+                "reviews": "18",
+            },
+            "buyer_intent": self._buyer_intent_fixture(),
+            "evidence": self._evidence_fixture(site_status="weak"),
+        }
+        raw_score = self._manual_score(
+            hard_disqualifiers=["Outside target vertical"],
+        )
+
+        row = merge_manual_score(enriched, raw_score, fallback_vertical="hardscaping")
+
+        self.assertEqual(row["Score Total"], 75)
+        self.assertEqual(row["Lead Priority"], "Skip")
+        self.assertEqual(row["Sendable"], "No")
+        self.assertIn("Hard disqualifier present", row["Send Blockers"])
+        self.assertEqual(row["Minimum Evidence Passed"], "No")
+        self.assertEqual(row["Packet Tier"], "No Packet")
+        self.assertEqual(row["Packet Eligible"], "")
+
+    def test_isolated_minor_fix_is_nurture_not_sendable(self) -> None:
+        enriched = {
+            "google": {**self._google_fixture(), "reviews": "18"},
+            "buyer_intent": self._buyer_intent_fixture(),
+            "evidence": self._evidence_fixture(site_status="weak"),
+        }
+        row = merge_manual_score(
+            enriched,
+            self._manual_score(
+                commercial_fit_state="minor-fix/nurture",
+                contact_eligibility="hold-commercial-case",
+            ),
+            fallback_vertical="hardscaping",
+        )
+        self.assertEqual(row["Sendable"], "No")
+        self.assertEqual(row["Commercial Fit State"], "minor-fix/nurture")
+        self.assertIn("Commercial fit gate failed: minor-fix/nurture", row["Send Blockers"])
+
+    def test_missing_asset_can_contact_now_with_asset_free_promise(self) -> None:
+        enriched = {
+            "google": {**self._google_fixture(), "reviews": "18"},
+            "buyer_intent": self._buyer_intent_fixture(),
+            "evidence": self._evidence_fixture(site_status="weak"),
+        }
+        row = merge_manual_score(
+            enriched,
+            self._manual_score(asset_state="none", promise_state="asset-free", contact_eligibility="contact-now"),
+            fallback_vertical="hardscaping",
+        )
+        self.assertEqual(row["Sendable"], "Yes")
+        self.assertEqual(row["Asset State"], "none")
+        self.assertEqual(row["Promise State"], "asset-free")
+
+    def test_asset_specific_promise_waits_for_asset(self) -> None:
+        enriched = {
+            "google": {**self._google_fixture(), "reviews": "18"},
+            "buyer_intent": self._buyer_intent_fixture(),
+            "evidence": self._evidence_fixture(site_status="weak"),
+        }
+        row = merge_manual_score(
+            enriched,
+            self._manual_score(
+                asset_state="planned", promise_state="future-build", contact_eligibility="contact-after-asset"
+            ),
+            fallback_vertical="hardscaping",
+        )
+        self.assertEqual(row["Sendable"], "No")
+        self.assertIn("Contact eligibility is not contact-now", row["Send Blockers"])
+        self.assertEqual(row["Minimum Evidence Passed"], "Yes")
+
+    def test_existing_asset_promise_requires_pass_receipt(self) -> None:
+        enriched = {
+            "google": {**self._google_fixture(), "reviews": "18"},
+            "buyer_intent": self._buyer_intent_fixture(),
+            "evidence": self._evidence_fixture(site_status="weak"),
+        }
+        with self.assertRaisesRegex(ValueError, "PASS asset_verifier_verdict"):
+            merge_manual_score(
+                enriched,
+                self._manual_score(
+                    asset_state="verified-existing", promise_state="existing-verified-asset",
+                    contact_eligibility="contact-now", asset_id="asset-1", asset_verifier_verdict="BLOCK",
+                ),
+                fallback_vertical="hardscaping",
+            )
 
     def test_send_trigger_is_required_for_sendable_yes(self) -> None:
         enriched = {
@@ -5253,6 +5517,7 @@ class LeadMachineContractsTest(unittest.TestCase):
 
     def _manual_score(self, **overrides: object) -> dict:
         score = {
+            "score_schema_version": 2,
             "subscores": {
                 "icp_fit": 14,
                 "reputation_demand_proof": 12,
@@ -5265,6 +5530,21 @@ class LeadMachineContractsTest(unittest.TestCase):
             "confidence": "medium",
             "hard_disqualifiers": [],
             "best_angle": "Estimate Funnel",
+            "commercial_fit_state": "commercially-sendable",
+            "commercial_materiality": "Premium estimate requests can fail to reach a clear conversion path.",
+            "recurring_consequence": "The same path affects each new high-intent visitor.",
+            "root_cause_confidence": "Fresh rendered evidence shows the CTA-path weakness.",
+            "offer_component": "Get the Lead",
+            "packageable_solution": "Rebuild the estimate path and trust placement.",
+            "value_mechanism": "Reduce friction between existing demand and estimate requests.",
+            "beyond_free_fix": "The CTA, mobile path, trust proof, and routing require one coherent system.",
+            "self_fix_risk": "The existing multi-step path has persisted and needs coordinated implementation.",
+            "intentionality": "The verified customer path contradicts an intentional low-conversion design.",
+            "contact_eligibility": "contact-now",
+            "asset_state": "none",
+            "promise_state": "asset-free",
+            "asset_id": "",
+            "asset_verifier_verdict": "",
             "recommended_action": "Build mockup then SMS owner",
             "why_this_lead": ["Strong reviews", "Visible quote-path issue"],
             "why_this_might_be_wrong": [],
