@@ -180,6 +180,24 @@ class GenerateSearchConfigTest(unittest.TestCase):
             self.assertIn("garage floor epoxy", cfg["exclude_terms"])
             self.assertIn("home depot", cfg["exclude_terms"])
 
+    def test_generate_plumbing_cleveland_medium(self) -> None:
+        path = self._generate(vertical="plumbing", market="cleveland", size="medium")
+        self.assertEqual(path.name, "plumbing_cleveland_medium_001.json")
+        cfg = self._load(path)
+        self.assertEqual(cfg["vertical"], "plumbing")
+        self.assertEqual(cfg["airtable_vertical"], "Plumbing")
+        self.assertIn("plumber Cleveland OH", cfg["queries"])
+        self.assertEqual(len(cfg["geo_slices"]), 6)
+        self.assertEqual(cfg["max_pages_per_query"], 2)
+        self.assertEqual(cfg["min_rating"], 4.3)
+        self.assertEqual(cfg["min_reviews"], 5)
+        self.assertEqual(
+            cfg["boost_terms"],
+            list(VERTICAL_PROFILES["plumbing"].high_ticket_terms),
+        )
+        self.assertIn("plumbing supply", cfg["exclude_terms"])
+        self.assertIn("roto-rooter", cfg["exclude_terms"])
+
     def test_refreshes_geo_slices_file(self) -> None:
         self._generate(vertical="epoxy", market="cleveland", size="small")
         geo_file = self.geo_dir / "cleveland.json"

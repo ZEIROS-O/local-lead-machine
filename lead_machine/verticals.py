@@ -250,6 +250,69 @@ GARAGE_DOOR_FRANCHISE_DENYLIST = (
     "wayne dalton",
 )
 
+PLUMBING_BATCH_TERMS = (
+    "plumber",
+    "plumbing",
+    "plumbing contractor",
+    "emergency plumber",
+    "sewer line repair",
+    "sewer line replacement",
+    "trenchless sewer repair",
+    "whole house repiping",
+    "water heater installation",
+    "tankless water heater installation",
+    "sump pump installation",
+)
+
+PLUMBING_SERVICE_TERMS = (
+    *PLUMBING_BATCH_TERMS,
+    "residential plumbing",
+    "commercial plumbing",
+    "drain cleaning",
+    "leak detection",
+    "gas line repair",
+    "backflow prevention",
+)
+
+PLUMBING_HIGH_TICKET_TERMS = (
+    "sewer line repair",
+    "sewer line replacement",
+    "trenchless sewer repair",
+    "whole house repiping",
+    "repiping",
+    "water heater installation",
+    "tankless water heater",
+    "gas line repair",
+    "commercial plumbing",
+)
+
+PLUMBING_DENY_TERMS = (
+    "plumbing supply",
+    "plumbing wholesale",
+    "hardware store",
+    "bathroom showroom",
+    "kitchen showroom",
+    "appliance repair",
+    "portable toilet",
+    "septic pumping",
+    "home depot",
+    "lowe's",
+    "lowes",
+    "menards",
+)
+
+PLUMBING_FRANCHISE_DENYLIST = (
+    "roto-rooter",
+    "roto rooter",
+    "mr. rooter",
+    "mr rooter",
+    "benjamin franklin plumbing",
+    "ars rescue rooter",
+    "rooter-man",
+    "rooter man",
+    "zoom drain",
+)
+
 
 VERTICAL_PROFILES: Mapping[str, VerticalProfile] = {
     "hardscaping": VerticalProfile(
@@ -330,6 +393,22 @@ VERTICAL_PROFILES: Mapping[str, VerticalProfile] = {
             "overhead door",
         ),
         min_reviews=10,
+        max_reviews=None,
+    ),
+    "plumbing": VerticalProfile(
+        key="plumbing",
+        label="Plumbing",
+        family="plumbing",
+        batch_terms=PLUMBING_BATCH_TERMS,
+        service_terms=PLUMBING_SERVICE_TERMS,
+        high_ticket_terms=PLUMBING_HIGH_TICKET_TERMS,
+        deny_terms=PLUMBING_DENY_TERMS,
+        low_ticket_terms=PLUMBING_DENY_TERMS,
+        franchise_denylist=PLUMBING_FRANCHISE_DENYLIST,
+        exclude_terms=(),
+        geo_terms=CLEVELAND_METRO_TERMS,
+        aliases=("plumber", "plumbers", "plumbing contractor", "plumbing company"),
+        min_reviews=5,
         max_reviews=None,
     ),
 }

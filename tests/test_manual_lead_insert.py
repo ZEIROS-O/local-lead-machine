@@ -133,6 +133,7 @@ class ManualLeadInsertTest(unittest.TestCase):
             ("garage doors", "garage_doors"),
             ("water restoration", "water_restoration"),
             ("epoxy", "epoxy"),
+            ("plumbing", "plumbing"),
         ):
             card = mli.build_manual_lead_card(RAW_LEAD, vertical=raw)
             self.assertEqual(card["airtable_fields"]["Vertical"], slug)
@@ -140,10 +141,10 @@ class ManualLeadInsertTest(unittest.TestCase):
 
     def test_unknown_vertical_fails_before_any_processing(self) -> None:
         with self.assertRaises(ValueError) as caught:
-            mli.build_manual_lead_card(RAW_LEAD, vertical="plumbing")
+            mli.build_manual_lead_card(RAW_LEAD, vertical="quantum remediation")
 
         message = str(caught.exception)
-        self.assertIn("Unknown vertical 'plumbing'", message)
+        self.assertIn("Unknown vertical 'quantum remediation'", message)
         self.assertIn("water_restoration", message)
 
     def test_place_key_falls_back_to_phone_domain_then_name_city(self) -> None:

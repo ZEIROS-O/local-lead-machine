@@ -1,0 +1,45 @@
+{
+  "vertical": "plumbing",
+  "display_name": "Plumbing",
+  "airtable_vertical": "Plumbing",
+  "search_terms": [
+    "plumber",
+    "plumbing contractor",
+    "emergency plumber",
+    "sewer line repair",
+    "sewer line replacement",
+    "whole house repiping",
+    "water heater installation",
+    "tankless water heater installation"
+  ],
+  "high_intent_terms": [
+    "trenchless sewer repair",
+    "commercial plumbing contractor"
+  ],
+  "exclude_terms": [
+    "plumbing supply",
+    "plumbing wholesale",
+    "hardware store",
+    "bathroom showroom",
+    "kitchen showroom",
+    "appliance repair",
+    "portable toilet",
+    "septic pumping",
+    "home depot",
+    "lowe's",
+    "lowes",
+    "menards",
+    "roto-rooter",
+    "roto rooter",
+    "mr. rooter",
+    "mr rooter",
+    "benjamin franklin plumbing",
+    "ars rescue rooter",
+    "rooter-man",
+    "rooter man",
+    "zoom drain"
+  ],
+  "min_rating": 4.3,
+  "min_reviews": 5,
+  "notes": "Target independent residential and commercial plumbing contractors, with emphasis on sewer-line, repipe, water-heater, gas-line, and commercial projects. Deny supply/retail/showroom, portable-toilet, septic-pumping, appliance-repair, and national-franchise noise."
+}
