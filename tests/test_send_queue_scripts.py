@@ -28,6 +28,7 @@ class TestBuildFormula(unittest.TestCase):
         self.assertEqual(
             formula,
             "AND({Sendable}='Yes',{Packet Eligible}='Yes',"
+            "{Commercial Fit State}='commercially-sendable',{Contact Eligibility}='contact-now',"
             "NOT({Status}='Sent'),NOT({Status}='Closed'))",
         )
 
@@ -40,14 +41,14 @@ class TestFetchReadyRecords(unittest.TestCase):
     def test_paginates_and_sorts_by_priority_then_score(self):
         page1 = {
             "records": [
-                {"id": "recB", "fields": {"Business Name": "B Co", "Lead Priority": "B", "Score Total": 10}},
-                {"id": "recA5", "fields": {"Business Name": "A5 Co", "Lead Priority": "A", "Score Total": 5}},
+                {"id": "recB", "fields": {"Business Name": "B Co", "Lead Priority": "B", "Score Total": 10, "Commercial Fit State": "commercially-sendable", "Contact Eligibility": "contact-now"}},
+                {"id": "recA5", "fields": {"Business Name": "A5 Co", "Lead Priority": "A", "Score Total": 5, "Commercial Fit State": "commercially-sendable", "Contact Eligibility": "contact-now"}},
             ],
             "offset": "next",
         }
         page2 = {
             "records": [
-                {"id": "recA9", "fields": {"Business Name": "A9 Co", "Lead Priority": "A", "Score Total": 9}},
+                {"id": "recA9", "fields": {"Business Name": "A9 Co", "Lead Priority": "A", "Score Total": 9, "Commercial Fit State": "commercially-sendable", "Contact Eligibility": "contact-now"}},
             ],
         }
         probe = _response(200, {"records": []})
@@ -77,6 +78,39 @@ class TestFetchReadyRecords(unittest.TestCase):
         with patch("requests.get", return_value=_response(401, text="unauthorized")):
             with self.assertRaises(RuntimeError):
                 qrs.fetch_ready_records("app123", "Prospects", "tok")
+
+    def test_missing_required_commercial_field_fails_closed(self):
+        response = _response(
+            422,
+            text='{"error": {"message": "Unknown field name: \\"Contact Eligibility\\""}}',
+        )
+        with patch("requests.get", return_value=response) as mock_get:
+            with self.assertRaises(RuntimeError):
+                qrs.fetch_ready_records("app123", "Prospects", "tok")
+        self.assertEqual(mock_get.call_count, 1)
+
+    def test_defensive_post_fetch_check_rejects_non_ready_rows(self):
+        page = {
+            "records": [
+                {
+                    "id": "recReady",
+                    "fields": {
+                        "Commercial Fit State": "commercially-sendable",
+                        "Contact Eligibility": "contact-now",
+                    },
+                },
+                {
+                    "id": "recHold",
+                    "fields": {
+                        "Commercial Fit State": "minor-fix/nurture",
+                        "Contact Eligibility": "contact-now",
+                    },
+                },
+            ]
+        }
+        with patch("requests.get", side_effect=[_response(200, {"records": []}), _response(200, page)]):
+            records = qrs.fetch_ready_records("app123", "Prospects", "tok")
+        self.assertEqual([record["record_id"] for record in records], ["recReady"])
 
 
 class TestQueryMain(unittest.TestCase):

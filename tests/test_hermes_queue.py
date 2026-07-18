@@ -28,6 +28,7 @@ def make_root(tmp: str, *, config: dict | None = None) -> Path:
     if config:
         payload.update(config)
     (root / "morning_queue.json").write_text(json.dumps(payload), encoding="utf-8")
+    (root / "outcomes.jsonl").write_text("", encoding="utf-8")
     return root
 
 
@@ -40,14 +41,23 @@ def make_record(i: int, *, vertical: str = "water_restoration", priority: str = 
         "Phone": "(216) 555-0000",
         "Email": "",
         "Website URL": f"https://biz{i}.example",
+        "Reviews": 40,
+        "Rating": 4.8,
         "Lead Priority": priority,
         "Score Total": 90 - i,
+        "AI Confidence": "high",
+        "Money Signal": "Yes",
+        "Buyer Intent Signals": "live review demand",
+        "Send Trigger": "Quote path dead end",
         "Best Service Angle": "Website Rebuild",
         "Offer Fit": "Website Rebuild",
         "Specific Observation": "obs",
         "Site Status": "Broken",
         "Opener": "stored opener",
         "Safe Outreach Claims": "claim A; claim B",
+        "Evidence Refs": '["ev-google-rating-1", "ev-site-status-2"]',
+        "Outreach Channel": "Phone",
+        "Consent Posture": "",
         "Mockup URL": "",
         "Video URL": "",
     }
@@ -221,10 +231,11 @@ class MorningQueueTest(unittest.TestCase):
     def test_writes_schema_file_with_items(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = make_root(tmp)
+            (root / "outcomes.jsonl").write_text("", encoding="utf-8")
             records = [make_record(i, priority="C") for i in range(1, 8)]
             with patch.object(hq, "fetch_pooled_records", return_value=records):
                 hq.cmd_morning_queue(execute=True, root=root, target=3)
-            data = json.loads(hq.queue_file_path(root, hq._today()).read_text(encoding="utf-8"))
+            data = read_latest_queue_run(root)
             self.assertEqual(data["schema_version"], hq.QUEUE_SCHEMA_VERSION)
             self.assertEqual(data["pooled_sendable"], 7)
             self.assertEqual(len(data["items"]), 3)  # target 3, no A/B overflow
@@ -233,7 +244,69 @@ class MorningQueueTest(unittest.TestCase):
             self.assertEqual(first["business"], "Biz 1")
             self.assertEqual(first["stored_opener"], "stored opener")
             self.assertEqual(first["safe_outreach_claims"], "claim A; claim B")
+            self.assertEqual(first["reviews"], 40)
+            self.assertEqual(first["rating"], 4.8)
+            self.assertEqual(first["channel"], "Phone")
+            self.assertEqual(first["suppression_status"], "clear")
+            self.assertIn("owner/operator", first["person_read"])
             self.assertIsNone(first["sent_at"])
+
+    def test_opted_out_record_is_excluded_from_immutable_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp)
+            record = make_record(1)
+            (root / "outcomes.jsonl").write_text(
+                json.dumps({"event": "opt_out", "record_id": record["record_id"]}) + "\n",
+                encoding="utf-8",
+            )
+            with patch.object(hq, "fetch_pooled_records", return_value=[record]):
+                hq.cmd_morning_queue(execute=True, root=root, target=1)
+            data = read_latest_queue_run(root)
+            self.assertEqual(data["items"], [])
+            self.assertEqual(data["fetched_count"], 1)
+            self.assertEqual(data["suppressed_excluded_count"], 1)
+            self.assertEqual(data["queued_count"], 0)
+
+    def test_suppression_exclusion_happens_before_target_refill(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp)
+            records = [make_record(i, priority="C") for i in range(1, 5)]
+            (root / "outcomes.jsonl").write_text(
+                json.dumps({"event": "opt-out", "phone": "+1 (216) 555-0000"}) + "\n",
+                encoding="utf-8",
+            )
+            records[1]["Phone"] = "216.555.0001"
+            records[2]["Phone"] = "216.555.0002"
+            records[3]["Phone"] = "216.555.0003"
+            with patch.object(hq, "fetch_pooled_records", return_value=records):
+                hq.cmd_morning_queue(execute=True, root=root, target=3)
+            data = read_latest_queue_run(root)
+            self.assertEqual(data["fetched_count"], 4)
+            self.assertEqual(data["suppressed_excluded_count"], 1)
+            self.assertEqual(data["queued_count"], 3)
+            self.assertEqual([item["business"] for item in data["items"]], ["Biz 2", "Biz 3", "Biz 4"])
+
+    def test_missing_suppression_source_writes_degraded_zero_item_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp)
+            (root / "outcomes.jsonl").unlink()
+            with patch.object(hq, "fetch_pooled_records", return_value=[make_record(1)]):
+                result = hq.cmd_morning_queue(execute=True, root=root, target=1)
+            data = read_latest_queue_run(root)
+            self.assertEqual(data["items"], [])
+            self.assertEqual(data["fetched_count"], 1)
+            self.assertIn("missing or unreadable", data["error"])
+            self.assertIn("DEGRADED", result.message)
+
+    def test_malformed_suppression_source_writes_degraded_zero_item_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp)
+            (root / "outcomes.jsonl").write_text('{"event": "opt_out"\n', encoding="utf-8")
+            with patch.object(hq, "fetch_pooled_records", return_value=[make_record(1)]):
+                hq.cmd_morning_queue(execute=True, root=root, target=1)
+            data = read_latest_queue_run(root)
+            self.assertEqual(data["items"], [])
+            self.assertIn("malformed JSON", data["error"])
 
     def test_ab_leads_extend_past_target_capped_at_overflow(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -241,10 +314,10 @@ class MorningQueueTest(unittest.TestCase):
             records = [make_record(i, priority="A") for i in range(1, 13)]
             with patch.object(hq, "fetch_pooled_records", return_value=records):
                 hq.cmd_morning_queue(execute=True, root=root, target=3)
-            data = json.loads(hq.queue_file_path(root, hq._today()).read_text(encoding="utf-8"))
+            data = read_latest_queue_run(root)
             self.assertEqual(len(data["items"]), 8)  # 12 A-leads capped by queue_overflow_cap=8
 
-    def test_overwrites_manual_file_and_merges_topup(self) -> None:
+    def test_preserves_prior_run_and_merges_topup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = make_root(tmp)
             today = hq._today()
@@ -269,8 +342,8 @@ class MorningQueueTest(unittest.TestCase):
             )
             with patch.object(hq, "fetch_pooled_records", return_value=[make_record(1)]):
                 res = hq.cmd_morning_queue(execute=True, root=root)
-            data = json.loads(hq.queue_file_path(root, today).read_text(encoding="utf-8"))
-            self.assertNotIn("manual_rehearsal", data)
+            data = read_latest_queue_run(root, today)
+            self.assertEqual(json.loads(hq.queue_file_path(root, today).read_text(encoding="utf-8"))["runs"][-1]["queue_run_id"], data["queue_run_id"])
             self.assertEqual(data["topup"]["outcome"], "completed")
             self.assertIn("outcome: completed", res.message)
 
@@ -279,7 +352,7 @@ class MorningQueueTest(unittest.TestCase):
             root = make_root(tmp, config={"topup_enabled": False})
             with patch.object(hq, "fetch_pooled_records", return_value=[make_record(1)]):
                 res = hq.cmd_morning_queue(execute=True, root=root)
-            data = json.loads(hq.queue_file_path(root, hq._today()).read_text(encoding="utf-8"))
+            data = read_latest_queue_run(root)
             self.assertEqual(data["topup_report"]["status"], "missing")
             self.assertFalse(data["topup_report"]["produced"])
             self.assertEqual(data["topup_report"]["message"], hq.TOPUP_REPORT_MISSING)
@@ -291,7 +364,7 @@ class MorningQueueTest(unittest.TestCase):
             hq.topup_file_path(root, hq._today()).write_text("{bad json", encoding="utf-8")
             with patch.object(hq, "fetch_pooled_records", return_value=[make_record(1)]):
                 hq.cmd_morning_queue(execute=True, root=root)
-            data = json.loads(hq.queue_file_path(root, hq._today()).read_text(encoding="utf-8"))
+            data = read_latest_queue_run(root)
             self.assertEqual(data["topup_report"]["message"], hq.TOPUP_REPORT_MISSING)
 
     def test_disabled_topup_report_is_present_and_zero_spend(self) -> None:
@@ -300,7 +373,7 @@ class MorningQueueTest(unittest.TestCase):
             hq.cmd_queue_topup(execute=True, root=root)
             with patch.object(hq, "fetch_pooled_records", return_value=[make_record(1)]):
                 res = hq.cmd_morning_queue(execute=True, root=root)
-            data = json.loads(hq.queue_file_path(root, hq._today()).read_text(encoding="utf-8"))
+            data = read_latest_queue_run(root)
             self.assertEqual(data["topup_report"]["status"], "present")
             self.assertTrue(data["topup_report"]["produced"])
             self.assertIn("topup disabled in config", data["topup_report"]["message"])
@@ -313,7 +386,7 @@ class MorningQueueTest(unittest.TestCase):
             with patch.object(hq, "fetch_pooled_records", return_value=records):
                 hq.cmd_queue_topup(execute=True, root=root)
                 hq.cmd_morning_queue(execute=True, root=root)
-            data = json.loads(hq.queue_file_path(root, hq._today()).read_text(encoding="utf-8"))
+            data = read_latest_queue_run(root)
             self.assertEqual(data["topup_report"]["status"], "present")
             self.assertIn("reason: target met", data["topup_report"]["message"])
 
@@ -322,7 +395,7 @@ class MorningQueueTest(unittest.TestCase):
             root = make_root(tmp)
             with patch.object(hq, "fetch_pooled_records", side_effect=CommandError("Airtable list failed 503")):
                 res = hq.cmd_morning_queue(execute=True, root=root)
-            data = json.loads(hq.queue_file_path(root, hq._today()).read_text(encoding="utf-8"))
+            data = read_latest_queue_run(root)
             self.assertEqual(data["items"], [])
             self.assertIn("503", data["error"])
             self.assertIn("DEGRADED", res.message)
@@ -337,10 +410,19 @@ class MorningQueueTest(unittest.TestCase):
             self.assertFalse(hq.queue_file_path(root, hq._today()).exists())
 
 
-def write_queue_file(root: Path, *, items: list[dict], date: str | None = None) -> Path:
+def read_latest_queue_run(root: Path, date: str | None = None) -> dict:
+    date = date or hq._today()
+    index = json.loads(hq.queue_file_path(root, date).read_text(encoding="utf-8"))
+    run_id = index["latest_queue_run_id"]
+    return json.loads(hq.queue_run_path(root, date, run_id).read_text(encoding="utf-8"))
+
+
+def write_queue_file(root: Path, *, items: list[dict], date: str | None = None, queue_run_id: str = "mq-test-run") -> Path:
     date = date or hq._today()
     payload = {
         "schema_version": hq.QUEUE_SCHEMA_VERSION,
+        "queue_run_id": queue_run_id,
+        "created_at": "2026-07-09T08:00:00-04:00",
         "date": date,
         "generated_at": "2026-07-09T08:00:00-04:00",
         "target": 5,
@@ -350,9 +432,26 @@ def write_queue_file(root: Path, *, items: list[dict], date: str | None = None) 
         "error": None,
         "items": items,
     }
-    path = hq.queue_file_path(root, date)
+    payload["queue_sha256"] = hq._queue_content_hash(payload)
+    path = hq.queue_run_path(root, date, queue_run_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload), encoding="utf-8")
+    hq._write_queue_index(root, date, payload, hq.queue_file_path(root, date))
     return path
+
+
+def queue_identity(path: Path) -> dict:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return {
+        "queue_run_id": data["queue_run_id"],
+        "queue_sha256": data["queue_sha256"],
+        "artifact_sha256": "a" * 64,
+    }
+
+
+def dry_run_approval(root: Path, path: Path, tokens: list[str], *, channel: str = "sms") -> str:
+    res = hq.cmd_mark_sent(tokens, channel=channel, dry_run=True, execute=True, root=root, **queue_identity(path))
+    return next(line.split(": ", 1)[1] for line in res.message.splitlines() if line.startswith("approval_id:"))
 
 
 def queue_item(n: int, *, sent_at: str | None = None) -> dict:
@@ -375,14 +474,17 @@ class MarkSentTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = make_root(tmp)
             path = write_queue_file(root, items=[queue_item(1), queue_item(2), queue_item(3)])
+            immutable_before = path.read_bytes()
+            approval_id = dry_run_approval(root, path, ["1", "3"])
             with patch.object(hq, "_run_capture", return_value=ok_proc()) as run:
-                res = hq.cmd_mark_sent(["1", "3"], channel="sms", execute=True, root=root)
+                res = hq.cmd_mark_sent(["1", "3"], channel="sms", approval_id=approval_id, execute=True, root=root, **queue_identity(path))
             self.assertEqual(run.call_count, 2)
             data = json.loads(path.read_text(encoding="utf-8"))
-            self.assertIsNotNone(data["items"][0]["sent_at"])
-            self.assertIsNone(data["items"][1]["sent_at"])
-            self.assertIsNotNone(data["items"][2]["sent_at"])
-            self.assertEqual(data["items"][0]["sent_channel"], "SMS")
+            self.assertIsNone(data["items"][0]["sent_at"])
+            self.assertEqual(path.read_bytes(), immutable_before)
+            state = json.loads(hq.queue_writeback_path(root, data["queue_run_id"]).read_text(encoding="utf-8"))
+            self.assertEqual(set(state["sent"]), {data["items"][0]["record_id"], data["items"][2]["record_id"]})
+            self.assertEqual(state["sent"][data["items"][0]["record_id"]]["sent_channel"], "SMS")
             self.assertIn("[SENT] 1. Biz 1", res.message)
             outcomes = (root / "outcomes.jsonl").read_text(encoding="utf-8").strip().splitlines()
             self.assertEqual(len(outcomes), 2)
@@ -390,39 +492,122 @@ class MarkSentTest(unittest.TestCase):
     def test_unknown_number_refused_with_valid_range(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = make_root(tmp)
-            write_queue_file(root, items=[queue_item(1), queue_item(2)])
+            path = write_queue_file(root, items=[queue_item(1), queue_item(2)])
             with self.assertRaises(CommandError) as ctx:
-                hq.cmd_mark_sent(["7"], execute=True, root=root)
+                hq.cmd_mark_sent(["7"], execute=True, root=root, **queue_identity(path))
             self.assertIn("1..2", str(ctx.exception))
+
+    def test_bare_number_against_latest_queue_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp)
+            write_queue_file(root, items=[queue_item(1)])
+            with self.assertRaisesRegex(CommandError, "exact --queue-run-id"):
+                hq.cmd_mark_sent(["1"], artifact_sha256="a" * 64, execute=True, root=root)
+
+    def test_davis_roofing_digest_cannot_mark_sbr_concrete_after_regeneration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp)
+            davis = queue_item(1)
+            davis["business"] = "Davis Roofing"
+            davis["record_id"] = "recDAVISROOFING01"
+            davis_path = write_queue_file(root, items=[davis], queue_run_id="mq-davis")
+            approval_id = dry_run_approval(root, davis_path, ["1"])
+
+            sbr = queue_item(1)
+            sbr["business"] = "SBR Concrete"
+            sbr["record_id"] = "recSBRCONCRETE001"
+            sbr_path = write_queue_file(root, items=[sbr], queue_run_id="mq-sbr")
+
+            with patch.object(hq, "_run_capture") as run, self.assertRaisesRegex(CommandError, "approval mismatch"):
+                hq.cmd_mark_sent(
+                    ["1"], approval_id=approval_id, execute=True, root=root, **queue_identity(sbr_path)
+                )
+            run.assert_not_called()
+            self.assertFalse(hq.queue_writeback_path(root, "mq-sbr").exists())
+
+    def test_changed_channel_or_artifact_hash_invalidates_dry_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp)
+            path = write_queue_file(root, items=[queue_item(1)])
+            approval_id = dry_run_approval(root, path, ["1"], channel="sms")
+            identity = queue_identity(path)
+            identity["artifact_sha256"] = "b" * 64
+            with self.assertRaisesRegex(CommandError, "artifact_sha256"):
+                hq.cmd_mark_sent(["1"], channel="sms", approval_id=approval_id, execute=True, root=root, **identity)
 
     def test_already_sent_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = make_root(tmp)
-            write_queue_file(root, items=[queue_item(1, sent_at="2026-07-09T09:00:00-04:00")])
-            with patch.object(hq, "_run_capture") as run:
-                res = hq.cmd_mark_sent(["1"], execute=True, root=root)
-            run.assert_not_called()
+            path = write_queue_file(root, items=[queue_item(1)])
+            immutable_before = path.read_bytes()
+            approval_id = dry_run_approval(root, path, ["1"])
+            with patch.object(hq, "_run_capture", return_value=ok_proc()):
+                hq.cmd_mark_sent(["1"], approval_id=approval_id, execute=True, root=root, **queue_identity(path))
+            queue_run_id = json.loads(path.read_text(encoding="utf-8"))["queue_run_id"]
+            writeback_path = hq.queue_writeback_path(root, queue_run_id)
+            writeback_before = writeback_path.read_bytes()
+            outcomes_before = (root / "outcomes.jsonl").read_bytes()
+            with patch.object(hq, "_run_capture") as repeated:
+                res = hq.cmd_mark_sent(["1"], approval_id=approval_id, execute=True, root=root, **queue_identity(path))
+            repeated.assert_not_called()
             self.assertIn("[ALREADY-SENT]", res.message)
+            self.assertEqual(path.read_bytes(), immutable_before)
+            self.assertEqual(writeback_path.read_bytes(), writeback_before)
+            self.assertEqual((root / "outcomes.jsonl").read_bytes(), outcomes_before)
 
     def test_record_id_token_matches(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = make_root(tmp)
             item = queue_item(2)
-            write_queue_file(root, items=[queue_item(1), item])
+            path = write_queue_file(root, items=[queue_item(1), item])
+            approval_id = dry_run_approval(root, path, [item["record_id"]], channel="ig-dm")
             with patch.object(hq, "_run_capture", return_value=ok_proc()):
-                res = hq.cmd_mark_sent([item["record_id"]], channel="ig-dm", execute=True, root=root)
+                res = hq.cmd_mark_sent([item["record_id"]], channel="ig-dm", approval_id=approval_id, execute=True, root=root, **queue_identity(path))
             self.assertIn("Instagram DM", res.message)
             self.assertIn("[SENT] 2. Biz 2", res.message)
+
+    def test_record_id_writeback_does_not_require_number_or_latest_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp)
+            record_id = "recDIRECTRECORD01"
+            dry = hq.cmd_mark_sent(
+                [record_id],
+                channel="email",
+                artifact_sha256="c" * 64,
+                dry_run=True,
+                execute=True,
+                root=root,
+            )
+            approval_id = next(
+                line.split(": ", 1)[1] for line in dry.message.splitlines() if line.startswith("approval_id:")
+            )
+            with patch.object(hq, "_run_capture", return_value=ok_proc()) as run:
+                live = hq.cmd_mark_sent(
+                    [record_id],
+                    channel="email",
+                    artifact_sha256="c" * 64,
+                    approval_id=approval_id,
+                    execute=True,
+                    root=root,
+                )
+            self.assertIn(f"[SENT]", live.message)
+            self.assertIn(record_id, run.call_args.args[0])
+            with patch.object(hq, "_run_capture") as repeated:
+                again = hq.cmd_mark_sent(
+                    [record_id], channel="email", artifact_sha256="c" * 64,
+                    approval_id=approval_id, execute=True, root=root,
+                )
+            repeated.assert_not_called()
+            self.assertIn("[ALREADY-SENT]", again.message)
 
     def test_non_schema_manual_file_refused(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = make_root(tmp)
-            hq.queue_file_path(root, hq._today()).write_text(
-                json.dumps({"date": hq._today(), "manual_rehearsal": True, "items": [queue_item(1)]}),
-                encoding="utf-8",
-            )
+            run_path = hq.queue_run_path(root, hq._today(), "mq-manual")
+            run_path.parent.mkdir(parents=True, exist_ok=True)
+            run_path.write_text(json.dumps({"date": hq._today(), "manual_rehearsal": True, "items": [queue_item(1)]}), encoding="utf-8")
             with self.assertRaises(CommandError) as ctx:
-                hq.cmd_mark_sent(["1"], execute=True, root=root)
+                hq.cmd_mark_sent(["1"], queue_run_id="mq-manual", queue_sha256="b" * 64, artifact_sha256="a" * 64, execute=True, root=root)
             self.assertIn("schema", str(ctx.exception))
 
     def test_dry_run_writes_nothing(self) -> None:
@@ -431,11 +616,11 @@ class MarkSentTest(unittest.TestCase):
             path = write_queue_file(root, items=[queue_item(1)])
             before = path.read_text(encoding="utf-8")
             with patch.object(hq, "_run_capture") as run:
-                res = hq.cmd_mark_sent(["1"], dry_run=True, execute=True, root=root)
+                res = hq.cmd_mark_sent(["1"], dry_run=True, execute=True, root=root, **queue_identity(path))
             run.assert_not_called()
             self.assertIn("[DRY-RUN]", res.message)
             self.assertEqual(path.read_text(encoding="utf-8"), before)
-            self.assertFalse((root / "outcomes.jsonl").exists())
+            self.assertEqual((root / "outcomes.jsonl").read_text(encoding="utf-8"), "")
 
     def test_outcomes_rows_deduped_by_record_channel_date(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -454,13 +639,45 @@ class MarkSentTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = make_root(tmp)
             path = write_queue_file(root, items=[queue_item(1)])
+            approval_id = dry_run_approval(root, path, ["1"])
             failed = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="[ERROR] Airtable PATCH failed 503")
             with patch.object(hq, "_run_capture", return_value=failed):
-                res = hq.cmd_mark_sent(["1"], execute=True, root=root)
+                res = hq.cmd_mark_sent(["1"], approval_id=approval_id, execute=True, root=root, **queue_identity(path))
             self.assertIn("[FAIL]", res.message)
             data = json.loads(path.read_text(encoding="utf-8"))
             self.assertIsNone(data["items"][0]["sent_at"])
-            self.assertFalse((root / "outcomes.jsonl").exists())
+            self.assertEqual((root / "outcomes.jsonl").read_text(encoding="utf-8"), "")
+
+    def test_dry_run_refuses_opt_out_recorded_after_queue_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp)
+            item = queue_item(1)
+            item["phone"] = "(216) 555-1234"
+            path = write_queue_file(root, items=[item])
+            (root / "outcomes.jsonl").write_text(
+                json.dumps({"event": "opt_out", "phone": "+1 216-555-1234"}) + "\n",
+                encoding="utf-8",
+            )
+            with patch.object(hq, "_run_capture") as run, self.assertRaisesRegex(CommandError, "suppressed or opted out"):
+                hq.cmd_mark_sent(["1"], dry_run=True, execute=True, root=root, **queue_identity(path))
+            run.assert_not_called()
+
+    def test_live_mark_sent_refuses_opt_out_recorded_after_dry_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp)
+            item = queue_item(1)
+            item["email"] = "Owner@Example.COM"
+            path = write_queue_file(root, items=[item])
+            approval_id = dry_run_approval(root, path, ["1"])
+            (root / "outcomes.jsonl").write_text(
+                json.dumps({"event": "unsubscribed", "email": "owner@example.com"}) + "\n",
+                encoding="utf-8",
+            )
+            with patch.object(hq, "_run_capture") as run, self.assertRaisesRegex(CommandError, "suppressed or opted out"):
+                hq.cmd_mark_sent(
+                    ["1"], approval_id=approval_id, execute=True, root=root, **queue_identity(path)
+                )
+            run.assert_not_called()
 
 
 class ParserDispatchTest(unittest.TestCase):

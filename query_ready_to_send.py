@@ -33,17 +33,41 @@ DISPLAY_FIELDS = [
     "Owner Name",
     "Vertical",
     "City",
+    "Metro Context",
     "Phone",
     "Email",
     "Website URL",
     "Reviews",
     "Rating",
+    "AI Confidence",
+    "Money Signal",
+    "Buyer Intent Signals",
+    "Send Trigger",
     "Best Service Angle",
     "Offer Fit",
     "Specific Observation",
     "Site Status",
     "Opener",
     "Safe Outreach Claims",
+    "Evidence Refs",
+    "Evidence Snapshot",
+    "Commercial Fit State",
+    "Commercial Materiality",
+    "Recurring Consequence",
+    "Root Cause Confidence",
+    "LPM Offer Component",
+    "Packageable Solution",
+    "Value Mechanism",
+    "Beyond Free Fix",
+    "Self Fix Risk",
+    "Intentionality",
+    "Contact Eligibility",
+    "Asset State",
+    "Promise State",
+    "Asset ID",
+    "Asset Verifier Verdict",
+    "Outreach Channel",
+    "Consent Posture",
     "Mockup URL",
     "Video URL",
     "Lead Priority",
@@ -54,6 +78,7 @@ DISPLAY_FIELDS = [
 ]
 
 _PRIORITY_RANK = {"A": 0, "B": 1, "C": 2}
+REQUIRED_READINESS_FIELDS = {"Commercial Fit State", "Contact Eligibility"}
 
 
 def airtable_base_url(base_id: str, table: str) -> str:
@@ -63,6 +88,7 @@ def airtable_base_url(base_id: str, table: str) -> str:
 def build_formula(vertical: str) -> str:
     formula = (
         "AND({Sendable}='Yes',{Packet Eligible}='Yes',"
+        "{Commercial Fit State}='commercially-sendable',{Contact Eligibility}='contact-now',"
         "NOT({Status}='Sent'),NOT({Status}='Closed')"
     )
     if vertical:
@@ -91,7 +117,12 @@ def fetch_ready_records(base_id: str, table: str, token: str, *, vertical: str =
         if probe.status_code < 400:
             break
         match = _UNKNOWN_FIELD_RE.search(probe.text)
-        if probe.status_code == 422 and match and match.group(1) in requested:
+        if (
+            probe.status_code == 422
+            and match
+            and match.group(1) in requested
+            and match.group(1) not in REQUIRED_READINESS_FIELDS
+        ):
             print(f"[WARN] Airtable has no column '{match.group(1)}'; querying without it", file=sys.stderr)
             requested.remove(match.group(1))
             continue
@@ -115,6 +146,15 @@ def fetch_ready_records(base_id: str, table: str, token: str, *, vertical: str =
             fields = record.get("fields") or {}
             row = {"record_id": record.get("id", "")}
             row.update({field: fields.get(field, "") for field in DISPLAY_FIELDS})
+            if (
+                str(row.get("Commercial Fit State") or "").strip().casefold() != "commercially-sendable"
+                or str(row.get("Contact Eligibility") or "").strip().casefold() != "contact-now"
+            ):
+                print(
+                    f"[WARN] Airtable record {row['record_id'] or '<missing-id>'} failed defensive commercial readiness check",
+                    file=sys.stderr,
+                )
+                continue
             records.append(row)
         offset = data.get("offset")
         if not offset:

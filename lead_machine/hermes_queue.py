@@ -2,8 +2,8 @@
 """Morning send-queue verbs for the Hermes command layer.
 
 Deterministic half of the morning outreach loop: pooled sendable counts,
-budget-capped pipeline top-up, the canonical morning queue file, and the
-sent write-back. Opener drafting and digest prose live agent-side
+budget-capped pipeline top-up, immutable morning queue runs and their dated
+discovery indexes, and separate sent write-back. Opener drafting and digest prose live agent-side
 (operator-agent SKILLS/morning-queue); every fact the digest states comes
 from the queue JSON this module writes. Draft-only: nothing here ever
 contacts a prospect — mark-sent only records sends Lou already made.
@@ -17,6 +17,8 @@ import re
 import shlex
 import subprocess
 import sys
+import uuid
+import hashlib
 from datetime import date as date_cls
 from datetime import datetime
 from pathlib import Path
@@ -43,7 +45,7 @@ from lead_machine.hermes_commands import (
 from lead_machine.hermes_executor import render_command
 
 
-QUEUE_SCHEMA_VERSION = 1
+QUEUE_SCHEMA_VERSION = 2
 QUERY_SCRIPT = "query_ready_to_send.py"
 MARK_SENT_SCRIPT = "mark_sent.py"
 CONFIG_ENV = "MORNING_QUEUE_CONFIG"
@@ -92,19 +94,45 @@ CHANNEL_LABELS = {
 ITEM_FIELD_MAP = [
     ("business", "Business Name"),
     ("city", "City"),
+    ("metro_context", "Metro Context"),
     ("phone", "Phone"),
     ("email", "Email"),
     ("website", "Website URL"),
+    ("reviews", "Reviews"),
+    ("rating", "Rating"),
     ("lead_priority", "Lead Priority"),
     ("score_total", "Score Total"),
+    ("ai_confidence", "AI Confidence"),
+    ("money_signal", "Money Signal"),
+    ("buyer_intent_signals", "Buyer Intent Signals"),
+    ("send_trigger", "Send Trigger"),
     ("best_service_angle", "Best Service Angle"),
     ("offer_fit", "Offer Fit"),
     ("specific_observation", "Specific Observation"),
     ("site_status", "Site Status"),
     ("stored_opener", "Opener"),
     ("safe_outreach_claims", "Safe Outreach Claims"),
+    ("evidence_refs", "Evidence Refs"),
+    ("evidence_snapshot", "Evidence Snapshot"),
     ("mockup_url", "Mockup URL"),
     ("video_url", "Video URL"),
+    ("commercial_fit_state", "Commercial Fit State"),
+    ("commercial_materiality", "Commercial Materiality"),
+    ("recurring_consequence", "Recurring Consequence"),
+    ("root_cause_confidence", "Root Cause Confidence"),
+    ("offer_component", "LPM Offer Component"),
+    ("packageable_solution", "Packageable Solution"),
+    ("value_mechanism", "Value Mechanism"),
+    ("beyond_free_fix", "Beyond Free Fix"),
+    ("self_fix_risk", "Self Fix Risk"),
+    ("intentionality", "Intentionality"),
+    ("contact_eligibility", "Contact Eligibility"),
+    ("asset_state", "Asset State"),
+    ("promise_state", "Promise State"),
+    ("asset_id", "Asset ID"),
+    ("asset_verifier_verdict", "Asset Verifier Verdict"),
+    ("channel", "Outreach Channel"),
+    ("consent_posture", "Consent Posture"),
 ]
 
 
@@ -148,16 +176,66 @@ def queue_file_path(root: Path, date: str) -> Path:
     return root / "run_state" / f"morning_queue_{date}.json"
 
 
-def topup_file_path(root: Path, date: str) -> Path:
-    return root / "run_state" / f"morning_topup_{date}.json"
+def queue_runs_dir(root: Path, date: str) -> Path:
+    return root / "run_state" / "morning_queue_runs" / date
+
+
+def queue_run_path(root: Path, date: str, queue_run_id: str) -> Path:
+    return queue_runs_dir(root, date) / f"{queue_run_id}.json"
+
+
+def queue_approval_path(root: Path, approval_id: str) -> Path:
+    return root / "run_state" / "morning_queue_approvals" / f"{approval_id}.json"
+
+
+def queue_writeback_path(root: Path, queue_run_id: str) -> Path:
+    return root / "run_state" / "morning_queue_writebacks" / f"{queue_run_id}.json"
 
 
 def latest_queue_file(root: Path) -> Path | None:
+    """Return the newest dated discovery index for read-only queue status reporting."""
     state_dir = root / "run_state"
     if not state_dir.exists():
         return None
     candidates = sorted(state_dir.glob("morning_queue_*.json"))
     return candidates[-1] if candidates else None
+
+
+def topup_file_path(root: Path, date: str) -> Path:
+    return root / "run_state" / f"morning_topup_{date}.json"
+
+
+def _canonical_hash(value: Any) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _queue_content_hash(payload: dict[str, Any]) -> str:
+    return _canonical_hash({key: value for key, value in payload.items() if key != "queue_sha256"})
+
+
+def _new_queue_run_id(queue_date: str) -> str:
+    return f"mq-{queue_date.replace('-', '')}-{uuid.uuid4().hex}"
+
+
+def _write_queue_index(root: Path, queue_date: str, run: dict[str, Any], path: Path) -> None:
+    index: dict[str, Any] = {"schema_version": QUEUE_SCHEMA_VERSION, "date": queue_date, "runs": []}
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            existing = None
+        if isinstance(existing, dict) and existing.get("schema_version") == QUEUE_SCHEMA_VERSION:
+            index = existing
+    runs = index.setdefault("runs", [])
+    runs.append({
+        "queue_run_id": run["queue_run_id"],
+        "queue_sha256": run["queue_sha256"],
+        "created_at": run["created_at"],
+        "path": str(queue_run_path(root, queue_date, run["queue_run_id"]).relative_to(root)),
+    })
+    index["latest_queue_run_id"] = run["queue_run_id"]
+    _atomic_write_json(path, index)
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -418,11 +496,116 @@ def cmd_queue_topup(
 # ---------------------------------------------------------------- morning-queue
 
 
-def _build_queue_items(records: list[dict[str, Any]], *, target: int, overflow_cap: int) -> list[dict[str, Any]]:
+def _suppression_identifier(kind: str, value: Any) -> str:
+    cleaned = str(value or "").strip()
+    if not cleaned:
+        return ""
+    if kind == "phone":
+        cleaned = "".join(character for character in cleaned if character.isdigit())
+        if len(cleaned) == 11 and cleaned.startswith("1"):
+            cleaned = cleaned[1:]
+    else:
+        cleaned = cleaned.casefold()
+    return f"{kind}:{cleaned}" if cleaned else ""
+
+
+def _load_suppression_index(config: dict[str, Any]) -> tuple[set[str], str]:
+    raw_path = os.environ.get("LPM_OUTCOMES_JSONL", "").strip() or str(config.get("outcomes_jsonl") or "").strip()
+    if not raw_path:
+        return set(), "outcomes_jsonl suppression source is not configured"
+    path = _absolute(raw_path)
+    if not path.is_file():
+        return set(), f"suppression source {path} is missing or unreadable"
+    suppressed: set[str] = set()
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        return set(), f"suppression source {path} is unreadable: {exc}"
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            return set(), f"suppression source {path}:{line_number} is malformed JSON: {exc.msg}"
+        if not isinstance(row, dict):
+            return set(), f"suppression source {path}:{line_number} must contain a JSON object"
+        event = str(row.get("event") or "").strip().casefold().replace("-", "_").replace(" ", "_")
+        if event not in {"opt_out", "opted_out", "unsubscribe", "unsubscribed", "suppressed", "stop"}:
+            continue
+        identifiers = {
+            identifier
+            for key in ("record_id", "phone", "email")
+            if (identifier := _suppression_identifier(key, row.get(key)))
+        }
+        if not identifiers:
+            return set(), f"suppression source {path}:{line_number} has a suppression event without an identifier"
+        suppressed.update(identifiers)
+    return suppressed, ""
+
+
+def _item_suppression_identifiers(item: dict[str, Any]) -> set[str]:
+    values = {
+        "record_id": item.get("record_id"),
+        "phone": item.get("phone") or item.get("Phone"),
+        "email": item.get("email") or item.get("Email"),
+    }
+    return {
+        identifier
+        for key in ("record_id", "phone", "email")
+        if (identifier := _suppression_identifier(key, values[key]))
+    }
+
+
+def _is_suppressed(item: dict[str, Any], suppression: set[str]) -> bool:
+    return bool(_item_suppression_identifiers(item) & suppression)
+
+
+def _compliance_annotations(item: dict[str, Any], suppression: set[str]) -> dict[str, str]:
+    channel = str(item.get("channel") or "").strip()
+    channel_key = channel.casefold()
+    suppression_status = "suppressed" if _is_suppressed(item, suppression) else "clear"
+
+    if channel_key == "phone":
+        consent = "manual-business-call-not-sms"
+        opt_out = "honor-do-not-call-and-stop"
+    elif channel_key in {"instagram dm", "dm"}:
+        consent = "manual-platform-message"
+        opt_out = "honor-stop-and-platform-suppression"
+    elif channel_key == "email":
+        consent = "cold-business-email"
+        opt_out = "requires-unsubscribe-and-physical-address"
+    elif channel_key == "sms":
+        consent = str(item.get("consent_posture") or "unknown").strip()
+        opt_out = "honor-stop-and-suppression"
+    else:
+        consent = "unknown"
+        opt_out = "unknown"
+
+    vertical = str(item.get("vertical") or "local service").replace("_", " ")
+    return {
+        "suppression_status": suppression_status,
+        "consent_posture": consent,
+        "opt_out_posture": opt_out,
+        "person_read": f"{vertical} owner/operator; practical buyer; sophistication unknown",
+        "state_read": "unknown; do not infer mood or urgency",
+        "status_read": "cold stranger; buyer controls attention; use a level non-needy posture",
+        "moment_read": f"first manual {channel or 'unknown-channel'} touch; thin attention; lead with verified evidence",
+    }
+
+
+def _build_queue_items(
+    records: list[dict[str, Any]],
+    *,
+    target: int,
+    overflow_cap: int,
+    suppression: set[str] | None = None,
+) -> list[dict[str, Any]]:
     ab_count = sum(
         1 for record in records if str(record.get("Lead Priority") or "").strip().upper() in {"A", "B"}
     )
     take = min(max(target, ab_count), max(1, overflow_cap), len(records))
+    suppression = suppression or set()
     items: list[dict[str, Any]] = []
     for index, record in enumerate(records[:take], start=1):
         item: dict[str, Any] = {
@@ -432,6 +615,7 @@ def _build_queue_items(records: list[dict[str, Any]], *, target: int, overflow_c
         }
         for key, field in ITEM_FIELD_MAP:
             item[key] = record.get(field, "")
+        item.update(_compliance_annotations(item, suppression))
         item["sent_at"] = None
         item["sent_channel"] = None
         items.append(item)
@@ -540,13 +724,14 @@ def cmd_morning_queue(
         raise CommandError("Target queue size must be a positive integer.")
     overflow_cap = int(config.get("queue_overflow_cap") or resolved_target)
     queue_date = _validate_date(date) if date else _today()
-    path = queue_file_path(root_path, queue_date)
+    index_path = queue_file_path(root_path, queue_date)
 
     if not execute:
         return CommandResult(
             f"repo_root: {root_path}\n"
             f"preview /morning-queue: pooled Airtable query -> top max({resolved_target}, all A+B) capped at "
-            f"{overflow_cap} -> atomic-write {path} (overwrites any manual file for {queue_date})."
+            f"{overflow_cap} -> create a new immutable run under {queue_runs_dir(root_path, queue_date)} "
+            f"and append its identity to {index_path}."
         )
 
     topup = _load_topup_telemetry(root_path, queue_date)
@@ -555,12 +740,19 @@ def cmd_morning_queue(
         queue_date=queue_date,
         topup_enabled=bool(config.get("topup_enabled")),
     )
+    queue_run_id = _new_queue_run_id(queue_date)
+    created_at = _local_now().isoformat()
     payload: dict[str, Any] = {
         "schema_version": QUEUE_SCHEMA_VERSION,
+        "queue_run_id": queue_run_id,
+        "created_at": created_at,
         "date": queue_date,
-        "generated_at": _local_now().isoformat(),
+        "generated_at": created_at,
         "target": resolved_target,
         "pooled_sendable": 0,
+        "fetched_count": 0,
+        "suppressed_excluded_count": 0,
+        "queued_count": 0,
         "per_vertical": {},
         "topup": topup,
         "topup_report": topup_report,
@@ -569,22 +761,43 @@ def cmd_morning_queue(
     }
     try:
         records = fetch_pooled_records(root=root_path, python_path=python_path)
+        payload["pooled_sendable"] = len(records)
+        payload["fetched_count"] = len(records)
+        suppression, suppression_error = _load_suppression_index(config)
+        if suppression_error:
+            raise CommandError(suppression_error)
     except CommandError as exc:
         # Degraded, never silent: write the dated file with zero items so
         # mark-sent can never map numbers against a stale day.
         payload["error"] = str(exc)
-        _atomic_write_json(path, payload)
+        payload["queue_sha256"] = _queue_content_hash(payload)
+        run_path = queue_run_path(root_path, queue_date, queue_run_id)
+        _atomic_write_json(run_path, payload)
+        _write_queue_index(root_path, queue_date, payload, index_path)
         return CommandResult(
-            f"morning-queue DEGRADED: pooled query failed; wrote {path} with 0 items.\nError: {exc}"
+            f"morning-queue DEGRADED: compliance/query input failed; wrote immutable run {run_path} with 0 items.\n"
+            f"queue_run_id: {queue_run_id}\nqueue_sha256: {payload['queue_sha256']}\nError: {exc}"
         )
 
-    payload["pooled_sendable"] = len(records)
     payload["per_vertical"] = per_vertical_counts(records)
-    payload["items"] = _build_queue_items(records, target=resolved_target, overflow_cap=overflow_cap)
-    _atomic_write_json(path, payload)
+    clear_records = [record for record in records if not _is_suppressed(record, suppression)]
+    payload["suppressed_excluded_count"] = len(records) - len(clear_records)
+    payload["items"] = _build_queue_items(
+        clear_records,
+        target=resolved_target,
+        overflow_cap=overflow_cap,
+        suppression=suppression,
+    )
+    payload["queued_count"] = len(payload["items"])
+    payload["queue_sha256"] = _queue_content_hash(payload)
+    run_path = queue_run_path(root_path, queue_date, queue_run_id)
+    _atomic_write_json(run_path, payload)
+    _write_queue_index(root_path, queue_date, payload, index_path)
     return CommandResult(
-        f"morning-queue written: {path}\n"
-        f"pooled {payload['pooled_sendable']}; queued {len(payload['items'])} "
+        f"morning-queue immutable run written: {run_path}\n"
+        f"queue_run_id: {queue_run_id}\nqueue_sha256: {payload['queue_sha256']}\n"
+        f"fetched {payload['fetched_count']}; excluded {payload['suppressed_excluded_count']}; "
+        f"queued {payload['queued_count']} "
         f"(target {resolved_target}, cap {overflow_cap}).\n"
         f"top-up report: {topup_report['message']}"
     )
@@ -593,18 +806,13 @@ def cmd_morning_queue(
 # ------------------------------------------------------------------- mark-sent
 
 
-def _load_queue_for_marking(root: Path, date: str) -> tuple[Path, dict[str, Any]]:
-    if date:
-        path = queue_file_path(root, _validate_date(date))
-        if not path.exists():
-            raise CommandError(f"No queue file for {date}: {path}")
-    else:
-        path = queue_file_path(root, _today())
-        if not path.exists():
-            latest = latest_queue_file(root)
-            if latest is None:
-                raise CommandError("No morning_queue_*.json found in run_state/. Run morning-queue --execute first.")
-            path = latest
+def _load_queue_for_marking(root: Path, queue_run_id: str, queue_sha256: str) -> tuple[Path, dict[str, Any]]:
+    if not queue_run_id or not queue_sha256:
+        raise CommandError("Item numbers require the exact --queue-run-id and --queue-sha256 from the delivered digest.")
+    candidates = list((root / "run_state" / "morning_queue_runs").glob(f"*/{queue_run_id}.json"))
+    if len(candidates) != 1:
+        raise CommandError(f"Queue run {queue_run_id!r} was not found exactly once.")
+    path = candidates[0]
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
@@ -617,7 +825,93 @@ def _load_queue_for_marking(root: Path, date: str) -> tuple[Path, dict[str, Any]
     items = data.get("items")
     if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
         raise CommandError(f"Queue file {path} has no valid items list.")
+    if data.get("queue_run_id") != queue_run_id:
+        raise CommandError("Queue run ID does not match immutable artifact content.")
+    actual_hash = _queue_content_hash(data)
+    if data.get("queue_sha256") != actual_hash or queue_sha256 != actual_hash:
+        raise CommandError("Queue hash is missing, changed, or does not match the immutable artifact.")
     return path, data
+
+
+def _load_writeback_state(root: Path, queue_run_id: str) -> dict[str, Any]:
+    path = queue_writeback_path(root, queue_run_id)
+    if not path.exists():
+        return {"schema_version": 1, "queue_run_id": queue_run_id, "sent": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise CommandError(f"Write-back state {path} is not valid JSON: {exc}") from exc
+    if not isinstance(data, dict) or data.get("queue_run_id") != queue_run_id or not isinstance(data.get("sent"), dict):
+        raise CommandError(f"Write-back state {path} is malformed or belongs to another run.")
+    return data
+
+
+def _validate_sha256(label: str, value: str) -> str:
+    cleaned = str(value or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", cleaned):
+        raise CommandError(f"{label} must be an exact 64-character SHA-256 hash.")
+    return cleaned
+
+
+def _write_dry_run_approval(
+    root: Path,
+    *,
+    queue_run_id: str,
+    queue_sha256: str,
+    artifact_sha256: str,
+    channel: str,
+    record_ids: list[str],
+) -> dict[str, Any]:
+    approval_id = f"msa-{uuid.uuid4().hex}"
+    payload = {
+        "schema_version": 1,
+        "approval_id": approval_id,
+        "created_at": _local_now().isoformat(),
+        "queue_run_id": queue_run_id,
+        "queue_sha256": queue_sha256,
+        "artifact_sha256": artifact_sha256,
+        "channel": channel,
+        "record_ids": record_ids,
+    }
+    payload["approval_sha256"] = _canonical_hash(payload)
+    _atomic_write_json(queue_approval_path(root, approval_id), payload)
+    return payload
+
+
+def _require_matching_approval(
+    root: Path,
+    approval_id: str,
+    *,
+    queue_run_id: str,
+    queue_sha256: str,
+    artifact_sha256: str,
+    channel: str,
+    record_ids: list[str],
+) -> dict[str, Any]:
+    if not approval_id:
+        raise CommandError("Live write-back requires --approval-id from the clean dry-run of this exact artifact.")
+    path = queue_approval_path(root, approval_id)
+    if not path.is_file():
+        raise CommandError(f"Dry-run approval {approval_id!r} does not exist.")
+    try:
+        approval = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise CommandError(f"Dry-run approval {approval_id!r} is malformed: {exc}") from exc
+    expected = {
+        "queue_run_id": queue_run_id,
+        "queue_sha256": queue_sha256,
+        "artifact_sha256": artifact_sha256,
+        "channel": channel,
+        "record_ids": record_ids,
+    }
+    changed = [key for key, value in expected.items() if approval.get(key) != value]
+    stored_hash = approval.get("approval_sha256")
+    actual_hash = _canonical_hash({key: value for key, value in approval.items() if key != "approval_sha256"})
+    if stored_hash != actual_hash:
+        changed.append("approval_sha256")
+    if changed:
+        raise CommandError("Refusing live write-back: dry-run approval mismatch in " + ", ".join(changed) + ".")
+    return approval
 
 
 def _resolve_channel(channel: str) -> str:
@@ -653,6 +947,24 @@ def _match_items(tokens: list[str], items: list[dict[str, Any]]) -> list[dict[st
     return matched
 
 
+def _require_current_suppression_clear(
+    matched: list[dict[str, Any]],
+    *,
+    config: dict[str, Any],
+) -> None:
+    suppression, error = _load_suppression_index(config)
+    if error:
+        raise CommandError(f"Refusing mark-sent: current suppression state is unknown: {error}.")
+    unknown = [str(item.get("record_id") or "") for item in matched if not _item_suppression_identifiers(item)]
+    if unknown:
+        raise CommandError("Refusing mark-sent: selected queue item has no suppression identity: " + ", ".join(unknown))
+    suppressed = [str(item.get("record_id") or item.get("business") or "unknown") for item in matched if _is_suppressed(item, suppression)]
+    if suppressed:
+        raise CommandError(
+            "Refusing mark-sent: selected item is currently suppressed or opted out: " + ", ".join(suppressed)
+        )
+
+
 def _append_outcome_row(config: dict[str, Any], row: dict[str, Any]) -> str:
     # morning_queue.json carries a machine-absolute default; LPM_OUTCOMES_JSONL
     # overrides it so other machines can redirect without editing tracked config.
@@ -681,7 +993,10 @@ def cmd_mark_sent(
     tokens: list[str],
     *,
     channel: str = "sms",
-    date: str = "",
+    queue_run_id: str = "",
+    queue_sha256: str = "",
+    artifact_sha256: str = "",
+    approval_id: str = "",
     dry_run: bool = False,
     execute: bool = False,
     root: Path | str = Path("."),
@@ -696,14 +1011,65 @@ def cmd_mark_sent(
     if not execute:
         return CommandResult(
             f"repo_root: {root_path}\n"
-            f"preview /mark-sent: map {' '.join(tokens)} against today's queue file, PATCH Airtable "
-            f"Status=Sent via {MARK_SENT_SCRIPT} with Outreach Channel={channel_label}, update queue file, "
-            f"append operator-agent outcomes row."
+            f"preview /mark-sent: map {' '.join(tokens)} against an immutable queue run, PATCH Airtable "
+            f"Status=Sent via {MARK_SENT_SCRIPT} with Outreach Channel={channel_label}, update separate "
+            f"write-back state, and append one idempotent operator-agent outcomes row."
         )
 
-    path, data = _load_queue_for_marking(root_path, date)
-    items = data["items"]
-    matched = _match_items(tokens, items)
+    artifact_sha256 = _validate_sha256("--artifact-sha256", artifact_sha256)
+    has_numbers = any(token.isdigit() for token in tokens)
+    if has_numbers or queue_run_id or queue_sha256:
+        path, data = _load_queue_for_marking(root_path, queue_run_id, queue_sha256)
+        items = data["items"]
+        matched = _match_items(tokens, items)
+        resolved_run_id = str(data["queue_run_id"])
+        resolved_queue_sha = str(data["queue_sha256"])
+        queue_date = str(data.get("date") or _today())
+    else:
+        if not all(RECORD_ID_RE.match(token) for token in tokens):
+            raise CommandError("Bare item numbers are forbidden; use record IDs or bind numbers to an exact queue run.")
+        path = None
+        data = {"items": []}
+        matched = [{"n": None, "record_id": token, "business": token, "vertical": ""} for token in dict.fromkeys(tokens)]
+        resolved_run_id = "record-ids-direct"
+        resolved_queue_sha = _canonical_hash([item["record_id"] for item in matched])
+        queue_date = _today()
+
+    record_ids = [str(item.get("record_id") or "") for item in matched]
+    if any(not record_id for record_id in record_ids):
+        raise CommandError("Every selected item must have an Airtable record ID.")
+    # Re-read the authority source for both dry-run and live execution. This
+    # catches opt-outs written after queue generation or after approval.
+    _require_current_suppression_clear(matched, config=config)
+    writeback = _load_writeback_state(root_path, resolved_run_id)
+
+    if dry_run:
+        approval = _write_dry_run_approval(
+            root_path,
+            queue_run_id=resolved_run_id,
+            queue_sha256=resolved_queue_sha,
+            artifact_sha256=artifact_sha256,
+            channel=channel_label,
+            record_ids=record_ids,
+        )
+        lines = [
+            f"[DRY-RUN] {item.get('n') or 'record'}. {item.get('business') or item.get('record_id')} "
+            f"({item.get('record_id')}) -> Sent via {channel_label}"
+            for item in matched
+        ]
+        lines.append(f"approval_id: {approval['approval_id']}")
+        lines.append(f"approval_sha256: {approval['approval_sha256']}")
+        return CommandResult("\n".join(lines))
+
+    _require_matching_approval(
+        root_path,
+        approval_id,
+        queue_run_id=resolved_run_id,
+        queue_sha256=resolved_queue_sha,
+        artifact_sha256=artifact_sha256,
+        channel=channel_label,
+        record_ids=record_ids,
+    )
 
     lines: list[str] = []
     changed = False
@@ -713,13 +1079,16 @@ def cmd_mark_sent(
         if not record_id:
             lines.append(f"[SKIP] {label}: no record_id in queue file")
             continue
-        if item.get("sent_at"):
-            lines.append(f"[ALREADY-SENT] {label} at {item.get('sent_at')} via {item.get('sent_channel')}")
+        prior = writeback["sent"].get(record_id)
+        if prior:
+            lines.append(f"[ALREADY-SENT] {label} at {prior.get('sent_at')} via {prior.get('sent_channel')}")
             continue
-        if dry_run:
-            lines.append(f"[DRY-RUN] would mark {label} ({record_id}) Sent via {channel_label}")
-            continue
-        cmd = [str(python_path or sys.executable), MARK_SENT_SCRIPT, "--record-id", record_id, "--channel", channel_label]
+        cmd = [
+            str(python_path or sys.executable), MARK_SENT_SCRIPT,
+            "--record-id", record_id,
+            "--channel", channel_label,
+            "--date", queue_date,
+        ]
         try:
             result = _run_capture(cmd, cwd=root_path, timeout_seconds=MARK_SENT_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
@@ -730,8 +1099,12 @@ def cmd_mark_sent(
             lines.append(f"[FAIL] {label}: " + " / ".join(tail))
             continue
         sent_at = _local_now().isoformat()
-        item["sent_at"] = sent_at
-        item["sent_channel"] = channel_label
+        writeback["sent"][record_id] = {
+            "sent_at": sent_at,
+            "sent_channel": channel_label,
+            "approval_id": approval_id,
+            "artifact_sha256": artifact_sha256,
+        }
         changed = True
         # Row shape follows the SKILLS/send-queue log-step contract so
         # outreach Loop D can join feedback on record_id.
@@ -743,16 +1116,21 @@ def cmd_mark_sent(
                 "vertical": item.get("vertical") or "",
                 "contact": item.get("business") or "",
                 "channel": channel_label,
-                "date": str(data.get("date") or _today()),
+                "date": queue_date,
                 "event": "sent",
                 "result": None,
                 "sent_at": sent_at,
                 "source": "hermes mark-sent",
+                "queue_run_id": resolved_run_id,
+                "queue_sha256": resolved_queue_sha,
+                "artifact_sha256": artifact_sha256,
+                "approval_id": approval_id,
             },
         )
         lines.append(f"[SENT] {label} ({record_id}) via {channel_label}; {outcome_note}")
 
     if changed:
-        _atomic_write_json(path, data)
-        lines.append(f"Queue file updated: {path}")
+        state_path = queue_writeback_path(root_path, resolved_run_id)
+        _atomic_write_json(state_path, writeback)
+        lines.append(f"Write-back state updated: {state_path}")
     return CommandResult("\n".join(lines))

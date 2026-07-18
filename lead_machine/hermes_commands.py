@@ -1489,8 +1489,9 @@ def cmd_help() -> CommandResult:
             "Morning queue:\n"
             "/queue-status - pooled sendable counts (read-only)\n"
             "/queue-topup [--budget USD] [--target N] - top up ONE deficit vertical under budget\n"
-            "/morning-queue [--target N] [--date YYYY-MM-DD] - write the canonical queue file\n"
-            "/mark-sent <numbers|rec ids> [--channel sms] [--date YYYY-MM-DD] [--dry-run] - record Lou's sends"
+            "/morning-queue [--target N] [--date YYYY-MM-DD] - create an immutable queue run\n"
+            "/mark-sent <numbers|rec ids> --artifact-sha256 HASH [--queue-run-id ID --queue-sha256 HASH] "
+            "[--channel sms] [--dry-run|--approval-id ID] - record Lou's sends"
         )
     )
 
@@ -1588,7 +1589,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("mark-sent", parents=[runtime])
     p.add_argument("items", nargs="+")
     p.add_argument("--channel", default="sms")
-    p.add_argument("--date", default="")
+    p.add_argument("--queue-run-id", default="")
+    p.add_argument("--queue-sha256", default="")
+    p.add_argument("--artifact-sha256", default="")
+    p.add_argument("--approval-id", default="")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--execute", action="store_true")
 
@@ -1751,7 +1755,10 @@ def dispatch(args: argparse.Namespace) -> CommandResult:
             return hermes_queue.cmd_mark_sent(
                 args.items,
                 channel=args.channel,
-                date=args.date,
+                queue_run_id=args.queue_run_id,
+                queue_sha256=args.queue_sha256,
+                artifact_sha256=args.artifact_sha256,
+                approval_id=args.approval_id,
                 dry_run=args.dry_run,
                 execute=args.execute,
                 root=repo_root,
