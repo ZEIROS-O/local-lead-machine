@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, Route, Routes, useParams } from "react-router-dom";
 import { getJson, params } from "./api";
 import type { BatchSummary, BatchesResponse, Health, LeadsResponse, Overview, Progress } from "./types";
@@ -161,9 +161,13 @@ function OverviewPage() {
   const [batches, setBatches] = useState<BatchSummary[]>([]);
   const [filters, setFilters] = useState<Filters>({ vertical: "", market: "", view: "", q: "" });
   const [error, setError] = useState("");
+  const request = useRef<{ generation: number; controller: AbortController | null }>({ generation: 0, controller: null });
 
   const load = useCallback(async (manual = false) => {
+    request.current.controller?.abort();
     const controller = new AbortController();
+    const generation = request.current.generation + 1;
+    request.current = { generation, controller };
     try {
       const base = { vertical: filters.vertical, market: filters.market, refresh: manual || undefined };
       const batchQuery: Record<string, string | boolean | undefined> = { ...base, q: filters.q };
@@ -175,19 +179,25 @@ function OverviewPage() {
         getJson<Overview>(`/api/overview${params(base)}`, controller.signal),
         getJson<BatchesResponse>(`/api/batches${params(batchQuery)}`, controller.signal),
       ]);
-      setOverview(overviewData);
-      setBatches(batchData.items);
-      setError("");
+      if (request.current.generation === generation && !controller.signal.aborted) {
+        setOverview(overviewData);
+        setBatches(batchData.items);
+        setError("");
+      }
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Dashboard data could not be refreshed");
+      if (request.current.generation === generation && !controller.signal.aborted) {
+        setError(caught instanceof Error ? caught.message : "Dashboard data could not be refreshed");
+      }
     }
-    return () => controller.abort();
   }, [filters]);
 
   useEffect(() => {
     void load();
     const interval = window.setInterval(() => void load(), REFRESH_MS);
-    return () => window.clearInterval(interval);
+    return () => {
+      window.clearInterval(interval);
+      request.current.controller?.abort();
+    };
   }, [load]);
 
   const manualRefresh = () => void load(true);
@@ -241,7 +251,7 @@ function ArtifactPanel({ batch }: { batch: BatchSummary }) {
 }
 
 function LeadTable({ response }: { response: LeadsResponse }) {
-  return <div className="table-wrap"><table className="lead-table"><thead><tr><th>Business</th><th>Scoring</th><th>Score</th><th>Priority</th><th>Packet tier</th><th>Money signal</th><th>Sendable</th><th>Confidence</th><th>Blockers</th></tr></thead><tbody>{response.items.map((lead, index) => <tr key={lead.key || `${lead.business_name}-${index}`}><td data-label="Business"><strong>{lead.business_name || "Unnamed lead"}</strong><small>{lead.city}</small><span className="row-links">{lead.website_url && <a href={lead.website_url} target="_blank" rel="noreferrer">Website</a>}{lead.google_maps_url && <a href={lead.google_maps_url} target="_blank" rel="noreferrer">Maps</a>}</span></td><td data-label="Scoring"><span className={`scoring-state ${lead.scoring_state}`}>{humanize(lead.scoring_state)}</span></td><td data-label="Score"><strong className="tabular">{lead.score_total || "—"}</strong></td><td data-label="Priority">{lead.priority || "—"}</td><td data-label="Packet tier">{lead.packet_tier || "—"}</td><td data-label="Money signal">{lead.money_signal ? "Present" : "No"}</td><td data-label="Sendable">{lead.sendable ? "Yes" : "No"}</td><td data-label="Confidence">{lead.ai_confidence || "—"}</td><td data-label="Blockers"><span className="blocker-text">{lead.blockers || "None recorded"}</span></td></tr>)}</tbody></table>{!response.items.length && <div className="empty-state table-empty"><strong>No leads match this view</strong><p>Adjust the scoring-state filter or search term.</p></div>}</div>;
+  return <div className="table-wrap"><table className="lead-table"><thead><tr><th>Business</th><th>Scoring</th><th>Score</th><th>Priority</th><th>Packet tier</th><th>Money signal</th><th>Sendable</th><th>Confidence</th><th>Blockers</th></tr></thead><tbody>{response.items.map((lead, index) => <tr key={lead.key || `${lead.business_name}-${index}`}><td data-label="Business"><strong>{lead.business_name || "Unnamed lead"}</strong><small>{lead.city}</small><span className="row-links">{lead.website_url && <a href={lead.website_url} target="_blank" rel="noreferrer">Website</a>}{lead.google_maps_url && <a href={lead.google_maps_url} target="_blank" rel="noreferrer">Maps</a>}</span></td><td data-label="Scoring"><span className={`scoring-state ${lead.scoring_state}`}>{humanize(lead.scoring_state)}</span></td><td data-label="Score"><strong className="tabular">{lead.score_total || "—"}</strong></td><td data-label="Priority">{lead.priority || "—"}</td><td data-label="Packet tier">{lead.packet_tier || "—"}</td><td data-label="Money signal">{lead.money_signal ? "Present" : "No"}</td><td data-label="Sendable">{lead.sendable ? "Yes" : lead.readiness_mismatch ? "No — contract mismatch" : "No"}</td><td data-label="Confidence">{lead.ai_confidence || "—"}</td><td data-label="Blockers"><span className="blocker-text">{lead.blockers || "None recorded"}</span></td></tr>)}</tbody></table>{!response.items.length && <div className="empty-state table-empty"><strong>No leads match this view</strong><p>Adjust the scoring-state filter or search term.</p></div>}</div>;
 }
 
 function BatchDetailPage() {
@@ -252,19 +262,37 @@ function BatchDetailPage() {
   const [query, setQuery] = useState("");
   const [page, setPage] = useState(1);
   const [error, setError] = useState("");
+  const request = useRef<{ generation: number; controller: AbortController | null }>({ generation: 0, controller: null });
 
   const load = useCallback(async (manual = false) => {
+    request.current.controller?.abort();
+    const controller = new AbortController();
+    const generation = request.current.generation + 1;
+    request.current = { generation, controller };
     try {
       const refresh = manual || undefined;
       const [detail, leadData] = await Promise.all([
-        getJson<BatchSummary>(`/api/batches/${encodeURIComponent(batchId)}${params({ refresh })}`),
-        getJson<LeadsResponse>(`/api/batches/${encodeURIComponent(batchId)}/leads${params({ state: leadState, q: query, page, page_size: 50, refresh })}`),
+        getJson<BatchSummary>(`/api/batches/${encodeURIComponent(batchId)}${params({ refresh })}`, controller.signal),
+        getJson<LeadsResponse>(`/api/batches/${encodeURIComponent(batchId)}/leads${params({ state: leadState, q: query, page, page_size: 50, refresh })}`, controller.signal),
       ]);
-      setBatch(detail); setLeads(leadData); setError("");
-    } catch (caught) { setError(caught instanceof Error ? caught.message : "Batch could not be read"); }
+      if (request.current.generation === generation && !controller.signal.aborted) {
+        setBatch(detail); setLeads(leadData); setError("");
+      }
+    } catch (caught) {
+      if (request.current.generation === generation && !controller.signal.aborted) {
+        setError(caught instanceof Error ? caught.message : "Batch could not be read");
+      }
+    }
   }, [batchId, leadState, query, page]);
 
-  useEffect(() => { void load(); const interval = window.setInterval(() => void load(), REFRESH_MS); return () => window.clearInterval(interval); }, [load]);
+  useEffect(() => {
+    void load();
+    const interval = window.setInterval(() => void load(), REFRESH_MS);
+    return () => {
+      window.clearInterval(interval);
+      request.current.controller?.abort();
+    };
+  }, [load]);
   const manualRefresh = () => void load(true);
   if (!batch || !leads) return <AppShell stale={Boolean(error)}><div className="loading-screen"><div className="loading-rail" /><strong>Reading batch artifacts…</strong>{error && <p>{error}</p>}<Link to="/">Return to overview</Link></div></AppShell>;
 

@@ -487,6 +487,26 @@ def merge_manual_score(
         "Packet Eligible": packet_eligible,
         "Packet Eligibility Reason": "Manual grade A/B" if packet_eligible else "Manual grade below B threshold",
     }
+    commercial_aliases = {
+        "Commercial Materiality": "commercial_materiality",
+        "Recurring Consequence": "recurring_consequence",
+        "Root Cause Confidence": "root_cause_confidence",
+        "LPM Offer Component": "offer_component",
+        "Packageable Solution": "packageable_solution",
+        "Value Mechanism": "value_mechanism",
+        "Beyond Free Fix": "beyond_free_fix",
+        "Self Fix Risk": "self_fix_risk",
+        "Intentionality": "intentionality",
+        "Contact Eligibility": "contact_eligibility",
+        "Asset State": "asset_state",
+        "Promise State": "promise_state",
+        "Asset ID": "asset_id",
+        "Asset Verifier Verdict": "asset_verifier_verdict",
+    }
+    for title, snake in commercial_aliases.items():
+        value = row.get(title, validated.get(snake, ""))
+        row[title] = value
+        row[snake] = value
     extra_refs_used = set(validated.get("evidence_refs") or []) - allowed_evidence_ids(enriched)
     for claim in validated.get("safe_outreach_claims") or []:
         extra_refs_used.update(set(claim.get("evidence_refs") or []) - allowed_evidence_ids(enriched))

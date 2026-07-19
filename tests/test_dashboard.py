@@ -83,6 +83,9 @@ def scored_rows(count: int) -> list[dict[str, str]]:
                 "Lead Priority": "A" if sendable else "B",
                 "Packet Tier": PACKET_TIER_SENDABLE if sendable else PACKET_TIER_MANUAL,
                 "Sendable": "Yes" if sendable else "No",
+                "Packet Eligible": "Yes",
+                "Commercial Fit State": "commercially-sendable" if sendable else "needs-broader-system-evidence",
+                "Contact Eligibility": "contact-now" if sendable else "hold-commercial-case",
                 "Money Signal": "Yes" if sendable else "No",
                 "AI Confidence": "high",
                 "Send Blockers": "" if sendable else "Needs review",
@@ -135,8 +138,8 @@ class DashboardRepositoryTest(unittest.TestCase):
         write_csv(
             self.paths.packet_index,
             [
-                {"Business Name": "Lead 0", "Packet Tier": PACKET_TIER_SENDABLE},
-                {"Business Name": "Lead 1", "Packet Tier": PACKET_TIER_MANUAL},
+                {"Place Key": "place-0", "Business Name": "Lead 0", "City": "Cleveland", "Packet Tier": PACKET_TIER_SENDABLE},
+                {"Place Key": "place-1", "Business Name": "Lead 1", "City": "Cleveland", "Packet Tier": PACKET_TIER_MANUAL},
             ],
         )
         sync_hash = current_sync_hash(self.paths, include_manual=True)
@@ -171,12 +174,92 @@ class DashboardRepositoryTest(unittest.TestCase):
         self.assertEqual(batch["progress"], "finished")
         self.assertEqual(batch["airtable"]["live"]["status"], "current")
 
-        with self.paths.packet_index.open("a", encoding="utf-8") as handle:
-            handle.write("Lead extra,Sendable Packet\n")
+        state = json.loads(self.paths.state_json.read_text(encoding="utf-8"))
+        state["dry_run_skip_count"] = []
+        self.paths.state_json.write_text(json.dumps(state), encoding="utf-8")
+        malformed = self.repo.batch(BATCH, force=True)
+        assert malformed is not None
+        self.assertEqual(malformed["health"], "blocked")
+        self.assertNotEqual(malformed["progress"], "finished")
+        self.assertIn("invalid_run_state_dry_run_skip_count", {issue["code"] for issue in malformed["issues"]})
+        state["dry_run_skip_count"] = 0
+        self.paths.state_json.write_text(json.dumps(state), encoding="utf-8")
+
+        write_csv(
+            self.paths.packet_index,
+            [
+                {"Place Key": "place-0", "Business Name": "Lead 0", "City": "Cleveland", "Packet Tier": PACKET_TIER_SENDABLE},
+                {"Place Key": "place-substituted", "Business Name": "Lead 1", "City": "Cleveland", "Packet Tier": PACKET_TIER_MANUAL},
+            ],
+        )
         changed = self.repo.batch(BATCH, force=True)
         assert changed is not None
         self.assertNotEqual(changed["progress"], "finished")
         self.assertIn("stale_packets", {issue["code"] for issue in changed["issues"]})
+        self.assertIn("packet_identity_drift", {issue["code"] for issue in changed["issues"]})
+
+    def test_sendable_tier_without_shared_readiness_is_blocked_and_not_counted(self) -> None:
+        write_enriched(self.paths.enriched, 1)
+        rows = scored_rows(1)
+        rows[0]["Contact Eligibility"] = "hold-commercial-case"
+        write_csv(self.paths.scored_csv, rows)
+        write_csv(self.paths.tiered_csv, rows)
+        batch = self.repo.batch(BATCH, force=True)
+        assert batch is not None
+        self.assertEqual(batch["counts"]["sendable"], 0)
+        self.assertEqual(batch["health"], "blocked")
+        self.assertIn("sendable_readiness_mismatch", {issue["code"] for issue in batch["issues"]})
+
+        leads = self.repo.leads(BATCH, force=True)
+        assert leads is not None
+        self.assertEqual(leads["items"][0]["sendable"], False)
+        self.assertEqual(leads["items"][0]["declared_sendable"], True)
+        self.assertEqual(leads["items"][0]["readiness_mismatch"], True)
+        filtered = self.repo.leads(BATCH, sendable=True, force=True)
+        assert filtered is not None
+        self.assertEqual(filtered["total"], 0)
+
+    def test_nonfinite_and_negative_usage_values_fail_visible_without_invalid_json(self) -> None:
+        self.paths.usage_json.write_text(
+            '{"calls": Infinity, "total_tokens": -10, "estimated_usd": NaN, '
+            '"caps": {"MAX_LLM_CALLS_PER_RUN": 10, "MAX_LLM_TOKENS_PER_RUN": 1000, '
+            '"MAX_LLM_USD_PER_RUN": -2}}',
+            encoding="utf-8",
+        )
+        batch = self.repo.batch(BATCH, force=True)
+        assert batch is not None
+        self.assertEqual(batch["health"], "blocked")
+        self.assertEqual(batch["llm_usage"]["calls"], 0)
+        self.assertEqual(batch["llm_usage"]["tokens"], 0)
+        self.assertEqual(batch["llm_usage"]["estimated_usd"], 0.0)
+        self.assertEqual(batch["llm_usage"]["usd_cap"], 0.0)
+        codes = {issue["code"] for issue in batch["issues"]}
+        self.assertIn("invalid_llm_usage_calls", codes)
+        self.assertIn("invalid_llm_usage_total_tokens", codes)
+        self.assertIn("invalid_llm_usage_estimated_usd", codes)
+        self.assertIn("invalid_llm_usage_caps_max_llm_usd_per_run", codes)
+        json.dumps(batch, allow_nan=False)
+
+    def test_oversized_usage_integers_fail_visible_without_crashing(self) -> None:
+        oversized = 10**400
+        self.paths.usage_json.write_text(
+            json.dumps(
+                {
+                    "estimated_usd": oversized,
+                    "caps": {"MAX_LLM_USD_PER_RUN": oversized},
+                }
+            ),
+            encoding="utf-8",
+        )
+        batch = self.repo.batch(BATCH, force=True)
+        assert batch is not None
+        self.assertEqual(batch["health"], "blocked")
+        self.assertEqual(batch["llm_usage"]["estimated_usd"], 0.0)
+        self.assertEqual(batch["llm_usage"]["usd_cap"], 0.0)
+        codes = {issue["code"] for issue in batch["issues"]}
+        self.assertIn("invalid_llm_usage_estimated_usd", codes)
+        self.assertIn("invalid_llm_usage_caps_max_llm_usd_per_run", codes)
+        json.dumps(batch, allow_nan=False)
 
     def test_expired_approval_is_attention_not_actionable(self) -> None:
         write_enriched(self.paths.enriched, 1)

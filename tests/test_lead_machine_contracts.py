@@ -111,6 +111,8 @@ class LeadMachineContractsTest(unittest.TestCase):
             "Packet Eligible": "Yes",
             "Packet Eligibility Reason": "A lead with Website Rebuild angle.",
             "Sendable": "Yes",
+            "Commercial Fit State": "commercially-sendable",
+            "Contact Eligibility": "contact-now",
             "Minimum Evidence Passed": "Yes",
             "Send Blockers": "",
             "Place Key": "ChIJ123",
@@ -150,7 +152,7 @@ class LeadMachineContractsTest(unittest.TestCase):
 
     def _write_packet_index(self, packet_dir: Path, rows: list[dict[str, str]]) -> None:
         packet_dir.mkdir(parents=True, exist_ok=True)
-        fieldnames = ["Packet Path", "Business Name", "Place Key", "Phone", "Lead Priority", "Offer Fit"]
+        fieldnames = ["Packet Path", "Business Name", "City", "Place Key", "Phone", "Lead Priority", "Offer Fit"]
         with (packet_dir / "packet_index.csv").open("w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
@@ -506,6 +508,8 @@ class LeadMachineContractsTest(unittest.TestCase):
 
                 with csv_path.open(newline="", encoding="utf-8") as f:
                     rows = list(csv.DictReader(f))
+                tiered_mtime = csv_path.stat().st_mtime_ns
+                index_mtime = Path("packets_current_batch_manual/packet_index.csv").stat().st_mtime_ns
             finally:
                 os.chdir(old_cwd)
 
@@ -515,6 +519,7 @@ class LeadMachineContractsTest(unittest.TestCase):
             "packets_current_batch_manual/A_no-site-launch/001-m-m-masonry-and-landscape-llc.md",
         )
         self.assertNotIn("packets_manual_existing_manual", rows[0]["Packet Path"])
+        self.assertGreaterEqual(index_mtime, tiered_mtime)
 
     def test_airtable_uses_current_batch_packet_index_instead_of_stale_packet_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -567,6 +572,133 @@ class LeadMachineContractsTest(unittest.TestCase):
         fields = planned[0]["payload"]["fields"]  # type: ignore[index]
         self.assertEqual(fields["Packet Path"], current_path)
         self.assertNotIn("packets_manual_existing_manual", fields["Packet Path"])
+
+    def test_packet_index_legacy_fallback_requires_unique_business_and_city(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_cwd = Path.cwd()
+            os.chdir(tmp)
+            try:
+                packet_dir = Path("packets_legacy")
+                cleveland_path = packet_dir / "cleveland.md"
+                columbus_path = packet_dir / "columbus.md"
+                packet_dir.mkdir()
+                cleveland_path.write_text("cleveland", encoding="utf-8")
+                columbus_path.write_text("columbus", encoding="utf-8")
+                self._write_packet_index(
+                    packet_dir,
+                    [
+                        {"Packet Path": str(cleveland_path), "Business Name": "Same Name LLC", "City": "Cleveland"},
+                        {"Packet Path": str(columbus_path), "Business Name": "Same Name LLC", "City": "Columbus"},
+                    ],
+                )
+                matched = upload_airtable.existing_packet_path(
+                    {"Business Name": "Same Name LLC", "City": "Cleveland", "Place Key": ""}, packet_dir
+                )
+            finally:
+                os.chdir(old_cwd)
+        self.assertEqual(matched, str(cleveland_path))
+
+    def test_packet_index_refuses_duplicate_place_and_legacy_identities(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_cwd = Path.cwd()
+            os.chdir(tmp)
+            try:
+                packet_dir = Path("packets_ambiguous")
+                packet_dir.mkdir()
+                first = packet_dir / "first.md"
+                second = packet_dir / "second.md"
+                first.write_text("first", encoding="utf-8")
+                second.write_text("second", encoding="utf-8")
+                self._write_packet_index(
+                    packet_dir,
+                    [
+                        {"Packet Path": str(first), "Place Key": "ChIJdup", "Business Name": "Duplicate Co", "City": "Cleveland"},
+                        {"Packet Path": str(second), "Place Key": "ChIJdup", "Business Name": "Duplicate Co", "City": "Cleveland"},
+                    ],
+                )
+                with self.assertRaisesRegex(ValueError, "duplicate Place Key"):
+                    upload_airtable.existing_packet_path(
+                        {"Business Name": "Duplicate Co", "City": "Cleveland", "Place Key": "ChIJdup"}, packet_dir
+                    )
+                with self.assertRaisesRegex(ValueError, "ambiguous legacy identity"):
+                    upload_airtable.existing_packet_path(
+                        {"Business Name": "Duplicate Co", "City": "Cleveland", "Place Key": ""}, packet_dir
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+    def test_packet_index_counts_missing_packet_rows_before_identity_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_cwd = Path.cwd()
+            os.chdir(tmp)
+            try:
+                packet_dir = Path("packets_ambiguous_missing")
+                packet_dir.mkdir()
+                existing = packet_dir / "existing.md"
+                missing = packet_dir / "missing.md"
+                existing.write_text("existing", encoding="utf-8")
+                self._write_packet_index(
+                    packet_dir,
+                    [
+                        {"Packet Path": str(existing), "Place Key": "ChIJdup", "Business Name": "Duplicate Co", "City": "Cleveland"},
+                        {"Packet Path": str(missing), "Place Key": "ChIJdup", "Business Name": "Duplicate Co", "City": "Cleveland"},
+                    ],
+                )
+                with self.assertRaisesRegex(ValueError, "duplicate Place Key"):
+                    upload_airtable.existing_packet_path(
+                        {"Business Name": "Duplicate Co", "City": "Cleveland", "Place Key": "ChIJdup"},
+                        packet_dir,
+                    )
+                with self.assertRaisesRegex(ValueError, "ambiguous legacy identity"):
+                    upload_airtable.existing_packet_path(
+                        {"Business Name": "Duplicate Co", "City": "Cleveland", "Place Key": ""},
+                        packet_dir,
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+    def test_packet_index_refuses_unique_match_with_missing_packet(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_cwd = Path.cwd()
+            os.chdir(tmp)
+            try:
+                packet_dir = Path("packets_missing")
+                packet_dir.mkdir()
+                missing = packet_dir / "missing.md"
+                self._write_packet_index(
+                    packet_dir,
+                    [
+                        {"Packet Path": str(missing), "Place Key": "ChIJmissing", "Business Name": "Missing Co", "City": "Cleveland"},
+                    ],
+                )
+                with self.assertRaisesRegex(ValueError, "points to a missing packet"):
+                    upload_airtable.existing_packet_path(
+                        {"Business Name": "Missing Co", "City": "Cleveland", "Place Key": "ChIJmissing"},
+                        packet_dir,
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+    def test_packet_lookup_does_not_fall_back_to_phone_name_or_filename(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_cwd = Path.cwd()
+            os.chdir(tmp)
+            try:
+                packet_dir = Path("packets_no_heuristics")
+                packet_dir.mkdir()
+                packet = packet_dir / "001-filename-only-co.md"
+                packet.write_text("packet", encoding="utf-8")
+                self._write_packet_index(
+                    packet_dir,
+                    [{"Packet Path": str(packet), "Business Name": "Filename Only Co", "City": "", "Phone": "2165550101"}],
+                )
+                matched = upload_airtable.existing_packet_path(
+                    {"Business Name": "Filename Only Co", "City": "", "Phone": "2165550101", "Place Key": ""},
+                    packet_dir,
+                )
+            finally:
+                os.chdir(old_cwd)
+        self.assertEqual(matched, "")
 
     def test_airtable_payload_uses_current_packet_path_when_available(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

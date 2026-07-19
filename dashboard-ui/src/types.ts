@@ -98,6 +98,8 @@ export interface LeadRow {
   priority: string;
   packet_tier: string;
   sendable: boolean;
+  declared_sendable: boolean;
+  readiness_mismatch: boolean;
   money_signal: boolean;
   ai_confidence: string;
   blockers: string;

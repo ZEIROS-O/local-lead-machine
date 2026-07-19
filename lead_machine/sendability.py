@@ -16,6 +16,13 @@ from .score_schema import (
 MIN_SENDABLE_SCORE = 65
 MIN_SENDABLE_CONFIDENCE = 0.75
 
+CONTACT_READINESS_FIELDS = (
+    "Sendable",
+    "Packet Eligible",
+    "Commercial Fit State",
+    "Contact Eligibility",
+)
+
 SCORE_BLOCKER = "Score below B threshold"
 GRADE_BLOCKER = "Lead grade below sendable threshold"
 HARD_DISQUALIFIER_BLOCKER = "Hard disqualifier present"
@@ -465,6 +472,28 @@ def evaluate_sendability(row: Dict[str, Any]) -> Dict[str, Any]:
         "buyer_intent_signals": buyer_intent_summary(row),
         **commercial_fit,
     }
+
+
+def contact_readiness_failures(row: Dict[str, Any]) -> List[str]:
+    """Return authoritative contact-readiness contract failures.
+
+    Packet eligibility by itself is intentionally insufficient: manual-review
+    packets may be uploadable while remaining unsafe to contact.
+    """
+    failures: List[str] = []
+    if _pick(row, "Sendable", "sendable").strip().casefold() != "yes":
+        failures.append("Sendable must be Yes")
+    if _pick(row, "Packet Eligible", "packet_eligible").strip().casefold() != "yes":
+        failures.append("Packet Eligible must be Yes")
+    if _pick(row, "Commercial Fit State", "commercial_fit_state").strip().casefold() != "commercially-sendable":
+        failures.append("Commercial Fit State must be commercially-sendable")
+    if _pick(row, "Contact Eligibility", "contact_eligibility").strip().casefold() != "contact-now":
+        failures.append("Contact Eligibility must be contact-now")
+    return failures
+
+
+def is_contact_ready(row: Dict[str, Any]) -> bool:
+    return not contact_readiness_failures(row)
 
 
 def evaluate_commercial_fit(row: Dict[str, Any]) -> Dict[str, Any]:

@@ -17,9 +17,11 @@ import json
 import re
 import sys
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any, Dict, List, Optional
 
 from lead_machine.email_hygiene import emails_text, sanitize_record_emails
+from lead_machine.sendability import is_contact_ready
 
 
 CORE_AIRTABLE_FIELDS = [
@@ -219,10 +221,13 @@ def is_eligible(row: Dict[str, str], include_all: bool, priority_filter: Optiona
 
     tier = row.get("Packet Tier", "").strip()
     if tier:
+        if tier == "Sendable Packet" and not is_contact_ready(row):
+            identity = row.get("Place Key") or f"{row.get('Business Name', '')}|{row.get('City', '')}"
+            raise ValueError(f"Sendable Packet row {identity!r} fails the contact-readiness contract")
         return tier in PACKET_TIERS_WITH_PACKET
 
     # Fallback for rows scored before packet tiers existed.
-    return row.get("Packet Eligible", "").strip().lower() == "yes" and row.get("Sendable", "").strip().lower() == "yes"
+    return is_contact_ready(row)
 
 
 def core_tsv_draft(row: Dict[str, str]) -> str:
@@ -543,6 +548,7 @@ def write_index(output_dir: Path, packet_rows: List[Dict[str, str]]) -> None:
 
     fields = [
         "Packet Path",
+        "Place Key",
         "Business Name",
         "Lead Priority",
         "Offer Fit",
@@ -573,12 +579,35 @@ def write_index(output_dir: Path, packet_rows: List[Dict[str, str]]) -> None:
         "Source File",
     ]
 
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
+    _atomic_write_csv(
+        path,
+        fields,
+        [{field: row.get(field, "") for field in fields} for row in packet_rows],
+    )
 
-        for row in packet_rows:
-            writer.writerow({field: row.get(field, "") for field in fields})
+
+def _atomic_write_csv(path: Path, fieldnames: List[str], rows: List[Dict[str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with NamedTemporaryFile(
+            "w",
+            newline="",
+            encoding="utf-8",
+            dir=str(path.parent),
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp:
+            temp_path = Path(tmp.name)
+            writer = csv.DictWriter(tmp, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+        temp_path.replace(path)
+    except Exception:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+        raise
 
 
 def update_input_packet_paths(input_paths: List[Path], packet_rows: List[Dict[str, str]]) -> List[Path]:
@@ -612,10 +641,7 @@ def update_input_packet_paths(input_paths: List[Path], packet_rows: List[Dict[st
         if not changed:
             continue
 
-        with path.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(rows)
+        _atomic_write_csv(path, fieldnames, rows)
 
         updated.append(path)
 
@@ -638,11 +664,15 @@ def main() -> int:
 
     rows = read_rows(input_paths)
 
-    filtered = [
-        row
-        for row in rows
-        if is_eligible(row, include_all=args.include_all, priority_filter=args.priority or None)
-    ]
+    try:
+        filtered = [
+            row
+            for row in rows
+            if is_eligible(row, include_all=args.include_all, priority_filter=args.priority or None)
+        ]
+    except ValueError as exc:
+        print(f"[REFUSE] {exc}", file=sys.stderr)
+        return 2
 
     def sort_key(row: Dict[str, str]):
         priority_rank = {"A": 0, "B": 1, "C": 2, "Skip": 3}
@@ -682,8 +712,10 @@ def main() -> int:
         packet_rows.append(row)
         print(f"[PACKET] {packet_path}")
 
-    write_index(output_dir, packet_rows)
     updated_inputs = update_input_packet_paths(input_paths, packet_rows)
+    # The index is the completion marker consumed by the dashboard, so write
+    # it only after every source row points at the packet set it describes.
+    write_index(output_dir, packet_rows)
 
     print(f"[DONE] Inputs: {', '.join(str(p) for p in input_paths)}")
     print(f"[DONE] Output dir: {output_dir}")

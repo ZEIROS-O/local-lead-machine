@@ -19,6 +19,8 @@ import subprocess
 import sys
 import uuid
 import hashlib
+import fcntl
+from contextlib import contextmanager
 from datetime import date as date_cls
 from datetime import datetime
 from pathlib import Path
@@ -43,6 +45,16 @@ from lead_machine.hermes_commands import (
     validate_slug,
 )
 from lead_machine.hermes_executor import render_command
+from lead_machine.sendability import is_contact_ready
+from lead_machine.compliance import (
+    ComplianceError,
+    has_acceptable_sms_consent,
+    is_mark_sent_source_status,
+    is_suppressed,
+    load_suppression_index,
+    record_suppression_identifiers,
+    suppression_source_path,
+)
 
 
 QUEUE_SCHEMA_VERSION = 2
@@ -131,6 +143,7 @@ ITEM_FIELD_MAP = [
     ("promise_state", "Promise State"),
     ("asset_id", "Asset ID"),
     ("asset_verifier_verdict", "Asset Verifier Verdict"),
+    ("status", "Status"),
     ("channel", "Outreach Channel"),
     ("consent_posture", "Consent Posture"),
 ]
@@ -192,6 +205,10 @@ def queue_writeback_path(root: Path, queue_run_id: str) -> Path:
     return root / "run_state" / "morning_queue_writebacks" / f"{queue_run_id}.json"
 
 
+def mark_sent_lock_path(outcomes_path: Path) -> Path:
+    return outcomes_path.with_name(f"{outcomes_path.name}.mark-sent.lock")
+
+
 def latest_queue_file(root: Path) -> Path | None:
     """Return the newest dated discovery index for read-only queue status reporting."""
     state_dir = root / "run_state"
@@ -243,6 +260,24 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.replace(tmp, path)
+
+
+@contextmanager
+def _mark_sent_lock(outcomes_path: Path):
+    path = mark_sent_lock_path(outcomes_path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = path.open("a+", encoding="utf-8")
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    except OSError as exc:
+        raise CommandError(f"Could not acquire shared mark-sent lock {path}: {exc}") from exc
+    try:
+        yield
+    finally:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
 
 def _run_capture(cmd: list[str], *, cwd: Path, timeout_seconds: float) -> subprocess.CompletedProcess[str]:
@@ -496,69 +531,28 @@ def cmd_queue_topup(
 # ---------------------------------------------------------------- morning-queue
 
 
-def _suppression_identifier(kind: str, value: Any) -> str:
-    cleaned = str(value or "").strip()
-    if not cleaned:
-        return ""
-    if kind == "phone":
-        cleaned = "".join(character for character in cleaned if character.isdigit())
-        if len(cleaned) == 11 and cleaned.startswith("1"):
-            cleaned = cleaned[1:]
-    else:
-        cleaned = cleaned.casefold()
-    return f"{kind}:{cleaned}" if cleaned else ""
-
-
 def _load_suppression_index(config: dict[str, Any]) -> tuple[set[str], str]:
     raw_path = os.environ.get("LPM_OUTCOMES_JSONL", "").strip() or str(config.get("outcomes_jsonl") or "").strip()
-    if not raw_path:
-        return set(), "outcomes_jsonl suppression source is not configured"
-    path = _absolute(raw_path)
-    if not path.is_file():
-        return set(), f"suppression source {path} is missing or unreadable"
-    suppressed: set[str] = set()
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError as exc:
-        return set(), f"suppression source {path} is unreadable: {exc}"
-    for line_number, line in enumerate(lines, start=1):
-        if not line.strip():
-            continue
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError as exc:
-            return set(), f"suppression source {path}:{line_number} is malformed JSON: {exc.msg}"
-        if not isinstance(row, dict):
-            return set(), f"suppression source {path}:{line_number} must contain a JSON object"
-        event = str(row.get("event") or "").strip().casefold().replace("-", "_").replace(" ", "_")
-        if event not in {"opt_out", "opted_out", "unsubscribe", "unsubscribed", "suppressed", "stop"}:
-            continue
-        identifiers = {
-            identifier
-            for key in ("record_id", "phone", "email")
-            if (identifier := _suppression_identifier(key, row.get(key)))
-        }
-        if not identifiers:
-            return set(), f"suppression source {path}:{line_number} has a suppression event without an identifier"
-        suppressed.update(identifiers)
-    return suppressed, ""
+        return load_suppression_index(raw_path), ""
+    except ComplianceError as exc:
+        return set(), str(exc).replace("suppression source is not configured", "outcomes_jsonl suppression source is not configured")
 
 
 def _item_suppression_identifiers(item: dict[str, Any]) -> set[str]:
-    values = {
-        "record_id": item.get("record_id"),
-        "phone": item.get("phone") or item.get("Phone"),
-        "email": item.get("email") or item.get("Email"),
-    }
-    return {
-        identifier
-        for key in ("record_id", "phone", "email")
-        if (identifier := _suppression_identifier(key, values[key]))
-    }
+    return record_suppression_identifiers(item)
 
 
 def _is_suppressed(item: dict[str, Any], suppression: set[str]) -> bool:
-    return bool(_item_suppression_identifiers(item) & suppression)
+    return is_suppressed(item, suppression)
+
+
+def _has_acceptable_sms_consent(item: dict[str, Any]) -> bool:
+    channel = str(item.get("channel") or item.get("Outreach Channel") or "").strip().casefold()
+    if channel != "sms":
+        return True
+    posture = item.get("consent_posture") or item.get("Consent Posture")
+    return has_acceptable_sms_consent(posture)
 
 
 def _compliance_annotations(item: dict[str, Any], suppression: set[str]) -> dict[str, str]:
@@ -752,6 +746,9 @@ def cmd_morning_queue(
         "pooled_sendable": 0,
         "fetched_count": 0,
         "suppressed_excluded_count": 0,
+        "sms_consent_excluded_count": 0,
+        "readiness_excluded_count": 0,
+        "status_excluded_count": 0,
         "queued_count": 0,
         "per_vertical": {},
         "topup": topup,
@@ -780,10 +777,16 @@ def cmd_morning_queue(
         )
 
     payload["per_vertical"] = per_vertical_counts(records)
-    clear_records = [record for record in records if not _is_suppressed(record, suppression)]
-    payload["suppressed_excluded_count"] = len(records) - len(clear_records)
+    ready_records = [record for record in records if is_contact_ready(record)]
+    payload["readiness_excluded_count"] = len(records) - len(ready_records)
+    status_ready_records = [record for record in ready_records if is_mark_sent_source_status(record.get("Status"))]
+    payload["status_excluded_count"] = len(ready_records) - len(status_ready_records)
+    clear_records = [record for record in status_ready_records if not _is_suppressed(record, suppression)]
+    payload["suppressed_excluded_count"] = len(status_ready_records) - len(clear_records)
+    consented_records = [record for record in clear_records if _has_acceptable_sms_consent(record)]
+    payload["sms_consent_excluded_count"] = len(clear_records) - len(consented_records)
     payload["items"] = _build_queue_items(
-        clear_records,
+        consented_records,
         target=resolved_target,
         overflow_cap=overflow_cap,
         suppression=suppression,
@@ -796,7 +799,9 @@ def cmd_morning_queue(
     return CommandResult(
         f"morning-queue immutable run written: {run_path}\n"
         f"queue_run_id: {queue_run_id}\nqueue_sha256: {payload['queue_sha256']}\n"
-        f"fetched {payload['fetched_count']}; excluded {payload['suppressed_excluded_count']}; "
+        f"fetched {payload['fetched_count']}; not ready {payload['readiness_excluded_count']}; "
+        f"suppressed {payload['suppressed_excluded_count']}; "
+        f"SMS without consent {payload['sms_consent_excluded_count']}; "
         f"queued {payload['queued_count']} "
         f"(target {resolved_target}, cap {overflow_cap}).\n"
         f"top-up report: {topup_report['message']}"
@@ -833,17 +838,99 @@ def _load_queue_for_marking(root: Path, queue_run_id: str, queue_sha256: str) ->
     return path, data
 
 
-def _load_writeback_state(root: Path, queue_run_id: str) -> dict[str, Any]:
+def _load_writeback_state(root: Path, queue_run_id: str, *, queue_date: str = "") -> dict[str, Any]:
     path = queue_writeback_path(root, queue_run_id)
     if not path.exists():
-        return {"schema_version": 1, "queue_run_id": queue_run_id, "sent": {}}
+        return {"schema_version": 2, "queue_run_id": queue_run_id, "operations": {}, "sent": {}}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise CommandError(f"Write-back state {path} is not valid JSON: {exc}") from exc
     if not isinstance(data, dict) or data.get("queue_run_id") != queue_run_id or not isinstance(data.get("sent"), dict):
         raise CommandError(f"Write-back state {path} is malformed or belongs to another run.")
+    if data.get("schema_version") == 1:
+        migrated_sent: dict[str, Any] = {}
+        for record_id, raw_entry in data["sent"].items():
+            if not isinstance(raw_entry, dict):
+                raise CommandError(f"Write-back state {path} has a malformed v1 Sent entry for {record_id}.")
+            entry = dict(raw_entry)
+            sent_date = str(entry.get("sent_date") or "").strip()
+            if not sent_date and queue_date:
+                sent_date = queue_date
+            if not sent_date:
+                sent_at = str(entry.get("sent_at") or "").strip()
+                candidate = sent_at[:10]
+                try:
+                    sent_date = date_cls.fromisoformat(candidate).isoformat()
+                except ValueError as exc:
+                    raise CommandError(
+                        f"Write-back state {path} cannot derive the v1 Sent date for {record_id}."
+                    ) from exc
+            entry["sent_date"] = sent_date
+            if entry.get("sent_channel"):
+                entry["event_id"] = _mark_sent_event_id(
+                    record_id=str(record_id), channel=str(entry["sent_channel"]), send_date=sent_date
+                )
+            migrated_sent[str(record_id)] = entry
+        return {
+            "schema_version": 2,
+            "queue_run_id": queue_run_id,
+            "operations": {},
+            "sent": migrated_sent,
+        }
+    if data.get("schema_version") != 2 or not isinstance(data.get("operations"), dict):
+        raise CommandError(f"Write-back state {path} uses an unsupported schema.")
     return data
+
+
+def _mark_sent_operation_id(
+    *, queue_run_id: str, record_id: str, channel: str, send_date: str, artifact_sha256: str
+) -> str:
+    digest = _canonical_hash(
+        {
+            "queue_run_id": queue_run_id,
+            "record_id": record_id,
+            "channel": channel,
+            "send_date": send_date,
+            "artifact_sha256": artifact_sha256,
+        }
+    )
+    return f"mark-sent-{digest}"
+
+
+def _mark_sent_event_id(*, record_id: str, channel: str, send_date: str) -> str:
+    digest = _canonical_hash(
+        {
+            "record_id": str(record_id or "").strip(),
+            "channel": str(channel or "").strip().casefold(),
+            "send_date": str(send_date or "").strip(),
+        }
+    )
+    return f"sent-event-{digest}"
+
+
+def _parse_mark_sent_receipt(result: subprocess.CompletedProcess[str], *, operation_id: str) -> dict[str, Any]:
+    if result.returncode != 0:
+        tail = (result.stderr or result.stdout or "").strip().splitlines()[-3:]
+        raise CommandError(" / ".join(tail) or f"{MARK_SENT_SCRIPT} failed")
+    lines = [line for line in (result.stdout or "").splitlines() if line.strip()]
+    if not lines:
+        raise CommandError(f"{MARK_SENT_SCRIPT} returned no receipt for {operation_id}")
+    try:
+        receipt = json.loads(lines[-1])
+    except json.JSONDecodeError as exc:
+        raise CommandError(f"{MARK_SENT_SCRIPT} returned a malformed receipt for {operation_id}") from exc
+    if not isinstance(receipt, dict) or receipt.get("result") not in {"applied", "already_applied"}:
+        raise CommandError(f"{MARK_SENT_SCRIPT} returned an unvalidated receipt for {operation_id}")
+    return receipt
+
+
+def _resolved_suppression_path(config: dict[str, Any]) -> Path:
+    raw = os.environ.get("LPM_OUTCOMES_JSONL", "").strip() or str(config.get("outcomes_jsonl") or "").strip()
+    try:
+        return suppression_source_path(raw)
+    except ComplianceError as exc:
+        raise CommandError(f"Refusing mark-sent: current suppression state is unknown: {exc}.") from exc
 
 
 def _validate_sha256(label: str, value: str) -> str:
@@ -860,17 +947,19 @@ def _write_dry_run_approval(
     queue_sha256: str,
     artifact_sha256: str,
     channel: str,
+    send_date: str,
     record_ids: list[str],
 ) -> dict[str, Any]:
     approval_id = f"msa-{uuid.uuid4().hex}"
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "approval_id": approval_id,
         "created_at": _local_now().isoformat(),
         "queue_run_id": queue_run_id,
         "queue_sha256": queue_sha256,
         "artifact_sha256": artifact_sha256,
         "channel": channel,
+        "send_date": send_date,
         "record_ids": record_ids,
     }
     payload["approval_sha256"] = _canonical_hash(payload)
@@ -886,6 +975,8 @@ def _require_matching_approval(
     queue_sha256: str,
     artifact_sha256: str,
     channel: str,
+    send_date: str,
+    queue_date: str,
     record_ids: list[str],
 ) -> dict[str, Any]:
     if not approval_id:
@@ -909,6 +1000,14 @@ def _require_matching_approval(
     actual_hash = _canonical_hash({key: value for key, value in approval.items() if key != "approval_sha256"})
     if stored_hash != actual_hash:
         changed.append("approval_sha256")
+    schema_version = approval.get("schema_version")
+    if schema_version not in {1, 2}:
+        changed.append("schema_version")
+    elif schema_version == 2 or "send_date" in approval:
+        if approval.get("send_date") != send_date:
+            changed.append("send_date")
+    elif not queue_date or send_date != queue_date:
+        changed.append("send_date")
     if changed:
         raise CommandError("Refusing live write-back: dry-run approval mismatch in " + ", ".join(changed) + ".")
     return approval
@@ -965,27 +1064,110 @@ def _require_current_suppression_clear(
         )
 
 
+def _require_sms_consent(matched: list[dict[str, Any]], *, channel: str) -> None:
+    if channel.casefold() != "sms":
+        return
+    missing = [
+        str(item.get("record_id") or item.get("business") or "unknown")
+        for item in matched
+        if ("consent_posture" in item or "Consent Posture" in item)
+        and not _has_acceptable_sms_consent({**item, "channel": "SMS"})
+    ]
+    if missing:
+        raise CommandError(
+            "Refusing mark-sent via SMS: documented consent is missing or unacceptable for " + ", ".join(missing)
+        )
+
+
+def _require_queue_status_eligible(matched: list[dict[str, Any]]) -> None:
+    invalid = [
+        str(item.get("record_id") or item.get("business") or "unknown")
+        for item in matched
+        if ("status" in item or "Status" in item)
+        and not is_mark_sent_source_status(item.get("status") or item.get("Status"))
+    ]
+    if invalid:
+        raise CommandError(
+            "Refusing mark-sent: selected queue item is not in New or Mockup Needed status: "
+            + ", ".join(invalid)
+        )
+
+
+def _read_outcome_rows(config: dict[str, Any]) -> tuple[Path, list[dict[str, Any]]]:
+    raw_path = os.environ.get("LPM_OUTCOMES_JSONL", "").strip() or str(config.get("outcomes_jsonl") or "").strip()
+    try:
+        path = suppression_source_path(raw_path)
+    except ComplianceError as exc:
+        raise CommandError(f"Could not write required outcomes row: {exc}") from exc
+    try:
+        existing_lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise CommandError(f"Could not read required outcomes log {path}: {exc}") from exc
+    rows: list[dict[str, Any]] = []
+    for line_number, line in enumerate(existing_lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            existing = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise CommandError(f"Required outcomes log {path}:{line_number} is malformed") from exc
+        if not isinstance(existing, dict):
+            raise CommandError(f"Required outcomes log {path}:{line_number} must contain an object")
+        rows.append(existing)
+    return path, rows
+
+
+def _row_event_id(row: dict[str, Any]) -> str:
+    existing = str(row.get("event_id") or "").strip()
+    if existing:
+        return existing
+    if not all(row.get(key) for key in ("record_id", "channel", "date")):
+        return ""
+    return _mark_sent_event_id(
+        record_id=str(row.get("record_id")),
+        channel=str(row.get("channel")),
+        send_date=str(row.get("date")),
+    )
+
+
+def _matching_sent_outcome(config: dict[str, Any], event_id: str) -> dict[str, Any] | None:
+    _, rows = _read_outcome_rows(config)
+    for row in rows:
+        if str(row.get("event") or "").strip().casefold() == "sent" and _row_event_id(row) == event_id:
+            return row
+    return None
+
+
 def _append_outcome_row(config: dict[str, Any], row: dict[str, Any]) -> str:
     # morning_queue.json carries a machine-absolute default; LPM_OUTCOMES_JSONL
     # overrides it so other machines can redirect without editing tracked config.
-    raw_path = os.environ.get("LPM_OUTCOMES_JSONL", "").strip() or str(config.get("outcomes_jsonl") or "").strip()
-    if not raw_path:
-        return "outcomes_jsonl not configured; send not logged to operator-agent STATE"
-    path = _absolute(raw_path)
-    key = (row.get("record_id"), row.get("channel"), row.get("date"))
-    if path.exists():
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            try:
-                existing = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if (existing.get("record_id"), existing.get("channel"), existing.get("date")) == key:
-                return f"outcomes row already present in {path.name}"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    path, existing_rows = _read_outcome_rows(config)
+    operation_id = str(row.get("operation_id") or "").strip()
+    event_id = str(row.get("event_id") or "").strip() or _mark_sent_event_id(
+        record_id=str(row.get("record_id") or ""),
+        channel=str(row.get("channel") or ""),
+        send_date=str(row.get("date") or ""),
+    )
+    row["event_id"] = event_id
+    artifact_sha256 = str(row.get("artifact_sha256") or "").strip()
+    for existing in existing_rows:
+        existing_event_id = _row_event_id(existing)
+        if str(existing.get("event") or "sent").strip().casefold() == "sent" and existing_event_id == event_id:
+            existing_artifact = str(existing.get("artifact_sha256") or "").strip()
+            if artifact_sha256 and existing_artifact and artifact_sha256 != existing_artifact:
+                raise CommandError(
+                    "Refusing conflicting outcome artifacts for the same record, channel, and date."
+                )
+            return f"outcomes event already present in {path.name}"
+        if operation_id and existing.get("operation_id") == operation_id:
+            return f"outcomes row already present in {path.name}"
+    try:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError as exc:
+        raise CommandError(f"Could not append required outcomes row to {path}: {exc}") from exc
     return f"outcomes row appended to {path.name}"
 
 
@@ -997,6 +1179,7 @@ def cmd_mark_sent(
     queue_sha256: str = "",
     artifact_sha256: str = "",
     approval_id: str = "",
+    date: str = "",
     dry_run: bool = False,
     execute: bool = False,
     root: Path | str = Path("."),
@@ -1005,6 +1188,7 @@ def cmd_mark_sent(
     root_path = _absolute(root)
     config = load_queue_config(root_path)
     channel_label = _resolve_channel(channel)
+    send_date = _validate_date(date) if date else _today()
     if not tokens:
         raise CommandError("Pass at least one item number or record id.")
 
@@ -1012,7 +1196,8 @@ def cmd_mark_sent(
         return CommandResult(
             f"repo_root: {root_path}\n"
             f"preview /mark-sent: map {' '.join(tokens)} against an immutable queue run, PATCH Airtable "
-            f"Status=Sent via {MARK_SENT_SCRIPT} with Outreach Channel={channel_label}, update separate "
+            f"Status=Sent via {MARK_SENT_SCRIPT} with Outreach Channel={channel_label} and "
+            f"Last Contacted={send_date}, update separate "
             f"write-back state, and append one idempotent operator-agent outcomes row."
         )
 
@@ -1024,7 +1209,7 @@ def cmd_mark_sent(
         matched = _match_items(tokens, items)
         resolved_run_id = str(data["queue_run_id"])
         resolved_queue_sha = str(data["queue_sha256"])
-        queue_date = str(data.get("date") or _today())
+        queue_date = str(data.get("date") or "")
     else:
         if not all(RECORD_ID_RE.match(token) for token in tokens):
             raise CommandError("Bare item numbers are forbidden; use record IDs or bind numbers to an exact queue run.")
@@ -1033,23 +1218,24 @@ def cmd_mark_sent(
         matched = [{"n": None, "record_id": token, "business": token, "vertical": ""} for token in dict.fromkeys(tokens)]
         resolved_run_id = "record-ids-direct"
         resolved_queue_sha = _canonical_hash([item["record_id"] for item in matched])
-        queue_date = _today()
+        queue_date = ""
 
     record_ids = [str(item.get("record_id") or "") for item in matched]
     if any(not record_id for record_id in record_ids):
         raise CommandError("Every selected item must have an Airtable record ID.")
-    # Re-read the authority source for both dry-run and live execution. This
-    # catches opt-outs written after queue generation or after approval.
-    _require_current_suppression_clear(matched, config=config)
-    writeback = _load_writeback_state(root_path, resolved_run_id)
+    suppression_path = _resolved_suppression_path(config)
 
     if dry_run:
+        _require_current_suppression_clear(matched, config=config)
+        _require_sms_consent(matched, channel=channel_label)
+        _require_queue_status_eligible(matched)
         approval = _write_dry_run_approval(
             root_path,
             queue_run_id=resolved_run_id,
             queue_sha256=resolved_queue_sha,
             artifact_sha256=artifact_sha256,
             channel=channel_label,
+            send_date=send_date,
             record_ids=record_ids,
         )
         lines = [
@@ -1068,69 +1254,161 @@ def cmd_mark_sent(
         queue_sha256=resolved_queue_sha,
         artifact_sha256=artifact_sha256,
         channel=channel_label,
+        send_date=send_date,
+        queue_date=queue_date,
         record_ids=record_ids,
     )
 
     lines: list[str] = []
-    changed = False
-    for item in matched:
-        label = f"{item.get('n')}. {item.get('business') or item.get('record_id')}"
-        record_id = str(item.get("record_id") or "")
-        if not record_id:
-            lines.append(f"[SKIP] {label}: no record_id in queue file")
-            continue
-        prior = writeback["sent"].get(record_id)
-        if prior:
-            lines.append(f"[ALREADY-SENT] {label} at {prior.get('sent_at')} via {prior.get('sent_channel')}")
-            continue
-        cmd = [
-            str(python_path or sys.executable), MARK_SENT_SCRIPT,
-            "--record-id", record_id,
-            "--channel", channel_label,
-            "--date", queue_date,
-        ]
-        try:
-            result = _run_capture(cmd, cwd=root_path, timeout_seconds=MARK_SENT_TIMEOUT_SECONDS)
-        except subprocess.TimeoutExpired:
-            lines.append(f"[FAIL] {label}: {MARK_SENT_SCRIPT} timed out")
-            continue
-        if result.returncode != 0:
-            tail = (result.stderr or result.stdout or "").strip().splitlines()[-3:]
-            lines.append(f"[FAIL] {label}: " + " / ".join(tail))
-            continue
-        sent_at = _local_now().isoformat()
-        writeback["sent"][record_id] = {
-            "sent_at": sent_at,
-            "sent_channel": channel_label,
-            "approval_id": approval_id,
-            "artifact_sha256": artifact_sha256,
-        }
-        changed = True
-        # Row shape follows the SKILLS/send-queue log-step contract so
-        # outreach Loop D can join feedback on record_id.
-        outcome_note = _append_outcome_row(
-            config,
-            {
-                "record_id": record_id,
-                "business": "lpm",
-                "vertical": item.get("vertical") or "",
-                "contact": item.get("business") or "",
-                "channel": channel_label,
-                "date": queue_date,
-                "event": "sent",
-                "result": None,
-                "sent_at": sent_at,
-                "source": "hermes mark-sent",
-                "queue_run_id": resolved_run_id,
-                "queue_sha256": resolved_queue_sha,
-                "artifact_sha256": artifact_sha256,
-                "approval_id": approval_id,
-            },
-        )
-        lines.append(f"[SENT] {label} ({record_id}) via {channel_label}; {outcome_note}")
+    state_path = queue_writeback_path(root_path, resolved_run_id)
+    with _mark_sent_lock(suppression_path):
+        # Re-read inside the shared outcomes lock so attempts from different
+        # immutable queue runs cannot race the external write or outcome log.
+        _require_current_suppression_clear(matched, config=config)
+        _require_sms_consent(matched, channel=channel_label)
+        _require_queue_status_eligible(matched)
+        writeback = _load_writeback_state(root_path, resolved_run_id, queue_date=queue_date)
+        for item in matched:
+            label = f"{item.get('n')}. {item.get('business') or item.get('record_id')}"
+            record_id = str(item.get("record_id") or "")
+            operation_id = _mark_sent_operation_id(
+                queue_run_id=resolved_run_id,
+                record_id=record_id,
+                channel=channel_label,
+                send_date=send_date,
+                artifact_sha256=artifact_sha256,
+            )
+            event_id = _mark_sent_event_id(
+                record_id=record_id,
+                channel=channel_label,
+                send_date=send_date,
+            )
+            prior = writeback["sent"].get(record_id)
+            if prior:
+                exact_prior = (
+                    prior.get("sent_channel") == channel_label
+                    and prior.get("sent_date") == send_date
+                    and prior.get("artifact_sha256") == artifact_sha256
+                )
+                if not exact_prior:
+                    raise CommandError(f"Refusing conflicting prior Sent state for {record_id}.")
+                lines.append(f"[ALREADY-SENT] {label} at {prior.get('sent_at')} via {prior.get('sent_channel')}")
+                continue
 
-    if changed:
-        state_path = queue_writeback_path(root_path, resolved_run_id)
-        _atomic_write_json(state_path, writeback)
-        lines.append(f"Write-back state updated: {state_path}")
+            existing_outcome = _matching_sent_outcome(config, event_id)
+            if existing_outcome:
+                existing_artifact = str(existing_outcome.get("artifact_sha256") or "").strip()
+                if existing_artifact and existing_artifact != artifact_sha256:
+                    raise CommandError(
+                        f"Refusing conflicting outcome artifact for prior Sent event {record_id}."
+                    )
+                sent_at = str(existing_outcome.get("sent_at") or _local_now().isoformat())
+                writeback["operations"][record_id] = {
+                    "operation_id": operation_id,
+                    "event_id": event_id,
+                    "record_id": record_id,
+                    "phase": "complete",
+                    "channel": channel_label,
+                    "send_date": send_date,
+                    "approval_id": approval_id,
+                    "artifact_sha256": artifact_sha256,
+                    "airtable_result": "already_applied_from_outcome",
+                    "completed_at": _local_now().isoformat(),
+                }
+                writeback["sent"][record_id] = {
+                    "operation_id": operation_id,
+                    "event_id": event_id,
+                    "sent_at": sent_at,
+                    "sent_date": send_date,
+                    "sent_channel": channel_label,
+                    "approval_id": approval_id,
+                    "artifact_sha256": artifact_sha256,
+                }
+                _atomic_write_json(state_path, writeback)
+                lines.append(f"[ALREADY-SENT] {label} at {sent_at} via {channel_label}; outcomes event already present")
+                continue
+
+            operation = writeback["operations"].get(record_id)
+            if operation and operation.get("operation_id") != operation_id:
+                raise CommandError(f"Refusing conflicting pending mark-sent operation for {record_id}.")
+            if not operation:
+                operation = {
+                    "operation_id": operation_id,
+                    "event_id": event_id,
+                    "record_id": record_id,
+                    "phase": "pending",
+                    "channel": channel_label,
+                    "send_date": send_date,
+                    "approval_id": approval_id,
+                    "artifact_sha256": artifact_sha256,
+                    "created_at": _local_now().isoformat(),
+                }
+                writeback["operations"][record_id] = operation
+                # The durable pending intent must exist before Airtable can be
+                # mutated. Any local write failure aborts the operation here.
+                _atomic_write_json(state_path, writeback)
+
+            if operation.get("phase") == "pending":
+                cmd = [
+                    str(python_path or sys.executable), MARK_SENT_SCRIPT,
+                    "--record-id", record_id,
+                    "--channel", channel_label,
+                    "--date", send_date,
+                    "--suppression-source", str(suppression_path),
+                ]
+                try:
+                    result = _run_capture(cmd, cwd=root_path, timeout_seconds=MARK_SENT_TIMEOUT_SECONDS)
+                    receipt = _parse_mark_sent_receipt(result, operation_id=operation_id)
+                except subprocess.TimeoutExpired:
+                    lines.append(f"[FAIL] {label}: {MARK_SENT_SCRIPT} timed out; pending intent retained")
+                    continue
+                except CommandError as exc:
+                    lines.append(f"[FAIL] {label}: {exc}; pending intent retained")
+                    continue
+                operation["phase"] = "airtable_applied"
+                operation["airtable_result"] = receipt["result"]
+                operation["airtable_confirmed_at"] = _local_now().isoformat()
+                _atomic_write_json(state_path, writeback)
+
+            if operation.get("phase") != "airtable_applied":
+                raise CommandError(f"Write-back operation {operation_id} has invalid phase {operation.get('phase')!r}.")
+
+            sent_at = str(operation.get("airtable_confirmed_at") or _local_now().isoformat())
+            outcome_note = _append_outcome_row(
+                config,
+                {
+                    "operation_id": operation_id,
+                    "event_id": event_id,
+                    "record_id": record_id,
+                    "business": "lpm",
+                    "vertical": item.get("vertical") or "",
+                    "contact": item.get("business") or "",
+                    "channel": channel_label,
+                    "date": send_date,
+                    "event": "sent",
+                    "result": None,
+                    "sent_at": sent_at,
+                    "source": "hermes mark-sent",
+                    "queue_run_id": resolved_run_id,
+                    "queue_sha256": resolved_queue_sha,
+                    "artifact_sha256": artifact_sha256,
+                    "approval_id": approval_id,
+                },
+            )
+            operation["phase"] = "complete"
+            operation["completed_at"] = _local_now().isoformat()
+            writeback["sent"][record_id] = {
+                "operation_id": operation_id,
+                "event_id": event_id,
+                "sent_at": sent_at,
+                "sent_date": send_date,
+                "sent_channel": channel_label,
+                "approval_id": approval_id,
+                "artifact_sha256": artifact_sha256,
+            }
+            _atomic_write_json(state_path, writeback)
+            lines.append(f"[SENT] {label} ({record_id}) via {channel_label}; {outcome_note}")
+
+        if writeback["operations"] or writeback["sent"]:
+            lines.append(f"Write-back state updated: {state_path}")
     return CommandResult("\n".join(lines))

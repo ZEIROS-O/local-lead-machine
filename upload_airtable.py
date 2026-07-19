@@ -29,6 +29,7 @@ from lead_machine.airtable_sync import (
     plan_airtable_sync,
 )
 from lead_machine.schema import GENERIC_DOMAINS, normalize_domain, normalize_phone
+from lead_machine.sendability import is_contact_ready
 
 
 _TIER_SENDABLE = "Sendable Packet"
@@ -91,7 +92,7 @@ _FIELD_SCHEMA: List[tuple[str, str, str]] = [
     ("Send Blockers",          "Long text",          ""),
     ("Skip Reason",            "Single line text",   ""),
     ("Place Key",              "Single line text",   "Used as upsert key; must be unique per business"),
-    ("Status",                 "Single select",      "Options: Mockup Needed, Manual Review, Sent, Follow-Up, Closed"),
+    ("Status",                 "Single select",      "Options: New, Mockup Needed, Manual Review, Sent, Follow-Up, Closed"),
     ("Outreach Channel",       "Single select",      "Options: Email, Phone, Instagram DM, SMS"),
     ("Consent Posture",        "Single line text",   "Required and documented before any SMS draft can pass"),
     ("Next Action",            "Single line text",   ""),
@@ -264,15 +265,12 @@ def truthy_yes(value: Any) -> bool:
 
 def is_sendable_record(record: Dict[str, Any]) -> bool:
     fields = record.get("airtable_fields") or record
-    sendable = record.get("sendable")
-    packet_eligible = record.get("packet_eligible")
-
-    if sendable is None:
-        sendable = fields.get("Sendable")
-    if packet_eligible is None:
-        packet_eligible = fields.get("Packet Eligible")
-
-    return truthy_yes(sendable) and truthy_yes(packet_eligible)
+    readiness = dict(fields)
+    if record.get("sendable") is not None:
+        readiness.setdefault("Sendable", "Yes" if truthy_yes(record.get("sendable")) else "No")
+    if record.get("packet_eligible") is not None:
+        readiness.setdefault("Packet Eligible", "Yes" if truthy_yes(record.get("packet_eligible")) else "No")
+    return is_contact_ready(readiness)
 
 
 def clean_cell(value: Any) -> str:
@@ -334,37 +332,41 @@ def existing_packet_path(row: Dict[str, str], packet_dir: Path) -> str:
         return ""
 
     business = clean_cell(row.get("Business Name"))
-    business_key = business.casefold()
-    phone = normalize_phone(row.get("Phone", ""))
+    business_key = normalize_business_name(business)
+    city = clean_cell(row.get("City"))
+    city_key = normalize_city(city)
     place_key = clean_cell(row.get("Place Key"))
 
     index_path = packet_dir / "packet_index.csv"
     if index_path.exists():
         with index_path.open(newline="", encoding="utf-8") as f:
-            for index_row in csv.DictReader(f):
-                indexed_path = clean_cell(index_row.get("Packet Path"))
-                if not indexed_path:
-                    continue
-                if not packet_path_exists(indexed_path):
-                    continue
+            indexed_rows = list(csv.DictReader(f))
 
-                indexed_place = clean_cell(index_row.get("Place Key"))
-                indexed_phone = normalize_phone(index_row.get("Phone", ""))
-                indexed_business = clean_cell(index_row.get("Business Name")).casefold()
-                if place_key and indexed_place == place_key:
-                    return indexed_path
-                if phone and indexed_phone == phone:
-                    return indexed_path
-                if business_key and indexed_business == business_key:
-                    return indexed_path
+        def matched_packet_path(index_row: dict[str, str], identity: str) -> str:
+            indexed_path = clean_cell(index_row.get("Packet Path"))
+            if not indexed_path:
+                raise ValueError(f"Packet index match for {identity} has no Packet Path")
+            if not packet_path_exists(indexed_path):
+                raise ValueError(f"Packet index match for {identity} points to a missing packet: {indexed_path}")
+            return indexed_path
 
-    business_slug = safe_slug(business)
-    if not business_slug:
-        return ""
+        if place_key:
+            matches = [item for item in indexed_rows if clean_cell(item.get("Place Key")) == place_key]
+            if len(matches) > 1:
+                raise ValueError(f"Packet index has duplicate Place Key {place_key}")
+            return matched_packet_path(matches[0], f"Place Key {place_key}") if matches else ""
 
-    for path in sorted(packet_dir.rglob("*.md")):
-        if business_slug in path.stem:
-            return str(path)
+        if not business_key or not city_key:
+            return ""
+        matches = [
+            item
+            for item in indexed_rows
+            if normalize_business_name(clean_cell(item.get("Business Name"))) == business_key
+            and normalize_city(clean_cell(item.get("City"))) == city_key
+        ]
+        if len(matches) > 1:
+            raise ValueError(f"Packet index has ambiguous legacy identity for {business}, {city}")
+        return matched_packet_path(matches[0], f"{business}, {city}") if matches else ""
 
     return ""
 
@@ -479,9 +481,7 @@ def read_csv_records(
 
         records: List[Dict[str, Any]] = []
         for row in reader:
-            if only_sendable and not (
-                truthy_yes(row.get("Sendable")) and truthy_yes(row.get("Packet Eligible"))
-            ):
+            if only_sendable and not is_contact_ready(row):
                 continue
             if include_manual_review and not only_sendable:
                 tier = (row.get("Packet Tier") or "").strip()
@@ -671,7 +671,7 @@ def main() -> int:
     parser.add_argument(
         "--only-sendable",
         action="store_true",
-        help="Only upload Sendable = Yes and Packet Eligible = Yes rows",
+        help="Only upload rows that pass the four-field contact-readiness contract",
     )
     parser.add_argument(
         "--include-manual-review",

@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
@@ -42,6 +42,16 @@ const batch = {
   artifacts: {},
 };
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+function response(payload: unknown) {
+  return { ok: true, json: () => Promise.resolve(payload) };
+}
+
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
@@ -72,5 +82,61 @@ describe("dashboard", () => {
     fireEvent.click(screen.getByRole("button", { name: "Refresh data" }));
     expect(await screen.findByText("Last known data")).toBeInTheDocument();
     expect(screen.getByText("Know where every batch stands.")).toBeInTheDocument();
+  });
+
+  it("ignores a superseded overview refresh after filters change", async () => {
+    const oldOverview = deferred<ReturnType<typeof response>>();
+    const oldBatches = deferred<ReturnType<typeof response>>();
+    const newer = { ...batch, batch: "detailing_cleveland_medium_002" };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response(overview))
+      .mockResolvedValueOnce(response({ generated_at: overview.generated_at, total: 1, items: [batch] }))
+      .mockReturnValueOnce(oldOverview.promise)
+      .mockReturnValueOnce(oldBatches.promise)
+      .mockResolvedValueOnce(response(overview))
+      .mockResolvedValueOnce(response({ generated_at: overview.generated_at, total: 1, items: [newer] }));
+    vi.stubGlobal("fetch", fetchMock);
+    render(<MemoryRouter><App /></MemoryRouter>);
+    await screen.findByText(batch.batch);
+    fireEvent.click(screen.getByRole("button", { name: "Refresh data" }));
+    fireEvent.change(screen.getByLabelText("Market"), { target: { value: "cleveland" } });
+    expect(await screen.findByText(newer.batch)).toBeInTheDocument();
+    const oldSignal = fetchMock.mock.calls[2][1].signal as AbortSignal;
+    expect(oldSignal.aborted).toBe(true);
+    await act(async () => {
+      oldOverview.resolve(response(overview));
+      oldBatches.resolve(response({ generated_at: overview.generated_at, total: 1, items: [batch] }));
+      await Promise.resolve();
+    });
+    expect(screen.getByText(newer.batch)).toBeInTheDocument();
+    expect(screen.queryByText(batch.batch)).not.toBeInTheDocument();
+  });
+
+  it("ignores an older detail page after a newer lead query", async () => {
+    const oldDetail = deferred<ReturnType<typeof response>>();
+    const oldLeads = deferred<ReturnType<typeof response>>();
+    const initialLeads = { generated_at: overview.generated_at, batch: batch.batch, total: 2, page: 1, page_size: 1, pages: 2, items: [{ key: "one", scoring_state: "scored", business_name: "Initial Lead", city: "Cleveland", website_url: "", google_maps_url: "", score_total: 80, priority: "A", packet_tier: "Sendable Packet", sendable: true, declared_sendable: true, readiness_mismatch: false, money_signal: true, ai_confidence: "high", blockers: "" }] };
+    const newerLeads = { ...initialLeads, total: 1, pages: 1, items: [{ ...initialLeads.items[0], key: "new", business_name: "New Query Lead" }] };
+    const staleLeads = { ...initialLeads, page: 2, items: [{ ...initialLeads.items[0], key: "old", business_name: "Old Page Lead" }] };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response(batch))
+      .mockResolvedValueOnce(response(initialLeads))
+      .mockReturnValueOnce(oldDetail.promise)
+      .mockReturnValueOnce(oldLeads.promise)
+      .mockResolvedValueOnce(response(batch))
+      .mockResolvedValueOnce(response(newerLeads));
+    vi.stubGlobal("fetch", fetchMock);
+    render(<MemoryRouter initialEntries={[`/batches/${batch.batch}`]}><App /></MemoryRouter>);
+    await screen.findByText("Initial Lead");
+    fireEvent.click(screen.getByRole("button", { name: "Next page" }));
+    fireEvent.change(screen.getByLabelText("Find business"), { target: { value: "New" } });
+    expect(await screen.findByText("New Query Lead")).toBeInTheDocument();
+    await act(async () => {
+      oldDetail.resolve(response(batch));
+      oldLeads.resolve(response(staleLeads));
+      await Promise.resolve();
+    });
+    expect(screen.getByText("New Query Lead")).toBeInTheDocument();
+    expect(screen.queryByText("Old Page Lead")).not.toBeInTheDocument();
   });
 });

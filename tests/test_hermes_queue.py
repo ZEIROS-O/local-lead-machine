@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import subprocess
 import tempfile
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -58,6 +60,11 @@ def make_record(i: int, *, vertical: str = "water_restoration", priority: str = 
         "Evidence Refs": '["ev-google-rating-1", "ev-site-status-2"]',
         "Outreach Channel": "Phone",
         "Consent Posture": "",
+        "Sendable": "Yes",
+        "Packet Eligible": "Yes",
+        "Commercial Fit State": "commercially-sendable",
+        "Contact Eligibility": "contact-now",
+        "Status": "New",
         "Mockup URL": "",
         "Video URL": "",
     }
@@ -286,6 +293,32 @@ class MorningQueueTest(unittest.TestCase):
             self.assertEqual(data["queued_count"], 3)
             self.assertEqual([item["business"] for item in data["items"]], ["Biz 2", "Biz 3", "Biz 4"])
 
+    def test_sms_without_documented_consent_is_excluded_before_target_refill(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp)
+            records = [make_record(i, priority="C") for i in range(1, 5)]
+            records[0]["Outreach Channel"] = "SMS"
+            records[0]["Consent Posture"] = ""
+            records[1]["Outreach Channel"] = "SMS"
+            records[1]["Consent Posture"] = "express written consent"
+            with patch.object(hq, "fetch_pooled_records", return_value=records):
+                hq.cmd_morning_queue(execute=True, root=root, target=3)
+            data = read_latest_queue_run(root)
+            self.assertEqual(data["sms_consent_excluded_count"], 1)
+            self.assertEqual(data["queued_count"], 3)
+            self.assertEqual([item["business"] for item in data["items"]], ["Biz 2", "Biz 3", "Biz 4"])
+
+    def test_unsafe_status_is_excluded_before_queue_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp)
+            records = [make_record(1, priority="C"), make_record(2, priority="C")]
+            records[0]["Status"] = "Manual Review"
+            with patch.object(hq, "fetch_pooled_records", return_value=records):
+                hq.cmd_morning_queue(execute=True, root=root, target=1)
+            data = read_latest_queue_run(root)
+            self.assertEqual(data["status_excluded_count"], 1)
+            self.assertEqual([item["business"] for item in data["items"]], ["Biz 2"])
+
     def test_missing_suppression_source_writes_degraded_zero_item_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = make_root(tmp)
@@ -460,16 +493,237 @@ def queue_item(n: int, *, sent_at: str | None = None) -> dict:
         "record_id": f"recABCDEFGHIJKLM{n}",
         "business": f"Biz {n}",
         "vertical": "water_restoration",
+        "consent_posture": "express written consent",
         "sent_at": sent_at,
         "sent_channel": "SMS" if sent_at else None,
     }
 
 
 def ok_proc() -> subprocess.CompletedProcess[str]:
-    return subprocess.CompletedProcess(args=[], returncode=0, stdout="[SENT] ok", stderr="")
+    return subprocess.CompletedProcess(
+        args=[],
+        returncode=0,
+        stdout=json.dumps({"result": "applied", "record_id": "rec", "status": "Sent"}),
+        stderr="",
+    )
 
 
 class MarkSentTest(unittest.TestCase):
+    def test_concurrent_mark_sent_attempts_serialize_to_one_external_apply(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp)
+            path = write_queue_file(root, items=[queue_item(1)])
+            approval_id = dry_run_approval(root, path, ["1"])
+
+            def slow_apply(*_args, **_kwargs):
+                time.sleep(0.05)
+                return ok_proc()
+
+            def execute_once():
+                return hq.cmd_mark_sent(
+                    ["1"], approval_id=approval_id, execute=True, root=root, **queue_identity(path)
+                )
+
+            with patch.object(hq, "_run_capture", side_effect=slow_apply) as run:
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    results = list(pool.map(lambda _: execute_once(), range(2)))
+            self.assertEqual(run.call_count, 1)
+            self.assertTrue(any("[SENT]" in result.message for result in results))
+            self.assertTrue(any("[ALREADY-SENT]" in result.message for result in results))
+            self.assertEqual(len((root / "outcomes.jsonl").read_text(encoding="utf-8").splitlines()), 1)
+
+    def test_concurrent_queue_runs_share_one_event_and_external_apply(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp)
+            first_path = write_queue_file(root, items=[queue_item(1)], queue_run_id="mq-first")
+            second_path = write_queue_file(root, items=[queue_item(1)], queue_run_id="mq-second")
+            first_approval = dry_run_approval(root, first_path, ["1"])
+            second_approval = dry_run_approval(root, second_path, ["1"])
+
+            def slow_apply(*_args, **_kwargs):
+                time.sleep(0.05)
+                return ok_proc()
+
+            calls = [
+                (first_path, first_approval),
+                (second_path, second_approval),
+            ]
+
+            def execute(call):
+                path, approval_id = call
+                return hq.cmd_mark_sent(
+                    ["1"], approval_id=approval_id, execute=True, root=root, **queue_identity(path)
+                )
+
+            with patch.object(hq, "_run_capture", side_effect=slow_apply) as run:
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    results = list(pool.map(execute, calls))
+            self.assertEqual(run.call_count, 1)
+            self.assertTrue(any("[SENT]" in result.message for result in results))
+            self.assertTrue(any("[ALREADY-SENT]" in result.message for result in results))
+            outcomes = (root / "outcomes.jsonl").read_text(encoding="utf-8").strip().splitlines()
+            self.assertEqual(len(outcomes), 1)
+            self.assertTrue(json.loads(outcomes[0])["event_id"].startswith("sent-event-"))
+
+    def test_same_event_with_different_artifact_is_refused_before_external_apply(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp)
+            first_path = write_queue_file(root, items=[queue_item(1)], queue_run_id="mq-first")
+            first_approval = dry_run_approval(root, first_path, ["1"])
+            with patch.object(hq, "_run_capture", return_value=ok_proc()):
+                hq.cmd_mark_sent(
+                    ["1"], approval_id=first_approval, execute=True, root=root, **queue_identity(first_path)
+                )
+
+            second_path = write_queue_file(root, items=[queue_item(1)], queue_run_id="mq-second")
+            second_identity = queue_identity(second_path)
+            second_identity["artifact_sha256"] = "b" * 64
+            dry = hq.cmd_mark_sent(["1"], dry_run=True, execute=True, root=root, **second_identity)
+            second_approval = next(
+                line.split(": ", 1)[1] for line in dry.message.splitlines() if line.startswith("approval_id:")
+            )
+            with patch.object(hq, "_run_capture") as run, self.assertRaisesRegex(
+                CommandError, "conflicting outcome artifact"
+            ):
+                hq.cmd_mark_sent(
+                    ["1"], approval_id=second_approval, execute=True, root=root, **second_identity
+                )
+            run.assert_not_called()
+
+    def test_v1_approval_without_send_date_is_bound_to_immutable_queue_date(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp)
+            path = write_queue_file(root, items=[queue_item(1)], date="2026-07-10")
+            approval_id = dry_run_approval(root, path, ["1"])
+            approval_path = hq.queue_approval_path(root, approval_id)
+            approval = json.loads(approval_path.read_text(encoding="utf-8"))
+            approval["schema_version"] = 1
+            approval.pop("send_date")
+            approval["approval_sha256"] = hq._canonical_hash(
+                {key: value for key, value in approval.items() if key != "approval_sha256"}
+            )
+            approval_path.write_text(json.dumps(approval), encoding="utf-8")
+
+            with patch.object(hq, "_run_capture", return_value=ok_proc()) as run:
+                hq.cmd_mark_sent(
+                    ["1"], date="2026-07-10", approval_id=approval_id, execute=True, root=root,
+                    **queue_identity(path),
+                )
+            self.assertEqual(run.call_count, 1)
+
+            with self.assertRaisesRegex(CommandError, "send_date"):
+                hq.cmd_mark_sent(
+                    ["1"], date="2026-07-11", approval_id=approval_id, execute=True, root=root,
+                    **queue_identity(path),
+                )
+
+    def test_v1_writeback_exact_retry_remains_idempotent_and_immutable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp)
+            queue_date = hq._today()
+            path = write_queue_file(root, items=[queue_item(1)], date=queue_date)
+            approval_id = dry_run_approval(root, path, ["1"])
+            state_path = hq.queue_writeback_path(root, "mq-test-run")
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "queue_run_id": "mq-test-run",
+                        "sent": {
+                            queue_item(1)["record_id"]: {
+                                "sent_at": f"{queue_date}T09:00:00-04:00",
+                                "sent_channel": "SMS",
+                                "approval_id": "legacy",
+                                "artifact_sha256": "a" * 64,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            before = state_path.read_bytes()
+            with patch.object(hq, "_run_capture") as run:
+                result = hq.cmd_mark_sent(
+                    ["1"], date=queue_date, approval_id=approval_id, execute=True, root=root,
+                    **queue_identity(path),
+                )
+            run.assert_not_called()
+            self.assertIn("[ALREADY-SENT]", result.message)
+            self.assertEqual(state_path.read_bytes(), before)
+
+    def test_journal_failure_before_airtable_aborts_external_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp)
+            path = write_queue_file(root, items=[queue_item(1)])
+            approval_id = dry_run_approval(root, path, ["1"])
+            with patch.object(hq, "_atomic_write_json", side_effect=OSError("disk full")), patch.object(
+                hq, "_run_capture"
+            ) as run, self.assertRaises(OSError):
+                hq.cmd_mark_sent(["1"], approval_id=approval_id, execute=True, root=root, **queue_identity(path))
+            run.assert_not_called()
+
+    def test_retry_after_airtable_confirmation_journal_failure_converges(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp)
+            path = write_queue_file(root, items=[queue_item(1)])
+            approval_id = dry_run_approval(root, path, ["1"])
+            real_write = hq._atomic_write_json
+            writes = 0
+
+            def fail_second(write_path, payload):
+                nonlocal writes
+                writes += 1
+                if writes == 2:
+                    raise OSError("post-patch disk failure")
+                return real_write(write_path, payload)
+
+            with patch.object(hq, "_atomic_write_json", side_effect=fail_second), patch.object(
+                hq, "_run_capture", return_value=ok_proc()
+            ) as run, self.assertRaises(OSError):
+                hq.cmd_mark_sent(["1"], approval_id=approval_id, execute=True, root=root, **queue_identity(path))
+            self.assertEqual(run.call_count, 1)
+            pending = json.loads(hq.queue_writeback_path(root, "mq-test-run").read_text(encoding="utf-8"))
+            self.assertEqual(pending["operations"][queue_item(1)["record_id"]]["phase"], "pending")
+
+            already = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=json.dumps({"result": "already_applied"}), stderr=""
+            )
+            with patch.object(hq, "_run_capture", return_value=already) as retry:
+                hq.cmd_mark_sent(["1"], approval_id=approval_id, execute=True, root=root, **queue_identity(path))
+            self.assertEqual(retry.call_count, 1)
+            completed = json.loads(hq.queue_writeback_path(root, "mq-test-run").read_text(encoding="utf-8"))
+            self.assertEqual(completed["operations"][queue_item(1)["record_id"]]["phase"], "complete")
+            self.assertEqual(len((root / "outcomes.jsonl").read_text(encoding="utf-8").splitlines()), 1)
+
+    def test_retry_after_outcome_logging_failure_deduplicates_without_patch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp)
+            path = write_queue_file(root, items=[queue_item(1)])
+            approval_id = dry_run_approval(root, path, ["1"])
+            real_write = hq._atomic_write_json
+            writes = 0
+
+            def fail_third(write_path, payload):
+                nonlocal writes
+                writes += 1
+                if writes == 3:
+                    raise OSError("completion disk failure")
+                return real_write(write_path, payload)
+
+            with patch.object(hq, "_atomic_write_json", side_effect=fail_third), patch.object(
+                hq, "_run_capture", return_value=ok_proc()
+            ), self.assertRaises(OSError):
+                hq.cmd_mark_sent(["1"], approval_id=approval_id, execute=True, root=root, **queue_identity(path))
+            state = json.loads(hq.queue_writeback_path(root, "mq-test-run").read_text(encoding="utf-8"))
+            self.assertEqual(state["operations"][queue_item(1)["record_id"]]["phase"], "airtable_applied")
+            self.assertEqual(len((root / "outcomes.jsonl").read_text(encoding="utf-8").splitlines()), 1)
+
+            with patch.object(hq, "_run_capture") as run:
+                hq.cmd_mark_sent(["1"], approval_id=approval_id, execute=True, root=root, **queue_identity(path))
+            run.assert_not_called()
+            self.assertEqual(len((root / "outcomes.jsonl").read_text(encoding="utf-8").splitlines()), 1)
+
     def test_number_mapping_marks_and_updates_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = make_root(tmp)
@@ -488,6 +742,51 @@ class MarkSentTest(unittest.TestCase):
             self.assertIn("[SENT] 1. Biz 1", res.message)
             outcomes = (root / "outcomes.jsonl").read_text(encoding="utf-8").strip().splitlines()
             self.assertEqual(len(outcomes), 2)
+
+    def test_delayed_send_uses_actual_date_not_queue_date(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp)
+            path = write_queue_file(root, items=[queue_item(1)], date="2026-07-09")
+            identity = queue_identity(path)
+            dry = hq.cmd_mark_sent(
+                ["1"], date="2026-07-10", dry_run=True, execute=True, root=root, **identity
+            )
+            approval_id = next(
+                line.split(": ", 1)[1] for line in dry.message.splitlines() if line.startswith("approval_id:")
+            )
+            with patch.object(hq, "_run_capture", return_value=ok_proc()) as run:
+                hq.cmd_mark_sent(
+                    ["1"], date="2026-07-10", approval_id=approval_id, execute=True, root=root, **identity
+                )
+            command = run.call_args.args[0]
+            self.assertEqual(command[command.index("--date") + 1], "2026-07-10")
+            self.assertEqual(command[command.index("--suppression-source") + 1], str(root / "outcomes.jsonl"))
+            outcome = json.loads((root / "outcomes.jsonl").read_text(encoding="utf-8"))
+            self.assertEqual(outcome["date"], "2026-07-10")
+
+    def test_sms_mark_sent_refuses_missing_consent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp)
+            item = queue_item(1)
+            item["consent_posture"] = ""
+            path = write_queue_file(root, items=[item])
+            with patch.object(hq, "_run_capture") as run, self.assertRaisesRegex(
+                CommandError, "documented consent is missing or unacceptable"
+            ):
+                hq.cmd_mark_sent(["1"], dry_run=True, execute=True, root=root, **queue_identity(path))
+            run.assert_not_called()
+
+    def test_mark_sent_refuses_unsafe_status_bound_into_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp)
+            item = queue_item(1)
+            item["status"] = "Manual Review"
+            path = write_queue_file(root, items=[item])
+            with patch.object(hq, "_run_capture") as run, self.assertRaisesRegex(
+                CommandError, "New or Mockup Needed"
+            ):
+                hq.cmd_mark_sent(["1"], dry_run=True, execute=True, root=root, **queue_identity(path))
+            run.assert_not_called()
 
     def test_unknown_number_refused_with_valid_range(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -685,8 +984,11 @@ class ParserDispatchTest(unittest.TestCase):
         from lead_machine import hermes_commands as hc
 
         parser = hc.build_parser()
-        args = parser.parse_args(["mark-sent", "1", "3", "--channel", "sms", "--execute"])
+        args = parser.parse_args(
+            ["mark-sent", "1", "3", "--channel", "sms", "--date", "2026-07-10", "--execute"]
+        )
         self.assertEqual(args.items, ["1", "3"])
+        self.assertEqual(args.date, "2026-07-10")
         parser.parse_args(["queue-status", "--execute"])
         parser.parse_args(["queue-topup", "--budget", "0.30", "--execute"])
         parser.parse_args(["morning-queue", "--target", "5", "--execute"])

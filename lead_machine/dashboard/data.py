@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import math
 import os
 import sys
 from collections import Counter
@@ -18,6 +19,8 @@ from lead_machine.sendability import (
     PACKET_TIER_NONE,
     PACKET_TIER_SENDABLE,
     PACKET_TIER_WATCHLIST,
+    contact_readiness_failures,
+    is_contact_ready,
 )
 
 
@@ -146,6 +149,12 @@ def _row_key(row: dict[str, Any]) -> str:
     return f"fallback:{name}|{city}" if name or city else ""
 
 
+def _fallback_row_key(row: dict[str, Any]) -> str:
+    name = str(_first(row, "Business Name", "business_name")).strip().casefold()
+    city = str(_first(row, "City", "city")).strip().casefold()
+    return f"fallback:{name}|{city}" if name or city else ""
+
+
 def _enriched_google(row: dict[str, Any]) -> dict[str, Any]:
     google = row.get("google")
     return google if isinstance(google, dict) else row
@@ -178,6 +187,75 @@ def _tier_counts(rows: Iterable[dict[str, str]]) -> dict[str, int]:
         elif tier == PACKET_TIER_NONE:
             counts["no_packet"] += 1
     return counts
+
+
+def _typed_int(
+    source: dict[str, Any], key: str, issues: list[dict[str, str]], *, scope: str, default: int = 0
+) -> int:
+    if key not in source or source.get(key) is None:
+        return default
+    value = source.get(key)
+    if isinstance(value, bool):
+        issues.append(_issue(f"invalid_{scope}_{key.lower()}", "blocked", f"{scope} field {key} must be an integer."))
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        issues.append(_issue(f"invalid_{scope}_{key.lower()}", "blocked", f"{scope} field {key} must be an integer."))
+        return default
+    if isinstance(value, float) and not value.is_integer():
+        issues.append(_issue(f"invalid_{scope}_{key.lower()}", "blocked", f"{scope} field {key} must be an integer."))
+        return default
+    if parsed < 0:
+        issues.append(_issue(f"invalid_{scope}_{key.lower()}", "blocked", f"{scope} field {key} must be nonnegative."))
+        return default
+    return parsed
+
+
+def _typed_float(
+    source: dict[str, Any], key: str, issues: list[dict[str, str]], *, scope: str, default: float = 0.0
+) -> float:
+    if key not in source or source.get(key) is None:
+        return default
+    value = source.get(key)
+    if isinstance(value, bool):
+        issues.append(_issue(f"invalid_{scope}_{key.lower()}", "blocked", f"{scope} field {key} must be numeric."))
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        issues.append(_issue(f"invalid_{scope}_{key.lower()}", "blocked", f"{scope} field {key} must be numeric."))
+        return default
+    if not math.isfinite(parsed) or parsed < 0:
+        issues.append(_issue(f"invalid_{scope}_{key.lower()}", "blocked", f"{scope} field {key} must be finite and nonnegative."))
+        return default
+    return parsed
+
+
+def _typed_bool(
+    source: dict[str, Any], key: str, issues: list[dict[str, str]], *, scope: str, default: bool = False
+) -> bool:
+    if key not in source or source.get(key) is None:
+        return default
+    value = source.get(key)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().casefold() in {"true", "false"}:
+        return value.strip().casefold() == "true"
+    issues.append(_issue(f"invalid_{scope}_{key.lower()}", "blocked", f"{scope} field {key} must be boolean."))
+    return default
+
+
+def _typed_string_list(
+    source: dict[str, Any], key: str, issues: list[dict[str, str]], *, scope: str
+) -> list[str]:
+    if key not in source or source.get(key) is None:
+        return []
+    value = source.get(key)
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        issues.append(_issue(f"invalid_{scope}_{key.lower()}", "blocked", f"{scope} field {key} must be a string list."))
+        return []
+    return value
 
 
 def _path_meta(path: Path, root: Path, *, rows: int | None = None) -> dict[str, Any]:
@@ -296,11 +374,43 @@ class DashboardRepository:
         signature = self._signature(names)
         if not force and signature == self._cache_signature:
             return self._cache_reads, self._cache_ignored
-        reads = {name: self._read_batch(name) for name in sorted(names)}
+        reads: dict[str, BatchRead] = {}
+        for name in sorted(names):
+            try:
+                reads[name] = self._read_batch(name)
+            except Exception as exc:  # per-batch containment is an API integrity boundary
+                reads[name] = self._blocked_batch(name, exc)
         self._cache_signature = signature
         self._cache_reads = reads
         self._cache_ignored = ignored
         return reads, ignored
+
+    def _blocked_batch(self, batch: str, exc: Exception) -> BatchRead:
+        paths = resolve_batch_paths(batch, root=self.root)
+        issue = _issue("unexpected_batch_read_failure", "blocked", f"Batch artifacts could not be reconciled: {exc}.")
+        summary = {
+            "batch": batch,
+            "vertical": paths.vertical,
+            "market": paths.market,
+            "size": paths.size,
+            "sequence": paths.seq,
+            "location": paths.market.replace("_", " ").title(),
+            "query_count": 0,
+            "progress": "configured",
+            "progress_rank": PROGRESS_ORDER["configured"],
+            "health": "blocked",
+            "health_rank": HEALTH_ORDER["blocked"],
+            "counts": {"raw": 0, "deduped": 0, "enriched": 0, "scored": 0, "unscored": 0, "packets": 0, "sendable": 0, "manual_review": 0, "watchlist": 0, "no_packet": 0},
+            "stages": {key: {"status": "blocked" if key != "discovery" else "not_started", "count": 0} for key in ("discovery", "enrichment", "scoring", "packets", "airtable")},
+            "issues": [issue],
+            "latest_activity_at": "",
+            "next_action": f"/status {batch}",
+            "pending_approval": {"active": False, "stage": "", "expires_at": ""},
+            "llm_usage": {"available": False, "calls": 0, "call_cap": 0, "tokens": 0, "token_cap": 0, "estimated_usd": 0.0, "usd_cap": 0.0, "stopped_by_cap": False, "stop_reason": "", "updated_at": ""},
+            "airtable": {"dry_run": {"status": "not_run", "timestamp": "", "post": 0, "patch": 0, "skip": 0, "warnings": []}, "live": {"status": "not_run", "timestamp": "", "post": 0, "patch": 0, "skip": 0}, "current_input_hash": ""},
+            "artifacts": {},
+        }
+        return BatchRead(summary=summary, scored_rows=[], enriched_rows=[])
 
     def _read_batch(self, batch: str) -> BatchRead:
         paths = resolve_batch_paths(batch, root=self.root)
@@ -379,23 +489,69 @@ class DashboardRepository:
             )
         )
         scoring_complete = bool(enriched_count) and identities_clean and scored_count == enriched_count
-        tiers = _tier_counts(tiered_rows or scored_rows)
-        expected_packets = tiers["sendable"] + tiers["manual_review"]
+        effective_tiered_rows = tiered_rows or (scored_rows if tiered_path == base_scored_path else [])
+        declared_tiers = _tier_counts(effective_tiered_rows)
+        readiness_mismatches = [
+            row
+            for row in effective_tiered_rows
+            if str(row.get("Packet Tier") or "").strip() == PACKET_TIER_SENDABLE
+            and not is_contact_ready(row)
+        ]
+        tiers = dict(declared_tiers)
+        tiers["sendable"] = sum(
+            1
+            for row in effective_tiered_rows
+            if str(row.get("Packet Tier") or "").strip() == PACKET_TIER_SENDABLE
+            and is_contact_ready(row)
+        )
+        expected_packet_rows = [
+            row
+            for row in effective_tiered_rows
+            if str(row.get("Packet Tier") or "").strip() in {PACKET_TIER_SENDABLE, PACKET_TIER_MANUAL}
+        ]
+        expected_packets = len(expected_packet_rows)
+
+        tiered_identities, missing_tiered_identities = _identity_counts(
+            _row_key(row) for row in effective_tiered_rows
+        )
+        expected_packet_identities, _ = _identity_counts(_row_key(row) for row in expected_packet_rows)
+        expected_by_fallback: dict[str, list[str]] = {}
+        for row in expected_packet_rows:
+            expected_by_fallback.setdefault(_fallback_row_key(row), []).append(_row_key(row))
+
+        def packet_identity(row: dict[str, Any]) -> str:
+            explicit = _first(row, "Place Key", "place_key", "Place ID", "place_id")
+            if explicit:
+                return str(explicit).strip()
+            fallback = _fallback_row_key(row)
+            matches = expected_by_fallback.get(fallback, [])
+            return matches[0] if fallback and len(matches) == 1 else fallback
+
+        packet_identities, missing_packet_identities = _identity_counts(packet_identity(row) for row in packet_rows)
+        duplicate_tiered = sum(count - 1 for count in tiered_identities.values() if count > 1)
+        duplicate_packets = sum(count - 1 for count in packet_identities.values() if count > 1)
+        tiered_missing = sorted((scored_identities - tiered_identities).elements())
+        tiered_extra = sorted((tiered_identities - scored_identities).elements())
+        packet_missing = sorted((expected_packet_identities - packet_identities).elements())
+        packet_extra = sorted((packet_identities - expected_packet_identities).elements())
 
         scored_mtime = base_scored_path.stat().st_mtime if base_scored_path.exists() else 0.0
         tiered_mtime = tiered_path.stat().st_mtime if tiered_path.exists() else 0.0
         packet_mtime = paths.packet_index.stat().st_mtime if paths.packet_index.exists() else 0.0
-        tiered_current = bool(scored_rows) and bool(tiered_rows)
-        if base_scored_path != tiered_path:
-            tiered_current = (
-                tiered_current
-                and len(tiered_rows) == raw_scored_count
-                and tiered_mtime >= scored_mtime
-            )
+        tiered_current = bool(scored_rows) and bool(effective_tiered_rows)
+        tiered_current = bool(
+            tiered_current
+            and tiered_identities == scored_identities
+            and not missing_tiered_identities
+            and not duplicate_tiered
+            and (base_scored_path == tiered_path or tiered_mtime >= scored_mtime)
+        )
         packets_current = (
             tiered_current
             and paths.packet_index.exists()
-            and len(packet_rows) == expected_packets
+            and packet_identities == expected_packet_identities
+            and not missing_packet_identities
+            and not duplicate_packets
             and packet_mtime >= tiered_mtime
         )
 
@@ -441,6 +597,36 @@ class DashboardRepository:
                     f"Scored output contains {missing_scored_identities} row(s) without a stable identity.",
                 )
             )
+        if readiness_mismatches:
+            mismatch_details = ", ".join(
+                f"{_row_key(row) or '<missing-identity>'} ({'; '.join(contact_readiness_failures(row))})"
+                for row in readiness_mismatches
+            )
+            issues.append(
+                _issue(
+                    "sendable_readiness_mismatch",
+                    "blocked",
+                    "Sendable packet tier conflicts with contact readiness: " + mismatch_details,
+                )
+            )
+        if effective_tiered_rows and (tiered_missing or tiered_extra or duplicate_tiered or missing_tiered_identities):
+            issues.append(
+                _issue(
+                    "tiered_identity_drift",
+                    "blocked",
+                    f"Tiered identities drifted (missing={tiered_missing}, extra={tiered_extra}, "
+                    f"duplicates={duplicate_tiered}, unidentified={missing_tiered_identities}).",
+                )
+            )
+        if paths.packet_index.exists() and (packet_missing or packet_extra or duplicate_packets or missing_packet_identities):
+            issues.append(
+                _issue(
+                    "packet_identity_drift",
+                    "blocked",
+                    f"Packet identities drifted (missing={packet_missing}, extra={packet_extra}, "
+                    f"duplicates={duplicate_packets}, unidentified={missing_packet_identities}).",
+                )
+            )
         if scored_count and not tiered_current:
             issues.append(_issue("stale_tiered", "attention", "Packet tiers are missing, stale, or row counts do not reconcile."))
         elif tiered_current and not packets_current:
@@ -453,11 +639,22 @@ class DashboardRepository:
             "sendable_count": tiers["sendable"],
             "manual_review_count": tiers["manual_review"],
         }
-        drift = [key for key, value in state_counts.items() if state.get(key) not in (None, value)]
+        stored_state_counts = {
+            key: _typed_int(state, key, issues, scope="run_state", default=value)
+            for key, value in state_counts.items()
+        }
+        drift = [
+            key
+            for key, value in state_counts.items()
+            if key in state and state.get(key) is not None and stored_state_counts[key] != value
+        ]
         if paths.state_json.exists() and drift:
             issues.append(_issue("state_count_drift", "attention", "Saved run-state counts differ from current artifacts."))
 
-        pending = state.get("pending_approval") if isinstance(state.get("pending_approval"), dict) else None
+        pending_value = state.get("pending_approval")
+        pending = pending_value if isinstance(pending_value, dict) else None
+        if pending_value not in (None, {}) and pending is None:
+            issues.append(_issue("invalid_run_state_pending_approval", "blocked", "Run-state pending_approval must be an object."))
         pending_active = False
         if pending:
             expires = _parse_iso(pending.get("expires_at"))
@@ -467,25 +664,34 @@ class DashboardRepository:
 
         if str(state.get("last_error") or "").strip():
             issues.append(_issue("last_run_error", "blocked", str(state["last_error"]).strip()))
-        if usage.get("stopped_by_cap") and unscored:
+        stopped_by_cap = _typed_bool(usage, "stopped_by_cap", issues, scope="llm_usage")
+        if stopped_by_cap and unscored:
             reason = str(usage.get("stop_reason") or "configured LLM cap")
             issues.append(_issue("llm_cap_stop", "attention", f"Scoring stopped at {reason}."))
+
+        dry_include_manual = _typed_bool(state, "dry_run_include_manual", issues, scope="run_state")
+        dry_skip_count = _typed_int(state, "dry_run_skip_count", issues, scope="run_state")
+        live_skip_count = _typed_int(state, "live_skip_count", issues, scope="run_state")
+        dry_post_count = _typed_int(state, "dry_run_post_count", issues, scope="run_state")
+        dry_patch_count = _typed_int(state, "dry_run_patch_count", issues, scope="run_state")
+        live_post_count = _typed_int(state, "live_post_count", issues, scope="run_state")
+        live_patch_count = _typed_int(state, "live_patch_count", issues, scope="run_state")
+        warnings = _typed_string_list(state, "dry_run_warnings", issues, scope="run_state")
 
         current_hash = ""
         if paths.tiered_csv.exists() and paths.packet_index.exists():
             try:
-                current_hash = current_sync_hash(paths, include_manual=bool(state.get("dry_run_include_manual")))
+                current_hash = current_sync_hash(paths, include_manual=dry_include_manual)
             except (FileNotFoundError, OSError):
                 current_hash = ""
         dry_hash = str(state.get("dry_run_input_hash") or "")
         live_hash = str(state.get("live_sync_input_hash") or "")
-        warnings = [str(value) for value in (state.get("dry_run_warnings") or [])]
         dry_clean = bool(
             packets_current
             and dry_hash
             and current_hash
             and dry_hash == current_hash
-            and int(state.get("dry_run_skip_count") or 0) == 0
+            and dry_skip_count == 0
             and not warnings
         )
         live_current = bool(
@@ -493,18 +699,19 @@ class DashboardRepository:
             and state.get("last_live_sync_timestamp")
             and live_hash
             and live_hash == current_hash
-            and int(state.get("live_skip_count") or 0) == 0
+            and live_skip_count == 0
         )
         if warnings:
             issues.append(_issue("airtable_warnings", "blocked", f"Airtable receipt has {len(warnings)} warning(s)."))
-        if int(state.get("dry_run_skip_count") or 0):
+        if dry_skip_count:
             issues.append(_issue("airtable_dry_skips", "blocked", "Airtable dry-run contains skipped rows."))
         if packets_current and state.get("last_airtable_dry_run_timestamp") and not dry_clean:
             issues.append(_issue("stale_airtable_dry_run", "attention", "Airtable dry-run no longer matches current packet inputs."))
         if state.get("last_live_sync_timestamp") and not live_current:
             issues.append(_issue("stale_live_sync", "attention", "Airtable live receipt no longer matches current packet inputs."))
 
-        if live_current and scoring_complete:
+        has_blocked_issue = any(item["severity"] == "blocked" for item in issues)
+        if live_current and scoring_complete and not has_blocked_issue:
             progress = "finished"
         elif dry_clean and scoring_complete:
             progress = "airtable_ready"
@@ -521,7 +728,7 @@ class DashboardRepository:
         else:
             progress = "configured"
 
-        if any(item["severity"] == "blocked" for item in issues):
+        if has_blocked_issue:
             health = "blocked"
         elif issues:
             health = "attention"
@@ -545,19 +752,28 @@ class DashboardRepository:
 
         artifact_paths = self._artifact_paths(paths) + [base_scored_path, tiered_path]
         updated_at = _iso_timestamp(_latest_mtime(artifact_paths))
-        caps = usage.get("caps") if isinstance(usage.get("caps"), dict) else {}
+        caps_value = usage.get("caps")
+        caps = caps_value if isinstance(caps_value, dict) else {}
+        if caps_value not in (None, {}) and not isinstance(caps_value, dict):
+            issues.append(_issue("invalid_llm_usage_caps", "blocked", "LLM usage caps must be an object."))
+            health = "blocked"
         llm_usage = {
             "available": bool(usage),
-            "calls": int(usage.get("calls") or 0),
-            "call_cap": int(caps.get("MAX_LLM_CALLS_PER_RUN") or 0),
-            "tokens": int(usage.get("total_tokens") or 0),
-            "token_cap": int(caps.get("MAX_LLM_TOKENS_PER_RUN") or 0),
-            "estimated_usd": float(usage.get("estimated_usd") or 0.0),
-            "usd_cap": float(caps.get("MAX_LLM_USD_PER_RUN") or 0.0),
-            "stopped_by_cap": bool(usage.get("stopped_by_cap")),
+            "calls": _typed_int(usage, "calls", issues, scope="llm_usage"),
+            "call_cap": _typed_int(caps, "MAX_LLM_CALLS_PER_RUN", issues, scope="llm_usage_caps"),
+            "tokens": _typed_int(usage, "total_tokens", issues, scope="llm_usage"),
+            "token_cap": _typed_int(caps, "MAX_LLM_TOKENS_PER_RUN", issues, scope="llm_usage_caps"),
+            "estimated_usd": _typed_float(usage, "estimated_usd", issues, scope="llm_usage"),
+            "usd_cap": _typed_float(caps, "MAX_LLM_USD_PER_RUN", issues, scope="llm_usage_caps"),
+            "stopped_by_cap": stopped_by_cap,
             "stop_reason": str(usage.get("stop_reason") or ""),
             "updated_at": _iso_timestamp(paths.usage_json.stat().st_mtime) if paths.usage_json.exists() else "",
         }
+        if any(item["severity"] == "blocked" for item in issues):
+            health = "blocked"
+            if progress in {"finished", "airtable_ready"}:
+                progress = "packets_current" if packets_current and scoring_complete else "scored"
+            next_action = f"/status {batch}"
 
         summary = {
             "batch": batch,
@@ -585,7 +801,7 @@ class DashboardRepository:
                 "enrichment": {"status": "complete" if enriched_count else "not_started", "count": enriched_count},
                 "scoring": {"status": "complete" if scoring_complete else ("in_progress" if raw_scored_count else "not_started"), "count": scored_count},
                 "packets": {"status": "complete" if packets_current else ("stale" if raw_scored_count else "not_started"), "count": len(packet_rows)},
-                "airtable": {"status": "complete" if live_current else ("ready" if dry_clean else ("in_progress" if state.get("last_airtable_dry_run_timestamp") else "not_started")), "count": int(state.get("live_post_count") or 0) + int(state.get("live_patch_count") or 0)},
+                "airtable": {"status": "complete" if live_current else ("ready" if dry_clean else ("in_progress" if state.get("last_airtable_dry_run_timestamp") else "not_started")), "count": live_post_count + live_patch_count},
             },
             "issues": issues,
             "latest_activity_at": updated_at,
@@ -600,17 +816,17 @@ class DashboardRepository:
                 "dry_run": {
                     "status": "clean" if dry_clean else ("stale" if state.get("last_airtable_dry_run_timestamp") else "not_run"),
                     "timestamp": str(state.get("last_airtable_dry_run_timestamp") or ""),
-                    "post": int(state.get("dry_run_post_count") or 0),
-                    "patch": int(state.get("dry_run_patch_count") or 0),
-                    "skip": int(state.get("dry_run_skip_count") or 0),
+                    "post": dry_post_count,
+                    "patch": dry_patch_count,
+                    "skip": dry_skip_count,
                     "warnings": warnings,
                 },
                 "live": {
                     "status": "current" if live_current else ("stale" if state.get("last_live_sync_timestamp") else "not_run"),
                     "timestamp": str(state.get("last_live_sync_timestamp") or ""),
-                    "post": int(state.get("live_post_count") or 0),
-                    "patch": int(state.get("live_patch_count") or 0),
-                    "skip": int(state.get("live_skip_count") or 0),
+                    "post": live_post_count,
+                    "patch": live_patch_count,
+                    "skip": live_skip_count,
                 },
                 "current_input_hash": current_hash,
             },
@@ -777,6 +993,12 @@ class DashboardRepository:
         seen: set[str] = set()
 
         def clean_scored(row: dict[str, Any], scoring_state: str) -> dict[str, Any]:
+            packet_tier = str(row.get("Packet Tier") or "")
+            declared_sendable = _yes(row.get("Sendable"))
+            effective_sendable = packet_tier == PACKET_TIER_SENDABLE and is_contact_ready(row)
+            readiness_mismatch = declared_sendable != effective_sendable or (
+                packet_tier == PACKET_TIER_SENDABLE
+            ) != effective_sendable
             return {
                 "key": _row_key(row),
                 "scoring_state": scoring_state,
@@ -786,8 +1008,10 @@ class DashboardRepository:
                 "google_maps_url": str(_first(row, "Google Maps URL", "google_maps_url")),
                 "score_total": _first(row, "Score Total", "Total Score", "total_score"),
                 "priority": str(_first(row, "Lead Priority", "Grade", "grade")),
-                "packet_tier": str(row.get("Packet Tier") or ""),
-                "sendable": _yes(row.get("Sendable")),
+                "packet_tier": packet_tier,
+                "sendable": effective_sendable,
+                "declared_sendable": declared_sendable,
+                "readiness_mismatch": readiness_mismatch,
                 "money_signal": _yes(_first(row, "Money Signal", "money_signal")),
                 "ai_confidence": str(_first(row, "AI Confidence", "Confidence", "confidence")),
                 "blockers": str(_first(row, "Send Blockers", "Sendability Blockers")),
