@@ -7,6 +7,7 @@ from pathlib import Path
 
 from import_llm_score_bundle import REQUIRED_BUNDLE_SCORE_KEYS
 from lead_machine.manual_scores import validate_manual_score
+from lead_machine.sendability import evaluate_commercial_fit
 from score_batch_subscription import (
     DEFAULT_SCHEMA,
     ProcessResult,
@@ -121,6 +122,16 @@ class SubscriptionScoringTests(unittest.TestCase):
         validated = validate_manual_score(score, allowed_evidence_ids={"ev-1"})
 
         self.assertEqual(validated["commercial_fit_state"], "not-an-LPM-fit")
+        evaluated = evaluate_commercial_fit(
+            {
+                "Commercial Fit State": validated["commercial_fit_state"],
+                "Contact Eligibility": "hold-commercial-case",
+                "Asset State": "none",
+                "Promise State": "asset-free",
+            }
+        )
+        self.assertEqual(evaluated["commercial_fit_state"], "not-an-LPM-fit")
+        self.assertEqual(evaluated["state_errors"], [])
 
     def test_evidence_refs_canonicalize_separator_only_model_drift(self) -> None:
         score = valid_score()
