@@ -47,6 +47,9 @@ manual_leads/
 
 # Local lead/prospect data dumps
 data/
+!data/
+data/*
+!data/manual_score_bundle.schema.json
 *.csv
 *.jsonl
 *.xlsx
