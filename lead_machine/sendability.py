@@ -497,14 +497,17 @@ def is_contact_ready(row: Dict[str, Any]) -> bool:
 
 
 def evaluate_commercial_fit(row: Dict[str, Any]) -> Dict[str, Any]:
-    raw_state = _pick(row, "Commercial Fit State", "commercial_fit_state").strip().lower()
-    state = raw_state if raw_state in COMMERCIAL_FIT_STATES else "unverified"
+    raw_state = _pick(row, "Commercial Fit State", "commercial_fit_state").strip()
+    state = next(
+        (candidate for candidate in COMMERCIAL_FIT_STATES if candidate.casefold() == raw_state.casefold()),
+        "unverified",
+    )
     dimensions = {
         name: _pick(row, *fields).strip()
         for name, fields in COMMERCIAL_DIMENSION_FIELDS.items()
     }
     state_errors: List[str] = []
-    if raw_state not in COMMERCIAL_FIT_STATES:
+    if state == "unverified" and raw_state.casefold() != "unverified":
         state_errors.append(f"invalid commercial_fit_state {raw_state or '<missing>'}")
     if state == "commercially-sendable":
         missing = [name for name, value in dimensions.items() if not value]

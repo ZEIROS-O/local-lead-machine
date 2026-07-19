@@ -20,8 +20,9 @@ confidence 5. Reputation/compliance risks are independent gates rather than
 hidden negative points.
 
 Exact profiles currently exist for detailing and water restoration in Cleveland
-and Columbus. An absent exact profile returns `manual-review` with no rank; v3
-never falls back to another market's profile.
+and Columbus, plus the plumbing/Cleveland shadow-expansion cell. An absent exact
+profile returns `manual-review` with no rank; v3 never falls back to another
+market's profile.
 
 Profiles resolve in `scoring_profiles/` as global safety defaults, vertical,
 metro, then exact vertical/metro overrides. The directory is validated before

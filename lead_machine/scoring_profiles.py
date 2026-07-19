@@ -270,27 +270,34 @@ def infer_market(record: Mapping[str, Any], *, market_dir: Path | None = None) -
     explicit_slugs = {_slug(value) for value in explicit_values if _slug(value)}
     if len(explicit_slugs) == 1:
         return next(iter(explicit_slugs))
-    explicit = " ".join(explicit_values)
-    source = " ".join(
-        str(value or "")
-        for value in (
-            record.get("source_batch"),
-            record.get("Source Batch"),
-            record.get("source_geo"),
-            record.get("Source Geo"),
-            record.get("source_query"),
-            record.get("Source Query"),
-            google.get("source_batch"),
-            google.get("source_geo"),
-            google.get("source_query"),
-        )
-    )
+    if len(explicit_slugs) > 1:
+        return ""
+
     root = market_dir or Path(__file__).resolve().parents[1] / "market_profiles"
     profiles = _market_profiles(root)
-    for text in (explicit, source):
+    for source_values in (
+        (
+            record.get("source_batch"),
+            record.get("Source Batch"),
+            google.get("source_batch"),
+        ),
+        (
+            record.get("source_geo"),
+            record.get("Source Geo"),
+            google.get("source_geo"),
+        ),
+        (
+            record.get("source_query"),
+            record.get("Source Query"),
+            google.get("source_query"),
+        ),
+    ):
+        text = " ".join(str(value or "") for value in source_values)
         matches = [market for market in profiles if _contains_token(text, market)]
         if len(matches) == 1:
             return matches[0]
+        if len(matches) > 1:
+            return ""
 
     city = str(record.get("City") or record.get("city") or google.get("city") or "").strip().casefold()
     if not city:

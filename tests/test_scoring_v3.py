@@ -10,6 +10,7 @@ from lead_machine.review_velocity import ReviewSnapshotStore, build_review_veloc
 from lead_machine.scoring_profiles import (
     ScoringProfileError,
     _deep_merge,
+    infer_market,
     load_scoring_profile,
     validate_scoring_profile,
     validate_scoring_profile_directory,
@@ -294,6 +295,53 @@ class ScoringV3Test(unittest.TestCase):
         self.assertEqual(sum(profile.weights.values()), 100)
         with self.assertRaises(ScoringProfileError):
             load_scoring_profile("detailing", "toledo")
+
+    def test_plumbing_cleveland_shadow_profile_is_exact_and_versioned(self) -> None:
+        profile = load_scoring_profile("plumbing", "cleveland")
+
+        self.assertEqual(profile.profile_id, "plumbing__cleveland")
+        self.assertEqual(profile.profile_version, "1.0.0")
+        self.assertEqual(profile.launch_mode, "shadow")
+        self.assertIn("sewer line replacement", profile.high_value_services)
+        self.assertIn("plumbing supply", profile.exclusions)
+
+    def test_batch_market_scope_precedes_overlapping_query_geography(self) -> None:
+        record = {
+            "google": {
+                "city": "Parma",
+                "source_batch": "plumbing_cleveland_medium_001",
+                "source_geo": "Parma OH",
+                "source_query": "plumber Parma OH",
+            }
+        }
+
+        self.assertEqual(infer_market(record), "cleveland")
+
+    def test_conflicting_explicit_markets_fail_closed(self) -> None:
+        record = {
+            "Metro Context": "cleveland",
+            "market": "parma",
+            "google": {"source_batch": "plumbing_cleveland_medium_001"},
+        }
+
+        self.assertEqual(infer_market(record), "")
+
+    def test_plumbing_profile_rejects_known_franchise_and_supplier_noise(self) -> None:
+        for business_name in ("ARS / Rescue Rooter", "Menyhart Plumbing & Heating Supply Co"):
+            with self.subTest(business_name=business_name):
+                record = {
+                    "vertical": "plumbing",
+                    "google": {
+                        "business_name": business_name,
+                        "category": "plumber",
+                        "source_batch": "plumbing_cleveland_medium_001",
+                    },
+                }
+
+                result = score_v3(record, self._row())
+
+                self.assertEqual(result.disposition, "reject")
+                self.assertIn("excluded_business_type_or_service", result.hard_disqualifiers)
 
     def test_profile_hierarchy_and_directory_validation(self) -> None:
         source = Path(__file__).resolve().parents[1] / "scoring_profiles"

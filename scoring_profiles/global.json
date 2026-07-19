@@ -33,6 +33,7 @@
   "supported_cells": [
     "detailing__cleveland",
     "detailing__columbus",
+    "plumbing__cleveland",
     "water_restoration__cleveland",
     "water_restoration__columbus"
   ]

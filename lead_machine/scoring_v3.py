@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -419,24 +420,28 @@ def _hard_disqualifiers(
     enriched: Mapping[str, Any], row: Mapping[str, Any], profile: ScoringProfile
 ) -> List[str]:
     google = enriched.get("google") if isinstance(enriched.get("google"), Mapping) else {}
-    identity_text = " ".join(
+    identity_text = _normalized_match_text(" ".join(
         str(value or "").lower()
         for value in (
             google.get("business_name"),
             google.get("category"),
             google.get("source_query"),
         )
-    )
+    ))
     result: List[str] = []
     status = str(google.get("business_status") or google.get("businessStatus") or "").upper()
     if status in {"CLOSED_PERMANENTLY", "PERMANENTLY_CLOSED"}:
         result.append("permanently_closed")
-    if any(term.casefold() in identity_text for term in profile.exclusions):
+    if any(_normalized_match_text(term) in identity_text for term in profile.exclusions):
         result.append("excluded_business_type_or_service")
     suppression = str(row.get("Suppressed") or row.get("Opt Out") or row.get("Do Not Contact") or "").strip().lower()
     if suppression in {"yes", "true", "1"}:
         result.append("suppressed_or_opted_out")
     return sorted(set(result))
+
+
+def _normalized_match_text(value: Any) -> str:
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", str(value or "").casefold()).split())
 
 
 def _reputation_risks(
