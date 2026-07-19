@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from lead_machine.manual_scores import validate_manual_score
+from lead_machine.score_schema import V2_SCORE_FIELDS
 from lead_machine.sendability import normalize_evidence_refs
 
 
@@ -26,6 +27,7 @@ REQUIRED_BUNDLE_SCORE_KEYS = {
     "safe_outreach_claims",
     "unsafe_claims",
     "airtable_fields",
+    *V2_SCORE_FIELDS,
 }
 
 
@@ -103,7 +105,11 @@ def validate_bundle_scores(bundle: Dict[str, Any]) -> List[Tuple[str, Dict[str, 
             continue
 
         try:
-            validated = validate_manual_score(score, allowed_evidence_ids=allowed_ids_from_score(score))
+            validated = validate_manual_score(
+                score,
+                allowed_evidence_ids=allowed_ids_from_score(score),
+                require_schema_v2=True,
+            )
         except ValueError as exc:
             failures.append(f"{location} ({score_file}): {exc}")
             continue

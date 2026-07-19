@@ -46,11 +46,12 @@ from lead_machine import llm_client
 from lead_machine.llm_queue import safe_slug
 from lead_machine.manual_scores import allowed_evidence_ids as original_evidence_ids
 from lead_machine.manual_scores import load_manual_score, merge_manual_score
+from lead_machine.score_schema import MANUAL_SCORE_SCHEMA, SHARED_COMMERCIAL_SCORING_RULES
 from lead_machine.schema import normalize_lead
 from lead_machine.scoring_rules import SHARED_SENDABILITY_RULES
 from lead_machine.sendability import apply_sendability, normalize_evidence_refs
 from lead_machine.verticals import VerticalProfile, resolve_profile
-from make_llm_batch import MANUAL_SCORE_SCHEMA, score_file_for_record
+from make_llm_batch import score_file_for_record
 
 
 PRIORITY_RANK = {"A": 0, "B": 1, "C": 2, "Skip": 3}
@@ -1146,37 +1147,98 @@ def deterministic_safe_claims(record: Dict[str, Any], offer_fit: str) -> List[Di
     return claims
 
 
-def deterministic_opener(record: Dict[str, Any], offer_fit: str) -> str:
+def governed_opener(
+    record: Dict[str, Any],
+    offer_fit: str,
+    *,
+    channel: str = "sms",
+    problem_severity: str = "material",
+    commercial_materiality: str = "material",
+    buyer_sophistication: str = "late",
+    credibility: str = "lpm-identity",
+    relationship_warmth: str = "cold",
+    evidence_strength: str = "strong",
+    asset_state: str = "none",
+    desired_next_step: str = "show-the-mechanism",
+    asset_id: str = "",
+    asset_verifier_verdict: str = "",
+) -> str:
+    """Select one governed opening move from declared context; never imply nonexistent proof."""
     g = record.get("google", {}) or {}
     business = g.get("business_name", "your business")
-    rating = g.get("rating", "")
-    reviews = g.get("reviews", "")
-    status = (record.get("website", {}) or {}).get("site_status", "")
     send_trigger = str((record.get("evidence", {}) or {}).get("send_trigger") or "").strip()
-
-    if status == "No Website":
-        return (
-            f"Your Google profile looks strong ({rating} stars / {reviews} reviews), "
-            "but I couldn't find an owned website or estimate path. Want me to send a cleaner direction?"
-        )
-    if send_trigger:
-        return (
-            f"{business} looks credible from the outside ({rating} stars / {reviews} reviews), "
-            f"but I noticed this specific web issue: {send_trigger.lower()}. Want me to send a cleaner version?"
-        )
-    if offer_fit == "Estimate Funnel":
-        return (
-            f"{business} looks credible from the outside ({rating} stars / {reviews} reviews), "
-            "but the estimate path looks harder to find than it should be. Want me to send a cleaner version?"
-        )
-    return (
-        f"{business} looks credible from the outside ({rating} stars / {reviews} reviews), "
-        "but the online conversion path looks weaker than the business proof. Want me to send what I noticed?"
+    observation = send_trigger or (
+        "the estimate path is difficult to locate" if offer_fit == "Estimate Funnel"
+        else "the online conversion path is weaker than the visible business proof"
     )
+    if not send_trigger and evidence_strength == "strong":
+        evidence_strength = "moderate"
+    if asset_state == "verified-existing" and (not asset_id or asset_verifier_verdict != "PASS"):
+        raise ValueError("verified-existing opening requires asset_id and PASS asset verifier verdict")
+    if asset_state not in {"none", "planned", "verified-existing"}:
+        raise ValueError(f"invalid asset_state: {asset_state}")
+    if relationship_warmth not in {"cold", "warm"}:
+        raise ValueError(f"invalid relationship_warmth: {relationship_warmth}")
+
+    spoken = channel.lower() in {"phone", "call", "voicemail"}
+    identity = "Lou with LPM"
+    if relationship_warmth == "warm":
+        lead = f"{identity}. Following up on our earlier conversation about {business}: {observation}."
+    elif evidence_strength == "strong" and problem_severity == "material" and commercial_materiality == "material":
+        lead = f"{identity}. I went through {business}'s customer path and found this: {observation}."
+    else:
+        lead = f"{identity}. I may be missing an intentional setup, but I found this on {business}'s customer path: {observation}."
+
+    consequence = " That adds friction between existing demand and a completed inquiry."
+    if buyer_sophistication == "high":
+        consequence = " The mechanism is the handoff between visible demand and a completed inquiry."
+    if asset_state == "verified-existing":
+        next_step = f" I built a verified example ({asset_id}) that shows the path."
+    elif asset_state == "planned":
+        next_step = " I can build the example against the exact path I found."
+    else:
+        next_step = " I can show you what I mean without pretending the example already exists."
+    if desired_next_step == "diagnostic-question" and relationship_warmth == "warm":
+        next_step = " Is that path intentional, or is it worth walking through?"
+    if spoken:
+        next_step = ""
+    del credibility
+    return lead + consequence + next_step
+
+
+def preferred_outreach_channel(record: Dict[str, Any]) -> str:
+    google = record.get("google", {}) or {}
+    website = record.get("website", {}) or {}
+    if str(google.get("phone") or "").strip():
+        return "Phone"
+    if website.get("emails_found"):
+        return "Email"
+    return ""
+
+
+def deterministic_opener(record: Dict[str, Any], offer_fit: str) -> str:
+    channel = preferred_outreach_channel(record)
+    return governed_opener(record, offer_fit, channel=channel.lower() or "phone")
 
 
 def review_fit_band(record: Dict[str, Any], vertical: str) -> str:
     return buyer_review_demand_band(record, vertical=vertical)
+
+
+def infer_metro_context(record: Dict[str, Any]) -> str:
+    google = record.get("google", {}) or {}
+    source = " ".join(
+        str(google.get(key) or record.get(key) or "").lower()
+        for key in ("source_batch", "Source Batch", "source_geo", "Source Geo")
+    )
+    profile_dir = Path(__file__).resolve().parent / "market_profiles"
+    matches = []
+    for path in profile_dir.glob("*.json"):
+        slug = path.stem
+        token = slug.replace("_", " ")
+        if re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", source.replace("_", " ")):
+            matches.append(slug)
+    return matches[0].replace("_", "-") if len(set(matches)) == 1 else ""
 
 
 def score_record(record: Dict[str, Any], fallback_vertical: str) -> Dict[str, Any]:
@@ -1262,16 +1324,54 @@ def score_record(record: Dict[str, Any], fallback_vertical: str) -> Dict[str, An
             if ref not in evidence_refs:
                 evidence_refs.append(ref)
 
+    site_state = str(w.get("site_status") or "").strip().lower().replace("_", " ")
+    pain_categories = {str(value).strip() for value in evidence_profile.get("visible_pain_categories") or []}
+    issue_flags = {str(value).strip() for value in w.get("site_issue_flags") or []}
+    broad_system_issue = site_state in {
+        "no website", "missing", "broken website", "broken", "social only", "jobber only",
+    } or bool(pain_categories & {
+        "premium_perception_gap", "portfolio_presentation_pain", "estimate_path_pain",
+        "mobile_usability_pain", "trust_proof_pain", "service_clarity_pain",
+        "no_site_or_social_only_pain", "broken_site_pain", "followup_or_missed_call_pain",
+    }) or bool(issue_flags & {
+        "premium_perception_gap", "premium_brand_mismatch", "outdated_site", "weak_project_gallery",
+        "buried_project_photos", "missing_estimate_path", "weak_mobile_path", "low_visible_trust",
+        "reviews_not_near_cta", "followup_gap", "missed_call_path",
+    })
+    commercial_state = (
+        "commercially-sendable"
+        if priority in {"A", "B"} and send_trigger and broad_system_issue
+        else "needs-broader-system-evidence" if send_trigger else "unverified"
+    )
+    offer_component = (
+        "Get Found" if offer_fit in {"No-Site Launch", "Website Rebuild", "Website Cleanup", "Premium Perception Gap", "Portfolio Rebuild", "Service Page Cleanup"}
+        else "Get the Lead" if offer_fit in {"Estimate Funnel", "Mobile Quote Path Cleanup", "Social/Jobber Escape", "Review/Trust Proof Upgrade"}
+        else "See It All" if offer_fit == "Tracking" else "Get the Lead"
+    )
+    commercial_dimensions = {
+        "Commercial Materiality": f"{send_trigger} affects a high-intent customer path." if commercial_state == "commercially-sendable" else "",
+        "Recurring Consequence": "The same observed path is presented to each new prospective customer." if commercial_state == "commercially-sendable" else "",
+        "Root Cause Confidence": "Fresh structured site evidence supports the named path-level issue." if commercial_state == "commercially-sendable" else "",
+        "LPM Offer Component": offer_component if commercial_state == "commercially-sendable" else "",
+        "Packageable Solution": f"A bounded {offer_fit} implementation tied to the verified path." if commercial_state == "commercially-sendable" else "",
+        "Value Mechanism": "Reduce friction between existing demand and a completed inquiry or estimate request." if commercial_state == "commercially-sendable" else "",
+        "Beyond Free Fix": "The issue spans the customer path, trust/CTA presentation, and conversion routing rather than one isolated edit." if commercial_state == "commercially-sendable" else "",
+        "Self Fix Risk": "The observed multi-part path remains live and requires coordinated implementation, not a link swap." if commercial_state == "commercially-sendable" else "",
+        "Intentionality": "The customer-facing path and stated service intent do not support treating the dead end as intentional." if commercial_state == "commercially-sendable" else "",
+    }
+
+    contact_email = emails_text(
+        w.get("emails_found", []),
+        business_domain=w.get("domain") or w.get("final_url") or g.get("website_url", ""),
+    )
     row = {
         "Business Name": g.get("business_name", ""),
         "Owner Name": "",
         "Vertical": vertical,
         "City": g.get("city", ""),
+        "Metro Context": infer_metro_context(record),
         "Phone": g.get("phone", ""),
-        "Email": emails_text(
-            w.get("emails_found", []),
-            business_domain=w.get("domain") or w.get("final_url") or g.get("website_url", ""),
-        ),
+        "Email": contact_email,
         "Website URL": g.get("website_url", ""),
         "Google Maps URL": g.get("google_maps_url", ""),
         "Reviews": g.get("reviews", ""),
@@ -1281,7 +1381,7 @@ def score_record(record: Dict[str, Any], fallback_vertical: str) -> Dict[str, An
         "Specific Observation": observation,
         "Mockup URL": "",
         "Video URL": "",
-        "Outreach Channel": "Google Maps",
+        "Outreach Channel": preferred_outreach_channel(record),
         "Status": "New",
         "Last Contacted": "",
         "Next Follow-Up": "",
@@ -1345,6 +1445,7 @@ def score_record(record: Dict[str, Any], fallback_vertical: str) -> Dict[str, An
         "Review Demand Band": review_fit_band(record, vertical),
         "Opener": deterministic_opener(record, offer_fit),
         "Evidence Refs": json.dumps(evidence_refs, ensure_ascii=False),
+        "Evidence Snapshot": json.dumps(evidence_profile, ensure_ascii=False),
         "Safe Outreach Claims": json.dumps(safe_claims, ensure_ascii=False),
         "Unsafe Claims": json.dumps(
             [
@@ -1353,6 +1454,12 @@ def score_record(record: Dict[str, Any], fallback_vertical: str) -> Dict[str, An
             ],
             ensure_ascii=False,
         ),
+        "Commercial Fit State": commercial_state,
+        "commercial_fit_state": commercial_state,
+        **commercial_dimensions,
+        "Contact Eligibility": "contact-now" if commercial_state == "commercially-sendable" else "hold-commercial-case",
+        "Asset State": "none",
+        "Promise State": "asset-free",
         "Packet Eligible": packet_eligible(priority, offer_fit),
         "Packet Eligibility Reason": packet_eligibility_reason(priority, offer_fit),
     }
@@ -2230,6 +2337,7 @@ Rules:
 - If an exact text snippet supports a claim but no evidence_ref_options ID directly supports it, lower evidence confidence instead of inventing an evidence ref.
 - unsafe_claims must list tempting claims that the capsule does not prove.
 {SHARED_SENDABILITY_RULES}
+{SHARED_COMMERCIAL_SCORING_RULES}
 - Buyer intent is required for A/B quality: look for fixable gap times money signal, not just a bad website.
 - Paid CRM/booking tools and known ad signals can support money intent.
 - Bad site alone without buyer_intent.money_signal should not be an A lead.

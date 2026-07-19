@@ -38,7 +38,7 @@
 | Send Blockers | Long text | ? |  |
 | Skip Reason | Single line text | ? |  |
 | Place Key | Single line text | ? | Used as upsert key; must be unique per business |
-| Status | Single select | ? | Options: Mockup Needed, Manual Review, Sent, Follow-Up, Closed |
+| Status | Single select | ? | Options: New, Mockup Needed, Manual Review, Sent, Follow-Up, Closed |
 | Outreach Channel | Single select | ? | Options: Google Maps, Email, Phone |
 | Next Action | Single line text | ? |  |
 | Last Contacted | Date | ? |  |

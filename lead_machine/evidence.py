@@ -394,6 +394,20 @@ def build_evidence_profile(enriched: Dict[str, Any]) -> Dict[str, Any]:
         tools=tools,
         phone_consistency=derived.get("phone_consistency", "unknown"),
     )
+    verification_snapshot = dict(site.get("verification_snapshot") or {})
+    verification_snapshots = [dict(value) for value in site.get("verification_snapshots") or [] if isinstance(value, dict)]
+    if verification_snapshot:
+        rendered_key = rendered_site_status.strip().lower().replace(" ", "_")
+        if rendered_key == "loaded":
+            verification_snapshot["render_outcome"] = "loaded"
+        elif rendered_key in {"timeout", "unknown", "broken"}:
+            verification_snapshot["render_outcome"] = {
+                "timeout": "connection_error",
+                "unknown": "blocked",
+                "broken": "connection_error",
+            }[rendered_key]
+        if verification_snapshots:
+            verification_snapshots[0] = dict(verification_snapshot)
 
     _evidence_item(
         items,
@@ -486,4 +500,6 @@ def build_evidence_profile(enriched: Dict[str, Any]) -> Dict[str, Any]:
         "raw_flags": site.get("site_issue_flags") or [],
         "phone_consistency": derived.get("phone_consistency", "unknown"),
         "evidence_items": items,
+        "verification_snapshot": verification_snapshot,
+        "verification_snapshots": verification_snapshots or ([verification_snapshot] if verification_snapshot else []),
     }

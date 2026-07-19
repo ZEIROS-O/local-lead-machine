@@ -51,8 +51,6 @@ REQUIRED_FINAL_FIELDS = [
 ]
 
 INTERNAL_AIRTABLE_FIELDS = [
-    "Evidence Refs",
-    "Safe Outreach Claims",
     "Unsafe Claims",
     "Minimum Evidence Passed",
     "Packet Eligibility Reason",

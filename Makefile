@@ -21,7 +21,7 @@ PACKETS_DIR := packets_$(BATCH)_manual
 SEARCH_REPORT := reports/search_$(BATCH).md
 ICP_REPORT := reports/icp_lanes_$(BATCH).md
 
-.PHONY: test compile status pipeline search search-summary batch batch-lane icp-report save-batch validate-batch import-batch score packets inspect airtable-dry airtable-live full-from-search full-after-llm clean-manual
+.PHONY: test compile status pipeline search search-summary batch batch-lane icp-report save-batch validate-batch import-batch score packets inspect airtable-dry airtable-live full-from-search full-after-llm clean-manual dashboard dashboard-api dashboard-ui dashboard-build dashboard-test
 
 status:
 	@git status --short
@@ -31,6 +31,22 @@ test:
 
 compile:
 	$(PY) -m py_compile enrich_leads.py score_leads.py make_llm_queue.py make_llm_batch.py import_llm_score_bundle.py make_packets.py run_pipeline.py upload_airtable.py feedback_report.py make_search_batch.py make_icp_lane_report.py lead_machine/icp_lanes.py
+
+dashboard: dashboard-build
+	$(PY) -m lead_machine.dashboard
+
+dashboard-api:
+	$(PY) -m lead_machine.dashboard
+
+dashboard-ui:
+	npm --prefix dashboard-ui run dev
+
+dashboard-build:
+	npm --prefix dashboard-ui run build
+
+dashboard-test:
+	$(PY) -m unittest tests.test_dashboard
+	npm --prefix dashboard-ui test
 
 pipeline:
 	$(PY) run_pipeline.py --batch $(BATCH) --vertical $(VERTICAL) --skip-search --limit $(LIMIT) --no-screenshots

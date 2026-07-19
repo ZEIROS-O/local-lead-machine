@@ -29,6 +29,7 @@ from lead_machine.airtable_sync import (
     plan_airtable_sync,
 )
 from lead_machine.schema import GENERIC_DOMAINS, normalize_domain, normalize_phone
+from lead_machine.sendability import is_contact_ready
 
 
 _TIER_SENDABLE = "Sendable Packet"
@@ -40,6 +41,7 @@ _FIELD_SCHEMA: List[tuple[str, str, str]] = [
     ("Owner Name",             "Single line text",   ""),
     ("Vertical",               "Single select",      "Options: detailing, epoxy, garage_doors, hardscaping, landscaping, pressure_washing, roofing, water_restoration"),
     ("City",                   "Single line text",   ""),
+    ("Metro Context",          "Single line text",   "Authoritative Operator metro-context slug"),
     ("Phone",                  "Phone number",       ""),
     ("Email",                  "Email",              ""),
     ("Website URL",            "URL",                ""),
@@ -64,6 +66,24 @@ _FIELD_SCHEMA: List[tuple[str, str, str]] = [
     ("Send Trigger",           "Single line text",   ""),
     ("Money Signal",           "Single line text",   ""),
     ("Buyer Intent Signals",   "Long text",          "Comma-separated signals detected by LLM"),
+    ("Commercial Fit State",   "Single select",      "Options: commercially-sendable, minor-fix/nurture, needs-broader-system-evidence, intentional-or-ambiguous, not-an-LPM-fit, unverified"),
+    ("Commercial Materiality", "Long text",          "Evidence-backed commercial consequence"),
+    ("Recurring Consequence",  "Long text",          "Why the issue repeats or creates downstream loss"),
+    ("Root Cause Confidence",  "Long text",          "Bounded connection between evidence and mechanism"),
+    ("LPM Offer Component",    "Single line text",   "One authoritative offer component"),
+    ("Packageable Solution",   "Long text",          "Bounded deliverable LPM can build"),
+    ("Value Mechanism",        "Long text",          "Credible gain or avoided-loss mechanism"),
+    ("Beyond Free Fix",        "Long text",          "Why this is broader than one free edit"),
+    ("Self Fix Risk",          "Long text",          "Likelihood and scope of self-resolution"),
+    ("Intentionality",         "Long text",          "Why the condition is not intentional or ambiguous"),
+    ("Contact Eligibility",    "Single select",      "Options: contact-now, contact-after-asset, hold-commercial-case"),
+    ("Asset State",            "Single select",      "Options: none, planned, verified-existing"),
+    ("Promise State",          "Single select",      "Options: asset-free, future-build, existing-verified-asset"),
+    ("Asset ID",               "Single line text",   "Verified asset identifier when present"),
+    ("Asset Verifier Verdict", "Single select",      "Options: PASS, FAIL, BLOCK"),
+    ("Evidence Refs",          "Long text",          "Structured evidence identifiers"),
+    ("Safe Outreach Claims",   "Long text",          "Claims bound to evidence identifiers"),
+    ("Evidence Snapshot",      "Long text",          "Structured bounded evidence used by the morning verifier"),
     ("Review Demand Band",     "Single line text",   ""),
     ("AI Confidence",          "Single select",      "Options: low, medium, high"),
     ("Score Total",            "Number",             "Integer"),
@@ -72,8 +92,9 @@ _FIELD_SCHEMA: List[tuple[str, str, str]] = [
     ("Send Blockers",          "Long text",          ""),
     ("Skip Reason",            "Single line text",   ""),
     ("Place Key",              "Single line text",   "Used as upsert key; must be unique per business"),
-    ("Status",                 "Single select",      "Options: Mockup Needed, Manual Review, Sent, Follow-Up, Closed"),
-    ("Outreach Channel",       "Single select",      "Options: Google Maps, Email, Phone"),
+    ("Status",                 "Single select",      "Options: New, Mockup Needed, Manual Review, Sent, Follow-Up, Closed"),
+    ("Outreach Channel",       "Single select",      "Options: Email, Phone, Instagram DM, SMS"),
+    ("Consent Posture",        "Single line text",   "Required and documented before any SMS draft can pass"),
     ("Next Action",            "Single line text",   ""),
     ("Last Contacted",         "Date",               ""),
     ("Next Follow-Up",         "Date",               ""),
@@ -166,6 +187,7 @@ CSV_AIRTABLE_FIELDS = [
     "Owner Name",
     "Vertical",
     "City",
+    "Metro Context",
     "Phone",
     "Email",
     "Website URL",
@@ -190,6 +212,24 @@ CSV_AIRTABLE_FIELDS = [
     "Send Trigger",
     "Money Signal",
     "Buyer Intent Signals",
+    "Commercial Fit State",
+    "Commercial Materiality",
+    "Recurring Consequence",
+    "Root Cause Confidence",
+    "LPM Offer Component",
+    "Packageable Solution",
+    "Value Mechanism",
+    "Beyond Free Fix",
+    "Self Fix Risk",
+    "Intentionality",
+    "Contact Eligibility",
+    "Asset State",
+    "Promise State",
+    "Asset ID",
+    "Asset Verifier Verdict",
+    "Evidence Refs",
+    "Safe Outreach Claims",
+    "Evidence Snapshot",
     "Review Demand Band",
     "AI Confidence",
     "Skip Reason",
@@ -203,6 +243,7 @@ CSV_AIRTABLE_FIELDS = [
     "Last Contacted",
     "Next Follow-Up",
     "Assigned To",
+    "Consent Posture",
 ]
 
 OPERATIONAL_FIELDS = ["Status", "Next Action", "Outreach Channel"]
@@ -224,15 +265,12 @@ def truthy_yes(value: Any) -> bool:
 
 def is_sendable_record(record: Dict[str, Any]) -> bool:
     fields = record.get("airtable_fields") or record
-    sendable = record.get("sendable")
-    packet_eligible = record.get("packet_eligible")
-
-    if sendable is None:
-        sendable = fields.get("Sendable")
-    if packet_eligible is None:
-        packet_eligible = fields.get("Packet Eligible")
-
-    return truthy_yes(sendable) and truthy_yes(packet_eligible)
+    readiness = dict(fields)
+    if record.get("sendable") is not None:
+        readiness.setdefault("Sendable", "Yes" if truthy_yes(record.get("sendable")) else "No")
+    if record.get("packet_eligible") is not None:
+        readiness.setdefault("Packet Eligible", "Yes" if truthy_yes(record.get("packet_eligible")) else "No")
+    return is_contact_ready(readiness)
 
 
 def clean_cell(value: Any) -> str:
@@ -294,37 +332,41 @@ def existing_packet_path(row: Dict[str, str], packet_dir: Path) -> str:
         return ""
 
     business = clean_cell(row.get("Business Name"))
-    business_key = business.casefold()
-    phone = normalize_phone(row.get("Phone", ""))
+    business_key = normalize_business_name(business)
+    city = clean_cell(row.get("City"))
+    city_key = normalize_city(city)
     place_key = clean_cell(row.get("Place Key"))
 
     index_path = packet_dir / "packet_index.csv"
     if index_path.exists():
         with index_path.open(newline="", encoding="utf-8") as f:
-            for index_row in csv.DictReader(f):
-                indexed_path = clean_cell(index_row.get("Packet Path"))
-                if not indexed_path:
-                    continue
-                if not packet_path_exists(indexed_path):
-                    continue
+            indexed_rows = list(csv.DictReader(f))
 
-                indexed_place = clean_cell(index_row.get("Place Key"))
-                indexed_phone = normalize_phone(index_row.get("Phone", ""))
-                indexed_business = clean_cell(index_row.get("Business Name")).casefold()
-                if place_key and indexed_place == place_key:
-                    return indexed_path
-                if phone and indexed_phone == phone:
-                    return indexed_path
-                if business_key and indexed_business == business_key:
-                    return indexed_path
+        def matched_packet_path(index_row: dict[str, str], identity: str) -> str:
+            indexed_path = clean_cell(index_row.get("Packet Path"))
+            if not indexed_path:
+                raise ValueError(f"Packet index match for {identity} has no Packet Path")
+            if not packet_path_exists(indexed_path):
+                raise ValueError(f"Packet index match for {identity} points to a missing packet: {indexed_path}")
+            return indexed_path
 
-    business_slug = safe_slug(business)
-    if not business_slug:
-        return ""
+        if place_key:
+            matches = [item for item in indexed_rows if clean_cell(item.get("Place Key")) == place_key]
+            if len(matches) > 1:
+                raise ValueError(f"Packet index has duplicate Place Key {place_key}")
+            return matched_packet_path(matches[0], f"Place Key {place_key}") if matches else ""
 
-    for path in sorted(packet_dir.rglob("*.md")):
-        if business_slug in path.stem:
-            return str(path)
+        if not business_key or not city_key:
+            return ""
+        matches = [
+            item
+            for item in indexed_rows
+            if normalize_business_name(clean_cell(item.get("Business Name"))) == business_key
+            and normalize_city(clean_cell(item.get("City"))) == city_key
+        ]
+        if len(matches) > 1:
+            raise ValueError(f"Packet index has ambiguous legacy identity for {business}, {city}")
+        return matched_packet_path(matches[0], f"{business}, {city}") if matches else ""
 
     return ""
 
@@ -384,8 +426,10 @@ def csv_row_to_record(row: Dict[str, str], packet_dir: Path) -> Dict[str, Any]:
             del fields["Email"]
 
     if not clean_cell(fields.get("Outreach Channel")):
-        fields["Outreach Channel"] = "Google Maps"
-        defaulted_fields.append("Outreach Channel")
+        channel = "Phone" if clean_cell(fields.get("Phone")) else "Email" if clean_cell(fields.get("Email")) else ""
+        if channel:
+            fields["Outreach Channel"] = channel
+            defaulted_fields.append("Outreach Channel")
 
     packet_path = current_packet_path(row, packet_dir)
     if packet_path:
@@ -437,9 +481,7 @@ def read_csv_records(
 
         records: List[Dict[str, Any]] = []
         for row in reader:
-            if only_sendable and not (
-                truthy_yes(row.get("Sendable")) and truthy_yes(row.get("Packet Eligible"))
-            ):
+            if only_sendable and not is_contact_ready(row):
                 continue
             if include_manual_review and not only_sendable:
                 tier = (row.get("Packet Tier") or "").strip()
@@ -629,7 +671,7 @@ def main() -> int:
     parser.add_argument(
         "--only-sendable",
         action="store_true",
-        help="Only upload Sendable = Yes and Packet Eligible = Yes rows",
+        help="Only upload rows that pass the four-field contact-readiness contract",
     )
     parser.add_argument(
         "--include-manual-review",

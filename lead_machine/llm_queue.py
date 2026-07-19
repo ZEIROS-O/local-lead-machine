@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
 from .buyer_signals import buyer_intent_summary, review_demand_band
+from .score_schema import MANUAL_SCORE_SCHEMA, SHARED_COMMERCIAL_SCORING_RULES
 from .schema import normalize_lead
 from .scoring_rules import SHARED_SENDABILITY_RULES
 
@@ -62,6 +63,7 @@ Rules:
 - Every scored claim must reference evidence IDs from the packet.
 - If there is no evidence for a claim, lower evidence confidence instead of inventing.
 {SHARED_SENDABILITY_RULES}
+{SHARED_COMMERCIAL_SCORING_RULES}
 - Do not score A/sendable just because the business fits hardscaping.
 - The best lead is one where the website is visibly worse than the actual business.
 - Do not infer missing forms if evidence is uncertain.
@@ -108,39 +110,7 @@ Allowed best_angle values:
 - Social/Jobber Escape
 
 Output schema:
-{{
-  "subscores": {{
-    "icp_fit": 0,
-    "reputation_demand_proof": 0,
-    "web_conversion_pain": 0,
-    "mockup_leverage": 0,
-    "reachability": 0,
-    "offer_angle_clarity": 0,
-    "evidence_confidence": 0
-  }},
-  "total_score": 0,
-  "grade": "A|B|C|Skip",
-  "confidence": "low|medium|high",
-  "hard_disqualifiers": [],
-  "best_angle": "",
-  "visible_pain_score": 0,
-  "visible_pain_reasons": [],
-  "visible_pain_categories": [],
-  "send_trigger": "",
-  "recommended_action": "",
-  "why_this_lead": [],
-  "why_this_might_be_wrong": [],
-  "opener": "",
-  "evidence_refs": [],
-  "safe_outreach_claims": [
-    {{
-      "claim": "",
-      "evidence_refs": []
-    }}
-  ],
-  "unsafe_claims": [],
-  "airtable_fields": {{}}
-}}
+{json.dumps(MANUAL_SCORE_SCHEMA, ensure_ascii=False, indent=2)}
 
 Lead packet:
 {json.dumps(packet, ensure_ascii=False, indent=2)}

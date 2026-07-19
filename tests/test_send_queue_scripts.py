@@ -7,11 +7,23 @@ network or a real base.
 import io
 import json
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import mark_sent
 import query_ready_to_send as qrs
+
+
+READY_FIELDS = {
+    "Sendable": "Yes",
+    "Packet Eligible": "Yes",
+    "Commercial Fit State": "commercially-sendable",
+    "Contact Eligibility": "contact-now",
+    "Status": "New",
+    "Consent Posture": "express written consent",
+}
 
 
 def _response(status_code=200, payload=None, text=""):
@@ -28,7 +40,8 @@ class TestBuildFormula(unittest.TestCase):
         self.assertEqual(
             formula,
             "AND({Sendable}='Yes',{Packet Eligible}='Yes',"
-            "NOT({Status}='Sent'),NOT({Status}='Closed'))",
+            "{Commercial Fit State}='commercially-sendable',{Contact Eligibility}='contact-now',"
+            "OR({Status}='New',{Status}='Mockup Needed'))",
         )
 
     def test_vertical_clause_added_and_quotes_escaped(self):
@@ -40,14 +53,14 @@ class TestFetchReadyRecords(unittest.TestCase):
     def test_paginates_and_sorts_by_priority_then_score(self):
         page1 = {
             "records": [
-                {"id": "recB", "fields": {"Business Name": "B Co", "Lead Priority": "B", "Score Total": 10}},
-                {"id": "recA5", "fields": {"Business Name": "A5 Co", "Lead Priority": "A", "Score Total": 5}},
+                {"id": "recB", "fields": {**READY_FIELDS, "Business Name": "B Co", "Lead Priority": "B", "Score Total": 10}},
+                {"id": "recA5", "fields": {**READY_FIELDS, "Business Name": "A5 Co", "Lead Priority": "A", "Score Total": 5}},
             ],
             "offset": "next",
         }
         page2 = {
             "records": [
-                {"id": "recA9", "fields": {"Business Name": "A9 Co", "Lead Priority": "A", "Score Total": 9}},
+                {"id": "recA9", "fields": {**READY_FIELDS, "Business Name": "A9 Co", "Lead Priority": "A", "Score Total": 9}},
             ],
         }
         probe = _response(200, {"records": []})
@@ -78,6 +91,47 @@ class TestFetchReadyRecords(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 qrs.fetch_ready_records("app123", "Prospects", "tok")
 
+    def test_missing_required_commercial_field_fails_closed(self):
+        response = _response(
+            422,
+            text='{"error": {"message": "Unknown field name: \\"Contact Eligibility\\""}}',
+        )
+        with patch("requests.get", return_value=response) as mock_get:
+            with self.assertRaises(RuntimeError):
+                qrs.fetch_ready_records("app123", "Prospects", "tok")
+        self.assertEqual(mock_get.call_count, 1)
+
+    def test_defensive_post_fetch_check_rejects_non_ready_rows(self):
+        page = {
+            "records": [
+                {
+                    "id": "recReady",
+                    "fields": dict(READY_FIELDS),
+                },
+                {
+                    "id": "recHold",
+                    "fields": {
+                        "Commercial Fit State": "minor-fix/nurture",
+                        "Contact Eligibility": "contact-now",
+                    },
+                },
+            ]
+        }
+        with patch("requests.get", side_effect=[_response(200, {"records": []}), _response(200, page)]):
+            records = qrs.fetch_ready_records("app123", "Prospects", "tok")
+        self.assertEqual([record["record_id"] for record in records], ["recReady"])
+
+    def test_defensive_post_fetch_check_rejects_unsafe_status(self):
+        page = {
+            "records": [
+                {"id": "recReady", "fields": dict(READY_FIELDS)},
+                {"id": "recReview", "fields": {**READY_FIELDS, "Status": "Manual Review"}},
+            ]
+        }
+        with patch("requests.get", side_effect=[_response(200, {"records": []}), _response(200, page)]):
+            records = qrs.fetch_ready_records("app123", "Prospects", "tok")
+        self.assertEqual([record["record_id"] for record in records], ["recReady"])
+
 
 class TestQueryMain(unittest.TestCase):
     def test_missing_credentials_fails_before_network(self):
@@ -97,13 +151,112 @@ class TestMarkSent(unittest.TestCase):
         "AIRTABLE_PAT": "tok",
     }
 
+    def _suppression(self, directory: str) -> str:
+        path = Path(directory) / "outcomes.jsonl"
+        path.write_text("", encoding="utf-8")
+        return str(path)
+
+    def _apply(self, suppression: str, fields: dict, *, channel: str = "SMS", patch_fields: dict | None = None):
+        session = MagicMock()
+        session.get.return_value = _response(200, {"id": "rec42", "fields": fields})
+        confirmed = patch_fields or {**fields, "Status": "Sent", "Last Contacted": "2026-07-10", "Outreach Channel": channel}
+        session.patch.return_value = _response(200, {"id": "rec42", "fields": confirmed})
+        receipt = mark_sent.apply_mark_sent(
+            record_id="rec42",
+            channel=channel,
+            last_contacted="2026-07-10",
+            base_id="app123",
+            table="Prospects",
+            token="tok",
+            suppression_source=suppression,
+            session=session,
+        )
+        return receipt, session
+
+    def test_direct_sms_requires_current_consent_and_readiness(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            suppression = self._suppression(tmp)
+            with self.assertRaisesRegex(mark_sent.MarkSentError, "Consent Posture"):
+                self._apply(suppression, {**READY_FIELDS, "Consent Posture": "unknown"})
+            with self.assertRaisesRegex(mark_sent.MarkSentError, "Packet Eligible"):
+                self._apply(suppression, {**READY_FIELDS, "Packet Eligible": "No"}, channel="Email")
+
+    def test_only_new_and_mockup_needed_may_transition_to_sent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            suppression = self._suppression(tmp)
+            for allowed in ("New", "Mockup Needed", "  new  "):
+                receipt, session = self._apply(suppression, {**READY_FIELDS, "Status": allowed}, channel="Email")
+                self.assertEqual(receipt["result"], "applied")
+                session.patch.assert_called_once()
+            for refused in ("", "Manual Review", "Follow-Up", "Contacted", "Closed", "Unknown"):
+                with self.subTest(status=refused):
+                    session = MagicMock()
+                    session.get.return_value = _response(
+                        200, {"id": "rec42", "fields": {**READY_FIELDS, "Status": refused}}
+                    )
+                    with self.assertRaisesRegex(mark_sent.MarkSentError, "not eligible"):
+                        mark_sent.apply_mark_sent(
+                            record_id="rec42",
+                            channel="Email",
+                            last_contacted="2026-07-10",
+                            base_id="app123",
+                            table="Prospects",
+                            token="tok",
+                            suppression_source=suppression,
+                            session=session,
+                        )
+                    session.patch.assert_not_called()
+
+    def test_missing_malformed_and_matching_suppression_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(mark_sent.MarkSentError, "missing or unreadable"):
+                self._apply(str(Path(tmp) / "missing.jsonl"), dict(READY_FIELDS))
+            malformed = Path(tmp) / "malformed.jsonl"
+            malformed.write_text("{bad\n", encoding="utf-8")
+            with self.assertRaisesRegex(mark_sent.MarkSentError, "malformed JSON"):
+                self._apply(str(malformed), dict(READY_FIELDS))
+            opted_out = Path(tmp) / "opted-out.jsonl"
+            opted_out.write_text(json.dumps({"event": "opt_out", "record_id": "rec42"}) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(mark_sent.MarkSentError, "suppressed or opted out"):
+                self._apply(str(opted_out), dict(READY_FIELDS))
+
+    def test_conflicting_sent_refused_and_exact_sent_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            suppression = self._suppression(tmp)
+            with self.assertRaisesRegex(mark_sent.MarkSentError, "conflicting"):
+                self._apply(
+                    suppression,
+                    {**READY_FIELDS, "Status": "Sent", "Last Contacted": "2026-07-09", "Outreach Channel": "SMS"},
+                )
+            receipt, session = self._apply(
+                suppression,
+                {**READY_FIELDS, "Status": "Sent", "Last Contacted": "2026-07-10", "Outreach Channel": "SMS"},
+            )
+            self.assertEqual(receipt["result"], "already_applied")
+            session.patch.assert_not_called()
+
+    def test_patch_response_must_confirm_requested_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            suppression = self._suppression(tmp)
+            with self.assertRaisesRegex(mark_sent.MarkSentError, "does not confirm"):
+                self._apply(
+                    suppression,
+                    dict(READY_FIELDS),
+                    patch_fields={**READY_FIELDS, "Status": "Sent", "Last Contacted": "2026-07-09", "Outreach Channel": "SMS"},
+                )
+
     def test_patches_status_channel_and_date_with_typecast(self):
-        with patch.object(mark_sent, "load_dotenv", lambda: False), \
-             patch.dict(os.environ, self.ENV, clear=True), \
-             patch("requests.patch", return_value=_response(200, {})) as mock_patch, \
-             patch("sys.argv", ["mark_sent.py", "--record-id", "rec42", "--channel", "SMS", "--date", "2026-07-10"]), \
-             patch("sys.stdout", io.StringIO()):
-            self.assertEqual(mark_sent.main(), 0)
+        with tempfile.TemporaryDirectory() as tmp:
+            suppression = self._suppression(tmp)
+            current = _response(200, {"id": "rec42", "fields": dict(READY_FIELDS)})
+            applied = _response(200, {"id": "rec42", "fields": {**READY_FIELDS, "Status": "Sent", "Last Contacted": "2026-07-10", "Outreach Channel": "SMS"}})
+            with patch.object(mark_sent, "load_dotenv", lambda: False), \
+                 patch.dict(os.environ, self.ENV, clear=True), \
+                 patch("requests.get", return_value=current), \
+                 patch("requests.patch", return_value=applied) as mock_patch, \
+                 patch("sys.argv", ["mark_sent.py", "--record-id", "rec42", "--channel", "SMS", "--date", "2026-07-10", "--suppression-source", suppression]), \
+                 patch("sys.stdout", io.StringIO()):
+                self.assertEqual(mark_sent.main(), 0)
 
         self.assertIn("/rec42", mock_patch.call_args[0][0])
         payload = mock_patch.call_args.kwargs["json"]
@@ -114,27 +267,33 @@ class TestMarkSent(unittest.TestCase):
         )
 
     def test_channel_omitted_when_not_given(self):
-        with patch.object(mark_sent, "load_dotenv", lambda: False), \
-             patch.dict(os.environ, self.ENV, clear=True), \
-             patch("requests.patch", return_value=_response(200, {})) as mock_patch, \
-             patch("sys.argv", ["mark_sent.py", "--record-id", "rec42", "--date", "2026-07-10"]), \
-             patch("sys.stdout", io.StringIO()):
-            self.assertEqual(mark_sent.main(), 0)
+        with tempfile.TemporaryDirectory() as tmp:
+            suppression = self._suppression(tmp)
+            with patch.object(mark_sent, "load_dotenv", lambda: False), \
+                 patch.dict(os.environ, self.ENV, clear=True), \
+                 patch("requests.get", return_value=_response(200, {"id": "rec42", "fields": dict(READY_FIELDS)})), \
+                 patch("requests.patch", return_value=_response(200, {"id": "rec42", "fields": {**READY_FIELDS, "Status": "Sent", "Last Contacted": "2026-07-10"}})) as mock_patch, \
+                 patch("sys.argv", ["mark_sent.py", "--record-id", "rec42", "--date", "2026-07-10", "--suppression-source", suppression]), \
+                 patch("sys.stdout", io.StringIO()):
+                self.assertEqual(mark_sent.main(), 0)
         self.assertNotIn("Outreach Channel", mock_patch.call_args.kwargs["json"]["fields"])
 
     def test_api_error_returns_nonzero(self):
-        with patch.object(mark_sent, "load_dotenv", lambda: False), \
-             patch.dict(os.environ, self.ENV, clear=True), \
-             patch("requests.patch", return_value=_response(422, text="INVALID_VALUE")), \
-             patch("sys.argv", ["mark_sent.py", "--record-id", "rec42"]), \
-             patch("sys.stderr", io.StringIO()):
-            self.assertEqual(mark_sent.main(), 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            suppression = self._suppression(tmp)
+            with patch.object(mark_sent, "load_dotenv", lambda: False), \
+                 patch.dict(os.environ, self.ENV, clear=True), \
+                 patch("requests.get", return_value=_response(200, {"id": "rec42", "fields": dict(READY_FIELDS)})), \
+                 patch("requests.patch", return_value=_response(422, text="INVALID_VALUE")), \
+                 patch("sys.argv", ["mark_sent.py", "--record-id", "rec42", "--suppression-source", suppression]), \
+                 patch("sys.stderr", io.StringIO()):
+                self.assertEqual(mark_sent.main(), 1)
 
     def test_missing_credentials_fails_before_network(self):
         with patch.object(mark_sent, "load_dotenv", lambda: False), \
              patch.dict(os.environ, {}, clear=True), \
              patch("requests.patch") as mock_patch, \
-             patch("sys.argv", ["mark_sent.py", "--record-id", "rec42"]), \
+             patch("sys.argv", ["mark_sent.py", "--record-id", "rec42", "--suppression-source", "/tmp/missing.jsonl"]), \
              patch("sys.stderr", io.StringIO()):
             self.assertEqual(mark_sent.main(), 1)
         self.assertFalse(mock_patch.called)

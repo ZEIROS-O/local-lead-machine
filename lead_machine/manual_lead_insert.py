@@ -94,7 +94,7 @@ CONTROLLED_SELECT_LABELS = {
     "Contact Form Detected": {"Yes", "No"},
     "Estimate Form Detected": {"Yes", "No"},
     "Status": {"Mockup Needed", "Manual Review", "Sent", "Follow-Up", "Closed"},
-    "Outreach Channel": {"Google Maps", "Email", "Phone"},
+    "Outreach Channel": {"Email", "Phone", "Instagram DM", "SMS"},
 }
 # Vertical is validated through the shared registry (VERTICAL_LABELS), not a
 # hardcoded list, so new lanes work here the moment they exist in verticals.py
@@ -620,11 +620,12 @@ def build_manual_lead_card(
         "Sendable": "Yes" if sendable else "No",
         "Lead Priority": "C",
         "AI Confidence": "medium" if llm_fields else "low",
-        "Outreach Channel": "Google Maps",
         "Recommended Action": "Manual review before sending",
         "Next Action": "Review lead",
     }
     fields = _merge_fields(defaults, [regex_fields, llm_fields])
+    if not clean_cell(fields.get("Outreach Channel")):
+        fields["Outreach Channel"] = "Phone" if clean_cell(fields.get("Phone")) else "Email" if clean_cell(fields.get("Email")) else ""
     normalized_fields: Dict[str, str] = {}
     for key, value in fields.items():
         normalized_value = normalize_manual_field_value(key, value)
@@ -766,6 +767,12 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
+        # A live invocation without its complete Airtable authority must fail before producing
+        # local review artifacts. This keeps a rejected live attempt side-effect free and prevents
+        # test/operator retries from polluting the append-only manual-lead history.
+        if args.live and (not args.base_id or not args.table or not args.token):
+            raise ValueError("AIRTABLE_BASE_ID, AIRTABLE_PROSPECTS_TABLE, and AIRTABLE_PAT are required")
+
         raw_text = _read_raw_input(args.input)
         if not raw_text.strip():
             raise ValueError("No raw lead text supplied on stdin or --input")
@@ -794,13 +801,6 @@ def main() -> int:
             print("[DRY-RUN] Airtable plan follows")
             print(json.dumps(dry_plan, ensure_ascii=False, indent=2))
             return 0
-
-        if not args.base_id or not args.table or not args.token:
-            print(
-                "[ERROR] AIRTABLE_BASE_ID, AIRTABLE_PROSPECTS_TABLE, and AIRTABLE_PAT are required",
-                file=sys.stderr,
-            )
-            return 1
 
         validate_airtable_fields(args.base_id, args.table, args.token, payload_field_names([card]))
         existing = fetch_existing_records(args.base_id, args.table, args.token)
