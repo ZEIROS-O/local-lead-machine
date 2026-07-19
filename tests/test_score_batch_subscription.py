@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from import_llm_score_bundle import REQUIRED_BUNDLE_SCORE_KEYS
+from lead_machine.manual_scores import validate_manual_score
 from score_batch_subscription import (
     DEFAULT_SCHEMA,
     ProcessResult,
@@ -113,6 +114,29 @@ class FakeRunner:
 
 
 class SubscriptionScoringTests(unittest.TestCase):
+    def test_commercial_fit_state_accepts_case_insensitive_model_output(self) -> None:
+        score = valid_score()
+        score["commercial_fit_state"] = "not-an-lpm-fit"
+
+        validated = validate_manual_score(score, allowed_evidence_ids={"ev-1"})
+
+        self.assertEqual(validated["commercial_fit_state"], "not-an-LPM-fit")
+
+    def test_evidence_refs_canonicalize_separator_only_model_drift(self) -> None:
+        score = valid_score()
+        score["evidence_refs"] = ["ev-cta-strength-16"]
+
+        validated = validate_manual_score(
+            score,
+            allowed_evidence_ids={"ev-cta_strength-16"},
+        )
+
+        self.assertEqual(validated["evidence_refs"], ["ev-cta_strength-16"])
+
+        score["evidence_refs"] = ["invented-ref"]
+        with self.assertRaisesRegex(ValueError, "Unknown evidence_refs: invented-ref"):
+            validate_manual_score(score, allowed_evidence_ids={"ev-cta_strength-16"})
+
     def test_schema_required_keys_match_current_importer_contract(self) -> None:
         schema = json.loads(DEFAULT_SCHEMA.read_text(encoding="utf-8"))
         score_schema = schema["properties"]["scores"]["items"]["properties"]["score"]
