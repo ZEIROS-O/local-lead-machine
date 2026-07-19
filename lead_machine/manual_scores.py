@@ -20,6 +20,7 @@ from .score_schema import (
 )
 from .schema import normalize_lead
 from .sendability import apply_sendability, normalize_evidence_refs, normalize_safe_outreach_claims, normalize_unsafe_claims
+from .scoring_v3 import attach_scoring_v3
 
 
 SUBSCORE_LIMITS = {
@@ -543,7 +544,8 @@ def merge_manual_score(
     )
     if validated.get("_legacy_score_compatibility"):
         row = backfill_legacy_commercial_fit(row)
-    return apply_sendability(row)
+    governed = apply_sendability(row)
+    return attach_scoring_v3(enriched, governed, fallback_vertical=fallback_vertical)
 
 
 def _website_quality_from_status(status: str) -> str:

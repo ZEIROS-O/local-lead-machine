@@ -62,21 +62,21 @@ class BuyerSignalsTest(unittest.TestCase):
             },
         )
 
-    def test_low_review_count_and_rating_is_thin(self) -> None:
+    def test_lifetime_count_does_not_invent_review_velocity(self) -> None:
         from lead_machine.buyer_signals import build_buyer_intent
 
         buyer_intent = build_buyer_intent(self._record(rating="3.9", reviews="2"), ads_check=False)
 
-        self.assertEqual(buyer_intent["review_velocity"]["velocity_band"], "thin")
-        self.assertEqual(buyer_intent["review_velocity"]["source"], "count_only")
+        self.assertEqual(buyer_intent["review_velocity"]["velocity_band"], "unknown")
+        self.assertEqual(buyer_intent["review_velocity"]["source"], "insufficient_history")
         self.assertFalse(buyer_intent["money_signal"])
 
-    def test_strong_count_and_rating_is_live_or_steady(self) -> None:
+    def test_strong_lifetime_count_still_has_unknown_velocity(self) -> None:
         from lead_machine.buyer_signals import build_buyer_intent
 
         buyer_intent = build_buyer_intent(self._record(rating="4.8", reviews="120"), ads_check=False)
 
-        self.assertIn(buyer_intent["review_velocity"]["velocity_band"], {"live", "steady"})
+        self.assertEqual(buyer_intent["review_velocity"]["velocity_band"], "unknown")
         self.assertEqual(buyer_intent["review_demand_signal"]["demand_band"], "established")
         self.assertFalse(buyer_intent["money_signal"])
 
@@ -120,7 +120,7 @@ class BuyerSignalsTest(unittest.TestCase):
         self.assertIsNot(buyer_intent, old_buyer_intent)
         self.assertEqual(buyer_intent["logic_version"], BUYER_INTENT_LOGIC_VERSION)
         self.assertFalse(buyer_intent["money_signal"])
-        self.assertEqual(buyer_intent["review_velocity"]["velocity_band"], "live")
+        self.assertEqual(buyer_intent["review_velocity"]["velocity_band"], "unknown")
         self.assertEqual(buyer_intent["review_demand_signal"]["demand_band"], "established")
 
     def test_known_ad_yes_creates_money_signal(self) -> None:

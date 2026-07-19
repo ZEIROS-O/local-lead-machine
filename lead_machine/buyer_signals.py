@@ -7,6 +7,7 @@ from urllib.parse import quote_plus, urlparse
 import requests
 
 from .evidence import THIRD_PARTY_TOOLS, _detect_from_text
+from .review_velocity import build_review_velocity
 
 
 UNKNOWN_ADS = {
@@ -44,7 +45,7 @@ PAID_CRM = {
 }
 
 ADS_TIMEOUT_SECONDS = 3
-BUYER_INTENT_LOGIC_VERSION = 2
+BUYER_INTENT_LOGIC_VERSION = 3
 
 
 def build_buyer_intent(record: Dict[str, Any], *, ads_check: bool = False) -> Dict[str, Any]:
@@ -54,7 +55,7 @@ def build_buyer_intent(record: Dict[str, Any], *, ads_check: bool = False) -> Di
     crm_evidence = [f"Detected paid CRM/booking tool: {tool}" for tool in paid_tools]
 
     review_profile = _review_profile(record)
-    review_velocity = _legacy_review_velocity(record, review_profile)
+    review_velocity = build_review_velocity(record)
     ads = _ads_signals(record, ads_check=ads_check)
 
     known_ad_yes = any(
@@ -124,7 +125,8 @@ def buyer_intent_summary(record: Dict[str, Any]) -> str:
     return (
         f"money_signal={'yes' if _buyer_intent_has_money_signal(buyer_intent) else 'no'}; "
         f"tools={', '.join(str(tool) for tool in tools) or 'none'}; "
-        f"review_demand_band={review_signal.get('demand_band') or review_signal.get('velocity_band') or 'unknown'}; "
+        f"review_demand_band={review_signal.get('demand_band') or 'unknown'}; "
+        f"review_velocity={((buyer_intent.get('review_velocity') or {}).get('velocity_band') if isinstance(buyer_intent.get('review_velocity'), dict) else 'unknown') or 'unknown'}; "
         f"ads={ads_text}"
     )
 
@@ -263,22 +265,6 @@ def _review_profile(record: Dict[str, Any]) -> Dict[str, Any]:
         "reviews": reviews,
         "rating": rating,
         "evidence": evidence,
-    }
-
-
-def _legacy_review_velocity(record: Dict[str, Any], review_profile: Dict[str, Any]) -> Dict[str, Any]:
-    reviews = int(review_profile.get("reviews") or 0)
-    rating = float(review_profile.get("rating") or 0.0)
-    if reviews >= 75 and rating >= 4.5:
-        band = "live"
-    elif reviews >= 5 and rating >= 4.0:
-        band = "steady"
-    else:
-        band = "thin"
-    return {
-        "velocity_band": band,
-        "source": "count_only",
-        "evidence": list(review_profile.get("evidence") or []),
     }
 
 

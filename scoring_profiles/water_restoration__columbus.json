@@ -1,0 +1,23 @@
+{
+  "profile_id": "water_restoration__columbus",
+  "profile_version": "1.0.0",
+  "policy_version": "v3-shadow.1",
+  "vertical": "water_restoration",
+  "market": "columbus",
+  "launch_mode": "shadow",
+  "auto_eligible_min_score": 70,
+  "minimum_evidence_confidence": 3,
+  "minimum_cohort_size": 20,
+  "business_review_thresholds": {"some_proof": 10, "established": 35, "mature": 120},
+  "review_pain_recency_days": 120,
+  "weights": {
+    "icp_fit": 20,
+    "business_demand_capacity": 15,
+    "review_velocity": 10,
+    "problem_evidence": 25,
+    "offer_solution_fit": 15,
+    "reachability": 10,
+    "evidence_confidence": 5
+  },
+  "offer_lanes": ["Get Found", "Get the Lead", "Answer It", "Close It", "Keep", "See It All"]
+}

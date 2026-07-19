@@ -29,6 +29,9 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import requests
 from dotenv import load_dotenv
 
+from lead_machine.review_velocity import ReviewSnapshotStore
+from lead_machine.scoring_profiles import infer_market, infer_vertical_key
+
 
 TEXT_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText"
 PLACE_DETAILS_URL = "https://places.googleapis.com/v1/places/{place_id}"
@@ -347,6 +350,11 @@ def main() -> int:
     parser.add_argument("--searches", default="data/searches.csv", help="CSV with query,max_results columns")
     parser.add_argument("--output", default="output/raw_places.csv", help="Output CSV path")
     parser.add_argument("--sleep", type=float, default=0.15, help="Seconds between Google calls")
+    parser.add_argument(
+        "--review-snapshot-db",
+        default=os.getenv("REVIEW_SNAPSHOT_DB", "run_state/review_velocity.sqlite3"),
+        help="SQLite path for longitudinal Google review-count observations",
+    )
     args = parser.parse_args()
 
     api_key = os.getenv("GOOGLE_PLACES_API_KEY", "").strip()
@@ -370,6 +378,7 @@ def main() -> int:
     print(f"[INFO] Caps: searches={max_search_calls}, details={max_details_calls}, total_places={max_total_places}")
 
     leads_by_key: Dict[str, Lead] = {}
+    snapshot_store = ReviewSnapshotStore(args.review_snapshot_db)
     search_calls = 0
     details_calls = 0
 
@@ -409,6 +418,16 @@ def main() -> int:
                 details = place_details(api_key, place_id)
                 details_calls += 1
                 lead = normalize_place(details, query)
+                if lead.place_id and lead.reviews:
+                    snapshot_record = {"google": asdict(lead)}
+                    snapshot_store.record_snapshot(
+                        place_key=lead.place_id,
+                        review_count=int(float(lead.reviews)),
+                        rating=float(lead.rating) if lead.rating else None,
+                        vertical=infer_vertical_key(snapshot_record),
+                        market=infer_market(snapshot_record),
+                        source="google_places",
+                    )
             except Exception as exc:
                 print(f"[ERROR] Details failed for place_id={place_id}: {exc}", file=sys.stderr)
                 continue
