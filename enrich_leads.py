@@ -43,6 +43,7 @@ from lead_machine.evidence import build_evidence_profile
 from lead_machine.icp import hard_icp_gate
 from lead_machine.schema import normalize_lead
 from lead_machine.verticals import resolve_profile
+from lead_machine.review_velocity import ReviewSnapshotStore
 
 
 USER_AGENT = (
@@ -1329,6 +1330,7 @@ def enrich_row(
     rendered_form_check: bool = False,
     rendered_site_check: bool = False,
     buyer_intent_ads_check: bool = False,
+    review_snapshot_store: ReviewSnapshotStore | None = None,
 ) -> Dict[str, Any]:
     started_at = time.monotonic()
     lead = normalize_lead(row, fallback_vertical=row.get("category", "") or "service")
@@ -1413,6 +1415,8 @@ def enrich_row(
             "hard_icp_reasons": gate.reasons,
         },
     }
+    if review_snapshot_store is not None and lead.place_id_or_unique_key:
+        record["review_count_history"] = review_snapshot_store.history(lead.place_id_or_unique_key)
     total_elapsed = elapsed_seconds(started_at)
     record["enrichment"] = {"elapsed_seconds": round(total_elapsed, 1)}
     record["website"]["enrichment_elapsed_seconds"] = round(total_elapsed, 1)
@@ -1440,6 +1444,11 @@ def main() -> int:
     parser.add_argument("--screenshots-dir", default="screenshots", help="Screenshot directory")
     parser.add_argument("--limit", type=int, default=0, help="Optional max leads to enrich")
     parser.add_argument("--no-screenshots", action="store_true", help="Skip screenshots")
+    parser.add_argument(
+        "--review-snapshot-db",
+        default=os.getenv("REVIEW_SNAPSHOT_DB", "run_state/review_velocity.sqlite3"),
+        help="SQLite path containing longitudinal Google review-count observations",
+    )
     parser.add_argument(
         "--rendered-form-check",
         action="store_true",
@@ -1478,6 +1487,7 @@ def main() -> int:
     print(f"[INFO] Buyer-intent ads check={'on' if buyer_intent_ads_check else 'off'}")
 
     records: List[Dict[str, Any]] = []
+    review_snapshot_store = ReviewSnapshotStore(args.review_snapshot_db)
 
     for i, row in enumerate(rows, start=1):
         name = row.get("business_name", "")
@@ -1496,6 +1506,7 @@ def main() -> int:
                 rendered_form_check=args.rendered_form_check,
                 rendered_site_check=args.rendered_site_check,
                 buyer_intent_ads_check=buyer_intent_ads_check,
+                review_snapshot_store=review_snapshot_store,
             )
             records.append(enriched)
 
@@ -1514,6 +1525,9 @@ def main() -> int:
                 "derived": {},
                 "enrichment": {"elapsed_seconds": round(elapsed_seconds(lead_started_at), 1), "error": caught_error},
             }
+            place_key = str(row.get("place_id") or row.get("place_id_or_unique_key") or "").strip()
+            if place_key:
+                error_record["review_count_history"] = review_snapshot_store.history(place_key)
             error_record["evidence"] = build_evidence_profile(error_record)
             build_buyer_intent(error_record, ads_check=buyer_intent_ads_check)
             error_record["enrichment"]["elapsed_seconds"] = round(elapsed_seconds(lead_started_at), 1)

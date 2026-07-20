@@ -20,7 +20,7 @@ from lead_machine.feedback import compute_feedback_metrics
 from lead_machine.icp import hard_icp_gate
 from lead_machine.lead_card import build_lead_card
 from lead_machine.llm_queue import build_llm_prompt, write_review_queue
-from lead_machine.manual_scores import load_manual_score, merge_manual_score
+from lead_machine.manual_scores import load_manual_score, merge_manual_score, validate_manual_score
 from lead_machine.score_schema import V2_SCORE_FIELDS
 from lead_machine.schema import normalize_lead, row_dedupe_keys
 from lead_machine.sendability import apply_sendability, flatten_safe_outreach_claims, normalize_evidence_refs
@@ -1955,6 +1955,35 @@ class LeadMachineContractsTest(unittest.TestCase):
 
             with self.assertRaises(ValueError):
                 load_manual_score(score_path, allowed_evidence_ids={"ev-known"})
+
+    def test_manual_score_normalizes_bounded_model_format_drift(self) -> None:
+        score = self._manual_score(
+            commercial_fit_state="not-an-lpm-fit",
+            contact_eligibility="hold-commercial-case",
+            evidence_refs=["ev-cta-strength-16"],
+        )
+
+        validated = validate_manual_score(
+            score,
+            allowed_evidence_ids={"ev-cta_strength-16", "E2"},
+        )
+
+        self.assertEqual(validated["commercial_fit_state"], "not-an-LPM-fit")
+        self.assertEqual(validated["evidence_refs"], ["ev-cta_strength-16"])
+
+        governed = apply_sendability(
+            {
+                "Commercial Fit State": validated["commercial_fit_state"],
+                "Contact Eligibility": "hold-commercial-case",
+                "Asset State": "none",
+                "Promise State": "asset-free",
+            }
+        )
+        self.assertNotIn("invalid commercial_fit_state", governed["Sendability Blockers"])
+
+        score["evidence_refs"] = ["invented-ref"]
+        with self.assertRaisesRegex(ValueError, "Unknown evidence_refs: invented-ref"):
+            validate_manual_score(score, allowed_evidence_ids={"ev-cta_strength-16", "E2"})
 
     def test_llm_prompt_and_queue_use_manual_web_workflow(self) -> None:
         enriched = {

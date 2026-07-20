@@ -49,6 +49,7 @@ from lead_machine.manual_scores import load_manual_score, merge_manual_score
 from lead_machine.score_schema import MANUAL_SCORE_SCHEMA, SHARED_COMMERCIAL_SCORING_RULES
 from lead_machine.schema import normalize_lead
 from lead_machine.scoring_rules import SHARED_SENDABILITY_RULES
+from lead_machine.scoring_v3 import attach_scoring_v3
 from lead_machine.sendability import apply_sendability, normalize_evidence_refs
 from lead_machine.verticals import VerticalProfile, resolve_profile
 from make_llm_batch import score_file_for_record
@@ -1463,7 +1464,8 @@ def score_record(record: Dict[str, Any], fallback_vertical: str) -> Dict[str, An
         "Packet Eligible": packet_eligible(priority, offer_fit),
         "Packet Eligibility Reason": packet_eligibility_reason(priority, offer_fit),
     }
-    return apply_sendability(row)
+    governed = apply_sendability(row)
+    return attach_scoring_v3(record, governed, fallback_vertical=fallback_vertical)
 
 
 def read_jsonl(path: Path) -> List[Dict[str, Any]]:
@@ -2178,13 +2180,29 @@ def _compact_buyer_intent(buyer_intent: Dict[str, Any]) -> Dict[str, Any]:
         if known_ads:
             compact["ads"] = known_ads
 
-    for key in ("review_demand_signal", "review_profile", "review_velocity"):
+    for key in ("review_demand_signal", "review_profile"):
         value = buyer_intent.get(key)
         if isinstance(value, dict):
-            band = value.get("demand_band") or value.get("velocity_band")
+            band = value.get("demand_band")
             if band:
                 compact["review_demand_band"] = band
             break
+
+    velocity = buyer_intent.get("review_velocity")
+    if isinstance(velocity, dict):
+        compact["review_velocity"] = {
+            key: velocity.get(key)
+            for key in (
+                "state",
+                "velocity_band",
+                "reviews_per_30d",
+                "cohort_percentile",
+                "source",
+                "bound",
+                "confidence",
+            )
+            if velocity.get(key) not in (None, "")
+        }
 
     return compact
 

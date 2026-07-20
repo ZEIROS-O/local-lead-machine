@@ -1,0 +1,40 @@
+{
+  "policy_version": "v3-shadow.1",
+  "launch_mode": "shadow",
+  "auto_eligible_min_score": 70,
+  "minimum_evidence_confidence": 3,
+  "minimum_cohort_size": 20,
+  "review_observation_max_age_days": 45,
+  "external_signal_max_age_days": 30,
+  "weights": {
+    "icp_fit": 20,
+    "business_demand_capacity": 15,
+    "review_velocity": 10,
+    "problem_evidence": 25,
+    "offer_solution_fit": 15,
+    "reachability": 10,
+    "evidence_confidence": 5
+  },
+  "offer_lanes": ["Get Found", "Get the Lead", "Answer It", "Close It", "Keep", "See It All"],
+  "offer_mappings": {
+    "website rebuild": "Get Found",
+    "website cleanup": "Get Found",
+    "premium perception gap": "Get Found",
+    "portfolio rebuild": "Get Found",
+    "service page cleanup": "Get Found",
+    "no-site launch": "Get Found",
+    "estimate funnel": "Get the Lead",
+    "mobile quote path cleanup": "Get the Lead",
+    "review/trust proof upgrade": "Get the Lead",
+    "social/jobber escape": "Get the Lead",
+    "tracking": "See It All",
+    "tracking / missed call": "See It All"
+  },
+  "supported_cells": [
+    "detailing__cleveland",
+    "detailing__columbus",
+    "plumbing__cleveland",
+    "water_restoration__cleveland",
+    "water_restoration__columbus"
+  ]
+}

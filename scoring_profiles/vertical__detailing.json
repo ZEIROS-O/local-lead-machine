@@ -1,0 +1,51 @@
+{
+  "vertical": "detailing",
+  "vertical_terms": [
+    "ceramic coating",
+    "paint correction",
+    "ppf",
+    "paint protection film",
+    "auto detailing",
+    "car detailing",
+    "mobile detailing",
+    "ceramic pro",
+    "xpel",
+    "gtechniq",
+    "window tint",
+    "vehicle wrap",
+    "paint enhancement"
+  ],
+  "high_value_services": [
+    "ceramic coating",
+    "paint correction",
+    "ppf",
+    "paint protection film",
+    "ceramic pro",
+    "xpel",
+    "gtechniq",
+    "window tint",
+    "vehicle wrap"
+  ],
+  "exclusions": [
+    "express wash",
+    "car wash tunnel",
+    "automatic car wash",
+    "self-serve car wash",
+    "oil change",
+    "quick lube",
+    "gas station",
+    "auto parts",
+    "tire shop",
+    "body shop",
+    "collision",
+    "dealership",
+    "mister car wash",
+    "take 5",
+    "tommy's express",
+    "zips",
+    "quick quack",
+    "delta sonic"
+  ],
+  "business_review_thresholds": {"some_proof": 10, "established": 40, "mature": 125},
+  "review_pain_recency_days": 180
+}

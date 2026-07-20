@@ -20,6 +20,7 @@ from .score_schema import (
 )
 from .schema import normalize_lead
 from .sendability import apply_sendability, normalize_evidence_refs, normalize_safe_outreach_claims, normalize_unsafe_claims
+from .scoring_v3 import attach_scoring_v3
 
 
 SUBSCORE_LIMITS = {
@@ -55,6 +56,24 @@ def _require_keys(data: Dict[str, Any], keys: Iterable[str]) -> None:
     missing = [key for key in keys if key not in data]
     if missing:
         raise ValueError(f"Manual score missing required keys: {', '.join(missing)}")
+
+
+def _canonicalize_evidence_refs(refs: List[str], allowed_evidence_ids: Set[str]) -> List[str]:
+    aliases: Dict[str, List[str]] = {}
+    for allowed_id in sorted(allowed_evidence_ids):
+        alias = re.sub(r"[-_]+", "-", allowed_id.casefold())
+        aliases.setdefault(alias, []).append(allowed_id)
+
+    canonical: List[str] = []
+    for ref in refs:
+        resolved = ref
+        if ref not in allowed_evidence_ids:
+            matches = aliases.get(re.sub(r"[-_]+", "-", ref.casefold()), [])
+            if len(matches) == 1:
+                resolved = matches[0]
+        if resolved not in canonical:
+            canonical.append(resolved)
+    return canonical
 
 
 def validate_manual_score(
@@ -110,7 +129,10 @@ def validate_manual_score(
     if confidence not in CONFIDENCE_VALUES:
         raise ValueError("confidence must be low, medium, or high")
 
-    refs = normalize_evidence_refs(data.get("evidence_refs"))
+    refs = _canonicalize_evidence_refs(
+        normalize_evidence_refs(data.get("evidence_refs")),
+        allowed_evidence_ids,
+    )
     if not refs:
         raise ValueError("evidence_refs must be a non-empty list")
 
@@ -143,7 +165,15 @@ def validate_manual_score(
     else:
         _require_keys(data, V2_SCORE_FIELDS)
         validated["score_schema_version"] = SCORE_SCHEMA_VERSION
-        commercial_state = str(data.get("commercial_fit_state") or "").strip().lower()
+        raw_commercial_state = str(data.get("commercial_fit_state") or "").strip()
+        commercial_state = next(
+            (
+                state
+                for state in COMMERCIAL_FIT_STATES
+                if state.casefold() == raw_commercial_state.casefold()
+            ),
+            raw_commercial_state.lower(),
+        )
         contact = str(data.get("contact_eligibility") or "").strip().lower()
         asset = str(data.get("asset_state") or "").strip().lower()
         promise = str(data.get("promise_state") or "").strip().lower()
@@ -543,7 +573,8 @@ def merge_manual_score(
     )
     if validated.get("_legacy_score_compatibility"):
         row = backfill_legacy_commercial_fit(row)
-    return apply_sendability(row)
+    governed = apply_sendability(row)
+    return attach_scoring_v3(enriched, governed, fallback_vertical=fallback_vertical)
 
 
 def _website_quality_from_status(status: str) -> str:
