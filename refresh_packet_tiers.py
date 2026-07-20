@@ -12,14 +12,11 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Iterable
 
-from lead_machine.commercial_backfill import COMMERCIAL_FIELD_ALIASES, backfill_legacy_commercial_fit
 from lead_machine.score_schema import (
-    ASSET_STATES,
-    COMMERCIAL_DIMENSION_KEYS,
-    COMMERCIAL_FIT_STATES,
-    CONTACT_ELIGIBILITY_STATES,
-    PROMISE_STATES,
+    COMMERCIAL_FIELD_TITLES,
+    CSV_SCORE_ALIASES,
     SCORE_SCHEMA_VERSION,
+    validate_current_scored_row,
 )
 from lead_machine.sendability import apply_sendability, is_contact_ready
 
@@ -40,7 +37,7 @@ SCHEMA_FIELDS = [
 COMMERCIAL_FIELDS = [
     "Commercial Fit State",
     "commercial_fit_state",
-    *[field for pair in ((title, key) for key, title in COMMERCIAL_FIELD_ALIASES.items()) for field in pair],
+    *[field for pair in ((title, key) for key, title in COMMERCIAL_FIELD_TITLES.items()) for field in pair],
     "Contact Eligibility",
     "contact_eligibility",
     "Asset State",
@@ -61,16 +58,9 @@ SENDABILITY_FIELDS = [
 REFRESH_FIELDS = [*SCHEMA_FIELDS, *COMMERCIAL_FIELDS, *SENDABILITY_FIELDS, *PACKET_FIELDS]
 
 CONTRACT_ALIASES = {
-    "commercial_fit_state": ("Commercial Fit State", "commercial_fit_state"),
-    **{
-        key: (title, key)
-        for key, title in COMMERCIAL_FIELD_ALIASES.items()
-    },
-    "contact_eligibility": ("Contact Eligibility", "contact_eligibility"),
-    "asset_state": ("Asset State", "asset_state"),
-    "promise_state": ("Promise State", "promise_state"),
-    "asset_id": ("Asset ID", "asset_id"),
-    "asset_verifier_verdict": ("Asset Verifier Verdict", "asset_verifier_verdict"),
+    key: aliases
+    for key, aliases in CSV_SCORE_ALIASES.items()
+    if key != "score_schema_version"
 }
 SCHEMA_METADATA_ALIASES = {
     "score_schema_version": ("Score Schema Version", "score_schema_version"),
@@ -128,42 +118,7 @@ def row_identity(row: dict[str, Any]) -> str:
 
 
 def _contract_errors(row: dict[str, Any]) -> list[str]:
-    missing_fields = [key for key, aliases in CONTRACT_ALIASES.items() if not any(alias in row for alias in aliases)]
-    errors = [f"missing field {field}" for field in missing_fields]
-    errors.extend(
-        f"conflicting aliases {key}"
-        for key, aliases in CONTRACT_ALIASES.items()
-        if _alias_conflict(row, aliases)
-    )
-    state = _first(row, CONTRACT_ALIASES["commercial_fit_state"]).casefold()
-    contact = _first(row, CONTRACT_ALIASES["contact_eligibility"]).casefold()
-    asset = _first(row, CONTRACT_ALIASES["asset_state"]).casefold()
-    promise = _first(row, CONTRACT_ALIASES["promise_state"]).casefold()
-    if state not in COMMERCIAL_FIT_STATES:
-        errors.append(f"invalid commercial_fit_state {state or '<missing>'}")
-    if contact not in CONTACT_ELIGIBILITY_STATES:
-        errors.append(f"invalid contact_eligibility {contact or '<missing>'}")
-    if asset not in ASSET_STATES:
-        errors.append(f"invalid asset_state {asset or '<missing>'}")
-    if promise not in PROMISE_STATES:
-        errors.append(f"invalid promise_state {promise or '<missing>'}")
-    if contact == "contact-now" and state != "commercially-sendable":
-        errors.append("contact-now requires commercially-sendable")
-    if contact == "contact-after-asset" and asset != "planned":
-        errors.append("contact-after-asset requires planned asset_state")
-    if promise == "future-build" and asset != "planned":
-        errors.append("future-build requires planned asset_state")
-    asset_id = _first(row, CONTRACT_ALIASES["asset_id"])
-    verifier = _first(row, CONTRACT_ALIASES["asset_verifier_verdict"])
-    if asset == "verified-existing" and (not asset_id or verifier != "PASS"):
-        errors.append("verified-existing requires asset_id and PASS verifier")
-    if promise == "existing-verified-asset" and asset != "verified-existing":
-        errors.append("existing-verified-asset requires verified-existing asset_state")
-    if state == "commercially-sendable":
-        for key in COMMERCIAL_DIMENSION_KEYS:
-            if not _first(row, CONTRACT_ALIASES[key]):
-                errors.append(f"missing value {key}")
-    return errors
+    return validate_current_scored_row(row)
 
 
 def classify_schema(row: dict[str, Any]) -> tuple[str, list[str]]:
@@ -183,7 +138,18 @@ def classify_schema(row: dict[str, Any]) -> tuple[str, list[str]]:
     ]
     if raw_version and raw_version != str(SCORE_SCHEMA_VERSION):
         errors.append(f"schema version must be {SCORE_SCHEMA_VERSION}, got {raw_version}")
-    errors.extend(_contract_errors(row))
+    contract_errors = _contract_errors(row)
+    if not raw_version:
+        contract_errors = [
+            error
+            for error in contract_errors
+            if error
+            not in {
+                f"score_schema_version must be {SCORE_SCHEMA_VERSION}",
+                "missing field score_schema_version",
+            }
+        ]
+    errors.extend(contract_errors)
     if errors:
         return ("invalid_v2" if raw_version else "partial_v2"), errors
     return ("v2" if raw_version else "complete_unversioned_v2"), []
@@ -210,16 +176,11 @@ def _normalize_contract_aliases(row: dict[str, Any], *, source: str) -> dict[str
 def refresh_row(row: dict[str, Any]) -> dict[str, Any]:
     schema_class, errors = classify_schema(row)
     identity = row_identity(row) or "<missing-identity>"
-    if errors:
-        raise SchemaMigrationError(f"{identity}: {schema_class}: " + "; ".join(errors))
-    if schema_class == "legacy":
-        migrated = backfill_legacy_commercial_fit(row)
-    elif schema_class == "complete_unversioned_v2":
-        source = _first(row, SCHEMA_METADATA_ALIASES["commercial_fit_source"])
-        migrated = _normalize_contract_aliases(row, source=source or "unversioned-v2-contract")
-    else:
-        source = _first(row, ("Commercial Fit Source", "commercial_fit_source")) or "llm-schema-v2"
-        migrated = _normalize_contract_aliases(row, source=source)
+    if schema_class != "v2" or errors:
+        detail = "; ".join(errors) if errors else f"found {schema_class}"
+        raise SchemaMigrationError(f"{identity}: current schema v2 required: {detail}")
+    source = _first(row, ("Commercial Fit Source", "commercial_fit_source")) or "llm-schema-v2"
+    migrated = _normalize_contract_aliases(row, source=source)
     refreshed = apply_sendability(migrated)
     updated = dict(row)
     for field in REFRESH_FIELDS:
@@ -239,7 +200,12 @@ def impact_report(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[dict
         schema_class, row_errors = classify_schema(row)
         classes[schema_class] += 1
         if row_errors:
-            errors.append(f"{row_identity(row) or '<missing-identity>'}: " + "; ".join(row_errors))
+            errors.append(f"{row_identity(row) or '<missing-identity>'}: current schema v2 required: " + "; ".join(row_errors))
+            continue
+        if schema_class != "v2":
+            errors.append(
+                f"{row_identity(row) or '<missing-identity>'}: current schema v2 required: found {schema_class}"
+            )
             continue
         refreshed_rows.append(refresh_row(row))
     def previously_sendable(row: dict[str, Any]) -> bool:

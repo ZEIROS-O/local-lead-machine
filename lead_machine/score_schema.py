@@ -134,11 +134,6 @@ SHARED_COMMERCIAL_SCORING_RULES = """\
   I mean" or "I can build the example."""
 
 
-def is_truly_legacy_score(data: Dict[str, Any]) -> bool:
-    """Legacy means the score predates the entire v2 commercial contract."""
-    return "score_schema_version" not in data and not (set(data) & V2_SCORE_FIELDS)
-
-
 def _semantic(value: Any) -> str:
     return " ".join(str(value or "").strip().casefold().split())
 
