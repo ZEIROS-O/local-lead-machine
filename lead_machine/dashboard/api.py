@@ -81,6 +81,7 @@ def create_app(root: Path | str | None = None, *, frontend_dist: Path | str | No
         q: str = "",
         unscored: bool | None = None,
         finished: bool | None = None,
+        lifecycle: Literal["all", "active", "legacy"] = "all",
         refresh: bool = False,
     ) -> dict:
         return repo.batches(
@@ -91,6 +92,7 @@ def create_app(root: Path | str | None = None, *, frontend_dist: Path | str | No
             query=q,
             unscored=unscored,
             finished=finished,
+            lifecycle=lifecycle,
             force=refresh,
         )
 

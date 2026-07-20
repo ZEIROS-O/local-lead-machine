@@ -128,6 +128,52 @@ class DashboardRepositoryTest(unittest.TestCase):
         self.assertEqual(batch["next_action"], "/run detailing cleveland medium")
         self.assertEqual(self.repo.overview()["totals"]["batches"], 1)
 
+    def test_overview_excludes_legacy_from_operational_totals(self) -> None:
+        legacy_name = "detailing_columbus_medium_001"
+        (self.root / "market_profiles/columbus.json").write_text(
+            "{}\n", encoding="utf-8"
+        )
+        (self.root / f"search_configs/{legacy_name}.json").write_text(
+            json.dumps(
+                {
+                    "batch": legacy_name,
+                    "vertical": "detailing",
+                    "location": "Columbus OH",
+                    "queries": ["ceramic coating"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        registry = self.root / "lead_machine/dashboard/legacy_batches.json"
+        registry.parent.mkdir(parents=True, exist_ok=True)
+        registry.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "batches": [
+                        {
+                            "batch": legacy_name,
+                            "legacy_since": "2026-07-20",
+                            "reason": "pre_commercial_readiness_schema",
+                            "note": "History",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        repo = DashboardRepository(self.root)
+
+        overview = repo.overview(force=True)
+
+        self.assertEqual(
+            overview["inventory_totals"], {"all": 2, "active": 1, "legacy": 1}
+        )
+        self.assertEqual(overview["totals"]["batches"], 1)
+        self.assertEqual(repo.batches(lifecycle="all", force=True)["total"], 2)
+        self.assertEqual(repo.batches(lifecycle="legacy", force=True)["total"], 1)
+        self.assertEqual(repo.batches(lifecycle="active", force=True)["total"], 1)
+
     def test_partial_scoring_uses_artifact_counts_not_stale_state(self) -> None:
         write_enriched(self.paths.enriched, 3)
         write_csv(self.paths.scored_csv, scored_rows(2))
@@ -484,6 +530,10 @@ class DashboardApiTest(unittest.TestCase):
                 async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
                     self.assertEqual((await client.get("/api/health")).status_code, 200)
                     self.assertEqual((await client.get("/api/batches/not-a-batch")).status_code, 404)
+                    self.assertEqual(
+                        (await client.get("/api/batches?lifecycle=not-valid")).status_code,
+                        422,
+                    )
                     self.assertEqual((await client.post("/api/batches")).status_code, 405)
 
             asyncio.run(assert_responses())

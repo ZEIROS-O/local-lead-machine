@@ -10,7 +10,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal
 
 from lead_machine.airtable_receipts import validate_verified_cohort_receipt
 from lead_machine.dashboard.identity import Reconciliation, reconcile_rows
@@ -993,6 +993,7 @@ class DashboardRepository:
         query: str = "",
         unscored: bool | None = None,
         finished: bool | None = None,
+        lifecycle: Literal["all", "active", "legacy"] = "all",
     ) -> list[dict[str, Any]]:
         items = [read.summary for read in reads.values()]
         normalized_query = query.strip().casefold()
@@ -1007,24 +1008,45 @@ class DashboardRepository:
                 items = [item for item in items if item["health"] != "healthy"]
             else:
                 items = [item for item in items if item["health"] == health]
+        if lifecycle != "all":
+            items = [item for item in items if item["lifecycle"] == lifecycle]
         if normalized_query:
             items = [
                 item for item in items
                 if normalized_query in f"{item['batch']} {item['vertical']} {item['market']}".casefold()
             ]
         if unscored is not None:
-            items = [item for item in items if (item["counts"]["unscored"] > 0) is unscored]
+            if unscored:
+                items = [
+                    item
+                    for item in items
+                    if isinstance(item["counts"]["unscored"], int)
+                    and item["counts"]["unscored"] > 0
+                ]
+            else:
+                items = [item for item in items if item["counts"]["unscored"] == 0]
         if finished is not None:
             items = [item for item in items if (item["progress"] == "finished") is finished]
         return items
 
     def overview(self, *, vertical: str = "", market: str = "", force: bool = False) -> dict[str, Any]:
         reads, ignored = self._scan(force=force)
-        items = self._filtered(reads, vertical=vertical, market=market)
+        all_items = self._filtered(
+            reads, vertical=vertical, market=market, lifecycle="all"
+        )
+        items = [item for item in all_items if item["lifecycle"] == "active"]
+        inventory_totals = {
+            "all": len(all_items),
+            "active": len(items),
+            "legacy": sum(item["lifecycle"] == "legacy" for item in all_items),
+        }
         totals = {
             "batches": len(items),
             "needs_attention": sum(1 for item in items if item["health"] != "healthy"),
             "unscored": sum(item["counts"]["unscored"] or 0 for item in items),
+            "unknown_unscored_batches": sum(
+                item["counts"]["unscored"] is None for item in items
+            ),
             "sendable": sum(item["counts"]["sendable"] or 0 for item in items),
             "airtable_ready": sum(1 for item in items if item["progress"] == "airtable_ready"),
             "finished": sum(1 for item in items if item["progress"] == "finished"),
@@ -1056,6 +1078,7 @@ class DashboardRepository:
         return {
             "generated_at": _utc_now().isoformat(),
             "repo_root": str(self.root),
+            "inventory_totals": inventory_totals,
             "totals": totals,
             "pipeline": pipeline,
             "attention": attention[:12],
@@ -1064,6 +1087,7 @@ class DashboardRepository:
                 "markets": sorted({item.summary["market"] for item in reads.values()}),
                 "progress": list(PROGRESS_ORDER),
                 "health": list(HEALTH_ORDER),
+                "lifecycles": ["active", "legacy"],
             },
             "source_health": {
                 "ignored_noncanonical_artifacts": ignored,
@@ -1081,6 +1105,7 @@ class DashboardRepository:
         query: str = "",
         unscored: bool | None = None,
         finished: bool | None = None,
+        lifecycle: Literal["all", "active", "legacy"] = "all",
         force: bool = False,
     ) -> dict[str, Any]:
         reads, _ = self._scan(force=force)
@@ -1093,6 +1118,7 @@ class DashboardRepository:
             query=query,
             unscored=unscored,
             finished=finished,
+            lifecycle=lifecycle,
         )
         items.sort(
             key=lambda item: (
@@ -1223,10 +1249,13 @@ class DashboardRepository:
 
     def health(self) -> dict[str, Any]:
         names, ignored = self._candidate_names()
+        legacy_count = sum(name in self._legacy_batches for name in names)
         return {
             "ok": self.root.is_dir(),
             "repo_root": str(self.root),
             "canonical_batches": len(names),
+            "active_batches": len(names) - legacy_count,
+            "legacy_batches": legacy_count,
             "ignored_noncanonical_artifacts": ignored,
             "generated_at": _utc_now().isoformat(),
         }
