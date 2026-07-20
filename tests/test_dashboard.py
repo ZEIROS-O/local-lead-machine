@@ -8,6 +8,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from lead_machine.airtable_receipts import write_verified_cohort_receipt
 from lead_machine.dashboard.data import DashboardRepository
 from lead_machine.hermes_batch import BatchPaths
 from lead_machine.hermes_state import current_sync_hash
@@ -84,8 +85,22 @@ def scored_rows(count: int) -> list[dict[str, str]]:
                 "Packet Tier": PACKET_TIER_SENDABLE if sendable else PACKET_TIER_MANUAL,
                 "Sendable": "Yes" if sendable else "No",
                 "Packet Eligible": "Yes",
+                "Score Schema Version": "2",
                 "Commercial Fit State": "commercially-sendable" if sendable else "needs-broader-system-evidence",
+                "Commercial Materiality": "Material consequence",
+                "Recurring Consequence": "Recurring consequence",
+                "Root Cause Confidence": "High confidence",
+                "LPM Offer Component": "Get the Lead",
+                "Packageable Solution": "Estimate funnel",
+                "Value Mechanism": "More completed inquiries",
+                "Beyond Free Fix": "Multi-step conversion path",
+                "Self Fix Risk": "Low",
+                "Intentionality": "Not intentional",
                 "Contact Eligibility": "contact-now" if sendable else "hold-commercial-case",
+                "Asset State": "none",
+                "Promise State": "asset-free",
+                "Asset ID": "",
+                "Asset Verifier Verdict": "",
                 "Money Signal": "Yes" if sendable else "No",
                 "AI Confidence": "high",
                 "Send Blockers": "" if sendable else "Needs review",
@@ -128,6 +143,109 @@ class DashboardRepositoryTest(unittest.TestCase):
         self.assertEqual(batch["counts"]["unscored"], 1)
         self.assertIn("state_count_drift", {issue["code"] for issue in batch["issues"]})
         self.assertEqual(batch["next_action"], f"/score-dry {BATCH}")
+
+    def test_legacy_batch_uses_literal_counts_and_historical_packets(self) -> None:
+        write_enriched(self.paths.enriched, 2)
+        legacy_rows = scored_rows(2)
+        for row in legacy_rows:
+            for key in (
+                "Score Schema Version",
+                "Commercial Fit State",
+                "Contact Eligibility",
+                "Asset State",
+                "Promise State",
+            ):
+                row.pop(key, None)
+        write_csv(self.root / f"output/scored_{BATCH}.csv", legacy_rows)
+        registry = self.root / "lead_machine/dashboard/legacy_batches.json"
+        registry.parent.mkdir(parents=True, exist_ok=True)
+        registry.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "batches": [
+                        {
+                            "batch": BATCH,
+                            "legacy_since": "2026-07-20",
+                            "reason": "pre_commercial_readiness_schema",
+                            "note": "Preserved history",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        batch = DashboardRepository(self.root).batch(BATCH, force=True)
+
+        assert batch is not None
+        self.assertEqual(batch["lifecycle"], "legacy")
+        self.assertEqual(batch["counts"]["scored"], 2)
+        self.assertEqual(batch["current_sendability"]["status"], "incompatible")
+        self.assertIsNone(batch["current_sendability"]["count"])
+        self.assertEqual(batch["historical_packets"]["sendable"], 1)
+
+    def test_unreconciled_active_batch_reports_unknown_unscored(self) -> None:
+        write_enriched(self.paths.enriched, 2)
+        rows = scored_rows(2)
+        rows[1]["Place Key"] = "not-in-enrichment"
+        rows[1]["Phone"] = ""
+        rows[1]["Website URL"] = ""
+        rows[1]["Business Name"] = "Different"
+        rows[1]["City"] = "Elsewhere"
+        write_csv(self.paths.scored_csv, rows)
+
+        batch = self.repo.batch(BATCH, force=True)
+
+        assert batch is not None
+        self.assertEqual(batch["counts"]["scored"], 2)
+        self.assertIsNone(batch["counts"]["unscored"])
+        self.assertEqual(batch["reconciliation"]["status"], "unknown")
+
+    def test_manual_scored_csv_is_a_canonical_dashboard_fallback(self) -> None:
+        write_enriched(self.paths.enriched, 2)
+        write_csv(self.paths.manual_scored_csv, scored_rows(2))
+
+        batch = self.repo.batch(BATCH, force=True)
+        assert batch is not None
+        self.assertEqual(batch["progress"], "scored")
+        self.assertEqual(batch["counts"]["scored"], 2)
+        self.assertEqual(batch["counts"]["unscored"], 0)
+        self.assertEqual(batch["artifacts"]["scored"]["path"], f"output/scored_{BATCH}_manual.csv")
+        self.assertEqual(self.repo.leads(BATCH, state="scored", force=True)["total"], 2)
+
+    def test_api_scored_csv_takes_precedence_over_manual_fallback(self) -> None:
+        write_enriched(self.paths.enriched, 2)
+        write_csv(self.paths.manual_scored_csv, scored_rows(2))
+        write_csv(self.paths.scored_csv, scored_rows(1))
+
+        batch = self.repo.batch(BATCH, force=True)
+        assert batch is not None
+        self.assertEqual(batch["progress"], "partial_scoring")
+        self.assertEqual(batch["counts"]["scored"], 1)
+        self.assertEqual(batch["artifacts"]["scored"]["path"], f"output/scored_{BATCH}_api.csv")
+
+    def test_verified_custom_airtable_cohort_is_visible_but_not_full_completion(self) -> None:
+        write_enriched(self.paths.enriched, 2)
+        write_csv(self.paths.manual_scored_csv, scored_rows(2))
+        write_verified_cohort_receipt(
+            self.paths,
+            cohort="grades-a-b-plus-sendable",
+            identities=["place-0", "place-1"],
+            live_post_count=2,
+            live_patch_count=0,
+            verification_patch_count=2,
+        )
+
+        batch = self.repo.batch(BATCH, force=True)
+        assert batch is not None
+        self.assertEqual(batch["progress"], "scored")
+        self.assertEqual(batch["stages"]["airtable"], {"status": "partial", "count": 2})
+        self.assertEqual(batch["airtable"]["live"]["status"], "partial")
+        self.assertEqual(batch["airtable"]["custom"]["status"], "verified")
+        self.assertEqual(batch["airtable"]["custom"]["records"], 2)
+        self.assertIn("partial_airtable_sync", {issue["code"] for issue in batch["issues"]})
+        self.assertTrue(batch["artifacts"]["airtable_custom_receipt"]["exists"])
 
     def test_current_packets_and_matching_live_receipt_are_finished(self) -> None:
         write_enriched(self.paths.enriched, 2)
@@ -293,15 +411,19 @@ class DashboardRepositoryTest(unittest.TestCase):
         write_enriched(self.paths.enriched, 2)
         rows = scored_rows(2)
         rows[1]["Place Key"] = "place-extra"
+        rows[1]["Phone"] = ""
+        rows[1]["Website URL"] = ""
+        rows[1]["Business Name"] = "Different"
+        rows[1]["City"] = "Elsewhere"
         write_csv(self.paths.scored_csv, rows)
         batch = self.repo.batch(BATCH, force=True)
         assert batch is not None
         self.assertEqual(batch["progress"], "partial_scoring")
-        self.assertEqual(batch["counts"]["scored"], 1)
+        self.assertEqual(batch["counts"]["scored"], 2)
+        self.assertIsNone(batch["counts"]["unscored"])
         self.assertEqual(batch["artifacts"]["scored"]["rows"], 2)
         codes = {issue["code"] for issue in batch["issues"]}
-        self.assertIn("unscored_leads", codes)
-        self.assertIn("extra_scored_identities", codes)
+        self.assertIn("identity_reconciliation_unknown", codes)
 
     def test_duplicate_and_missing_scored_identities_block_completion(self) -> None:
         write_enriched(self.paths.enriched, 2)
@@ -314,8 +436,7 @@ class DashboardRepositoryTest(unittest.TestCase):
         batch = self.repo.batch(BATCH, force=True)
         assert batch is not None
         codes = {issue["code"] for issue in batch["issues"]}
-        self.assertIn("duplicate_scored_identities", codes)
-        self.assertIn("missing_scored_identities", codes)
+        self.assertIn("identity_reconciliation_unknown", codes)
         self.assertNotEqual(batch["progress"], "scored")
 
     def test_malformed_run_state_is_blocked_but_other_batches_still_scan(self) -> None:

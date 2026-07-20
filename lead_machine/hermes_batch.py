@@ -54,6 +54,10 @@ class BatchPaths:
         return _rel_or_root(self.root, f"output/scored_{self.batch}_api.csv")
 
     @property
+    def manual_scored_csv(self) -> Path:
+        return _rel_or_root(self.root, f"output/scored_{self.batch}_manual.csv")
+
+    @property
     def tiered_csv(self) -> Path:
         return _rel_or_root(self.root, f"output/scored_{self.batch}_api_tiered.csv")
 
@@ -88,6 +92,10 @@ class BatchPaths:
     @property
     def state_json(self) -> Path:
         return _rel_or_root(self.root, f"run_state/{self.batch}.json")
+
+    @property
+    def airtable_receipts_dir(self) -> Path:
+        return _rel_or_root(self.root, f"run_state/airtable_receipts/{self.batch}")
 
 
 def _known_stems(root: Path, directory: str) -> set[str]:

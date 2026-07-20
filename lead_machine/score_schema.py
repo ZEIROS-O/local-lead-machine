@@ -17,6 +17,18 @@ COMMERCIAL_DIMENSION_KEYS = (
     "intentionality",
 )
 
+COMMERCIAL_FIELD_TITLES = {
+    "commercial_materiality": "Commercial Materiality",
+    "recurring_consequence": "Recurring Consequence",
+    "root_cause_confidence": "Root Cause Confidence",
+    "offer_component": "LPM Offer Component",
+    "packageable_solution": "Packageable Solution",
+    "value_mechanism": "Value Mechanism",
+    "beyond_free_fix": "Beyond Free Fix",
+    "self_fix_risk": "Self Fix Risk",
+    "intentionality": "Intentionality",
+}
+
 COMMERCIAL_FIT_STATES = {
     "commercially-sendable",
     "minor-fix/nurture",
@@ -38,6 +50,23 @@ V2_SCORE_FIELDS = {
     "promise_state",
     "asset_id",
     "asset_verifier_verdict",
+}
+
+CSV_SCORE_ALIASES = {
+    "score_schema_version": ("Score Schema Version", "score_schema_version"),
+    "commercial_fit_state": ("Commercial Fit State", "commercial_fit_state"),
+    **{
+        key: (title, key)
+        for key, title in COMMERCIAL_FIELD_TITLES.items()
+    },
+    "contact_eligibility": ("Contact Eligibility", "contact_eligibility"),
+    "asset_state": ("Asset State", "asset_state"),
+    "promise_state": ("Promise State", "promise_state"),
+    "asset_id": ("Asset ID", "asset_id"),
+    "asset_verifier_verdict": (
+        "Asset Verifier Verdict",
+        "asset_verifier_verdict",
+    ),
 }
 
 MANUAL_SCORE_SCHEMA: Dict[str, Any] = {
@@ -108,3 +137,81 @@ SHARED_COMMERCIAL_SCORING_RULES = """\
 def is_truly_legacy_score(data: Dict[str, Any]) -> bool:
     """Legacy means the score predates the entire v2 commercial contract."""
     return "score_schema_version" not in data and not (set(data) & V2_SCORE_FIELDS)
+
+
+def _semantic(value: Any) -> str:
+    return " ".join(str(value or "").strip().casefold().split())
+
+
+def _alias_value(row: Dict[str, Any], aliases: tuple[str, ...]) -> str:
+    for alias in aliases:
+        value = row.get(alias)
+        if value not in (None, ""):
+            return str(value).strip()
+    return ""
+
+
+def validate_current_scored_row(row: Dict[str, Any]) -> list[str]:
+    """Return objective schema-v2 contract errors for one scored CSV row."""
+    errors: list[str] = []
+    version = _alias_value(row, CSV_SCORE_ALIASES["score_schema_version"])
+    if version != str(SCORE_SCHEMA_VERSION):
+        errors.append(f"score_schema_version must be {SCORE_SCHEMA_VERSION}")
+
+    for key, aliases in CSV_SCORE_ALIASES.items():
+        if not any(alias in row for alias in aliases):
+            errors.append(f"missing field {key}")
+            continue
+        values = {
+            _semantic(value)
+            for alias in aliases
+            if (value := row.get(alias)) not in (None, "")
+        }
+        if len(values) > 1:
+            errors.append(f"conflicting aliases {key}")
+
+    raw_state = _alias_value(
+        row, CSV_SCORE_ALIASES["commercial_fit_state"]
+    )
+    state = next(
+        (
+            candidate
+            for candidate in COMMERCIAL_FIT_STATES
+            if candidate.casefold() == raw_state.casefold()
+        ),
+        raw_state.casefold(),
+    )
+    contact = _alias_value(
+        row, CSV_SCORE_ALIASES["contact_eligibility"]
+    ).casefold()
+    asset = _alias_value(row, CSV_SCORE_ALIASES["asset_state"]).casefold()
+    promise = _alias_value(row, CSV_SCORE_ALIASES["promise_state"]).casefold()
+    if state not in COMMERCIAL_FIT_STATES:
+        errors.append("invalid commercial_fit_state")
+    if contact not in CONTACT_ELIGIBILITY_STATES:
+        errors.append("invalid contact_eligibility")
+    if asset not in ASSET_STATES:
+        errors.append("invalid asset_state")
+    if promise not in PROMISE_STATES:
+        errors.append("invalid promise_state")
+    if state == "commercially-sendable":
+        errors.extend(
+            f"missing value {key}"
+            for key in COMMERCIAL_DIMENSION_KEYS
+            if not _alias_value(row, CSV_SCORE_ALIASES[key])
+        )
+    if contact == "contact-now" and state != "commercially-sendable":
+        errors.append("contact-now requires commercially-sendable")
+    if contact == "contact-after-asset" and asset != "planned":
+        errors.append("contact-after-asset requires planned asset_state")
+    if promise == "future-build" and asset != "planned":
+        errors.append("future-build requires planned asset_state")
+    asset_id = _alias_value(row, CSV_SCORE_ALIASES["asset_id"])
+    verdict = _alias_value(
+        row, CSV_SCORE_ALIASES["asset_verifier_verdict"]
+    )
+    if asset == "verified-existing" and (not asset_id or verdict != "PASS"):
+        errors.append("verified-existing requires asset_id and PASS verifier")
+    if promise == "existing-verified-asset" and asset != "verified-existing":
+        errors.append("existing-verified-asset requires verified-existing asset_state")
+    return errors
