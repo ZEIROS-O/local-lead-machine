@@ -108,7 +108,6 @@ def validate_bundle_scores(bundle: Dict[str, Any]) -> List[Tuple[str, Dict[str, 
             validated = validate_manual_score(
                 score,
                 allowed_evidence_ids=allowed_ids_from_score(score),
-                require_schema_v2=True,
             )
         except ValueError as exc:
             failures.append(f"{location} ({score_file}): {exc}")

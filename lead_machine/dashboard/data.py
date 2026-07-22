@@ -10,10 +10,17 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal
 
+from lead_machine.airtable_receipts import validate_verified_cohort_receipt
+from lead_machine.dashboard.identity import Reconciliation, reconcile_rows
+from lead_machine.dashboard.legacy import (
+    REGISTRY_RELATIVE_PATH,
+    load_legacy_batches,
+)
 from lead_machine.hermes_batch import BatchPaths, BatchResolutionError, resolve_batch_paths
 from lead_machine.hermes_state import current_sync_hash, default_state
+from lead_machine.score_schema import validate_current_scored_row
 from lead_machine.sendability import (
     PACKET_TIER_MANUAL,
     PACKET_TIER_NONE,
@@ -297,6 +304,7 @@ class BatchRead:
     summary: dict[str, Any]
     scored_rows: list[dict[str, str]]
     enriched_rows: list[dict[str, Any]]
+    reconciliation: Reconciliation
 
 
 class DashboardRepository:
@@ -304,6 +312,7 @@ class DashboardRepository:
 
     def __init__(self, root: Path | str) -> None:
         self.root = Path(root).expanduser().resolve()
+        self._legacy_batches = load_legacy_batches(self.root)
         self._cache_signature: tuple[Any, ...] | None = None
         self._cache_reads: dict[str, BatchRead] = {}
         self._cache_ignored = 0
@@ -317,6 +326,7 @@ class DashboardRepository:
             ("output/enriched_*.jsonl", "enriched_", ""),
             ("output/scored_*_api.csv", "scored_", "_api"),
             ("output/scored_*_api_tiered.csv", "scored_", "_api_tiered"),
+            ("output/scored_*_manual.csv", "scored_", "_manual"),
             ("output/scored_*.csv", "scored_", ""),
             ("packets_*/packet_index.csv", "packets_", ""),
         )
@@ -330,7 +340,7 @@ class DashboardRepository:
                         candidate = candidate[len(prefix):]
                     if suffix and candidate.endswith(suffix):
                         candidate = candidate[: -len(suffix)]
-                    elif pattern == "output/scored_*.csv" and candidate.endswith(("_api", "_api_tiered")):
+                    elif pattern == "output/scored_*.csv" and candidate.endswith(("_api", "_api_tiered", "_manual")):
                         continue
                 raw_candidates.add(candidate)
         for candidate in raw_candidates:
@@ -343,6 +353,14 @@ class DashboardRepository:
 
     def _signature(self, names: Iterable[str]) -> tuple[Any, ...]:
         signature: list[Any] = []
+        registry_path = self.root / REGISTRY_RELATIVE_PATH
+        try:
+            registry_stat = registry_path.stat()
+            signature.extend(
+                (str(registry_path), registry_stat.st_mtime_ns, registry_stat.st_size)
+            )
+        except OSError:
+            pass
         for name in sorted(names):
             paths = resolve_batch_paths(name, root=self.root)
             candidates = self._artifact_paths(paths)
@@ -362,11 +380,13 @@ class DashboardRepository:
             paths.deduped_csv,
             paths.enriched,
             paths.scored_csv,
+            paths.manual_scored_csv,
             paths.tiered_csv,
             self.root / f"output/scored_{paths.batch}.csv",
             paths.packet_index,
             paths.usage_json,
             paths.state_json,
+            *sorted(paths.airtable_receipts_dir.glob("*.json")),
         ]
 
     def _scan(self, *, force: bool = False) -> tuple[dict[str, BatchRead], int]:
@@ -387,9 +407,19 @@ class DashboardRepository:
 
     def _blocked_batch(self, batch: str, exc: Exception) -> BatchRead:
         paths = resolve_batch_paths(batch, root=self.root)
+        legacy_entry = self._legacy_batches.get(batch)
+        lifecycle = "legacy" if legacy_entry else "active"
         issue = _issue("unexpected_batch_read_failure", "blocked", f"Batch artifacts could not be reconciled: {exc}.")
         summary = {
             "batch": batch,
+            "lifecycle": lifecycle,
+            "legacy": None
+            if legacy_entry is None
+            else {
+                "legacy_since": legacy_entry.legacy_since,
+                "reason": legacy_entry.reason,
+                "note": legacy_entry.note,
+            },
             "vertical": paths.vertical,
             "market": paths.market,
             "size": paths.size,
@@ -400,21 +430,37 @@ class DashboardRepository:
             "progress_rank": PROGRESS_ORDER["configured"],
             "health": "blocked",
             "health_rank": HEALTH_ORDER["blocked"],
-            "counts": {"raw": 0, "deduped": 0, "enriched": 0, "scored": 0, "unscored": 0, "packets": 0, "sendable": 0, "manual_review": 0, "watchlist": 0, "no_packet": 0},
+            "counts": {"raw": 0, "deduped": 0, "enriched": 0, "scored": 0, "unscored": None, "packets": 0, "sendable": None, "manual_review": None, "watchlist": None, "no_packet": None},
+            "reconciliation": {"status": "unknown", "matched": 0, "unmatched_enriched": None, "unmatched_scored": 0, "ambiguous": 0},
+            "current_sendability": {"status": "incompatible", "count": None},
+            "historical_packets": None,
             "stages": {key: {"status": "blocked" if key != "discovery" else "not_started", "count": 0} for key in ("discovery", "enrichment", "scoring", "packets", "airtable")},
             "issues": [issue],
             "latest_activity_at": "",
             "next_action": f"/status {batch}",
             "pending_approval": {"active": False, "stage": "", "expires_at": ""},
             "llm_usage": {"available": False, "calls": 0, "call_cap": 0, "tokens": 0, "token_cap": 0, "estimated_usd": 0.0, "usd_cap": 0.0, "stopped_by_cap": False, "stop_reason": "", "updated_at": ""},
-            "airtable": {"dry_run": {"status": "not_run", "timestamp": "", "post": 0, "patch": 0, "skip": 0, "warnings": []}, "live": {"status": "not_run", "timestamp": "", "post": 0, "patch": 0, "skip": 0}, "current_input_hash": ""},
+            "airtable": {
+                "dry_run": {"status": "not_run", "timestamp": "", "post": 0, "patch": 0, "skip": 0, "warnings": []},
+                "live": {"status": "not_run", "timestamp": "", "post": 0, "patch": 0, "skip": 0},
+                "custom": {"status": "not_run", "cohort": "", "timestamp": "", "records": 0, "verification_patch": 0},
+                "evidence": {"status": "unknown", "timestamp": "", "records": None},
+                "current_input_hash": "",
+            },
             "artifacts": {},
         }
-        return BatchRead(summary=summary, scored_rows=[], enriched_rows=[])
+        return BatchRead(
+            summary=summary,
+            scored_rows=[],
+            enriched_rows=[],
+            reconciliation=reconcile_rows([], []),
+        )
 
     def _read_batch(self, batch: str) -> BatchRead:
         paths = resolve_batch_paths(batch, root=self.root)
         issues: list[dict[str, str]] = []
+        legacy_entry = self._legacy_batches.get(batch)
+        lifecycle = "legacy" if legacy_entry else "active"
 
         config, config_error = _read_json(paths.config_path)
         if config_error:
@@ -424,13 +470,20 @@ class DashboardRepository:
         deduped_rows, deduped_error = _read_csv(paths.deduped_csv)
         enriched_rows, invalid_enriched, enriched_error = _read_jsonl(paths.enriched)
         plain_scored = self.root / f"output/scored_{batch}.csv"
-        base_scored_path = paths.scored_csv if paths.scored_csv.exists() else plain_scored
+        base_scored_path = next(
+            (
+                path
+                for path in (paths.scored_csv, paths.manual_scored_csv, plain_scored)
+                if path.exists()
+            ),
+            paths.scored_csv,
+        )
         scored_rows, scored_error = _read_csv(base_scored_path)
 
         if paths.tiered_csv.exists():
             tiered_path = paths.tiered_csv
-        elif base_scored_path == plain_scored and plain_scored.exists():
-            tiered_path = plain_scored
+        elif base_scored_path in {paths.manual_scored_csv, plain_scored} and base_scored_path.exists():
+            tiered_path = base_scored_path
         else:
             tiered_path = paths.tiered_csv
         tiered_rows, tiered_error = _read_csv(tiered_path)
@@ -465,45 +518,82 @@ class DashboardRepository:
 
         enriched_count = len(enriched_rows)
         raw_scored_count = len(scored_rows)
-        enriched_identities, missing_enriched_identities = _identity_counts(
-            _enriched_key(row) for row in enriched_rows
+        reconciliation = reconcile_rows(enriched_rows, scored_rows)
+        unscored = (
+            reconciliation.unmatched_enriched
+            if reconciliation.status == "reconciled"
+            else None
         )
-        scored_identities, missing_scored_identities = _identity_counts(_row_key(row) for row in scored_rows)
-        enriched_keys = set(enriched_identities)
+        scoring_complete = bool(enriched_count) and bool(scored_rows) and (
+            reconciliation.status == "reconciled"
+            and reconciliation.unmatched_enriched == 0
+        )
+        scored_identities, _missing_scored_receipt_identities = _identity_counts(
+            _row_key(row) for row in scored_rows
+        )
         scored_keys = set(scored_identities)
-        matched_keys = enriched_keys & scored_keys
-        scored_count = len(matched_keys)
-        unscored_keys = enriched_keys - scored_keys
-        extra_scored_keys = scored_keys - enriched_keys
-        duplicate_enriched = sum(count - 1 for count in enriched_identities.values() if count > 1)
-        duplicate_scored = sum(count - 1 for count in scored_identities.values() if count > 1)
-        unscored = len(unscored_keys)
-        identities_clean = not any(
-            (
-                unscored_keys,
-                extra_scored_keys,
-                duplicate_enriched,
-                duplicate_scored,
-                missing_enriched_identities,
-                missing_scored_identities,
+        current_schema_errors = [
+            f"row {index + 1}: {error}"
+            for index, row in enumerate(scored_rows)
+            for error in validate_current_scored_row(row)
+        ]
+        current_compatible = bool(scored_rows) and not current_schema_errors
+
+        custom_receipts: list[tuple[Path, dict[str, Any]]] = []
+        for receipt_path in sorted(paths.airtable_receipts_dir.glob("*.json")):
+            receipt, receipt_error = _read_json(receipt_path)
+            if receipt_error:
+                issues.append(
+                    _issue(
+                        "invalid_custom_airtable_receipt",
+                        "blocked",
+                        f"Custom Airtable receipt {receipt_path.name} could not be read: {receipt_error}.",
+                    )
+                )
+                continue
+            validation_error = validate_verified_cohort_receipt(
+                receipt,
+                paths=paths,
+                scored_identities=scored_keys,
             )
-        )
-        scoring_complete = bool(enriched_count) and identities_clean and scored_count == enriched_count
+            if validation_error:
+                issues.append(
+                    _issue(
+                        "invalid_custom_airtable_receipt",
+                        "blocked",
+                        f"Custom Airtable receipt {receipt_path.name} is invalid: {validation_error}.",
+                    )
+                )
+                continue
+            custom_receipts.append((receipt_path, receipt))
+        latest_custom_path: Path | None = None
+        latest_custom: dict[str, Any] = {}
+        if custom_receipts:
+            latest_custom_path, latest_custom = max(
+                custom_receipts,
+                key=lambda item: _activity_sort_value(item[1].get("recorded_at")),
+            )
+        custom_count = int(latest_custom.get("record_count") or 0)
+
         effective_tiered_rows = tiered_rows or (scored_rows if tiered_path == base_scored_path else [])
         declared_tiers = _tier_counts(effective_tiered_rows)
         readiness_mismatches = [
             row
             for row in effective_tiered_rows
+            if lifecycle == "active"
+            and current_compatible
             if str(row.get("Packet Tier") or "").strip() == PACKET_TIER_SENDABLE
             and not is_contact_ready(row)
         ]
         tiers = dict(declared_tiers)
-        tiers["sendable"] = sum(
-            1
-            for row in effective_tiered_rows
-            if str(row.get("Packet Tier") or "").strip() == PACKET_TIER_SENDABLE
-            and is_contact_ready(row)
+        current_sendable = (
+            sum(1 for row in effective_tiered_rows if is_contact_ready(row))
+            if lifecycle == "active" and current_compatible
+            else None
         )
+        if current_sendable is not None:
+            tiers["sendable"] = current_sendable
+        historical_tiers = declared_tiers if lifecycle == "legacy" else None
         expected_packet_rows = [
             row
             for row in effective_tiered_rows
@@ -557,44 +647,24 @@ class DashboardRepository:
 
         if unscored:
             issues.append(_issue("unscored_leads", "attention", f"{unscored} enriched lead(s) remain unscored."))
-        if extra_scored_keys:
+        if reconciliation.status == "unknown":
             issues.append(
                 _issue(
-                    "extra_scored_identities",
+                    "identity_reconciliation_unknown",
                     "blocked",
-                    f"Scored output contains {len(extra_scored_keys)} identity key(s) absent from enrichment.",
+                    "Enriched and scored artifacts could not be reconciled one-to-one "
+                    f"(matched={reconciliation.matched}, "
+                    f"unmatched_scored={reconciliation.unmatched_scored}, "
+                    f"ambiguous={reconciliation.ambiguous}).",
                 )
             )
-        if duplicate_enriched:
+        if lifecycle == "active" and scored_rows and not current_compatible:
+            preview = "; ".join(current_schema_errors[:5])
             issues.append(
                 _issue(
-                    "duplicate_enriched_identities",
+                    "incompatible_current_score_schema",
                     "blocked",
-                    f"Enriched output contains {duplicate_enriched} duplicate identity row(s).",
-                )
-            )
-        if duplicate_scored:
-            issues.append(
-                _issue(
-                    "duplicate_scored_identities",
-                    "blocked",
-                    f"Scored output contains {duplicate_scored} duplicate identity row(s).",
-                )
-            )
-        if missing_enriched_identities:
-            issues.append(
-                _issue(
-                    "missing_enriched_identities",
-                    "blocked",
-                    f"Enriched output contains {missing_enriched_identities} row(s) without a stable identity.",
-                )
-            )
-        if missing_scored_identities:
-            issues.append(
-                _issue(
-                    "missing_scored_identities",
-                    "blocked",
-                    f"Scored output contains {missing_scored_identities} row(s) without a stable identity.",
+                    f"Active scored output does not satisfy current schema v2: {preview}.",
                 )
             )
         if readiness_mismatches:
@@ -627,17 +697,17 @@ class DashboardRepository:
                     f"duplicates={duplicate_packets}, unidentified={missing_packet_identities}).",
                 )
             )
-        if scored_count and not tiered_current:
+        if lifecycle == "active" and raw_scored_count and current_compatible and not tiered_current:
             issues.append(_issue("stale_tiered", "attention", "Packet tiers are missing, stale, or row counts do not reconcile."))
-        elif tiered_current and not packets_current:
+        elif lifecycle == "active" and current_compatible and tiered_current and not packets_current:
             issues.append(_issue("stale_packets", "attention", "Packet index is missing, stale, or does not match packet-bearing tiers."))
 
         state_counts = {
             "enriched_rows": enriched_count,
             "scored_rows": raw_scored_count,
             "packet_count": len(packet_rows),
-            "sendable_count": tiers["sendable"],
-            "manual_review_count": tiers["manual_review"],
+            "sendable_count": current_sendable or 0,
+            "manual_review_count": tiers["manual_review"] if current_compatible else 0,
         }
         stored_state_counts = {
             key: _typed_int(state, key, issues, scope="run_state", default=value)
@@ -709,6 +779,15 @@ class DashboardRepository:
             issues.append(_issue("stale_airtable_dry_run", "attention", "Airtable dry-run no longer matches current packet inputs."))
         if state.get("last_live_sync_timestamp") and not live_current:
             issues.append(_issue("stale_live_sync", "attention", "Airtable live receipt no longer matches current packet inputs."))
+        if latest_custom and not live_current:
+            issues.append(
+                _issue(
+                    "partial_airtable_sync",
+                    "attention",
+                    f"Verified custom Airtable cohort '{latest_custom.get('cohort')}' covers "
+                    f"{custom_count} of {raw_scored_count} scored lead(s); this is not a full canonical batch receipt.",
+                )
+            )
 
         has_blocked_issue = any(item["severity"] == "blocked" for item in issues)
         if live_current and scoring_complete and not has_blocked_issue:
@@ -728,6 +807,16 @@ class DashboardRepository:
         else:
             progress = "configured"
 
+        if lifecycle == "legacy":
+            if raw_scored_count:
+                progress = "scored"
+            elif enriched_count:
+                progress = "enriched"
+            elif raw_rows or deduped_rows:
+                progress = "searched"
+            else:
+                progress = "configured"
+
         if has_blocked_issue:
             health = "blocked"
         elif issues:
@@ -735,7 +824,9 @@ class DashboardRepository:
         else:
             health = "healthy"
 
-        if pending_active:
+        if lifecycle == "legacy":
+            next_action = "Legacy batch — preserved history"
+        elif pending_active:
             next_action = "Reply yes/no in Hermes"
         elif not enriched_count:
             next_action = f"/run {paths.vertical} {paths.market} {paths.size}"
@@ -773,10 +864,19 @@ class DashboardRepository:
             health = "blocked"
             if progress in {"finished", "airtable_ready"}:
                 progress = "packets_current" if packets_current and scoring_complete else "scored"
-            next_action = f"/status {batch}"
+            if lifecycle == "active":
+                next_action = f"/status {batch}"
 
         summary = {
             "batch": batch,
+            "lifecycle": lifecycle,
+            "legacy": None
+            if legacy_entry is None
+            else {
+                "legacy_since": legacy_entry.legacy_since,
+                "reason": legacy_entry.reason,
+                "note": legacy_entry.note,
+            },
             "vertical": paths.vertical,
             "market": paths.market,
             "size": paths.size,
@@ -791,17 +891,33 @@ class DashboardRepository:
                 "raw": len(raw_rows),
                 "deduped": len(deduped_rows),
                 "enriched": enriched_count,
-                "scored": scored_count,
+                "scored": raw_scored_count,
                 "unscored": unscored,
                 "packets": len(packet_rows),
-                **tiers,
+                "sendable": current_sendable,
+                "manual_review": tiers["manual_review"] if lifecycle == "active" and current_compatible else None,
+                "watchlist": tiers["watchlist"] if lifecycle == "active" and current_compatible else None,
+                "no_packet": tiers["no_packet"] if lifecycle == "active" and current_compatible else None,
             },
+            "reconciliation": reconciliation.as_dict(),
+            "current_sendability": {
+                "status": "evaluated"
+                if lifecycle == "active" and current_compatible
+                else "incompatible"
+                if scored_rows
+                else "not_scored",
+                "count": current_sendable,
+            },
+            "historical_packets": historical_tiers,
             "stages": {
                 "discovery": {"status": "complete" if (raw_rows or deduped_rows) else "not_started", "count": len(deduped_rows or raw_rows)},
                 "enrichment": {"status": "complete" if enriched_count else "not_started", "count": enriched_count},
-                "scoring": {"status": "complete" if scoring_complete else ("in_progress" if raw_scored_count else "not_started"), "count": scored_count},
-                "packets": {"status": "complete" if packets_current else ("stale" if raw_scored_count else "not_started"), "count": len(packet_rows)},
-                "airtable": {"status": "complete" if live_current else ("ready" if dry_clean else ("in_progress" if state.get("last_airtable_dry_run_timestamp") else "not_started")), "count": live_post_count + live_patch_count},
+                "scoring": {"status": "complete" if scoring_complete else ("in_progress" if raw_scored_count else "not_started"), "count": raw_scored_count},
+                "packets": {"status": "historical" if lifecycle == "legacy" and raw_scored_count else ("complete" if packets_current else ("stale" if raw_scored_count else "not_started")), "count": len(packet_rows)},
+                "airtable": {
+                    "status": "complete" if live_current else ("partial" if latest_custom else ("ready" if dry_clean else ("in_progress" if state.get("last_airtable_dry_run_timestamp") else "not_started"))),
+                    "count": live_post_count + live_patch_count if live_current else custom_count,
+                },
             },
             "issues": issues,
             "latest_activity_at": updated_at,
@@ -822,11 +938,23 @@ class DashboardRepository:
                     "warnings": warnings,
                 },
                 "live": {
-                    "status": "current" if live_current else ("stale" if state.get("last_live_sync_timestamp") else "not_run"),
-                    "timestamp": str(state.get("last_live_sync_timestamp") or ""),
-                    "post": live_post_count,
-                    "patch": live_patch_count,
-                    "skip": live_skip_count,
+                    "status": "current" if live_current else ("stale" if state.get("last_live_sync_timestamp") else ("partial" if latest_custom else "not_run")),
+                    "timestamp": str(state.get("last_live_sync_timestamp") or latest_custom.get("recorded_at") or ""),
+                    "post": live_post_count if state.get("last_live_sync_timestamp") else int(latest_custom.get("live_post_count") or 0),
+                    "patch": live_patch_count if state.get("last_live_sync_timestamp") else int(latest_custom.get("live_patch_count") or 0),
+                    "skip": live_skip_count if state.get("last_live_sync_timestamp") else int(latest_custom.get("live_skip_count") or 0),
+                },
+                "custom": {
+                    "status": "verified" if latest_custom else "not_run",
+                    "cohort": str(latest_custom.get("cohort") or ""),
+                    "timestamp": str(latest_custom.get("recorded_at") or ""),
+                    "records": custom_count,
+                    "verification_patch": int(latest_custom.get("verification_patch_count") or 0),
+                },
+                "evidence": {
+                    "status": "verified" if live_current else ("partial" if latest_custom else "unknown"),
+                    "timestamp": str(state.get("last_live_sync_timestamp") or latest_custom.get("recorded_at") or ""),
+                    "records": live_post_count + live_patch_count if live_current else (custom_count if latest_custom else None),
                 },
                 "current_input_hash": current_hash,
             },
@@ -840,9 +968,19 @@ class DashboardRepository:
                 "packets": _path_meta(paths.packet_index, self.root, rows=len(packet_rows)),
                 "run_state": _path_meta(paths.state_json, self.root),
                 "llm_usage": _path_meta(paths.usage_json, self.root),
+                "airtable_custom_receipt": _path_meta(
+                    latest_custom_path or (paths.airtable_receipts_dir / "<none>.json"),
+                    self.root,
+                    rows=custom_count if latest_custom else None,
+                ),
             },
         }
-        return BatchRead(summary=summary, scored_rows=tiered_rows or scored_rows, enriched_rows=enriched_rows)
+        return BatchRead(
+            summary=summary,
+            scored_rows=scored_rows,
+            enriched_rows=enriched_rows,
+            reconciliation=reconciliation,
+        )
 
     def _filtered(
         self,
@@ -855,6 +993,7 @@ class DashboardRepository:
         query: str = "",
         unscored: bool | None = None,
         finished: bool | None = None,
+        lifecycle: Literal["all", "active", "legacy"] = "all",
     ) -> list[dict[str, Any]]:
         items = [read.summary for read in reads.values()]
         normalized_query = query.strip().casefold()
@@ -869,25 +1008,46 @@ class DashboardRepository:
                 items = [item for item in items if item["health"] != "healthy"]
             else:
                 items = [item for item in items if item["health"] == health]
+        if lifecycle != "all":
+            items = [item for item in items if item["lifecycle"] == lifecycle]
         if normalized_query:
             items = [
                 item for item in items
                 if normalized_query in f"{item['batch']} {item['vertical']} {item['market']}".casefold()
             ]
         if unscored is not None:
-            items = [item for item in items if (item["counts"]["unscored"] > 0) is unscored]
+            if unscored:
+                items = [
+                    item
+                    for item in items
+                    if isinstance(item["counts"]["unscored"], int)
+                    and item["counts"]["unscored"] > 0
+                ]
+            else:
+                items = [item for item in items if item["counts"]["unscored"] == 0]
         if finished is not None:
             items = [item for item in items if (item["progress"] == "finished") is finished]
         return items
 
     def overview(self, *, vertical: str = "", market: str = "", force: bool = False) -> dict[str, Any]:
         reads, ignored = self._scan(force=force)
-        items = self._filtered(reads, vertical=vertical, market=market)
+        all_items = self._filtered(
+            reads, vertical=vertical, market=market, lifecycle="all"
+        )
+        items = [item for item in all_items if item["lifecycle"] == "active"]
+        inventory_totals = {
+            "all": len(all_items),
+            "active": len(items),
+            "legacy": sum(item["lifecycle"] == "legacy" for item in all_items),
+        }
         totals = {
             "batches": len(items),
             "needs_attention": sum(1 for item in items if item["health"] != "healthy"),
-            "unscored": sum(item["counts"]["unscored"] for item in items),
-            "sendable": sum(item["counts"]["sendable"] for item in items),
+            "unscored": sum(item["counts"]["unscored"] or 0 for item in items),
+            "unknown_unscored_batches": sum(
+                item["counts"]["unscored"] is None for item in items
+            ),
+            "sendable": sum(item["counts"]["sendable"] or 0 for item in items),
             "airtable_ready": sum(1 for item in items if item["progress"] == "airtable_ready"),
             "finished": sum(1 for item in items if item["progress"] == "finished"),
         }
@@ -918,6 +1078,7 @@ class DashboardRepository:
         return {
             "generated_at": _utc_now().isoformat(),
             "repo_root": str(self.root),
+            "inventory_totals": inventory_totals,
             "totals": totals,
             "pipeline": pipeline,
             "attention": attention[:12],
@@ -926,6 +1087,7 @@ class DashboardRepository:
                 "markets": sorted({item.summary["market"] for item in reads.values()}),
                 "progress": list(PROGRESS_ORDER),
                 "health": list(HEALTH_ORDER),
+                "lifecycles": ["active", "legacy"],
             },
             "source_health": {
                 "ignored_noncanonical_artifacts": ignored,
@@ -943,6 +1105,7 @@ class DashboardRepository:
         query: str = "",
         unscored: bool | None = None,
         finished: bool | None = None,
+        lifecycle: Literal["all", "active", "legacy"] = "all",
         force: bool = False,
     ) -> dict[str, Any]:
         reads, _ = self._scan(force=force)
@@ -955,11 +1118,12 @@ class DashboardRepository:
             query=query,
             unscored=unscored,
             finished=finished,
+            lifecycle=lifecycle,
         )
         items.sort(
             key=lambda item: (
                 item["health_rank"],
-                -item["counts"]["unscored"],
+                -(item["counts"]["unscored"] or 0),
                 -_activity_sort_value(item["latest_activity_at"]),
             )
         )
@@ -988,17 +1152,34 @@ class DashboardRepository:
         read = reads.get(batch)
         if read is None:
             return None
-        scored_by_key = {_row_key(row): row for row in read.scored_rows if _row_key(row)}
         items: list[dict[str, Any]] = []
-        seen: set[str] = set()
+        seen_scored_indexes: set[int] = set()
+        lifecycle = read.summary["lifecycle"]
+        sendability_status = read.summary["current_sendability"]["status"]
 
         def clean_scored(row: dict[str, Any], scoring_state: str) -> dict[str, Any]:
             packet_tier = str(row.get("Packet Tier") or "")
             declared_sendable = _yes(row.get("Sendable"))
-            effective_sendable = packet_tier == PACKET_TIER_SENDABLE and is_contact_ready(row)
-            readiness_mismatch = declared_sendable != effective_sendable or (
-                packet_tier == PACKET_TIER_SENDABLE
-            ) != effective_sendable
+            if scoring_state == "unscored":
+                effective_sendable: bool | None = None
+                readiness_mismatch = False
+                sendability_state = "not_scored"
+            elif lifecycle == "legacy":
+                effective_sendable = None
+                readiness_mismatch = False
+                sendability_state = "historical"
+            elif sendability_status != "evaluated":
+                effective_sendable = None
+                readiness_mismatch = False
+                sendability_state = "incompatible"
+            else:
+                effective_sendable = (
+                    packet_tier == PACKET_TIER_SENDABLE and is_contact_ready(row)
+                )
+                readiness_mismatch = declared_sendable != effective_sendable or (
+                    packet_tier == PACKET_TIER_SENDABLE
+                ) != effective_sendable
+                sendability_state = "current"
             return {
                 "key": _row_key(row),
                 "scoring_state": scoring_state,
@@ -1010,6 +1191,7 @@ class DashboardRepository:
                 "priority": str(_first(row, "Lead Priority", "Grade", "grade")),
                 "packet_tier": packet_tier,
                 "sendable": effective_sendable,
+                "sendability_state": sendability_state,
                 "declared_sendable": declared_sendable,
                 "readiness_mismatch": readiness_mismatch,
                 "money_signal": _yes(_first(row, "Money Signal", "money_signal")),
@@ -1017,18 +1199,20 @@ class DashboardRepository:
                 "blockers": str(_first(row, "Send Blockers", "Sendability Blockers")),
             }
 
-        for enriched in read.enriched_rows:
+        for enriched_index, enriched in enumerate(read.enriched_rows):
             google = _enriched_google(enriched)
-            key = _enriched_key(enriched)
-            scored = scored_by_key.get(key)
-            if scored:
-                items.append(clean_scored(scored, "scored"))
+            scored_index = read.reconciliation.scored_by_enriched_index.get(
+                enriched_index
+            )
+            if scored_index is not None:
+                items.append(
+                    clean_scored(read.scored_rows[scored_index], "scored")
+                )
+                seen_scored_indexes.add(scored_index)
             else:
                 items.append(clean_scored(google, "unscored"))
-            if key:
-                seen.add(key)
-        for key, scored in scored_by_key.items():
-            if key not in seen:
+        for scored_index, scored in enumerate(read.scored_rows):
+            if scored_index not in seen_scored_indexes:
                 items.append(clean_scored(scored, "scored"))
 
         normalized_query = query.strip().casefold()
@@ -1065,10 +1249,13 @@ class DashboardRepository:
 
     def health(self) -> dict[str, Any]:
         names, ignored = self._candidate_names()
+        legacy_count = sum(name in self._legacy_batches for name in names)
         return {
             "ok": self.root.is_dir(),
             "repo_root": str(self.root),
             "canonical_batches": len(names),
+            "active_batches": len(names) - legacy_count,
+            "legacy_batches": legacy_count,
             "ignored_noncanonical_artifacts": ignored,
             "generated_at": _utc_now().isoformat(),
         }

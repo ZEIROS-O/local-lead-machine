@@ -36,6 +36,10 @@ function formatNumber(value: number): string {
   return new Intl.NumberFormat().format(value);
 }
 
+function countText(value: number | null): string {
+  return value === null ? "Unknown" : formatNumber(value);
+}
+
 function StatusPill({ health, label }: { health?: Health; label: string }) {
   return <span className={`status-pill ${health ? `status-${health}` : ""}`}>{label}</span>;
 }
@@ -64,10 +68,10 @@ function AppShell({ children, refreshedAt, stale, onRefresh }: { children: React
 
 function MetricStrip({ overview }: { overview: Overview }) {
   const metrics = [
-    ["Canonical batches", overview.totals.batches],
+    ["Active batches", overview.totals.batches],
     ["Need attention", overview.totals.needs_attention],
     ["Unscored leads", overview.totals.unscored],
-    ["Sendable packets", overview.totals.sendable],
+    ["Current sendable", overview.totals.sendable],
     ["Airtable ready", overview.totals.airtable_ready],
     ["Finished", overview.totals.finished],
   ] as const;
@@ -104,6 +108,7 @@ function PipelineRail({ stages }: { stages: Overview["pipeline"] }) {
 interface Filters {
   vertical: string;
   market: string;
+  lifecycle: string;
   view: string;
   q: string;
 }
@@ -114,6 +119,7 @@ function FilterBar({ filters, setFilters, options }: { filters: Filters; setFilt
       <label><span>Find batch</span><input value={filters.q} onChange={(event) => setFilters({ ...filters, q: event.target.value })} placeholder="Vertical, market, or batch" /></label>
       <label><span>Vertical</span><select value={filters.vertical} onChange={(event) => setFilters({ ...filters, vertical: event.target.value })}><option value="">All verticals</option>{options.verticals.map((value) => <option key={value}>{value}</option>)}</select></label>
       <label><span>Market</span><select value={filters.market} onChange={(event) => setFilters({ ...filters, market: event.target.value })}><option value="">All markets</option>{options.markets.map((value) => <option key={value}>{value}</option>)}</select></label>
+      <label><span>Lifecycle</span><select value={filters.lifecycle} onChange={(event) => setFilters({ ...filters, lifecycle: event.target.value })}><option value="all">All batches</option><option value="active">Active</option><option value="legacy">Legacy</option></select></label>
       <label><span>View</span><select value={filters.view} onChange={(event) => setFilters({ ...filters, view: event.target.value })}><option value="">All batches</option><option value="attention">Needs attention</option><option value="unscored">Has unscored leads</option><option value="airtable_ready">Airtable ready</option><option value="finished">Finished</option></select></label>
     </div>
   );
@@ -140,12 +146,12 @@ function BatchTable({ batches }: { batches: BatchSummary[] }) {
         <thead><tr><th>Batch</th><th>Progress</th><th>Enriched / scored</th><th>Unscored</th><th>Packet mix</th><th>Airtable</th><th>Latest activity</th><th>Next action</th></tr></thead>
         <tbody>{batches.map((batch) => (
           <tr key={batch.batch}>
-            <td data-label="Batch"><Link className="batch-link" to={`/batches/${batch.batch}`}>{batch.batch}</Link><small>{humanize(batch.vertical)} · {humanize(batch.market)} · {batch.size}</small></td>
+            <td data-label="Batch"><Link className="batch-link" to={`/batches/${batch.batch}`}>{batch.batch}</Link><span className={`lifecycle-badge lifecycle-${batch.lifecycle}`}>{humanize(batch.lifecycle)}</span><small>{humanize(batch.vertical)} · {humanize(batch.market)} · {batch.size}</small></td>
             <td data-label="Progress"><StatusPill health={batch.health} label={progressLabels[batch.progress]} /></td>
             <td data-label="Enriched / scored"><strong className="tabular">{batch.counts.enriched} / {batch.counts.scored}</strong></td>
-            <td data-label="Unscored"><span className={batch.counts.unscored ? "attention-number" : "quiet-number"}>{batch.counts.unscored}</span></td>
-            <td data-label="Packet mix"><span className="packet-mix"><b>{batch.counts.sendable}</b> sendable <i /> <b>{batch.counts.manual_review}</b> manual</span></td>
-            <td data-label="Airtable"><span className={`receipt-status receipt-${batch.airtable.live.status}`}>{humanize(batch.airtable.live.status)}</span></td>
+            <td data-label="Unscored"><span className={`unscored-value ${batch.counts.unscored ? "attention-number" : "quiet-number"}`}>{countText(batch.counts.unscored)}</span></td>
+            <td data-label="Packet mix">{batch.lifecycle === "legacy" && batch.historical_packets ? <span className="packet-mix historical-packet"><span>{batch.historical_packets.sendable} historical packet-ready</span> <i /> <span>{batch.historical_packets.manual_review} historical manual</span></span> : <span className="packet-mix"><b>{countText(batch.counts.sendable)}</b> current sendable <i /> <b>{countText(batch.counts.manual_review)}</b> manual</span>}</td>
+            <td data-label="Airtable"><span className={`receipt-status receipt-${batch.airtable.evidence.status}`}>{humanize(batch.airtable.evidence.status)}</span></td>
             <td data-label="Latest activity"><time dateTime={batch.latest_activity_at}>{formatTime(batch.latest_activity_at)}</time></td>
             <td data-label="Next action"><code>{batch.next_action}</code></td>
           </tr>
@@ -159,7 +165,7 @@ function BatchTable({ batches }: { batches: BatchSummary[] }) {
 function OverviewPage() {
   const [overview, setOverview] = useState<Overview | null>(null);
   const [batches, setBatches] = useState<BatchSummary[]>([]);
-  const [filters, setFilters] = useState<Filters>({ vertical: "", market: "", view: "", q: "" });
+  const [filters, setFilters] = useState<Filters>({ vertical: "", market: "", lifecycle: "all", view: "", q: "" });
   const [error, setError] = useState("");
   const request = useRef<{ generation: number; controller: AbortController | null }>({ generation: 0, controller: null });
 
@@ -170,7 +176,7 @@ function OverviewPage() {
     request.current = { generation, controller };
     try {
       const base = { vertical: filters.vertical, market: filters.market, refresh: manual || undefined };
-      const batchQuery: Record<string, string | boolean | undefined> = { ...base, q: filters.q };
+      const batchQuery: Record<string, string | boolean | undefined> = { ...base, q: filters.q, lifecycle: filters.lifecycle };
       if (filters.view === "attention") batchQuery.health = "needs_attention";
       if (filters.view === "unscored") batchQuery.unscored = true;
       if (filters.view === "airtable_ready") batchQuery.progress = "airtable_ready";
@@ -214,7 +220,7 @@ function OverviewPage() {
         <PipelineRail stages={overview.pipeline} />
         <section className="operations-grid">
           <div className="inventory-section">
-            <div className="section-heading"><div><span className="eyebrow">Batch inventory</span><h2>Available work</h2></div><p>{batches.length} canonical batch{batches.length === 1 ? "" : "es"} in this view</p></div>
+            <div className="section-heading"><div><span className="eyebrow">Batch inventory</span><h2>Available work</h2></div><p>{batches.length} of {overview.inventory_totals.all} batch{overview.inventory_totals.all === 1 ? "" : "es"} in this view</p></div>
             <FilterBar filters={filters} setFilters={setFilters} options={overview.filters} />
             <BatchTable batches={batches} />
           </div>
@@ -242,8 +248,8 @@ function UsagePanel({ batch }: { batch: BatchSummary }) {
 }
 
 function AirtablePanel({ batch }: { batch: BatchSummary }) {
-  const { dry_run: dry, live } = batch.airtable;
-  return <section className="detail-panel airtable-panel"><div className="panel-heading"><span>Airtable receipts</span><small>Local state only</small></div><div className="receipt-grid"><div><span>Dry-run</span><strong className={`receipt-status receipt-${dry.status}`}>{humanize(dry.status)}</strong><small>{formatTime(dry.timestamp)}</small><dl><div><dt>POST</dt><dd>{dry.post}</dd></div><div><dt>PATCH</dt><dd>{dry.patch}</dd></div><div><dt>SKIP</dt><dd>{dry.skip}</dd></div></dl></div><div><span>Live</span><strong className={`receipt-status receipt-${live.status}`}>{humanize(live.status)}</strong><small>{formatTime(live.timestamp)}</small><dl><div><dt>POST</dt><dd>{live.post}</dd></div><div><dt>PATCH</dt><dd>{live.patch}</dd></div><div><dt>SKIP</dt><dd>{live.skip}</dd></div></dl></div></div></section>;
+  const { dry_run: dry, live, custom, evidence } = batch.airtable;
+  return <section className="detail-panel airtable-panel"><div className="panel-heading"><span>Airtable receipts</span><small>Evidence: {humanize(evidence.status)}{evidence.records === null ? "" : ` · ${evidence.records} rows`}</small></div><div className="receipt-grid"><div><span>Dry-run</span><strong className={`receipt-status receipt-${dry.status}`}>{humanize(dry.status)}</strong><small>{formatTime(dry.timestamp)}</small><dl><div><dt>POST</dt><dd>{dry.post}</dd></div><div><dt>PATCH</dt><dd>{dry.patch}</dd></div><div><dt>SKIP</dt><dd>{dry.skip}</dd></div></dl></div><div><span>Live</span><strong className={`receipt-status receipt-${live.status}`}>{humanize(live.status)}</strong><small>{formatTime(live.timestamp)}</small><dl><div><dt>POST</dt><dd>{live.post}</dd></div><div><dt>PATCH</dt><dd>{live.patch}</dd></div><div><dt>SKIP</dt><dd>{live.skip}</dd></div></dl></div><div><span>Custom cohort</span><strong className={`receipt-status receipt-${custom.status}`}>{humanize(custom.status)}</strong><small>{custom.cohort ? humanize(custom.cohort) : "No custom receipt"}</small><dl><div><dt>ROWS</dt><dd>{custom.records}</dd></div><div><dt>VERIFIED</dt><dd>{custom.verification_patch}</dd></div><div><dt>AT</dt><dd>{formatTime(custom.timestamp)}</dd></div></dl></div></div></section>;
 }
 
 function ArtifactPanel({ batch }: { batch: BatchSummary }) {
@@ -251,7 +257,13 @@ function ArtifactPanel({ batch }: { batch: BatchSummary }) {
 }
 
 function LeadTable({ response }: { response: LeadsResponse }) {
-  return <div className="table-wrap"><table className="lead-table"><thead><tr><th>Business</th><th>Scoring</th><th>Score</th><th>Priority</th><th>Packet tier</th><th>Money signal</th><th>Sendable</th><th>Confidence</th><th>Blockers</th></tr></thead><tbody>{response.items.map((lead, index) => <tr key={lead.key || `${lead.business_name}-${index}`}><td data-label="Business"><strong>{lead.business_name || "Unnamed lead"}</strong><small>{lead.city}</small><span className="row-links">{lead.website_url && <a href={lead.website_url} target="_blank" rel="noreferrer">Website</a>}{lead.google_maps_url && <a href={lead.google_maps_url} target="_blank" rel="noreferrer">Maps</a>}</span></td><td data-label="Scoring"><span className={`scoring-state ${lead.scoring_state}`}>{humanize(lead.scoring_state)}</span></td><td data-label="Score"><strong className="tabular">{lead.score_total || "—"}</strong></td><td data-label="Priority">{lead.priority || "—"}</td><td data-label="Packet tier">{lead.packet_tier || "—"}</td><td data-label="Money signal">{lead.money_signal ? "Present" : "No"}</td><td data-label="Sendable">{lead.sendable ? "Yes" : lead.readiness_mismatch ? "No — contract mismatch" : "No"}</td><td data-label="Confidence">{lead.ai_confidence || "—"}</td><td data-label="Blockers"><span className="blocker-text">{lead.blockers || "None recorded"}</span></td></tr>)}</tbody></table>{!response.items.length && <div className="empty-state table-empty"><strong>No leads match this view</strong><p>Adjust the scoring-state filter or search term.</p></div>}</div>;
+  const sendabilityLabel = (lead: LeadsResponse["items"][number]) => {
+    if (lead.sendability_state === "historical") return "Historical";
+    if (lead.sendability_state === "not_scored") return "Not scored";
+    if (lead.sendability_state === "incompatible") return "Unknown — incompatible";
+    return lead.sendable ? "Yes" : lead.readiness_mismatch ? "No — contract mismatch" : "No";
+  };
+  return <div className="table-wrap"><table className="lead-table"><thead><tr><th>Business</th><th>Scoring</th><th>Score</th><th>Priority</th><th>Packet tier</th><th>Money signal</th><th>Sendable</th><th>Confidence</th><th>Blockers</th></tr></thead><tbody>{response.items.map((lead, index) => <tr key={lead.key || `${lead.business_name}-${index}`}><td data-label="Business"><strong>{lead.business_name || "Unnamed lead"}</strong><small>{lead.city}</small><span className="row-links">{lead.website_url && <a href={lead.website_url} target="_blank" rel="noreferrer">Website</a>}{lead.google_maps_url && <a href={lead.google_maps_url} target="_blank" rel="noreferrer">Maps</a>}</span></td><td data-label="Scoring"><span className={`scoring-state ${lead.scoring_state}`}>{humanize(lead.scoring_state)}</span></td><td data-label="Score"><strong className="tabular">{lead.score_total || "—"}</strong></td><td data-label="Priority">{lead.priority || "—"}</td><td data-label="Packet tier">{lead.packet_tier || "—"}</td><td data-label="Money signal">{lead.money_signal ? "Present" : "No"}</td><td data-label="Sendable">{sendabilityLabel(lead)}</td><td data-label="Confidence">{lead.ai_confidence || "—"}</td><td data-label="Blockers"><span className="blocker-text">{lead.blockers || "None recorded"}</span></td></tr>)}</tbody></table>{!response.items.length && <div className="empty-state table-empty"><strong>No leads match this view</strong><p>Adjust the scoring-state filter or search term.</p></div>}</div>;
 }
 
 function BatchDetailPage() {
@@ -296,7 +308,7 @@ function BatchDetailPage() {
   const manualRefresh = () => void load(true);
   if (!batch || !leads) return <AppShell stale={Boolean(error)}><div className="loading-screen"><div className="loading-rail" /><strong>Reading batch artifacts…</strong>{error && <p>{error}</p>}<Link to="/">Return to overview</Link></div></AppShell>;
 
-  return <AppShell refreshedAt={leads.generated_at} stale={Boolean(error)} onRefresh={manualRefresh}><div className="page detail-page"><nav className="breadcrumb" aria-label="Breadcrumb"><Link to="/">Pipeline overview</Link><span>/</span><span>{batch.batch}</span></nav><section className="detail-header"><div><span className="eyebrow">{humanize(batch.vertical)} · {humanize(batch.market)} · {batch.size}</span><h1>{batch.batch}</h1><p>{batch.counts.enriched} enriched, {batch.counts.scored} scored, {batch.counts.unscored} waiting.</p></div><div className="header-status"><StatusPill health={batch.health} label={progressLabels[batch.progress]} /><small>Latest artifact {formatTime(batch.latest_activity_at)}</small></div></section><DetailStageRail batch={batch} />{batch.issues.length > 0 && <section className="issue-list" aria-labelledby="batch-issues"><div><span className="eyebrow">Current health</span><h2 id="batch-issues">{batch.issues.length} item{batch.issues.length === 1 ? "" : "s"} to resolve</h2></div><ul>{batch.issues.map((issue) => <li key={issue.code}><span className={`severity-mark ${issue.severity}`} /><div><strong>{humanize(issue.code)}</strong><p>{issue.message}</p></div></li>)}</ul></section>}<section className="next-action"><span>Recommended next command</span><code>{batch.next_action}</code><small>Display only. This dashboard cannot execute commands.</small></section><div className="detail-grid"><UsagePanel batch={batch} /><AirtablePanel batch={batch} /></div><ArtifactPanel batch={batch} /><section className="lead-section"><div className="section-heading"><div><span className="eyebrow">Lead triage</span><h2>Current batch rows</h2></div><p>{leads.total} lead{leads.total === 1 ? "" : "s"}; contact fields intentionally excluded</p></div><div className="lead-toolbar"><label><span>Find business</span><input value={query} onChange={(event) => { setQuery(event.target.value); setPage(1); }} placeholder="Business or city" /></label><label><span>Scoring state</span><select value={leadState} onChange={(event) => { setLeadState(event.target.value); setPage(1); }}><option value="all">All leads</option><option value="unscored">Unscored only</option><option value="scored">Scored only</option></select></label></div><LeadTable response={leads} />{leads.pages > 1 && <nav className="pagination" aria-label="Lead pages"><button disabled={page <= 1} onClick={() => setPage((value) => value - 1)}>Previous page</button><span>Page {leads.page} of {leads.pages}</span><button disabled={page >= leads.pages} onClick={() => setPage((value) => value + 1)}>Next page</button></nav>}</section></div></AppShell>;
+  return <AppShell refreshedAt={leads.generated_at} stale={Boolean(error)} onRefresh={manualRefresh}><div className="page detail-page"><nav className="breadcrumb" aria-label="Breadcrumb"><Link to="/">Pipeline overview</Link><span>/</span><span>{batch.batch}</span></nav><section className="detail-header"><div><span className="eyebrow">{humanize(batch.vertical)} · {humanize(batch.market)} · {batch.size}</span><h1>{batch.batch}</h1><p>{batch.counts.enriched} enriched, {batch.counts.scored} scored, {countText(batch.counts.unscored)} waiting.</p>{batch.legacy && <p className="legacy-note">Historical batch · {batch.legacy.note || humanize(batch.legacy.reason)}</p>}</div><div className="header-status"><span className={`lifecycle-badge lifecycle-${batch.lifecycle}`}>{humanize(batch.lifecycle)}</span><StatusPill health={batch.health} label={progressLabels[batch.progress]} /><small>Latest artifact {formatTime(batch.latest_activity_at)}</small></div></section><DetailStageRail batch={batch} />{batch.issues.length > 0 && <section className="issue-list" aria-labelledby="batch-issues"><div><span className="eyebrow">Current health</span><h2 id="batch-issues">{batch.issues.length} item{batch.issues.length === 1 ? "" : "s"} to resolve</h2></div><ul>{batch.issues.map((issue) => <li key={issue.code}><span className={`severity-mark ${issue.severity}`} /><div><strong>{humanize(issue.code)}</strong><p>{issue.message}</p></div></li>)}</ul></section>}<section className="next-action"><span>Recommended next command</span><code>{batch.next_action}</code><small>Display only. This dashboard cannot execute commands.</small></section><div className="detail-grid"><UsagePanel batch={batch} /><AirtablePanel batch={batch} /></div><ArtifactPanel batch={batch} /><section className="lead-section"><div className="section-heading"><div><span className="eyebrow">Lead triage</span><h2>Current batch rows</h2></div><p>{leads.total} lead{leads.total === 1 ? "" : "s"}; contact fields intentionally excluded</p></div><div className="lead-toolbar"><label><span>Find business</span><input value={query} onChange={(event) => { setQuery(event.target.value); setPage(1); }} placeholder="Business or city" /></label><label><span>Scoring state</span><select value={leadState} onChange={(event) => { setLeadState(event.target.value); setPage(1); }}><option value="all">All leads</option><option value="unscored">Unscored only</option><option value="scored">Scored only</option></select></label></div><LeadTable response={leads} />{leads.pages > 1 && <nav className="pagination" aria-label="Lead pages"><button disabled={page <= 1} onClick={() => setPage((value) => value - 1)}>Previous page</button><span>Page {leads.page} of {leads.pages}</span><button disabled={page >= leads.pages} onClick={() => setPage((value) => value + 1)}>Next page</button></nav>}</section></div></AppShell>;
 }
 
 export default function App() {

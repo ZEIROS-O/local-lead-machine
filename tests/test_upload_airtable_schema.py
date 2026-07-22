@@ -8,9 +8,36 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import upload_airtable as ua
+from lead_machine.airtable_sync import AIRTABLE_ALLOWED_FIELDS
+
+
+LEGACY_FIELDS = {
+    "Legacy Current Website Quality",
+    "Legacy Send Trigger",
+    "Legacy Last Contacted",
+    "Legacy Recommended Action",
+    "Legacy Form Strength",
+    "Legacy CTA Strength",
+    "Legacy Skip Reason",
+}
+CANONICAL_FIELDS = {
+    "Current Website Quality",
+    "Send Trigger",
+    "Last Contacted",
+    "Recommended Action",
+    "Form Strength",
+    "CTA Strength",
+    "Skip Reason",
+}
 
 
 class SchemaReportContentTest(unittest.TestCase):
+    def test_active_schema_has_canonical_fields_and_no_legacy_fields(self):
+        schema_fields = {field for field, _, _ in ua._FIELD_SCHEMA}
+        for active_fields in (schema_fields, set(ua.CSV_AIRTABLE_FIELDS), set(AIRTABLE_ALLOWED_FIELDS)):
+            self.assertTrue(CANONICAL_FIELDS.issubset(active_fields))
+            self.assertTrue(LEGACY_FIELDS.isdisjoint(active_fields))
+
     def test_schema_report_includes_buyer_intent_signals(self):
         report = ua.build_schema_report()
         fields = [row["field"] for row in report]

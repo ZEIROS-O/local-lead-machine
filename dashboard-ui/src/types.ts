@@ -1,4 +1,5 @@
 export type Health = "healthy" | "attention" | "blocked";
+export type Lifecycle = "active" | "legacy";
 export type Progress =
   | "configured"
   | "searched"
@@ -17,6 +18,8 @@ export interface Issue {
 
 export interface BatchSummary {
   batch: string;
+  lifecycle: Lifecycle;
+  legacy: { legacy_since: string; reason: string; note: string } | null;
   vertical: string;
   market: string;
   size: string;
@@ -32,13 +35,22 @@ export interface BatchSummary {
     deduped: number;
     enriched: number;
     scored: number;
-    unscored: number;
+    unscored: number | null;
     packets: number;
-    sendable: number;
-    manual_review: number;
-    watchlist: number;
-    no_packet: number;
+    sendable: number | null;
+    manual_review: number | null;
+    watchlist: number | null;
+    no_packet: number | null;
   };
+  reconciliation: {
+    status: "reconciled" | "unknown";
+    matched: number;
+    unmatched_enriched: number | null;
+    unmatched_scored: number;
+    ambiguous: number;
+  };
+  current_sendability: { status: "evaluated" | "incompatible" | "not_scored"; count: number | null };
+  historical_packets: { sendable: number; manual_review: number; watchlist: number; no_packet: number } | null;
   stages: Record<string, { status: string; count: number }>;
   issues: Issue[];
   latest_activity_at: string;
@@ -59,6 +71,8 @@ export interface BatchSummary {
   airtable: {
     dry_run: { status: string; timestamp: string; post: number; patch: number; skip: number; warnings: string[] };
     live: { status: string; timestamp: string; post: number; patch: number; skip: number };
+    custom: { status: string; cohort: string; timestamp: string; records: number; verification_patch: number };
+    evidence: { status: "verified" | "partial" | "unknown"; timestamp: string; records: number | null };
     current_input_hash: string;
   };
   artifacts: Record<string, { path: string; exists: boolean; rows: number | null; size_bytes: number | null; updated_at: string }>;
@@ -67,17 +81,19 @@ export interface BatchSummary {
 export interface Overview {
   generated_at: string;
   repo_root: string;
+  inventory_totals: { all: number; active: number; legacy: number };
   totals: {
     batches: number;
     needs_attention: number;
     unscored: number;
+    unknown_unscored_batches: number;
     sendable: number;
     airtable_ready: number;
     finished: number;
   };
   pipeline: Array<{ key: string; label: string; count: number }>;
   attention: Array<Issue & { batch: string; vertical: string; market: string; latest_activity_at: string; next_action: string }>;
-  filters: { verticals: string[]; markets: string[]; progress: string[]; health: string[] };
+  filters: { verticals: string[]; markets: string[]; progress: string[]; health: string[]; lifecycles: Lifecycle[] };
   source_health: { ignored_noncanonical_artifacts: number; authority: string };
 }
 
@@ -97,7 +113,8 @@ export interface LeadRow {
   score_total: string | number;
   priority: string;
   packet_tier: string;
-  sendable: boolean;
+  sendable: boolean | null;
+  sendability_state: "current" | "historical" | "not_scored" | "incompatible";
   declared_sendable: boolean;
   readiness_mismatch: boolean;
   money_signal: boolean;
