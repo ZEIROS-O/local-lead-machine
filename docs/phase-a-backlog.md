@@ -76,6 +76,17 @@ copy-paste; `--mode manual-llm` still works as fallback.
 **Verify:** unittest stubbing `llm_client.score_batch` to return a recorded bundle, asserting the
 api-llm CSV is byte-identical to `manual-llm` fed the same bundle. Deterministic, no network.
 
+### G1 follow-on — subscription scoring adapter
+
+- [x] Add a manually invoked Codex/Claude adapter around `make_llm_batch.py` bundles and the existing
+  v2 importer. It must verify first-party subscription auth, remove API-provider overrides, run with
+  no tools or repo access, require an exact all-leads bundle, and fail closed on quota limits.
+- [x] Resume only through content-addressed receipts. Existing filenames alone never prove that a
+  score still matches the current evidence prompt; stale or partial state requires explicit `--force`.
+- [x] Keep API-LLM as an explicit fallback and leave the morning/Hermes and Airtable-live paths out
+  of the adapter. Operator workflow and account-side credit warning are in
+  [`subscription-scoring.md`](subscription-scoring.md).
+
 ---
 
 ## G2 — Switch live vertical to car detailing · backlog issue #3 · foundational, must land green

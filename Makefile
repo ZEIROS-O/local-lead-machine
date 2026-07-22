@@ -7,6 +7,7 @@ LIMIT ?= 12
 BATCH_SIZE ?= 5
 BATCH_ID ?= batch_001
 LANE ?= all
+RUNNER ?= codex
 CONFIG ?= search_configs/$(BATCH).json
 MAX_SEARCHES ?=
 MAX_DETAILS ?=
@@ -21,7 +22,7 @@ PACKETS_DIR := packets_$(BATCH)_manual
 SEARCH_REPORT := reports/search_$(BATCH).md
 ICP_REPORT := reports/icp_lanes_$(BATCH).md
 
-.PHONY: test compile status pipeline search search-summary batch batch-lane icp-report save-batch validate-batch import-batch score packets inspect airtable-dry airtable-live full-from-search full-after-llm clean-manual dashboard dashboard-api dashboard-ui dashboard-build dashboard-test
+.PHONY: test compile status pipeline search search-summary batch batch-lane icp-report save-batch validate-batch import-batch score score-batch-subscription packets inspect airtable-dry airtable-live full-from-search full-after-llm full-subscription clean-manual dashboard dashboard-api dashboard-ui dashboard-build dashboard-test
 
 status:
 	@git status --short
@@ -30,7 +31,7 @@ test:
 	$(PY) -m unittest discover -s tests
 
 compile:
-	$(PY) -m py_compile enrich_leads.py score_leads.py make_llm_queue.py make_llm_batch.py import_llm_score_bundle.py make_packets.py run_pipeline.py upload_airtable.py feedback_report.py make_search_batch.py make_icp_lane_report.py collect_review_signals.py collect_external_signals.py scoring_calibration.py lead_machine/icp_lanes.py lead_machine/signals.py lead_machine/review_velocity.py lead_machine/review_pain_verifier.py lead_machine/scoring_profiles.py lead_machine/scoring_v3.py lead_machine/scoring_calibration.py lead_machine/external_signals.py
+	$(PY) -m py_compile enrich_leads.py score_leads.py make_llm_queue.py make_llm_batch.py import_llm_score_bundle.py score_batch_subscription.py make_packets.py run_pipeline.py upload_airtable.py feedback_report.py make_search_batch.py make_icp_lane_report.py collect_review_signals.py collect_external_signals.py scoring_calibration.py lead_machine/icp_lanes.py lead_machine/signals.py lead_machine/review_velocity.py lead_machine/review_pain_verifier.py lead_machine/scoring_profiles.py lead_machine/scoring_v3.py lead_machine/scoring_calibration.py lead_machine/external_signals.py
 
 dashboard: dashboard-build
 	$(PY) -m lead_machine.dashboard
@@ -87,6 +88,9 @@ import-batch:
 score:
 	$(PY) score_leads.py --mode manual-llm --only-scored --input $(ENRICHED) --scores-dir $(SCORES_DIR) --output $(SCORED_MANUAL)
 
+score-batch-subscription:
+	$(PY) score_batch_subscription.py --queue-dir $(QUEUE_DIR) --runner $(RUNNER)
+
 packets:
 	rm -rf $(PACKETS_DIR)
 	$(PY) make_packets.py --inputs $(SCORED_MANUAL) --output-dir $(PACKETS_DIR)
@@ -103,6 +107,8 @@ airtable-live:
 full-from-search: search batch
 
 full-after-llm: validate-batch import-batch score packets inspect airtable-dry
+
+full-subscription: score-batch-subscription score packets inspect airtable-dry
 
 clean-manual:
 	rm -rf $(PACKETS_DIR)

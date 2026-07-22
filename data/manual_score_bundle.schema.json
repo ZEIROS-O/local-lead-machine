@@ -1,0 +1,181 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Local Lead Machine manual score bundle",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "batch_id",
+    "scores"
+  ],
+  "properties": {
+    "batch_id": {
+      "type": "string"
+    },
+    "scores": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "score_file",
+          "score"
+        ],
+        "properties": {
+          "score_file": {
+            "type": "string",
+            "minLength": 6,
+            "pattern": "^[^/\\\\]+\\.json$"
+          },
+          "score": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "airtable_fields",
+              "asset_id",
+              "asset_state",
+              "asset_verifier_verdict",
+              "best_angle",
+              "beyond_free_fix",
+              "commercial_fit_state",
+              "commercial_materiality",
+              "confidence",
+              "contact_eligibility",
+              "evidence_refs",
+              "grade",
+              "hard_disqualifiers",
+              "intentionality",
+              "offer_component",
+              "opener",
+              "packageable_solution",
+              "promise_state",
+              "recommended_action",
+              "recurring_consequence",
+              "root_cause_confidence",
+              "safe_outreach_claims",
+              "score_schema_version",
+              "self_fix_risk",
+              "subscores",
+              "total_score",
+              "unsafe_claims",
+              "value_mechanism",
+              "why_this_lead",
+              "why_this_might_be_wrong"
+            ],
+            "properties": {
+              "score_schema_version": {
+                "type": "integer",
+                "const": 2
+              },
+              "subscores": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "icp_fit",
+                  "reputation_demand_proof",
+                  "web_conversion_pain",
+                  "mockup_leverage",
+                  "reachability",
+                  "offer_angle_clarity",
+                  "evidence_confidence"
+                ],
+                "properties": {
+                  "icp_fit": {"type": "integer", "minimum": 0, "maximum": 20},
+                  "reputation_demand_proof": {"type": "integer", "minimum": 0, "maximum": 15},
+                  "web_conversion_pain": {"type": "integer", "minimum": 0, "maximum": 25},
+                  "mockup_leverage": {"type": "integer", "minimum": 0, "maximum": 15},
+                  "reachability": {"type": "integer", "minimum": 0, "maximum": 10},
+                  "offer_angle_clarity": {"type": "integer", "minimum": 0, "maximum": 10},
+                  "evidence_confidence": {"type": "integer", "minimum": 0, "maximum": 5}
+                }
+              },
+              "total_score": {"type": "integer", "minimum": 0, "maximum": 100},
+              "grade": {"type": "string", "enum": ["A", "B", "C", "Skip"]},
+              "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+              "hard_disqualifiers": {
+                "type": "array",
+                "items": {"type": "string"}
+              },
+              "best_angle": {"type": "string"},
+              "recommended_action": {"type": "string"},
+              "why_this_lead": {
+                "type": "array",
+                "items": {"type": "string"}
+              },
+              "why_this_might_be_wrong": {
+                "type": "array",
+                "items": {"type": "string"}
+              },
+              "opener": {"type": "string"},
+              "evidence_refs": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"type": "string"}
+              },
+              "safe_outreach_claims": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["claim", "evidence_refs"],
+                  "properties": {
+                    "claim": {"type": "string"},
+                    "evidence_refs": {
+                      "type": "array",
+                      "minItems": 1,
+                      "items": {"type": "string"}
+                    }
+                  }
+                }
+              },
+              "unsafe_claims": {
+                "type": "array",
+                "items": {"type": "string"}
+              },
+              "airtable_fields": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [],
+                "properties": {}
+              },
+              "commercial_fit_state": {
+                "type": "string",
+                "enum": [
+                  "commercially-sendable",
+                  "minor-fix/nurture",
+                  "needs-broader-system-evidence",
+                  "intentional-or-ambiguous",
+                  "not-an-LPM-fit",
+                  "unverified"
+                ]
+              },
+              "commercial_materiality": {"type": "string"},
+              "recurring_consequence": {"type": "string"},
+              "root_cause_confidence": {"type": "string"},
+              "offer_component": {"type": "string"},
+              "packageable_solution": {"type": "string"},
+              "value_mechanism": {"type": "string"},
+              "beyond_free_fix": {"type": "string"},
+              "self_fix_risk": {"type": "string"},
+              "intentionality": {"type": "string"},
+              "contact_eligibility": {
+                "type": "string",
+                "enum": ["contact-now", "contact-after-asset", "hold-commercial-case"]
+              },
+              "asset_state": {
+                "type": "string",
+                "enum": ["none", "planned", "verified-existing"]
+              },
+              "promise_state": {
+                "type": "string",
+                "enum": ["asset-free", "future-build", "existing-verified-asset"]
+              },
+              "asset_id": {"type": "string"},
+              "asset_verifier_verdict": {"type": "string"}
+            }
+          }
+        }
+      }
+    }
+  }
+}
