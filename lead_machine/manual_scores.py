@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Set
 
 from .buyer_signals import buyer_intent_summary, ensure_buyer_intent, has_money_signal, review_demand_band
-from .commercial_backfill import backfill_legacy_commercial_fit
 from .email_hygiene import emails_text
 from .score_schema import (
     ASSET_STATES,
@@ -16,7 +15,6 @@ from .score_schema import (
     PROMISE_STATES,
     SCORE_SCHEMA_VERSION,
     V2_SCORE_FIELDS,
-    is_truly_legacy_score,
 )
 from .schema import normalize_lead
 from .sendability import apply_sendability, normalize_evidence_refs, normalize_safe_outreach_claims, normalize_unsafe_claims
@@ -80,21 +78,11 @@ def validate_manual_score(
     data: Dict[str, Any],
     *,
     allowed_evidence_ids: Set[str],
-    require_schema_v2: bool = False,
 ) -> Dict[str, Any]:
     schema_value = data.get("score_schema_version")
-    legacy = schema_value is None
-    if legacy:
-        if require_schema_v2:
-            raise ValueError(f"score_schema_version must be {SCORE_SCHEMA_VERSION}")
-        if not is_truly_legacy_score(data):
-            partial = sorted(set(data) & V2_SCORE_FIELDS)
-            raise ValueError(
-                "Unversioned score partially populates the v2 commercial contract: "
-                + ", ".join(partial)
-            )
-    elif type(schema_value) is not int or schema_value != SCORE_SCHEMA_VERSION:
+    if type(schema_value) is not int or schema_value != SCORE_SCHEMA_VERSION:
         raise ValueError(f"score_schema_version must be {SCORE_SCHEMA_VERSION}")
+    _require_keys(data, V2_SCORE_FIELDS)
 
     _require_keys(
         data,
@@ -160,57 +148,53 @@ def validate_manual_score(
     validated["total_score"] = total
     validated["grade"] = grade
     validated["send_trigger"] = str(data.get("send_trigger") or "").strip()
-    if legacy:
-        validated["_legacy_score_compatibility"] = True
-    else:
-        _require_keys(data, V2_SCORE_FIELDS)
-        validated["score_schema_version"] = SCORE_SCHEMA_VERSION
-        raw_commercial_state = str(data.get("commercial_fit_state") or "").strip()
-        commercial_state = next(
-            (
-                state
-                for state in COMMERCIAL_FIT_STATES
-                if state.casefold() == raw_commercial_state.casefold()
-            ),
-            raw_commercial_state.lower(),
-        )
-        contact = str(data.get("contact_eligibility") or "").strip().lower()
-        asset = str(data.get("asset_state") or "").strip().lower()
-        promise = str(data.get("promise_state") or "").strip().lower()
-        if commercial_state not in COMMERCIAL_FIT_STATES:
-            raise ValueError(f"invalid commercial_fit_state: {commercial_state or '<missing>'}")
-        if contact not in CONTACT_ELIGIBILITY_STATES:
-            raise ValueError(f"invalid contact_eligibility: {contact or '<missing>'}")
-        if asset not in ASSET_STATES:
-            raise ValueError(f"invalid asset_state: {asset or '<missing>'}")
-        if promise not in PROMISE_STATES:
-            raise ValueError(f"invalid promise_state: {promise or '<missing>'}")
-        if contact == "contact-now" and commercial_state != "commercially-sendable":
-            raise ValueError("contact-now requires commercially-sendable")
-        asset_id = str(data.get("asset_id") or "").strip()
-        verifier = str(data.get("asset_verifier_verdict") or "").strip()
-        if asset == "verified-existing" and (not asset_id or verifier != "PASS"):
-            raise ValueError("verified-existing requires asset_id and PASS asset_verifier_verdict")
-        if promise == "existing-verified-asset" and asset != "verified-existing":
-            raise ValueError("existing-verified-asset requires verified-existing asset_state")
-        if contact == "contact-after-asset" and asset != "planned":
-            raise ValueError("contact-after-asset requires planned asset_state")
-        if promise == "future-build" and asset != "planned":
-            raise ValueError("future-build requires planned asset_state")
-        validated["commercial_fit_state"] = commercial_state
-        for key in COMMERCIAL_DIMENSION_KEYS:
-            validated[key] = str(data.get(key) or "").strip()
-        if commercial_state == "commercially-sendable":
-            missing_dimensions = [key for key in COMMERCIAL_DIMENSION_KEYS if not validated[key]]
-            if missing_dimensions:
-                raise ValueError(
-                    "commercially-sendable missing dimensions: " + ", ".join(missing_dimensions)
-                )
-        validated["contact_eligibility"] = contact
-        validated["asset_state"] = asset
-        validated["promise_state"] = promise
-        validated["asset_id"] = asset_id
-        validated["asset_verifier_verdict"] = verifier
+    validated["score_schema_version"] = SCORE_SCHEMA_VERSION
+    raw_commercial_state = str(data.get("commercial_fit_state") or "").strip()
+    commercial_state = next(
+        (
+            state
+            for state in COMMERCIAL_FIT_STATES
+            if state.casefold() == raw_commercial_state.casefold()
+        ),
+        raw_commercial_state.lower(),
+    )
+    contact = str(data.get("contact_eligibility") or "").strip().lower()
+    asset = str(data.get("asset_state") or "").strip().lower()
+    promise = str(data.get("promise_state") or "").strip().lower()
+    if commercial_state not in COMMERCIAL_FIT_STATES:
+        raise ValueError(f"invalid commercial_fit_state: {commercial_state or '<missing>'}")
+    if contact not in CONTACT_ELIGIBILITY_STATES:
+        raise ValueError(f"invalid contact_eligibility: {contact or '<missing>'}")
+    if asset not in ASSET_STATES:
+        raise ValueError(f"invalid asset_state: {asset or '<missing>'}")
+    if promise not in PROMISE_STATES:
+        raise ValueError(f"invalid promise_state: {promise or '<missing>'}")
+    if contact == "contact-now" and commercial_state != "commercially-sendable":
+        raise ValueError("contact-now requires commercially-sendable")
+    asset_id = str(data.get("asset_id") or "").strip()
+    verifier = str(data.get("asset_verifier_verdict") or "").strip()
+    if asset == "verified-existing" and (not asset_id or verifier != "PASS"):
+        raise ValueError("verified-existing requires asset_id and PASS asset_verifier_verdict")
+    if promise == "existing-verified-asset" and asset != "verified-existing":
+        raise ValueError("existing-verified-asset requires verified-existing asset_state")
+    if contact == "contact-after-asset" and asset != "planned":
+        raise ValueError("contact-after-asset requires planned asset_state")
+    if promise == "future-build" and asset != "planned":
+        raise ValueError("future-build requires planned asset_state")
+    validated["commercial_fit_state"] = commercial_state
+    for key in COMMERCIAL_DIMENSION_KEYS:
+        validated[key] = str(data.get(key) or "").strip()
+    if commercial_state == "commercially-sendable":
+        missing_dimensions = [key for key in COMMERCIAL_DIMENSION_KEYS if not validated[key]]
+        if missing_dimensions:
+            raise ValueError(
+                "commercially-sendable missing dimensions: " + ", ".join(missing_dimensions)
+            )
+    validated["contact_eligibility"] = contact
+    validated["asset_state"] = asset
+    validated["promise_state"] = promise
+    validated["asset_id"] = asset_id
+    validated["asset_verifier_verdict"] = verifier
     validated["visible_pain_score"] = data.get("visible_pain_score", "")
     visible_pain_reasons = data.get("visible_pain_reasons") or []
     if isinstance(visible_pain_reasons, str):
@@ -493,8 +477,8 @@ def merge_manual_score(
         "Unsafe Claims": json.dumps(validated.get("unsafe_claims") or [], ensure_ascii=False),
         "Score Schema Version": validated.get("score_schema_version", ""),
         "score_schema_version": validated.get("score_schema_version", ""),
-        "Commercial Fit Source": "llm-schema-v2" if not validated.get("_legacy_score_compatibility") else "",
-        "commercial_fit_source": "llm-schema-v2" if not validated.get("_legacy_score_compatibility") else "",
+        "Commercial Fit Source": "llm-schema-v2",
+        "commercial_fit_source": "llm-schema-v2",
         "Commercial Fit State": validated.get("commercial_fit_state", "unverified"),
         "commercial_fit_state": validated.get("commercial_fit_state", "unverified"),
         "Commercial Materiality": validated.get("commercial_materiality", ""),
@@ -571,8 +555,6 @@ def merge_manual_score(
             "Confidence": validated["confidence"],
         }
     )
-    if validated.get("_legacy_score_compatibility"):
-        row = backfill_legacy_commercial_fit(row)
     governed = apply_sendability(row)
     return attach_scoring_v3(enriched, governed, fallback_vertical=fallback_vertical)
 

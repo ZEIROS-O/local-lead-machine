@@ -10,6 +10,11 @@ It answers three questions without changing pipeline state:
 2. Where is each batch in the pipeline, and what artifact or gate needs attention?
 3. Which leads in a batch are scored, sendable, money-signal positive, or blocked?
 
+The inventory exposes every canonical batch through the **All**, **Active**,
+and **Legacy** lifecycle views. Operational totals, throughput, and the
+attention queue are active-only so preserved historical work cannot inflate
+current pipeline capacity.
+
 ## Install and run
 
 Install the dashboard dependencies once:
@@ -64,18 +69,34 @@ evidence, but it still contains internal batch and lead qualification data.
 - Physical CSV/JSONL artifacts determine row counts. `run_state/*.json` supplies
   receipts, approvals, cap stops, and errors; count differences are shown as
   drift instead of silently trusted.
-- `unscored` is `max(enriched rows - scored rows, 0)`.
+- Scored-artifact precedence is API, then manual, then the legacy unsuffixed
+  CSV. A `_manual.csv` is counted only when its identities reconcile against
+  enrichment; it is not relabeled as an API run.
+- Discovery, enriched, scored, and packet stage counts are literal row counts
+  from their selected artifacts. They are not inferred from status labels.
+- `unscored` is the unmatched enriched-row count only after stable-identity
+  reconciliation succeeds. It is `Unknown` when the artifacts cannot be
+  reconciled safely; the dashboard never substitutes row-count subtraction.
+- Current sendability is evaluated only for schema-v2 active scores and uses
+  the objective four-field gate: `Packet Tier`, `Sendable`, `Packet Eligible`,
+  and contact readiness. Legacy packet tiers are shown only as historical
+  packet counts and are never labeled current-sendable.
 - A batch is `finished` only when scoring is complete, tiers and packets are
   current, and the saved live Airtable sync hash still matches those current
   inputs with zero skipped live rows.
 - A matching clean dry-run receipt without a matching live receipt is
   `airtable_ready`, not finished.
+- Identity-verified custom Airtable receipts under
+  `run_state/airtable_receipts/<batch>/` are displayed as `partial`. They show
+  the actual synced cohort but never make the full batch appear finished.
+- Airtable evidence is explicitly `Verified`, `Partial`, or `Unknown`. A local
+  dry-run status by itself is not live Airtable proof.
 - Reads are stable-stat checked so an artifact being rewritten is not presented
   as a complete snapshot.
 
 No dashboard endpoint starts discovery, enrichment, scoring, packet generation,
-or Airtable sync. The displayed next action is an operator command to run in the
-existing Hermes workflow.
+or Airtable sync, and the dashboard never mutates Airtable. The displayed next
+action is an operator command to run in the existing Hermes workflow.
 
 ## Verification
 
@@ -84,6 +105,7 @@ make dashboard-test
 make dashboard-build
 ```
 
-The backend tests cover stage inference, stale receipts, malformed artifacts,
-expired approvals, privacy exclusions, and the read-only HTTP contract. The
-frontend tests cover the overview and batch inventory rendering.
+The backend tests cover stable-identity reconciliation, lifecycle totals, stage
+inference, stale receipts, malformed artifacts, expired approvals, privacy
+exclusions, and the read-only HTTP contract. The frontend tests cover lifecycle
+filtering and explicit current, historical, and unknown states.

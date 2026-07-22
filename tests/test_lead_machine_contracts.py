@@ -21,13 +21,12 @@ from lead_machine.icp import hard_icp_gate
 from lead_machine.lead_card import build_lead_card
 from lead_machine.llm_queue import build_llm_prompt, write_review_queue
 from lead_machine.manual_scores import load_manual_score, merge_manual_score, validate_manual_score
-from lead_machine.score_schema import V2_SCORE_FIELDS
 from lead_machine.schema import normalize_lead, row_dedupe_keys
 from lead_machine.sendability import apply_sendability, flatten_safe_outreach_claims, normalize_evidence_refs
 from make_packets import is_eligible, main as make_packets_main, packet_markdown
 from make_llm_batch import build_batch_prompt, write_llm_batches
 from import_llm_score_bundle import import_score_bundle
-from refresh_packet_tiers import refresh_row
+from refresh_packet_tiers import SchemaMigrationError, refresh_row
 from score_leads import main as score_leads_main
 from score_leads import governed_opener, read_csv_rows, score_record, score_records_manual, write_csv
 
@@ -4107,20 +4106,15 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(validated["grade"], "B")
         self.assertEqual(validated["confidence"], "medium")
 
-    def test_manual_score_loader_still_accepts_old_schema_without_total_or_grade(self) -> None:
+    def test_manual_score_loader_rejects_versionless_score(self) -> None:
         raw_score = self._manual_score()
-        for field in V2_SCORE_FIELDS:
-            raw_score.pop(field, None)
-        raw_score.pop("total_score", None)
-        raw_score.pop("grade", None)
+        raw_score.pop("score_schema_version", None)
 
         with tempfile.TemporaryDirectory() as tmp:
             score_path = Path(tmp) / "lead.json"
             score_path.write_text(json.dumps(raw_score), encoding="utf-8")
-            validated = load_manual_score(score_path, allowed_evidence_ids={"E1", "E2"})
-
-        self.assertEqual(validated["total_score"], 75)
-        self.assertEqual(validated["grade"], "B")
+            with self.assertRaisesRegex(ValueError, "score_schema_version must be 2"):
+                load_manual_score(score_path, allowed_evidence_ids={"E1", "E2"})
 
     def test_partially_populated_unversioned_score_is_rejected(self) -> None:
         raw_score = self._manual_score()
@@ -4128,47 +4122,12 @@ class LeadMachineContractsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             score_path = Path(tmp) / "lead.json"
             score_path.write_text(json.dumps(raw_score), encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "partially populates"):
+            with self.assertRaisesRegex(ValueError, "score_schema_version must be 2"):
                 load_manual_score(score_path, allowed_evidence_ids={"E1", "E2"})
 
-    def test_legacy_structural_score_backfills_v2_and_retains_commercial_eligibility(self) -> None:
-        legacy = self._manual_score(best_angle="No-Site Launch")
-        for field in V2_SCORE_FIELDS:
-            legacy.pop(field, None)
-        enriched = {
-            "google": {**self._google_fixture(), "reviews": "18", "website_url": ""},
-            "buyer_intent": self._buyer_intent_fixture(),
-            "evidence": self._evidence_fixture(site_status="missing"),
-        }
-        row = merge_manual_score(enriched, legacy, fallback_vertical="hardscaping")
-        self.assertEqual(row["Score Schema Version"], 2)
-        self.assertEqual(row["Commercial Fit Source"], "deterministic-backfill-v2")
-        self.assertEqual(row["Commercial Fit State"], "commercially-sendable")
-        self.assertEqual(row["Contact Eligibility"], "contact-now")
-
-    def test_legacy_isolated_fix_holds_and_non_sendable_rows_never_upgrade(self) -> None:
-        isolated = refresh_row(
-            {
-                "Sendable": "Yes",
-                "Site Status": "Loaded",
-                "Form Strength": "Basic",
-                "Send Trigger": "Basic form only",
-                "Best Service Angle": "Estimate Funnel",
-            }
-        )
-        self.assertEqual(isolated["Commercial Fit State"], "minor-fix/nurture")
-        self.assertEqual(isolated["Contact Eligibility"], "hold-commercial-case")
-
-        monotonic = refresh_row(
-            {
-                "Sendable": "No",
-                "Site Status": "Missing",
-                "Send Trigger": "No owned website found",
-                "Best Service Angle": "No-Site Launch",
-            }
-        )
-        self.assertNotEqual(monotonic["Commercial Fit State"], "commercially-sendable")
-        self.assertEqual(monotonic["Sendable"], "No")
+    def test_refresh_row_rejects_legacy_score(self) -> None:
+        with self.assertRaisesRegex(SchemaMigrationError, "current schema v2 required"):
+            refresh_row({"Place Key": "old", "Sendable": "Yes", "Packet Eligible": "Yes"})
 
     def test_missing_or_misspelled_contact_eligibility_holds_with_state_error(self) -> None:
         enriched = {

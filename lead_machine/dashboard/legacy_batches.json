@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "batches": [
+    {
+      "batch": "detailing_cleveland_medium_001",
+      "legacy_since": "2026-07-20",
+      "reason": "pre_commercial_readiness_schema",
+      "note": "Historical scores are preserved and are not current-sendability compatible."
+    },
+    {
+      "batch": "detailing_columbus_medium_001",
+      "legacy_since": "2026-07-20",
+      "reason": "pre_commercial_readiness_schema",
+      "note": "Historical scores are preserved and are not current-sendability compatible."
+    },
+    {
+      "batch": "epoxy_cleveland_medium_001",
+      "legacy_since": "2026-07-20",
+      "reason": "pre_commercial_readiness_schema",
+      "note": "Historical scores are preserved and are not current-sendability compatible."
+    },
+    {
+      "batch": "water_restoration_cleveland_medium_002",
+      "legacy_since": "2026-07-20",
+      "reason": "pre_commercial_readiness_schema",
+      "note": "Historical scores are preserved and are not current-sendability compatible."
+    },
+    {
+      "batch": "water_restoration_columbus_medium_002",
+      "legacy_since": "2026-07-20",
+      "reason": "pre_commercial_readiness_schema",
+      "note": "Historical scores are preserved and are not current-sendability compatible."
+    }
+  ]
+}

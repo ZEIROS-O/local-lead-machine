@@ -3,7 +3,6 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from annotate_legacy_scoring import annotate
 from lead_machine.external_signals import (
     BudgetExceeded,
     DataForSEOReviewsClient,
@@ -219,16 +218,6 @@ class CalibrationTest(unittest.TestCase):
     def test_kappa_target_can_be_measured(self) -> None:
         pairs = [("auto-eligible", "auto-eligible")] * 8 + [("reject", "reject")] * 2
         self.assertEqual(cohens_kappa(pairs), 1.0)
-
-
-class LegacyAnnotationTest(unittest.TestCase):
-    def test_legacy_annotation_does_not_rewrite_verdict(self) -> None:
-        result = annotate([{"Business Name": "Legacy", "Sendable": "Yes", "Lead Priority": "A"}])[0]
-
-        self.assertEqual(result["Sendable"], "Yes")
-        self.assertEqual(result["Lead Priority"], "A")
-        self.assertEqual(result["Scoring Policy Version"], "v2-legacy")
-        self.assertEqual(result["Revalidation Recommended"], "Yes")
 
 
 if __name__ == "__main__":

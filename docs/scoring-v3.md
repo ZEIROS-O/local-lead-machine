@@ -121,10 +121,6 @@ predictions and no more than 5% false rejects. Every cell must separately achiev
 Reports include the aggregate and per-cell gates plus breakdowns by offer lane,
 review-velocity band, evidence confidence, and data source.
 
-Annotate existing files without rescoring or overwriting them:
-
-```bash
-python annotate_legacy_scoring.py \
-  --input output/scored_existing.csv \
-  --output output/scored_existing_legacy_annotated.csv
-```
+Historical score files remain unchanged and are labeled as legacy by the
+dashboard registry. Current scoring and packet refresh paths require schema v2
+and will not annotate, backfill, or rewrite those historical artifacts.
