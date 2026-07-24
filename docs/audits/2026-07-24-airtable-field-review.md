@@ -10,7 +10,7 @@ reads it. No Airtable calls made (no credentials in this environment); no pipeli
 > demotions (`053d130`), and the `Packet Tier` consolidation (`d0a24d3`). The schema is now
 > **54 columns**; `docs/airtable_schema_required.md` is regenerated from `_FIELD_SCHEMA`.
 > Two things changed against the plan below, both found while implementing — see
-> **Outcome** at the end.
+> **Outcome** at the end. Follow-up findings were fixed in `6942e84` and `51aad92`.
 
 **Verification basis:** read of `lead_machine/airtable_sync.py`, `upload_airtable.py`,
 `lead_machine/sendability.py`, `lead_machine/score_schema.py`, `lead_machine/manual_scores.py`,
@@ -396,16 +396,37 @@ carried a `Sendable` string that the old code passed through verbatim.
 
 ### Still open
 
-- **`No-Site Launch` remains unreachable.** Making it reachable means changing `choose_offer_fit`
-  to return a distinct label for no-website/social-only instead of `Website Rebuild`, which is a
-  scoring change and out of scope for a schema pass. The option is harmless but dead; either wire
-  it up deliberately or drop it from the select.
-- **Two orphaned `Legacy *` pairs.** `airtable_schema_cutover.LEGACY_FIELD_PAIRS` still maps
-  `Legacy Current Website Quality` and `Legacy CTA Strength` to canonical columns that no longer
-  exist. If those legacy columns are still in the base, `prepare` will now report the canonical
-  half missing and refuse rather than generating a checklist — deliberately, so a human looks.
-  They should just be deleted outright. `tests/test_upload_airtable_schema.py` records this split
-  as `DEMOTED_CANONICAL_FIELDS`.
-- **The base-side checks from "Not verifiable from here" are still unverified** — no credentials in
-  this environment. Worth one `airtable_schema_cutover.py prepare` run to confirm nothing else is
-  lingering.
+- **The base-side checks from "Not verifiable from here" are still unverified** — no Airtable
+  credentials in this environment. One `airtable_schema_cutover.py prepare` run confirms whether the
+  seven `Legacy *` columns and the non-schema stragglers (`Google Place ID`, `Evidence Notes`,
+  `Manual Reviewed`, the two screenshot paths, `Created Time`, `Last Modified Time`) are still there.
+  This is the only item left.
+
+### Closed after the outcome above
+
+**`No-Site Launch` is now reachable from the deterministic path** (`6942e84`). It was only ever
+produced by the LLM path, via `Social/Jobber Escape`; `choose_offer_fit` called every no-site case
+`Website Rebuild`, so the operator got a "rebuild your site" pitch for a business whose only web
+presence is a Facebook page or a Jobber booking link. The scorer now splits on whether an owned site
+exists — `No Website` / `Social Only` / `Jobber Only` and the booking-URL case return
+`No-Site Launch`, `Broken Website` keeps `Website Rebuild`. Same offer score, same A grade.
+
+`CONCRETE_PACKET_OFFERS`, `base_priority_from_delta` and `infer_website_quality` were updated in the
+same commit — without the first, a no-site lead would have silently lost packet eligibility.
+`DELTA_RANK` and `sendability.MANUAL_REVIEW_OFFERS` already carried the label.
+
+One scoring behaviour change fell out, deliberately: **`Jobber Only` was missing from both the
+offer-fit and the grade paths**, so a business with no owned site scored as `Advanced Optimization`
+with `Good` website quality. It is now grouped with `No Website` / `Social Only`, which is how
+`enrich_leads.py:1299,1310` has always treated it. A differential across every site-status ×
+booking-flag combination shows this is the only case that moves — **11 of 12 identical** in grade,
+packet eligibility, sendability, score and tier.
+
+**The two orphaned `Legacy *` pairs are handled** (`51aad92`). Left as pairs, `prepare` would have
+reported the canonical half missing and refused forever — and because every value in an orphan is
+legacy-only by definition, the other blocking condition, they could never have been cleared. They
+now live in `LEGACY_ORPHAN_FIELDS`: backed up, listed in the delete checklist, and verified absent
+afterwards like any other legacy field, but excluded from a pair comparison with nothing to compare
+against. Their populated-row counts are reported and the checklist warns that `backup.json` is the
+only remaining copy. A cross-file test ties `DEMOTED_CANONICAL_FIELDS` to `LEGACY_ORPHAN_FIELDS` so
+neither list can drift alone.
