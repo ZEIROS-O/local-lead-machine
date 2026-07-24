@@ -21,7 +21,6 @@ AIRTABLE_ALLOWED_FIELDS = [
     "Reviews",
     "Rating",
     "Current Website Quality",
-    "Best Service Angle",
     "Specific Observation",
     "Mockup URL",
     "Video URL",
@@ -30,7 +29,6 @@ AIRTABLE_ALLOWED_FIELDS = [
     "Status",
     "Last Contacted",
     "Next Follow-Up",
-    "Assigned To",
     "Lead Priority",
     "Offer Fit",
     "Site Status",
@@ -42,7 +40,6 @@ AIRTABLE_ALLOWED_FIELDS = [
     "Visible Pain Score",
     "Visible Pain Reasons",
     "Send Trigger",
-    "Money Signal",
     "Buyer Intent Signals",
     "Commercial Fit State",
     "Commercial Materiality",
@@ -62,7 +59,6 @@ AIRTABLE_ALLOWED_FIELDS = [
     "Evidence Refs",
     "Safe Outreach Claims",
     "Evidence Snapshot",
-    "Review Demand Band",
     "AI Confidence",
     "Skip Reason",
     "Place Key",
@@ -73,7 +69,6 @@ AIRTABLE_ALLOWED_FIELDS = [
     "Recommended Action",
     "Send Blockers",
     "Packet Path",
-    "Next Action",
 ]
 
 INTEGER_FIELDS = {"Reviews", "Score Total", "Visible Pain Score"}
@@ -105,8 +100,11 @@ SITE_STATUS_LABELS = {
     "jobber only": "Social Only",
 }
 OFFER_FIT_FIELD = "Offer Fit"
-BEST_SERVICE_ANGLE_FIELD = "Best Service Angle"
-SERVICE_ANGLE_FIELDS = {OFFER_FIT_FIELD, BEST_SERVICE_ANGLE_FIELD}
+# Offer Fit is the only service-angle column that syncs. "Best Service Angle"
+# used to sit beside it here; it was a prose blurb no select option could ever
+# match, and on the manual path it was assigned from the same best_angle value
+# Offer Fit already carries.
+SERVICE_ANGLE_FIELDS = {OFFER_FIT_FIELD}
 SERVICE_ANGLE_LABELS = {
     "social/jobber escape": "No-Site Launch",
     "no-site launch": "No-Site Launch",

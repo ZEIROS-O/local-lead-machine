@@ -180,10 +180,12 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(planned[0]["upsert_key"], "place:ChIJ123")
         fields = planned[0]["payload"]["fields"]  # type: ignore[index]
         self.assertEqual(fields["Business Name"], "A+ Landscaping LLC")
-        self.assertEqual(fields["Best Service Angle"], "Website Rebuild")
         self.assertEqual(fields["Status"], "Mockup Needed")
-        self.assertEqual(fields["Next Action"], "Build mockup")
         self.assertEqual(fields["Outreach Channel"], "Phone")
+        # Both were dropped from the schema: Best Service Angle duplicated
+        # Offer Fit, Next Action restated Status.
+        self.assertNotIn("Best Service Angle", fields)
+        self.assertNotIn("Next Action", fields)
         self.assertEqual(fields["Packet Eligible"], "Yes")
         self.assertEqual(fields["Sendable"], "Yes")
         self.assertEqual(fields["Contact Form Detected"], "No")
@@ -312,7 +314,7 @@ class LeadMachineContractsTest(unittest.TestCase):
         planned = self._dry_run_plan(stdout)
         fields = planned[0]["payload"]["fields"]  # type: ignore[index]
         self.assertEqual(fields["Offer Fit"], "No-Site Launch")
-        self.assertEqual(fields["Best Service Angle"], "No-Site Launch")
+        self.assertNotIn("Best Service Angle", fields)
         self.assertEqual(fields["Send Trigger"], "social_jobber_escape lane: no owned website")
 
     def test_airtable_payload_normalizes_all_internal_lane_labels_for_select_fields(self) -> None:
@@ -347,9 +349,9 @@ class LeadMachineContractsTest(unittest.TestCase):
                 fields = build_airtable_payload(card)["fields"]
 
                 self.assertEqual(fields["Offer Fit"], expected)
-                self.assertEqual(fields["Best Service Angle"], expected)
                 self.assertIn(fields["Offer Fit"], supported_select_values)
-                self.assertIn(fields["Best Service Angle"], supported_select_values)
+                # Offer Fit is now the only service-angle column that syncs.
+                self.assertNotIn("Best Service Angle", fields)
                 self.assertEqual(fields["Specific Observation"], f"Internal lane: {lane}")
                 self.assertEqual(fields["Visible Pain Reasons"], f"Internal lane: {lane}")
                 self.assertEqual(fields["Send Trigger"], f"Internal lane: {lane}")
@@ -442,7 +444,7 @@ class LeadMachineContractsTest(unittest.TestCase):
                     self._airtable_csv_row(
                         **{
                             "Status": "Contacted",
-                            "Next Action": "Follow up",
+                            "Outreach Channel": "Email",
                         }
                     )
                 ],
@@ -455,7 +457,7 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(len(planned), 1)
         fields = planned[0]["payload"]["fields"]  # type: ignore[index]
         self.assertEqual(fields["Status"], "Contacted")
-        self.assertEqual(fields["Next Action"], "Follow up")
+        self.assertEqual(fields["Outreach Channel"], "Email")
 
     def test_airtable_patch_does_not_send_defaulted_operational_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -468,7 +470,6 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(planned[0]["method"], "PATCH")
         fields = planned[0]["payload"]["fields"]  # type: ignore[index]
         self.assertNotIn("Status", fields)
-        self.assertNotIn("Next Action", fields)
         self.assertNotIn("Outreach Channel", fields)
 
     def test_make_packets_updates_scored_csv_with_current_batch_packet_path(self) -> None:

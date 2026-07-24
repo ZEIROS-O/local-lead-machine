@@ -14,7 +14,6 @@
 | Reviews | Number | ? | Integer; set field to 'Integer' precision |
 | Rating | Number | ? | Decimal; set field to 2 decimal places |
 | Current Website Quality | Single line text | ? |  |
-| Best Service Angle | Single select | ? | Options: No-Site Launch, Website Rebuild, Estimate Funnel, Automation / Follow-Up |
 | Specific Observation | Long text | ? |  |
 | Packet Eligible | Single select | ? | Options: Yes, No |
 | Sendable | Single select | ? | Options: Yes, No |
@@ -29,7 +28,6 @@
 | Visible Pain Score | Number | ? | Integer 0–5 |
 | Visible Pain Reasons | Long text | ? |  |
 | Send Trigger | Single line text | ? |  |
-| Money Signal | Single line text | ? |  |
 | Buyer Intent Signals | Long text | ? | Comma-separated signals detected by LLM |
 | Commercial Fit State | Single select | ? | Options: commercially-sendable, minor-fix/nurture, needs-broader-system-evidence, intentional-or-ambiguous, not-an-LPM-fit, unverified |
 | Commercial Materiality | Long text | ? | Evidence-backed commercial consequence |
@@ -49,7 +47,6 @@
 | Evidence Refs | Long text | ? | Structured evidence identifiers |
 | Safe Outreach Claims | Long text | ? | Claims bound to evidence identifiers |
 | Evidence Snapshot | Long text | ? | Structured bounded evidence used by the morning verifier |
-| Review Demand Band | Single line text | ? |  |
 | AI Confidence | Single select | ? | Options: low, medium, high |
 | Score Total | Number | ? | Integer |
 | Opener | Long text | ? |  |
@@ -60,10 +57,8 @@
 | Status | Single select | ? | Options: New, Mockup Needed, Manual Review, Sent, Follow-Up, Closed |
 | Outreach Channel | Single select | ? | Options: Email, Phone, Instagram DM, SMS |
 | Consent Posture | Single line text | ? | Required and documented before any SMS draft can pass |
-| Next Action | Single line text | ? |  |
 | Last Contacted | Date | ? |  |
 | Next Follow-Up | Date | ? |  |
-| Assigned To | Single line text | ? |  |
 | Mockup URL | URL | ? |  |
 | Video URL | URL | ? |  |
 | Packet Path | Single line text | ? | Local file path to the packet markdown file |

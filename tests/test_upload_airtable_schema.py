@@ -95,16 +95,16 @@ class SchemaReportContentTest(unittest.TestCase):
         expected = {
             "Business Name", "Owner Name", "Vertical", "City", "Phone", "Email",
             "Website URL", "Google Maps URL", "Reviews", "Rating",
-            "Current Website Quality", "Best Service Angle", "Specific Observation",
+            "Current Website Quality", "Specific Observation",
             "Packet Eligible", "Sendable", "Lead Priority", "Offer Fit",
             "Site Status", "Contact Form Detected", "Estimate Form Detected",
             "Form Strength", "Form Detection Method", "CTA Strength",
             "Visible Pain Score", "Visible Pain Reasons", "Send Trigger",
-            "Money Signal", "Buyer Intent Signals", "Review Demand Band",
-            "AI Confidence", "Score Total", "Opener", "Recommended Action",
+            "Buyer Intent Signals", "AI Confidence", "Score Total",
+            "Opener", "Recommended Action",
             "Send Blockers", "Skip Reason", "Place Key", "Status",
-            "Outreach Channel", "Next Action", "Last Contacted", "Next Follow-Up",
-            "Assigned To", "Mockup URL", "Video URL", "Packet Path",
+            "Outreach Channel", "Last Contacted", "Next Follow-Up",
+            "Mockup URL", "Video URL", "Packet Path",
         }
         report_fields = {row["field"] for row in ua.build_schema_report()}
         self.assertTrue(expected.issubset(report_fields), f"Missing from report: {expected - report_fields}")

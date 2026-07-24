@@ -51,7 +51,6 @@ MANUAL_FIELDS = [
     "Rating",
     "Current Website Quality",
     "Site Status",
-    "Best Service Angle",
     "Specific Observation",
     "Packet Eligible",
     "Sendable",
@@ -64,7 +63,6 @@ MANUAL_FIELDS = [
     "Visible Pain Score",
     "Visible Pain Reasons",
     "Send Trigger",
-    "Money Signal",
     "Buyer Intent Signals",
     "AI Confidence",
     "Score Total",
@@ -73,7 +71,6 @@ MANUAL_FIELDS = [
     "Send Blockers",
     "Status",
     "Outreach Channel",
-    "Next Action",
     "Place Key",
     "Manual Notes",
 ]
@@ -438,7 +435,6 @@ def _infer_site_fields(text: str) -> Dict[str, str]:
     if "contact form" in lowered:
         fields["Contact Form Detected"] = "Yes" if "no contact form" not in lowered else "No"
     if any(term in lowered for term in ("ceramic", "paint correction", "ppf", "epoxy", "coating", "garage floor")):
-        fields["Money Signal"] = "High-ticket service mentioned"
         fields["Buyer Intent Signals"] = "High-ticket service term in manual notes"
     return fields
 
@@ -621,7 +617,6 @@ def build_manual_lead_card(
         "Lead Priority": "C",
         "AI Confidence": "medium" if llm_fields else "low",
         "Recommended Action": "Manual review before sending",
-        "Next Action": "Review lead",
     }
     fields = _merge_fields(defaults, [regex_fields, llm_fields])
     if not clean_cell(fields.get("Outreach Channel")):
