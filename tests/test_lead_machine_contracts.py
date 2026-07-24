@@ -188,11 +188,17 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertNotIn("Next Action", fields)
         self.assertEqual(fields["Packet Eligible"], "Yes")
         self.assertEqual(fields["Sendable"], "Yes")
-        self.assertEqual(fields["Contact Form Detected"], "No")
-        self.assertEqual(fields["Estimate Form Detected"], "No")
+        # Form Strength is the one form signal that still syncs; the rest of
+        # the scraper detail stays in the scored CSV and the packet.
         self.assertEqual(fields["Form Strength"], "None")
-        self.assertEqual(fields["Form Detection Method"], "none")
-        self.assertEqual(fields["CTA Strength"], "Weak")
+        for demoted in (
+            "Contact Form Detected",
+            "Estimate Form Detected",
+            "Form Detection Method",
+            "CTA Strength",
+            "Current Website Quality",
+        ):
+            self.assertNotIn(demoted, fields)
         self.assertEqual(fields["Visible Pain Score"], 35)
         self.assertEqual(fields["Visible Pain Reasons"], "No estimate form detected; No clear estimate CTA")
         self.assertEqual(fields["Send Trigger"], "No estimate form detected")

@@ -47,14 +47,20 @@ LEGACY_FIELDS = {
     "Legacy CTA Strength",
     "Legacy Skip Reason",
 }
+# Survivors of the Legacy* cutover that are still part of the active schema.
 CANONICAL_FIELDS = {
-    "Current Website Quality",
     "Send Trigger",
     "Last Contacted",
     "Recommended Action",
     "Form Strength",
-    "CTA Strength",
     "Skip Reason",
+}
+# Canonical halves of a Legacy* pair that have since been demoted off the
+# Airtable surface entirely. Their Legacy* counterparts have no migration
+# target left, so airtable_schema_cutover.py must not be pointed at them.
+DEMOTED_CANONICAL_FIELDS = {
+    "Current Website Quality",
+    "CTA Strength",
 }
 
 
@@ -64,6 +70,7 @@ class SchemaReportContentTest(unittest.TestCase):
         for active_fields in (schema_fields, set(ua.CSV_AIRTABLE_FIELDS), set(AIRTABLE_ALLOWED_FIELDS)):
             self.assertTrue(CANONICAL_FIELDS.issubset(active_fields))
             self.assertTrue(LEGACY_FIELDS.isdisjoint(active_fields))
+            self.assertTrue(DEMOTED_CANONICAL_FIELDS.isdisjoint(active_fields))
 
     def test_schema_report_includes_buyer_intent_signals(self):
         report = ua.build_schema_report()
@@ -95,10 +102,9 @@ class SchemaReportContentTest(unittest.TestCase):
         expected = {
             "Business Name", "Owner Name", "Vertical", "City", "Phone", "Email",
             "Website URL", "Google Maps URL", "Reviews", "Rating",
-            "Current Website Quality", "Specific Observation",
+            "Specific Observation",
             "Packet Eligible", "Sendable", "Lead Priority", "Offer Fit",
-            "Site Status", "Contact Form Detected", "Estimate Form Detected",
-            "Form Strength", "Form Detection Method", "CTA Strength",
+            "Site Status", "Form Strength",
             "Visible Pain Score", "Visible Pain Reasons", "Send Trigger",
             "Buyer Intent Signals", "AI Confidence", "Score Total",
             "Opener", "Recommended Action",
