@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import csv
 import io
 import json
@@ -13,7 +14,11 @@ from unittest.mock import patch
 
 import upload_airtable
 from enrich_leads import detect_form_signals, scrape_site
-from lead_machine.airtable_sync import build_airtable_payload, plan_airtable_sync
+from lead_machine.airtable_sync import (
+    build_airtable_payload,
+    normalize_airtable_value,
+    plan_airtable_sync,
+)
 from lead_machine.buyer_signals import BUYER_INTENT_LOGIC_VERSION
 from lead_machine.evidence import build_evidence_profile
 from lead_machine.feedback import compute_feedback_metrics
@@ -5691,6 +5696,72 @@ class LeadMachineContractsTest(unittest.TestCase):
         }
         score.update(overrides)
         return score
+
+
+class NoOwnedSiteOfferFitTest(unittest.TestCase):
+    """The deterministic scorer must draw the same no-owned-site line the LLM does.
+
+    There is nothing to rebuild for a business whose only web presence is a
+    Facebook page or a Jobber booking link, and the LLM path already labels that
+    No-Site Launch (via its "Social/Jobber Escape"). Before this, the
+    deterministic path called all of them Website Rebuild, so the No-Site Launch
+    select option was unreachable from it.
+    """
+
+    def _record(self, site_status: str, *, booking: bool = False) -> dict:
+        return {
+            "google": {
+                "business_name": "Acme Hardscaping", "rating": "4.9", "reviews": "130",
+                "city": "Cleveland", "phone": "(440) 637-5848", "place_id": "ChIJ1",
+                "website_url": "https://acme.example",
+            },
+            "website": {
+                "site_status": site_status, "form_strength": "None", "cta_strength": "Weak",
+                "contact_form_detected": "No", "estimate_form_detected": "No",
+                "high_ticket_terms": ["patio", "retaining wall"], "generic_copy_terms": [],
+                "combined_text": "patio retaining wall hardscape",
+            },
+            "derived": {
+                "phone_consistency": "matched", "has_email": False, "has_form": False,
+                "has_cta": False, "has_high_ticket_terms": True,
+                "non_standard_site_or_booking": booking,
+            },
+            "screenshots": {},
+        }
+
+    def test_no_owned_site_statuses_produce_no_site_launch(self) -> None:
+        for status in ("No Website", "Social Only", "Jobber Only"):
+            with self.subTest(site_status=status):
+                row = score_record(self._record(status), "hardscaping")
+                self.assertEqual(row["Offer Fit"], "No-Site Launch")
+                self.assertEqual(
+                    normalize_airtable_value("Offer Fit", row["Offer Fit"]), "No-Site Launch"
+                )
+
+    def test_booking_only_url_produces_no_site_launch(self) -> None:
+        row = score_record(self._record("Loaded", booking=True), "hardscaping")
+        self.assertEqual(row["Offer Fit"], "No-Site Launch")
+
+    def test_broken_owned_site_is_still_a_rebuild(self) -> None:
+        row = score_record(self._record("Broken Website"), "hardscaping")
+        self.assertEqual(row["Offer Fit"], "Website Rebuild")
+
+    def test_jobber_only_is_not_scored_as_a_healthy_site(self) -> None:
+        # Jobber Only was missing from both the offer-fit and grade paths, so a
+        # business with no owned site scored as Advanced Optimization / Good.
+        row = score_record(self._record("Jobber Only"), "hardscaping")
+        self.assertEqual(row["Current Website Quality"], "Poor")
+        self.assertNotEqual(row["Offer Fit"], "Advanced Optimization")
+
+    def test_no_site_launch_keeps_packet_eligibility_and_grade(self) -> None:
+        from score_leads import CONCRETE_PACKET_OFFERS, base_priority_from_delta
+
+        self.assertIn("No-Site Launch", CONCRETE_PACKET_OFFERS)
+        for status in ("No Website", "Social Only", "Jobber Only", "Broken Website"):
+            with self.subTest(site_status=status):
+                self.assertEqual(
+                    base_priority_from_delta(self._record(status), "No-Site Launch"), "A"
+                )
 
 
 if __name__ == "__main__":

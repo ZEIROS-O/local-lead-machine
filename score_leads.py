@@ -187,7 +187,13 @@ ESTIMATE_PATH_WEAKNESS_FLAGS = {
     "weak_basic_form",
 }
 
+# Statuses meaning the business has no owned site to rebuild. "Jobber Only" was
+# missing from the grade path entirely, so a Jobber-only business fell through
+# to Skip unless non_standard_site_or_booking happened to catch it.
+NO_OWNED_SITE_STATUSES = {"No Website", "Social Only", "Jobber Only"}
+
 CONCRETE_PACKET_OFFERS = {
+    "No-Site Launch",
     "Website Rebuild",
     "Estimate Funnel",
     "Premium Perception Gap",
@@ -790,13 +796,22 @@ def choose_offer_fit(record: Dict[str, Any], strength: int, weakness: int) -> Tu
 
     evidence: List[str] = []
 
-    if status in {"No Website", "Broken Website", "Social Only"}:
-        evidence.append("site missing/broken/social-only")
+    # Split by whether an owned site exists at all. There is nothing to rebuild
+    # for a business that only has a Facebook page or a Jobber booking link, and
+    # the LLM path already draws this line (its "Social/Jobber Escape" maps to
+    # No-Site Launch), so the deterministic path should agree. Same offer score
+    # and same A grade either way — only the label the operator pitches differs.
+    if status in NO_OWNED_SITE_STATUSES:
+        evidence.append("no owned site: missing or social/booking-only")
+        return "No-Site Launch", 20, evidence
+
+    if status == "Broken Website":
+        evidence.append("owned site is broken")
         return "Website Rebuild", 20, evidence
 
     if d.get("non_standard_site_or_booking"):
         evidence.append("uses booking/social URL instead of full owned site")
-        return "Website Rebuild", 20, evidence
+        return "No-Site Launch", 20, evidence
 
     strong_estimate_form = has_strong_estimate_form(record)
     current_form_strength = form_strength(record).lower()
@@ -880,7 +895,7 @@ def infer_website_quality(record: Dict[str, Any], weakness: int, offer_fit: str)
     if status == "Broken Website" or d.get("non_standard_site_or_booking"):
         return "Poor"
 
-    if offer_fit == "Website Rebuild":
+    if offer_fit in {"No-Site Launch", "Website Rebuild"}:
         return "Poor"
 
     if weakness >= 24:
@@ -901,10 +916,10 @@ def infer_website_quality(record: Dict[str, Any], weakness: int, offer_fit: str)
 def base_priority_from_delta(record: Dict[str, Any], offer_fit: str) -> str:
     status = record.get("website", {}).get("site_status", "Unknown")
 
-    if status in {"No Website", "Broken Website", "Social Only"}:
+    if status in NO_OWNED_SITE_STATUSES or status == "Broken Website":
         return "A"
 
-    if offer_fit == "Website Rebuild":
+    if offer_fit in {"No-Site Launch", "Website Rebuild"}:
         return "A"
 
     if offer_fit == "Estimate Funnel":
@@ -1001,6 +1016,12 @@ def make_observation(
             f"Keep only for market mapping unless manual screenshot review shows a much stronger visual gap."
         )
 
+    if offer_fit == "No-Site Launch":
+        return (
+            f"{name} has credible local demand/proof ({rating} rating, {reviews} reviews; {strength}) but no owned website — site status is {status}. "
+            f"Everything runs through a profile or booking link they do not control. Fit context: {fit}. The pitch is a first owned site with a working estimate path, not a redesign."
+        )
+
     if offer_fit == "Website Rebuild":
         return (
             f"{name} has credible local demand/proof ({rating} rating, {reviews} reviews; {strength}) but the owned web presence appears materially weaker than the business. "
@@ -1076,7 +1097,7 @@ def packet_eligibility_reason(priority: str, offer_fit: str) -> str:
         return "A/B lead with concrete visible-pain offer fit"
     if priority not in {"A", "B"}:
         return "Lead priority below B threshold"
-    return "Offer fit not Website Rebuild or Estimate Funnel"
+    return "Offer fit is not one of the concrete visible-pain offers"
 
 
 def evidence_id_by_field(record: Dict[str, Any], field: str) -> str:
