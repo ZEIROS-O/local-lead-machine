@@ -8,7 +8,34 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import upload_airtable as ua
-from lead_machine.airtable_sync import AIRTABLE_ALLOWED_FIELDS
+from lead_machine.airtable_sync import AIRTABLE_ALLOWED_FIELDS, normalize_airtable_value
+
+
+# Every label choose_offer_fit() can return (score_leads.py:784-869). A typed
+# select field whose value fails normalization is dropped from the payload
+# silently, so the column goes blank in Airtable for that whole branch.
+SCORER_OFFER_FITS = [
+    "Website Rebuild",
+    "Portfolio Rebuild",
+    "Premium Perception Gap",
+    "Mobile Quote Path Cleanup",
+    "Review/Trust Proof Upgrade",
+    "Service Page Cleanup",
+    "Website Cleanup",
+    "Advanced Optimization",
+    "Estimate Funnel",
+    "Tracking / Missed Call",
+]
+# Every site_status enrich_leads.py assigns.
+ENRICHER_SITE_STATUSES = [
+    "No Website",
+    "Broken Website",
+    "Broken",
+    "Jobber Only",
+    "Social Only",
+    "Loaded",
+    "Unknown",
+]
 
 
 LEGACY_FIELDS = {
@@ -81,6 +108,31 @@ class SchemaReportContentTest(unittest.TestCase):
         }
         report_fields = {row["field"] for row in ua.build_schema_report()}
         self.assertTrue(expected.issubset(report_fields), f"Missing from report: {expected - report_fields}")
+
+
+class TypedFieldNormalizationCoverageTest(unittest.TestCase):
+    """Every value the pipeline produces must survive the typed-field normalizer.
+
+    These are the fields where a miss is invisible: normalize_airtable_value
+    returns None, build_airtable_payload_with_drops discards the key, and the
+    column reads as empty in Airtable rather than wrong.
+    """
+
+    def test_every_scorer_offer_fit_normalizes(self):
+        for value in SCORER_OFFER_FITS:
+            with self.subTest(offer_fit=value):
+                self.assertIsNotNone(
+                    normalize_airtable_value("Offer Fit", value),
+                    f"choose_offer_fit returns {value!r} but it would be dropped from the payload",
+                )
+
+    def test_every_enricher_site_status_normalizes(self):
+        for value in ENRICHER_SITE_STATUSES:
+            with self.subTest(site_status=value):
+                self.assertIsNotNone(
+                    normalize_airtable_value("Site Status", value),
+                    f"enrich_leads emits {value!r} but it would be dropped from the payload",
+                )
 
 
 class SchemaReportNoUploadTest(unittest.TestCase):

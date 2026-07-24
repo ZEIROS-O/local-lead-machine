@@ -91,6 +91,10 @@ SITE_STATUS_FIELD = "Site Status"
 SITE_STATUS_LABELS = {
     "missing": "Missing",
     "broken": "Broken",
+    # enrich_leads emits "Broken Website"/"Jobber Only"; without these two the
+    # highest-value leads (broken or social-only sites, graded A by
+    # base_priority_from_delta) synced with Site Status blank.
+    "broken website": "Broken",
     "unknown": "Unknown",
     "no website": "No Website",
     "loaded": "Loaded",
@@ -98,6 +102,7 @@ SITE_STATUS_LABELS = {
     "redirect issue": "Redirect Issue",
     "social only": "Social Only",
     "facebook only": "Social Only",
+    "jobber only": "Social Only",
 }
 OFFER_FIT_FIELD = "Offer Fit"
 BEST_SERVICE_ANGLE_FIELD = "Best Service Angle"
@@ -117,6 +122,17 @@ SERVICE_ANGLE_LABELS = {
     "automation/follow up": "Automation / Follow-Up",
     "automation / follow-up": "Automation / Follow-Up",
     "automation/follow-up": "Automation / Follow-Up",
+    # The seven labels below are what choose_offer_fit actually returns today.
+    # Until they were mapped, every lead on one of these branches synced with
+    # Offer Fit blank. Grouped by the deliverable the option names, not by the
+    # symptom that triggered the branch.
+    "portfolio rebuild": "Website Rebuild",
+    "review/trust proof upgrade": "Website Rebuild",
+    "service page cleanup": "Website Rebuild",
+    "website cleanup": "Website Rebuild",
+    "mobile quote path cleanup": "Estimate Funnel",
+    "advanced optimization": "Automation / Follow-Up",
+    "tracking / missed call": "Automation / Follow-Up",
 }
 TYPED_AIRTABLE_FIELDS = (
     INTEGER_FIELDS | FLOAT_FIELDS | {AI_CONFIDENCE_FIELD, VERTICAL_FIELD, SITE_STATUS_FIELD} | SERVICE_ANGLE_FIELDS
