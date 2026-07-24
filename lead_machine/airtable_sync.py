@@ -92,6 +92,12 @@ SITE_STATUS_LABELS = {
     "social only": "Social Only",
     "facebook only": "Social Only",
     "jobber only": "Social Only",
+    # evidence._status_from_site uses its own lowercase vocabulary, and
+    # manual_scores writes it straight into this column on the LLM path.
+    # "weak" and "okay" both mean the site loads; the severity is carried by
+    # Visible Pain Score / Reasons, which this select has no options for.
+    "weak": "Loaded",
+    "okay": "Loaded",
 }
 OFFER_FIT_FIELD = "Offer Fit"
 # Offer Fit is the only service-angle column that syncs. "Best Service Angle"

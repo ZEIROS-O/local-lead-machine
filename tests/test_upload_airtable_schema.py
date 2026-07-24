@@ -26,7 +26,9 @@ SCORER_OFFER_FITS = [
     "Estimate Funnel",
     "Tracking / Missed Call",
 ]
-# Every site_status enrich_leads.py assigns.
+# Every site_status enrich_leads.py assigns (deterministic path) plus every
+# value evidence._status_from_site returns, which manual_scores writes straight
+# into the same column on the LLM path. The two use different vocabularies.
 ENRICHER_SITE_STATUSES = [
     "No Website",
     "Broken Website",
@@ -35,6 +37,15 @@ ENRICHER_SITE_STATUSES = [
     "Social Only",
     "Loaded",
     "Unknown",
+]
+EVIDENCE_SITE_STATUSES = [
+    "missing",
+    "broken",
+    "weak",
+    "okay",
+    "social_only",
+    "jobber_only",
+    "unknown",
 ]
 
 
@@ -138,6 +149,15 @@ class TypedFieldNormalizationCoverageTest(unittest.TestCase):
                 self.assertIsNotNone(
                     normalize_airtable_value("Site Status", value),
                     f"enrich_leads emits {value!r} but it would be dropped from the payload",
+                )
+
+    def test_every_evidence_site_status_normalizes(self):
+        for value in EVIDENCE_SITE_STATUSES:
+            with self.subTest(site_status=value):
+                self.assertIsNotNone(
+                    normalize_airtable_value("Site Status", value),
+                    f"evidence._status_from_site returns {value!r} but it would be "
+                    "dropped from the payload",
                 )
 
 
