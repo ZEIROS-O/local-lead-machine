@@ -67,8 +67,8 @@ CANONICAL_FIELDS = {
     "Skip Reason",
 }
 # Canonical halves of a Legacy* pair that have since been demoted off the
-# Airtable surface entirely. Their Legacy* counterparts have no migration
-# target left, so airtable_schema_cutover.py must not be pointed at them.
+# Airtable surface entirely. Their Legacy* counterparts are tracked as
+# airtable_schema_cutover.LEGACY_ORPHAN_FIELDS — deleted outright, not migrated.
 DEMOTED_CANONICAL_FIELDS = {
     "Current Website Quality",
     "CTA Strength",
@@ -125,6 +125,21 @@ class SchemaReportContentTest(unittest.TestCase):
         }
         report_fields = {row["field"] for row in ua.build_schema_report()}
         self.assertTrue(expected.issubset(report_fields), f"Missing from report: {expected - report_fields}")
+
+
+class LegacyOrphanRegistrationTest(unittest.TestCase):
+    def test_every_demoted_canonical_has_its_legacy_half_registered_as_an_orphan(self):
+        from airtable_schema_cutover import LEGACY_FIELD_PAIRS, LEGACY_ORPHAN_FIELDS
+
+        for canonical in DEMOTED_CANONICAL_FIELDS:
+            with self.subTest(canonical=canonical):
+                self.assertNotIn(canonical, set(LEGACY_FIELD_PAIRS.values()))
+                self.assertIn(f"Legacy {canonical}", LEGACY_ORPHAN_FIELDS)
+
+    def test_every_surviving_pair_still_points_at_a_live_column(self):
+        from airtable_schema_cutover import LEGACY_FIELD_PAIRS
+
+        self.assertTrue(set(LEGACY_FIELD_PAIRS.values()).issubset(set(AIRTABLE_ALLOWED_FIELDS)))
 
 
 class TypedFieldNormalizationCoverageTest(unittest.TestCase):

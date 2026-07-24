@@ -22,14 +22,28 @@ from dotenv import load_dotenv
 
 
 LEGACY_FIELD_PAIRS = {
-    "Legacy Current Website Quality": "Current Website Quality",
     "Legacy Send Trigger": "Send Trigger",
     "Legacy Last Contacted": "Last Contacted",
     "Legacy Recommended Action": "Recommended Action",
     "Legacy Form Strength": "Form Strength",
-    "Legacy CTA Strength": "CTA Strength",
     "Legacy Skip Reason": "Skip Reason",
 }
+
+# Legacy columns whose canonical half was later demoted off the Airtable surface
+# (see docs/audits/2026-07-24-airtable-field-review.md, section H). There is no
+# column left to migrate them into, so the pair checks below cannot apply: every
+# value in them is legacy-only by definition, which would refuse the cutover
+# forever. They are backed up and listed for deletion like any other legacy
+# field, and their populated-row counts are reported so the operator sees how
+# much data the deletion drops.
+LEGACY_ORPHAN_FIELDS = (
+    "Legacy Current Website Quality",
+    "Legacy CTA Strength",
+)
+
+
+def all_legacy_fields() -> list[str]:
+    return [*LEGACY_FIELD_PAIRS, *LEGACY_ORPHAN_FIELDS]
 
 
 def schema_field_names(schema: dict[str, Any]) -> set[str]:
@@ -52,10 +66,11 @@ def prepare_cutover(
     schema: dict[str, Any], records: list[dict[str, Any]]
 ) -> dict[str, Any]:
     names = schema_field_names(schema)
-    missing_legacy = sorted(set(LEGACY_FIELD_PAIRS) - names)
+    missing_legacy = sorted(set(all_legacy_fields()) - names)
     missing_canonical = sorted(set(LEGACY_FIELD_PAIRS.values()) - names)
     legacy_only = {field: [] for field in LEGACY_FIELD_PAIRS}
     conflicts = {field: [] for field in LEGACY_FIELD_PAIRS}
+    orphan_populated = {field: 0 for field in LEGACY_ORPHAN_FIELDS}
     for record in records:
         fields = record.get("fields") or {}
         if not isinstance(fields, dict):
@@ -68,6 +83,9 @@ def prepare_cutover(
                 legacy_only[legacy].append(record_id)
             elif old and new and old != new:
                 conflicts[legacy].append(record_id)
+        for orphan in LEGACY_ORPHAN_FIELDS:
+            if comparable(orphan, fields.get(orphan)):
+                orphan_populated[orphan] += 1
     populated_legacy_only = {key: value for key, value in legacy_only.items() if value}
     populated_conflicts = {key: value for key, value in conflicts.items() if value}
     return {
@@ -75,6 +93,9 @@ def prepare_cutover(
         "missing_legacy_fields": missing_legacy,
         "missing_canonical_fields": missing_canonical,
         "legacy_only": populated_legacy_only,
+        # Orphans have no canonical column left, so their values cannot be
+        # reconciled — only backed up. Reported, never blocking.
+        "orphan_populated_counts": {k: v for k, v in orphan_populated.items() if v},
         "conflicts": populated_conflicts,
         "safe_to_delete": not any(
             (missing_legacy, missing_canonical, populated_legacy_only, populated_conflicts)
@@ -92,7 +113,7 @@ def verify_cutover(
         errors.append(
             f"record count changed: expected {expected_count}, found {record_count}"
         )
-    remaining = sorted(set(LEGACY_FIELD_PAIRS) & names)
+    remaining = sorted(set(all_legacy_fields()) & names)
     if remaining:
         errors.append("legacy fields still present: " + ", ".join(remaining))
     missing_current = sorted(set(LEGACY_FIELD_PAIRS.values()) - names)
@@ -180,7 +201,7 @@ def write_text_atomic(path: Path, value: str) -> None:
 
 
 def backup_records(records: list[dict[str, Any]]) -> dict[str, Any]:
-    names = ["Place Key", *LEGACY_FIELD_PAIRS, *LEGACY_FIELD_PAIRS.values()]
+    names = ["Place Key", *all_legacy_fields(), *LEGACY_FIELD_PAIRS.values()]
     return {
         "records": [
             {
@@ -229,7 +250,7 @@ def _timestamp() -> str:
 def run_prepare(args: argparse.Namespace) -> int:
     base_id, table, token = _credentials(args)
     schema = fetch_table_schema(base_id, table, token)
-    paired_fields = ["Place Key", *LEGACY_FIELD_PAIRS, *LEGACY_FIELD_PAIRS.values()]
+    paired_fields = ["Place Key", *all_legacy_fields(), *LEGACY_FIELD_PAIRS.values()]
     records = fetch_records(base_id, str(schema.get("id") or table), token, paired_fields)
     report = prepare_cutover(schema, records)
     output_dir = args.output_dir or Path("run_state/airtable_schema_cutover") / _timestamp()
@@ -257,8 +278,24 @@ def run_prepare(args: argparse.Namespace) -> int:
             "",
             "Delete these fields manually in the Airtable UI:",
             "",
-            *[f"- [ ] `{name}`" for name in LEGACY_FIELD_PAIRS],
+            *[f"- [ ] `{name}`" for name in all_legacy_fields()],
             "",
+        ]
+        orphan_counts = report.get("orphan_populated_counts") or {}
+        if orphan_counts:
+            checklist += [
+                "## Read before deleting the orphans",
+                "",
+                "These have no canonical column left to migrate into, so deleting them",
+                f"drops their values from Airtable. `{backup_path.name}` is the only copy.",
+                "",
+                *[
+                    f"- `{name}` holds data on {count} of {len(records)} records"
+                    for name, count in sorted(orphan_counts.items())
+                ],
+                "",
+            ]
+        checklist += [
             "Then verify without modifying Airtable:",
             "",
             f"`.venv/bin/python airtable_schema_cutover.py verify {snapshot_path}`",
