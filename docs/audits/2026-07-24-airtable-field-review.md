@@ -5,6 +5,13 @@
 **Scope:** read-only review of the 65-column Airtable prospect schema against the code that writes and
 reads it. No Airtable calls made (no credentials in this environment); no pipeline behaviour changed.
 
+> **Implemented 2026-07-24.** The base was cut over by hand and the code followed in five
+> commits — label mappings first (`a504695`, `f888cb5`), then the deletions (`fac9469`), the
+> demotions (`053d130`), and the `Packet Tier` consolidation (`d0a24d3`). The schema is now
+> **54 columns**; `docs/airtable_schema_required.md` is regenerated from `_FIELD_SCHEMA`.
+> Two things changed against the plan below, both found while implementing — see
+> **Outcome** at the end.
+
 **Verification basis:** read of `lead_machine/airtable_sync.py`, `upload_airtable.py`,
 `lead_machine/sendability.py`, `lead_machine/score_schema.py`, `lead_machine/manual_scores.py`,
 `score_leads.py`, `query_ready_to_send.py`, `mark_sent.py`, `lead_machine/hermes_queue.py`,
@@ -350,3 +357,55 @@ live base. Two things to confirm with `airtable_schema_cutover.py prepare` befor
   `Evidence Notes`, `Manual Reviewed`, `Desktop Screenshot Path`, `Mobile Screenshot Path`,
   `Created Time`, `Last Modified Time` (all in `parse_airtable_records.FIELDS`, none in the write
   schema). If present and unpopulated, they are additional deletion candidates.
+
+---
+
+## Outcome (implementation notes, 2026-07-24)
+
+Landed as planned, in the sequence above, each batch green on the full suite. The schema went
+**65 → 54**; suite went 536 → 543 tests. Two things differed from the plan.
+
+**1. Section B was worse than reported — a second vocabulary.** The review checked the values
+`enrich_leads` assigns (`Broken Website`, `Jobber Only`, …). It missed that
+`evidence._status_from_site` returns a *different, lowercase* set — `missing`, `broken`, `weak`,
+`okay`, `social_only`, `jobber_only`, `unknown` — and that `manual_scores.py:407` writes that
+straight into the same `Site Status` column. That is the LLM path, which is the path real batches
+run on. `weak` and `okay` still dropped after the first fix; both now map to `Loaded`, since the
+severity separating them is already carried by Visible Pain Score and Reasons and this select has
+no option for it. Coverage now asserts against **both** vocabularies, which is what would have
+caught it.
+
+Verified end-to-end after the fix: all seven evidence statuses build a payload with **zero**
+dropped fields.
+
+**2. `Sendable` + `Packet Eligible` needed a derivation in both directions.** The plan only
+covered reading the tier back. Two more cases turned up:
+
+- `sendability.readiness_flags` reconstructs the two booleans from `Packet Tier` for rows read
+  back from the base, which no longer carry them. Explicit columns always win, so a hand-edited
+  `No` in Airtable is still honoured — the cross-check value described in section G survives.
+- `upload_airtable` needed the mirror: a scored CSV written before `Packet Tier` existed would
+  otherwise upload with no readiness column at all, and `query_ready_to_send`'s filter could never
+  match it. It now judges readiness on the source CSV row rather than the filtered payload and
+  derives a tier when absent, marked defaulted so a PATCH cannot clobber a tier already in the base.
+
+One behaviour change falls out of this and is worth knowing: a legacy-shaped CSV carrying
+`Sendable=Yes` with no commercial fit or contact eligibility now lands as **Manual Review Packet**,
+not as a sendable row. That is correct — it never satisfied the four-field contract; it just
+carried a `Sendable` string that the old code passed through verbatim.
+
+### Still open
+
+- **`No-Site Launch` remains unreachable.** Making it reachable means changing `choose_offer_fit`
+  to return a distinct label for no-website/social-only instead of `Website Rebuild`, which is a
+  scoring change and out of scope for a schema pass. The option is harmless but dead; either wire
+  it up deliberately or drop it from the select.
+- **Two orphaned `Legacy *` pairs.** `airtable_schema_cutover.LEGACY_FIELD_PAIRS` still maps
+  `Legacy Current Website Quality` and `Legacy CTA Strength` to canonical columns that no longer
+  exist. If those legacy columns are still in the base, `prepare` will now report the canonical
+  half missing and refuse rather than generating a checklist — deliberately, so a human looks.
+  They should just be deleted outright. `tests/test_upload_airtable_schema.py` records this split
+  as `DEMOTED_CANONICAL_FIELDS`.
+- **The base-side checks from "Not verifiable from here" are still unverified** — no credentials in
+  this environment. Worth one `airtable_schema_cutover.py prepare` run to confirm nothing else is
+  lingering.
