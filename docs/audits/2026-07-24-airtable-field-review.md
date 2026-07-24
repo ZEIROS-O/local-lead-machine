@@ -396,11 +396,7 @@ carried a `Sendable` string that the old code passed through verbatim.
 
 ### Still open
 
-- **The base-side checks from "Not verifiable from here" are still unverified** — no Airtable
-  credentials in this environment. One `airtable_schema_cutover.py prepare` run confirms whether the
-  seven `Legacy *` columns and the non-schema stragglers (`Google Place ID`, `Evidence Notes`,
-  `Manual Reviewed`, the two screenshot paths, `Created Time`, `Last Modified Time`) are still there.
-  This is the only item left.
+**Nothing in the schema. One data problem, described under "Live base verification" below.**
 
 ### Closed after the outcome above
 
@@ -430,3 +426,69 @@ afterwards like any other legacy field, but excluded from a pair comparison with
 against. Their populated-row counts are reported and the checklist warns that `backup.json` is the
 only remaining copy. A cross-file test ties `DEMOTED_CANONICAL_FIELDS` to `LEGACY_ORPHAN_FIELDS` so
 neither list can drift alone.
+
+---
+
+## Live base verification (2026-07-24, via the Airtable connector)
+
+Read-only pass over `Local Lead Machine CRM` / `Prospects` (`appLbCDdUDSZf7qaK` /
+`tblUwMo16aVtOnCEE`). All **132 of 132** records read. Nothing written.
+
+### Schema: clean
+
+- **All 54 columns the code writes exist in the base.** Nothing would 422
+  `validate_airtable_fields`.
+- **All 12 deleted columns are gone.**
+- **No `Legacy *` columns** — the earlier cutover was completed, so
+  `LEGACY_ORPHAN_FIELDS` has nothing left to clean up in this base. The handling stays as a guard.
+- **No stragglers**: `Google Place ID`, `Evidence Notes`, `Manual Reviewed`, the screenshot paths,
+  `Created Time` and `Last Modified Time` are all absent. `fetch_existing_records` still probes
+  `Google Place ID` and degrades correctly when it is missing.
+- **Every select option the code can emit exists**, checked value-by-value against
+  `SITE_STATUS_LABELS`, `SERVICE_ANGLE_LABELS`, `AI_CONFIDENCE_LABELS`, `VERTICAL_LABELS`,
+  the commercial/asset state sets and the packet tiers. Zero gaps — a live sync cannot 422 on a
+  select.
+- 11 base columns the pipeline never touches (`Notes`, `Lead Source`, `Sales Activities` and the
+  `Sales — *` block). Human CRM fields; leave them.
+
+### Data: `Packet Tier` was never backfilled
+
+**`Packet Tier` is empty on 130 of 132 records** (1 `No Packet`, 1 `Manual Review Packet`). The
+hand cutover deleted `Sendable` and `Packet Eligible` without populating their replacement, so:
+
+**`query_ready_to_send` currently returns 0 records.** The send queue is dark.
+
+Three records satisfy every other clause of the filter — `commercially-sendable` + `contact-now` +
+`New` — and are excluded only by the empty tier:
+
+| Business | Grade | Place Key |
+|---|---|---|
+| Carey Plumbing | A | `ChIJVbUnpRLxMIgRvxKj43fAVAw` |
+| C & S Plumbing Heating & Sewer | B | `ChIJ6ZbQ5EDvMIgR09hMIC5dEPM` |
+| Wiemels-Hiros Plumbing Co. | B | `ChIJ2exhP5jtMIgR3K7rErzGbxw` |
+
+**This cannot be safely repaired from inside Airtable.** The tier is a function of the full
+sendability gate — grade, score, confidence, visible pain, evidence refs, safe claims — and the two
+columns that recorded its outcome were deleted. Nothing left in the base reconstructs it, and no
+scored CSVs exist in this checkout. Deriving a tier from the commercial gates alone would mark leads
+sendable on a guess, which is the exact failure the contract exists to prevent.
+
+**The correct fix is a pipeline re-sync.** `upload_airtable` matches existing records by `Place Key`
+and PATCHes, so re-running it over the scored CSVs for these batches sets `Packet Tier` from real
+scored data and leaves everything else intact. Until then the base is accurate but the queue is
+empty — a safe failure, not a silent one.
+
+### Cosmetic: unused select options
+
+Only 2 records use any non-code option: `Offer Fit = "Review / Trust Proof"` (Malone's Epoxy,
+Armorcoat Inc, both from the 2026-06-07 batch). The current code maps
+`Review/Trust Proof Upgrade → Website Rebuild`, so that option will never be written again.
+
+Unused and safe to delete if you want the selects tidy: `AI Confidence → "No-Site Launch"`,
+`Site Status → "Audit site / booking flow"`, `Lead Priority → "(440) 537-2459"`, `"D"`, `"New"`,
+`Offer Fit → "Mediocre"`, `"Not Fit"`. The first three are data-entry accidents — a phone number and
+an offer-fit value that landed in the wrong column and auto-created an option.
+
+**Do not delete `Lead Priority → "Skip"`** even though no record uses it: `classify_priority` can
+return `Skip` and `build_airtable_payload` writes the grade through untyped, so removing the option
+would 422 the next sync that includes a skip-graded lead.
