@@ -110,6 +110,7 @@ class LeadMachineContractsTest(unittest.TestCase):
             "Packet Eligible": "Yes",
             "Packet Eligibility Reason": "A lead with Website Rebuild angle.",
             "Sendable": "Yes",
+            "Packet Tier": "Sendable Packet",
             "Commercial Fit State": "commercially-sendable",
             "Contact Eligibility": "contact-now",
             "Minimum Evidence Passed": "Yes",
@@ -186,8 +187,7 @@ class LeadMachineContractsTest(unittest.TestCase):
         # Offer Fit, Next Action restated Status.
         self.assertNotIn("Best Service Angle", fields)
         self.assertNotIn("Next Action", fields)
-        self.assertEqual(fields["Packet Eligible"], "Yes")
-        self.assertEqual(fields["Sendable"], "Yes")
+        self.assertEqual(fields["Packet Tier"], "Sendable Packet")
         # Form Strength is the one form signal that still syncs; the rest of
         # the scraper detail stays in the scored CSV and the packet.
         self.assertEqual(fields["Form Strength"], "None")
@@ -436,8 +436,13 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(fields["Phone"], "(440) 637-5848")
         self.assertEqual(fields["Lead Priority"], "A")
         self.assertEqual(fields["Score Total"], 86)
-        self.assertEqual(fields["Sendable"], "Yes")
-        self.assertEqual(fields["Packet Eligible"], "Yes")
+        # No Packet Tier column in this legacy-shaped CSV, so it is derived. The
+        # row carries Sendable=Yes but no commercial fit or contact eligibility,
+        # so it fails the readiness contract and lands as a manual-review packet
+        # rather than inheriting the bare Sendable string it used to sync.
+        self.assertEqual(fields["Packet Tier"], "Manual Review Packet")
+        self.assertNotIn("Sendable", fields)
+        self.assertNotIn("Packet Eligible", fields)
         self.assertNotIn("Recommended Action", fields)
         self.assertNotIn("Place Key", fields)
 

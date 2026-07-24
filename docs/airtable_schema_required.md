@@ -14,8 +14,7 @@
 | Reviews | Number | ? | Integer; set field to 'Integer' precision |
 | Rating | Number | ? | Decimal; set field to 2 decimal places |
 | Specific Observation | Long text | ? |  |
-| Packet Eligible | Single select | ? | Options: Yes, No |
-| Sendable | Single select | ? | Options: Yes, No |
+| Packet Tier | Single select | ? | Options: Sendable Packet, Manual Review Packet, Watchlist, No Packet |
 | Lead Priority | Single select | ? | Options: A, B, C (grade) |
 | Offer Fit | Single select | ? | Options: No-Site Launch, Website Rebuild, Estimate Funnel, Automation / Follow-Up |
 | Site Status | Single select | ? | Options: Missing, Broken, No Website, Loaded, Redirect Issue, Social Only, Unknown |

@@ -103,7 +103,7 @@ class SchemaReportContentTest(unittest.TestCase):
             "Business Name", "Owner Name", "Vertical", "City", "Phone", "Email",
             "Website URL", "Google Maps URL", "Reviews", "Rating",
             "Specific Observation",
-            "Packet Eligible", "Sendable", "Lead Priority", "Offer Fit",
+            "Packet Tier", "Lead Priority", "Offer Fit",
             "Site Status", "Form Strength",
             "Visible Pain Score", "Visible Pain Reasons", "Send Trigger",
             "Buyer Intent Signals", "AI Confidence", "Score Total",

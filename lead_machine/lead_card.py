@@ -36,6 +36,7 @@ AIRTABLE_CARD_FIELDS = [
     "Score Total",
     "Recommended Action",
     "Place Key",
+    "Packet Tier",
 ]
 
 

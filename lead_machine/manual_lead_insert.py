@@ -54,6 +54,7 @@ MANUAL_FIELDS = [
     "Specific Observation",
     "Packet Eligible",
     "Sendable",
+    "Packet Tier",
     "Lead Priority",
     "Offer Fit",
     "Contact Form Detected",
@@ -75,7 +76,14 @@ MANUAL_FIELDS = [
     "Manual Notes",
 ]
 
-LLM_FIELD_SET = set(MANUAL_FIELDS) - {"Vertical", "Packet Eligible", "Sendable", "Status", "Place Key"}
+LLM_FIELD_SET = set(MANUAL_FIELDS) - {
+    "Vertical",
+    "Packet Eligible",
+    "Sendable",
+    "Packet Tier",
+    "Status",
+    "Place Key",
+}
 DEFAULT_OUTPUT_DIR = Path("data/manual_leads")
 URL_FIELDS = {"Website URL", "Google Maps URL", "Mockup URL", "Video URL"}
 HTTP_URL_RE = re.compile(r"https?://[^\s<>\]\)\"']+", re.IGNORECASE)
@@ -87,6 +95,7 @@ EMAIL_FIELDS = {"Email"}
 CONTROLLED_SELECT_LABELS = {
     "Packet Eligible": {"Yes", "No"},
     "Sendable": {"Yes", "No"},
+    "Packet Tier": {"Sendable Packet", "Manual Review Packet", "Watchlist", "No Packet"},
     "Lead Priority": {"A", "B", "C"},
     "Contact Form Detected": {"Yes", "No"},
     "Estimate Form Detected": {"Yes", "No"},
@@ -614,6 +623,7 @@ def build_manual_lead_card(
         "Status": status or "Manual Review",
         "Packet Eligible": "Yes",
         "Sendable": "Yes" if sendable else "No",
+        "Packet Tier": "Sendable Packet" if sendable else "Manual Review Packet",
         "Lead Priority": "C",
         "AI Confidence": "medium" if llm_fields else "low",
         "Recommended Action": "Manual review before sending",

@@ -474,16 +474,40 @@ def evaluate_sendability(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def readiness_flags(row: Dict[str, Any]) -> tuple[str, str]:
+    """Return (Sendable, Packet Eligible) for *row*, deriving them if absent.
+
+    Airtable stores Packet Tier instead of the two booleans — it separates
+    Watchlist from No Packet, which the booleans could not. Rows read back from
+    the base therefore carry only the tier, while internal pipeline rows still
+    carry all three; explicit values always win so a hand-edited No is honoured.
+    """
+    tier = _pick(row, "Packet Tier", "packet_tier").strip()
+    sendable = _pick(row, "Sendable", "sendable").strip()
+    packet_eligible = _pick(row, "Packet Eligible", "packet_eligible").strip()
+    if not sendable and tier:
+        sendable = "Yes" if tier == PACKET_TIER_SENDABLE else "No"
+    if not packet_eligible and tier:
+        packet_eligible = "Yes" if tier in PACKET_TIERS_WITH_PACKET else "No"
+    return sendable, packet_eligible
+
+
 def contact_readiness_failures(row: Dict[str, Any]) -> List[str]:
     """Return authoritative contact-readiness contract failures.
 
     Packet eligibility by itself is intentionally insufficient: manual-review
     packets may be uploadable while remaining unsafe to contact.
+
+    Only the first clause is load-bearing for pipeline-written rows — a lead is
+    Sendable only if it is already commercially-sendable and contact-now. The
+    rest are kept as cross-checks against hand-edits in the base, which is what
+    query_ready_to_send uses this for on read-back.
     """
     failures: List[str] = []
-    if _pick(row, "Sendable", "sendable").strip().casefold() != "yes":
+    sendable, packet_eligible = readiness_flags(row)
+    if sendable.casefold() != "yes":
         failures.append("Sendable must be Yes")
-    if _pick(row, "Packet Eligible", "packet_eligible").strip().casefold() != "yes":
+    if packet_eligible.casefold() != "yes":
         failures.append("Packet Eligible must be Yes")
     if _pick(row, "Commercial Fit State", "commercial_fit_state").strip().casefold() != "commercially-sendable":
         failures.append("Commercial Fit State must be commercially-sendable")
