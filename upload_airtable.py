@@ -29,11 +29,20 @@ from lead_machine.airtable_sync import (
     plan_airtable_sync,
 )
 from lead_machine.schema import GENERIC_DOMAINS, normalize_domain, normalize_phone
-from lead_machine.sendability import is_contact_ready
+from lead_machine.sendability import (
+    PACKET_TIER_MANUAL,
+    PACKET_TIER_NONE,
+    PACKET_TIER_SENDABLE,
+    is_contact_ready,
+)
 
 
-_TIER_SENDABLE = "Sendable Packet"
-_TIER_MANUAL = "Manual Review Packet"
+# Alias the canonical tiers rather than restating the literals: sendability
+# owns these strings, and a silent divergence here is exactly the class of bug
+# this schema cut exists to remove.
+_TIER_SENDABLE = PACKET_TIER_SENDABLE
+_TIER_MANUAL = PACKET_TIER_MANUAL
+_TIER_NONE = PACKET_TIER_NONE
 
 # (field, airtable_type, notes)
 _FIELD_SCHEMA: List[tuple[str, str, str]] = [
@@ -402,15 +411,21 @@ def csv_row_to_record(row: Dict[str, str], packet_dir: Path) -> Dict[str, Any]:
     # one would upload a record the send-queue filter can never match. Derive it
     # from the booleans — the mirror of sendability.readiness_flags — and mark it
     # defaulted so a PATCH does not clobber a tier already in the base.
+    #
+    # A row that is neither sendable nor packet-eligible falls through to
+    # _TIER_NONE rather than to a blank. Blank has to keep meaning "the pipeline
+    # never computed a tier for this record", which is the state that silently
+    # emptied the send queue; it must not also mean "computed, and the answer was
+    # no packet".
     if not clean_cell(fields.get("Packet Tier")):
-        derived_tier = ""
         if row_is_sendable:
             derived_tier = _TIER_SENDABLE
         elif truthy_yes(source.get("Packet Eligible")):
             derived_tier = _TIER_MANUAL
-        if derived_tier:
-            fields["Packet Tier"] = derived_tier
-            defaulted_fields.append("Packet Tier")
+        else:
+            derived_tier = _TIER_NONE
+        fields["Packet Tier"] = derived_tier
+        defaulted_fields.append("Packet Tier")
 
     # Filter platform/system emails before Airtable payload creation.
     if "Email" in fields:

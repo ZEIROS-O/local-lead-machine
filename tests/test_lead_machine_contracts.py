@@ -451,6 +451,62 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertNotIn("Recommended Action", fields)
         self.assertNotIn("Place Key", fields)
 
+    def test_airtable_csv_dry_run_derives_no_packet_tier_rather_than_leaving_it_blank(self) -> None:
+        """A computed 'no packet' answer must not look like 'never computed'.
+
+        Blank Packet Tier is the state that silently emptied the send queue, so
+        it has to keep meaning exactly one thing: the pipeline never wrote a
+        tier for this record. A row the pipeline *did* judge, and judged as
+        unsendable, gets the explicit No Packet option instead.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "scored.csv"
+            self._write_airtable_csv(
+                csv_path,
+                [
+                    {
+                        "Business Name": "No Packet Landscaping",
+                        "Phone": "(440) 637-5849",
+                        "Lead Priority": "C",
+                        "Score Total": "41",
+                        "Sendable": "No",
+                        "Packet Eligible": "",
+                    }
+                ],
+            )
+
+            code, stdout, stderr = self._run_upload(["upload_airtable.py", "--input", str(csv_path)])
+
+        self.assertEqual(code, 0, stderr)
+        planned = self._dry_run_plan(stdout)
+        self.assertEqual(len(planned), 1)
+        fields = planned[0]["payload"]["fields"]  # type: ignore[index]
+        self.assertEqual(fields["Packet Tier"], "No Packet")
+
+    def test_airtable_derived_packet_tier_never_clobbers_an_existing_tier(self) -> None:
+        """A derived tier is a fallback for new records, not an overwrite.
+
+        The derivation only sees the CSV, so on a record that already exists it
+        could downgrade a tier the base got from a fuller scored run. Marking it
+        defaulted keeps it out of the PATCH payload.
+        """
+        card = {
+            "place_id_or_unique_key": "ChIJ-no-packet",
+            "airtable_fields": {
+                "Business Name": "No Packet Landscaping",
+                "Packet Tier": "No Packet",
+            },
+            "defaulted_airtable_fields": ["Packet Tier"],
+        }
+
+        posted = plan_airtable_sync([card])
+        patched = plan_airtable_sync([card], existing_records_by_key={"place:ChIJ-no-packet": "recExisting"})
+
+        self.assertEqual(posted[0]["method"], "POST")
+        self.assertEqual(posted[0]["payload"]["fields"]["Packet Tier"], "No Packet")
+        self.assertEqual(patched[0]["method"], "PATCH")
+        self.assertNotIn("Packet Tier", patched[0]["payload"]["fields"])
+
     def test_airtable_csv_dry_run_preserves_explicit_sendable_operational_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             csv_path = Path(tmp) / "scored.csv"
