@@ -48,6 +48,16 @@ AIRTABLE_ENV_VARS = (
 
 
 class LeadMachineContractsTest(unittest.TestCase):
+    def setUp(self) -> None:
+        # score_leads fails closed without a suppression source, the same as the
+        # search and enrichment entry points. This suite exercises scoring and
+        # schema contracts rather than compliance, so it opts out explicitly
+        # instead of the gate being softened for everyone. Compliance behaviour
+        # is pinned in tests/test_dnc_enrichment.py.
+        patcher = patch.dict(os.environ, {"ALLOW_MISSING_SUPPRESSION_INDEX": "1"}, clear=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_governed_openers_render_actual_copy_across_channels_and_asset_states(self) -> None:
         record = {
             "google": {"business_name": "Davis Roofing"},

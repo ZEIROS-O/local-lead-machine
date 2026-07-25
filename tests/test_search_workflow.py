@@ -243,7 +243,7 @@ class SearchWorkflowTest(unittest.TestCase):
                     "userRatingCount": 28,
                 }
 
-            def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False):
+            def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False, suppression_index=None):
                 return {"google": row, "website": {"site_status": "No Website"}, "derived": {}, "screenshots": {}}
 
             with patch("make_search_batch.text_search_paged", side_effect=fake_paged), patch(
@@ -349,7 +349,7 @@ class SearchWorkflowTest(unittest.TestCase):
                 },
             }
 
-            def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False):
+            def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False, suppression_index=None):
                 return {"google": row, "website": {"site_status": "No Website"}, "derived": {}, "screenshots": {}}
 
             with patch("make_search_batch.text_search_paged", return_value=(text_results, 1)), patch(
@@ -396,7 +396,7 @@ class SearchWorkflowTest(unittest.TestCase):
             }
             calls = []
 
-            def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False):
+            def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False, suppression_index=None):
                 calls.append(
                     {
                         "take_shots": take_shots,
@@ -445,7 +445,7 @@ class SearchWorkflowTest(unittest.TestCase):
                 "primaryType": "landscaper",
             }
 
-            def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False):
+            def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False, suppression_index=None):
                 return {
                     "google": row,
                     "website": {
@@ -496,7 +496,7 @@ class SearchWorkflowTest(unittest.TestCase):
                 "primaryType": "landscaper",
             }
 
-            def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False):
+            def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False, suppression_index=None):
                 return {"google": row, "website": {"site_status": "No Website"}, "derived": {}, "screenshots": {}}
 
             with patch("make_search_batch.text_search_paged", return_value=(text_results, 1)), patch(
@@ -540,7 +540,7 @@ class SearchWorkflowTest(unittest.TestCase):
                     "primaryType": "patio contractor",
                 }
 
-            def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False):
+            def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False, suppression_index=None):
                 return {"google": row, "website": {"site_status": "No Website"}, "derived": {}, "screenshots": {}}
 
             with patch("make_search_batch.text_search_paged", side_effect=fake_text_search) as search_call, patch(
@@ -586,7 +586,7 @@ class SearchWorkflowTest(unittest.TestCase):
                 "primaryType": "patio contractor",
             }
 
-            def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False):
+            def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False, suppression_index=None):
                 return {"google": row, "website": {"site_status": "No Website"}, "derived": {}, "screenshots": {}}
 
             progress = io.StringIO()

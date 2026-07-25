@@ -11,7 +11,7 @@ import time
 from collections import Counter
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import AbstractSet, Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 try:
     from dotenv import load_dotenv
@@ -27,6 +27,7 @@ from enrich_leads import (
     format_elapsed,
 )
 from places_search import normalize_place, place_details, text_search_paged
+from lead_machine.compliance import ComplianceError, load_configured_suppression_index
 from lead_machine.schema import GENERIC_DOMAINS, normalize_domain, normalize_phone, slug
 
 
@@ -742,6 +743,7 @@ def run_search_batch(
     max_searches: Optional[int] = None,
     max_details: Optional[int] = None,
     max_enrich: Optional[int] = None,
+    suppression_index: Optional[AbstractSet[str]] = None,
 ) -> SearchRunResult:
     config = load_search_config(config_path)
     if batch and batch != config.batch:
@@ -821,6 +823,7 @@ def run_search_batch(
                 screenshots_dir=screenshots_dir,
                 take_shots=not no_screenshots,
                 rendered_site_check=rendered_site_check,
+                suppression_index=suppression_index,
             )
             enriched_records.append(enriched)
         except Exception as exc:
@@ -993,6 +996,10 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
+        # This is the entry point the pipeline actually runs, so it is the one
+        # that has to fail closed. Loading here rather than inside
+        # run_search_batch keeps the refusal ahead of the first paid Places call.
+        suppression_index = load_configured_suppression_index()
         result = run_search_batch(
             config_path=Path(args.config),
             batch=args.batch,
@@ -1003,8 +1010,9 @@ def main() -> int:
             max_searches=args.max_searches,
             max_details=args.max_details,
             max_enrich=args.max_enrich,
+            suppression_index=suppression_index,
         )
-    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+    except (FileNotFoundError, RuntimeError, ValueError, ComplianceError) as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         return 1
 

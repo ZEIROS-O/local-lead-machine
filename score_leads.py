@@ -39,6 +39,13 @@ from lead_machine.buyer_signals import (
     has_money_signal as buyer_has_money_signal,
     review_demand_band as buyer_review_demand_band,
 )
+from lead_machine.compliance import (
+    ComplianceError,
+    is_suppressed_record,
+    load_configured_suppression_index,
+    merge_suppression_disqualifiers,
+    record_matches_suppression,
+)
 from lead_machine.email_hygiene import emails_text, sanitize_record_emails
 from lead_machine.evidence import build_evidence_profile
 from lead_machine.lead_card import build_lead_card
@@ -1485,6 +1492,7 @@ def score_record(record: Dict[str, Any], fallback_vertical: str) -> Dict[str, An
         "Packet Eligible": packet_eligible(priority, offer_fit),
         "Packet Eligibility Reason": packet_eligibility_reason(priority, offer_fit),
     }
+    merge_suppression_disqualifiers(row, record)
     governed = apply_sendability(row)
     return attach_scoring_v3(record, governed, fallback_vertical=fallback_vertical)
 
@@ -3218,6 +3226,26 @@ def main() -> int:
     records = [ensure_evidence(record) for record in read_jsonl(input_path)]
     if args.offset > 0:
         records = records[args.offset :]
+
+    # Drop suppressed leads before anything is spent on them. Two checks, and
+    # both are needed: the stored flag covers businesses already suppressed when
+    # they were enriched, and the live index covers the ordinary case where the
+    # opt-out arrived after enrichment and the flag on disk is a stale "clean".
+    # merge_suppression_disqualifiers still backstops this at the sendability
+    # gate, but in api-llm mode that happens after the tokens are paid for.
+    try:
+        suppression_index = load_configured_suppression_index()
+    except ComplianceError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+
+    def _suppressed(record: Dict[str, Any]) -> bool:
+        return is_suppressed_record(record) or record_matches_suppression(record, suppression_index)
+
+    kept = [record for record in records if not _suppressed(record)]
+    if len(kept) != len(records):
+        print(f"[SKIP] Suppressed leads dropped before scoring: {len(records) - len(kept)}")
+        records = kept
 
     existing_scored_rows: List[Dict[str, Any]] = []
     append_existing_scored_rows = False

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Set
 
 from .buyer_signals import buyer_intent_summary, ensure_buyer_intent, has_money_signal, review_demand_band
+from .compliance import merge_suppression_disqualifiers
 from .email_hygiene import emails_text
 from .score_schema import (
     ASSET_STATES,
@@ -555,6 +556,7 @@ def merge_manual_score(
             "Confidence": validated["confidence"],
         }
     )
+    merge_suppression_disqualifiers(row, enriched)
     governed = apply_sendability(row)
     return attach_scoring_v3(enriched, governed, fallback_vertical=fallback_vertical)
 

@@ -27,7 +27,7 @@ import time
 import warnings
 import datetime as dt
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import AbstractSet, Any, Dict, Iterable, List, Tuple
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -44,6 +44,12 @@ from lead_machine.icp import hard_icp_gate
 from lead_machine.schema import normalize_lead
 from lead_machine.verticals import resolve_profile
 from lead_machine.review_velocity import ReviewSnapshotStore
+from lead_machine.compliance import (  # re-exported: the enrichment entry points share these
+    DNC_SUPPRESSED_REASON,
+    ComplianceError,
+    has_suppression_match,
+    load_configured_suppression_index,
+)
 
 
 USER_AGENT = (
@@ -1331,6 +1337,7 @@ def enrich_row(
     rendered_site_check: bool = False,
     buyer_intent_ads_check: bool = False,
     review_snapshot_store: ReviewSnapshotStore | None = None,
+    suppression_index: AbstractSet[str] | None = None,
 ) -> Dict[str, Any]:
     started_at = time.monotonic()
     lead = normalize_lead(row, fallback_vertical=row.get("category", "") or "service")
@@ -1338,12 +1345,29 @@ def enrich_row(
     gate = hard_icp_gate(lead)
 
     website_url = row.get("website_url", "") or ""
-    site = scrape_site(
-        website_url,
-        rendered_form_check=rendered_form_check,
-        high_ticket_terms=profile.high_ticket_terms,
-        started_at=started_at,
+    google_phone = row.get("phone", "")
+
+    # Check the phone Google already gave us before spending anything. The full
+    # crawl costs page fetches and, with screenshots on, a browser launch — all
+    # of it wasted on a business we are not allowed to contact. The scraped
+    # emails and phones still get checked below for leads that survive this.
+    suppressed_before_crawl = bool(suppression_index) and has_suppression_match(
+        phones=[google_phone],
+        suppression_index=suppression_index,
     )
+
+    if suppressed_before_crawl:
+        # "Unknown", not a new "Suppressed" status: Site Status is a typed
+        # Airtable select, and an unmapped value normalizes to None and is
+        # dropped silently. The dnc_suppressed flag carries the meaning.
+        site = empty_site_result("Unknown", [DNC_SUPPRESSED_REASON], url=website_url)
+    else:
+        site = scrape_site(
+            website_url,
+            rendered_form_check=rendered_form_check,
+            high_ticket_terms=profile.high_ticket_terms,
+            started_at=started_at,
+        )
 
     screenshots = {"desktop": "", "mobile": "", "error": ""}
     screenshot_url = site.get("final_url") or normalize_url(website_url)
@@ -1377,7 +1401,6 @@ def enrich_row(
             screenshots = check_rendered_site(screenshot_url, timeout_ms=rendered_timeout_ms)
         site = apply_rendered_site_result(site, screenshots)
 
-    google_phone = row.get("phone", "")
     website_phones = site.get("phones_found", [])
 
     google_digits = normalize_digits(google_phone)
@@ -1411,10 +1434,30 @@ def enrich_row(
             "has_high_ticket_terms": bool(site.get("high_ticket_terms")),
             "non_standard_site_or_booking": is_non_standard_site_or_booking_url(website_url)
             or is_non_standard_site_or_booking_url(site.get("final_url", "")),
-            "hard_icp_skip": gate.should_skip,
-            "hard_icp_reasons": gate.reasons,
         },
     }
+
+    hard_icp_skip = gate.should_skip
+    hard_icp_reasons = list(gate.reasons)
+
+    # Re-check against everything the crawl turned up. The pre-crawl check only
+    # saw the Google phone; a business can be suppressed under an address or a
+    # second line that only appears on the site.
+    if suppression_index and (
+        suppressed_before_crawl
+        or has_suppression_match(
+            emails=site.get("emails_found") or [],
+            phones=(site.get("phones_found") or []) + [google_phone],
+            suppression_index=suppression_index,
+        )
+    ):
+        hard_icp_skip = True
+        if DNC_SUPPRESSED_REASON not in hard_icp_reasons:
+            hard_icp_reasons.append(DNC_SUPPRESSED_REASON)
+
+    record["derived"]["hard_icp_skip"] = hard_icp_skip
+    record["derived"]["hard_icp_reasons"] = hard_icp_reasons
+
     if review_snapshot_store is not None and lead.place_id_or_unique_key:
         record["review_count_history"] = review_snapshot_store.history(lead.place_id_or_unique_key)
     total_elapsed = elapsed_seconds(started_at)
@@ -1460,6 +1503,15 @@ def main() -> int:
         help="Use Playwright browser rendering to classify loaded/broken/timeout site status without requiring screenshots",
     )
     args = parser.parse_args()
+
+    # After parse_args, so --help works, and reported as an [ERROR] rather than
+    # an unhandled traceback — this fires on every run until the operator
+    # configures a suppression source, so it has to read as a config problem.
+    try:
+        suppression_index = load_configured_suppression_index()
+    except ComplianceError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
 
     input_path = Path(args.input)
     output_path = Path(args.output)
@@ -1507,6 +1559,7 @@ def main() -> int:
                 rendered_site_check=args.rendered_site_check,
                 buyer_intent_ads_check=buyer_intent_ads_check,
                 review_snapshot_store=review_snapshot_store,
+                suppression_index=suppression_index,
             )
             records.append(enriched)
 

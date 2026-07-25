@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
-from typing import Any, Iterable
+from typing import AbstractSet, Any, Iterable, Mapping
 
 
 ACCEPTABLE_SMS_CONSENT_POSTURES = frozenset(
@@ -118,3 +119,160 @@ def matching_suppression_identifiers(record: dict[str, Any], suppression: Iterab
 
 def is_suppressed(record: dict[str, Any], suppression: Iterable[str]) -> bool:
     return bool(matching_suppression_identifiers(record, suppression))
+
+
+# --- Enrichment-time suppression -----------------------------------------
+# Suppression has to bite before a lead is scored, not only at send time.
+# mark_sent is the last line of defence; these are what keep a suppressed
+# business out of the scored CSV, the packets, and the Airtable base in the
+# first place.
+
+DNC_SUPPRESSED_REASON = "dnc_suppressed"
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+def load_configured_suppression_index() -> set[str]:
+    """Load the suppression index named by the environment, failing closed.
+
+    A missing suppression source is an unsafe state, not an empty one: with no
+    index every opt-out silently stops applying. Callers must opt out loudly via
+    ALLOW_MISSING_SUPPRESSION_INDEX rather than getting an empty set by default.
+    """
+    suppression_source = (
+        os.getenv("SUPPRESSION_SOURCE", "").strip()
+        or os.getenv("LPM_OUTCOMES_JSONL", "").strip()
+    )
+
+    if not suppression_source:
+        if _env_flag("ALLOW_MISSING_SUPPRESSION_INDEX", False):
+            return set()
+        raise ComplianceError(
+            "No suppression source configured "
+            "(SUPPRESSION_SOURCE or LPM_OUTCOMES_JSONL). "
+            "Set ALLOW_MISSING_SUPPRESSION_INDEX=1 to bypass."
+        )
+
+    try:
+        return load_suppression_index(suppression_source)
+    except ComplianceError:
+        raise
+    except Exception as exc:
+        raise ComplianceError(
+            f"Suppression source was configured but could not be loaded: {suppression_source}"
+        ) from exc
+
+
+def has_suppression_match(
+    *,
+    emails: Iterable[Any] = (),
+    phones: Iterable[Any] = (),
+    suppression_index: AbstractSet[str],
+) -> bool:
+    for kind, values in (("email", emails), ("phone", phones)):
+        for value in values:
+            if not value:
+                continue
+            identifier = suppression_identifier(kind, value)
+            if identifier and identifier in suppression_index:
+                return True
+    return False
+
+
+def suppression_disqualifiers(enriched: Mapping[str, Any] | None) -> list[str]:
+    """Read the enrichment-time suppression verdict off an enriched record.
+
+    The bridge between the enricher, which is the only stage that sees scraped
+    emails and phones, and the scorers, which decide what ships. Tolerates a
+    malformed `derived` block rather than raising: a scorer that crashes on a
+    weird record fails open for the whole batch.
+    """
+    derived = enriched.get("derived") if isinstance(enriched, Mapping) else None
+    if not isinstance(derived, Mapping):
+        return []
+    reasons = derived.get("hard_icp_reasons")
+    if not isinstance(reasons, (list, tuple, set)):
+        return []
+    return [DNC_SUPPRESSED_REASON] if DNC_SUPPRESSED_REASON in reasons else []
+
+
+def is_suppressed_record(enriched: Mapping[str, Any] | None) -> bool:
+    return bool(suppression_disqualifiers(enriched))
+
+
+def enriched_contact_identifiers(enriched: Mapping[str, Any] | None) -> tuple[list[str], list[str]]:
+    """Return (emails, phones) visible on an enriched record."""
+    if not isinstance(enriched, Mapping):
+        return [], []
+    google = enriched.get("google") if isinstance(enriched.get("google"), Mapping) else {}
+    website = enriched.get("website") if isinstance(enriched.get("website"), Mapping) else {}
+
+    emails = [value for value in (website.get("emails_found") or []) if value]
+    for key in ("email", "Email"):
+        if google.get(key):
+            emails.append(google[key])
+
+    phones = [value for value in (website.get("phones_found") or []) if value]
+    for key in ("phone", "Phone"):
+        if google.get(key):
+            phones.append(google[key])
+
+    return emails, phones
+
+
+def record_matches_suppression(
+    enriched: Mapping[str, Any] | None, suppression_index: AbstractSet[str]
+) -> bool:
+    """Match an enriched record against a live suppression index.
+
+    Distinct from `is_suppressed_record`, which only reads the verdict the
+    enricher already stored. That verdict is a snapshot: opt-outs arrive *after*
+    enrichment almost by definition, so a record enriched before a business
+    opted out carries a clean flag forever. Every stage that can still stop a
+    lead has to re-check against the current index rather than trust it.
+    """
+    if not suppression_index:
+        return False
+    emails, phones = enriched_contact_identifiers(enriched)
+    return has_suppression_match(
+        emails=emails, phones=phones, suppression_index=suppression_index
+    )
+
+
+def merge_suppression_disqualifiers(row: dict[str, Any], enriched: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Carry the enricher's suppression verdict onto a scored row, in place.
+
+    Both scoring paths call this before `apply_sendability`, which is what makes
+    the verdict binding: `sendability.has_hard_disqualifier` reads these keys, so
+    a suppressed lead picks up HARD_DISQUALIFIER_BLOCKER, which is in
+    EVIDENCE_BLOCKERS, which forces minimum_evidence_passed False and therefore
+    Packet Tier = No Packet. No separate gate to keep in sync.
+
+    `Skip Reason` is set as well as the canonical list because it is already a
+    synced Airtable column, so the operator sees why the lead was dropped
+    instead of finding an unexplained No Packet.
+    """
+    reasons = suppression_disqualifiers(enriched)
+    if not reasons:
+        return row
+
+    existing = row.get("hard_disqualifiers")
+    merged = list(existing) if isinstance(existing, (list, tuple)) else []
+    for reason in reasons:
+        if reason not in merged:
+            merged.append(reason)
+    row["hard_disqualifiers"] = merged
+    row["Hard Disqualifiers"] = merged
+
+    skip_reason = str(row.get("Skip Reason") or "").strip()
+    parts = [part.strip() for part in skip_reason.split(";") if part.strip()]
+    for reason in reasons:
+        if reason not in parts:
+            parts.append(reason)
+    row["Skip Reason"] = "; ".join(parts)
+    return row
