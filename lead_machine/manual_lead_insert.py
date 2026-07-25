@@ -51,10 +51,10 @@ MANUAL_FIELDS = [
     "Rating",
     "Current Website Quality",
     "Site Status",
-    "Best Service Angle",
     "Specific Observation",
     "Packet Eligible",
     "Sendable",
+    "Packet Tier",
     "Lead Priority",
     "Offer Fit",
     "Contact Form Detected",
@@ -64,7 +64,6 @@ MANUAL_FIELDS = [
     "Visible Pain Score",
     "Visible Pain Reasons",
     "Send Trigger",
-    "Money Signal",
     "Buyer Intent Signals",
     "AI Confidence",
     "Score Total",
@@ -73,12 +72,18 @@ MANUAL_FIELDS = [
     "Send Blockers",
     "Status",
     "Outreach Channel",
-    "Next Action",
     "Place Key",
     "Manual Notes",
 ]
 
-LLM_FIELD_SET = set(MANUAL_FIELDS) - {"Vertical", "Packet Eligible", "Sendable", "Status", "Place Key"}
+LLM_FIELD_SET = set(MANUAL_FIELDS) - {
+    "Vertical",
+    "Packet Eligible",
+    "Sendable",
+    "Packet Tier",
+    "Status",
+    "Place Key",
+}
 DEFAULT_OUTPUT_DIR = Path("data/manual_leads")
 URL_FIELDS = {"Website URL", "Google Maps URL", "Mockup URL", "Video URL"}
 HTTP_URL_RE = re.compile(r"https?://[^\s<>\]\)\"']+", re.IGNORECASE)
@@ -90,6 +95,7 @@ EMAIL_FIELDS = {"Email"}
 CONTROLLED_SELECT_LABELS = {
     "Packet Eligible": {"Yes", "No"},
     "Sendable": {"Yes", "No"},
+    "Packet Tier": {"Sendable Packet", "Manual Review Packet", "Watchlist", "No Packet"},
     "Lead Priority": {"A", "B", "C"},
     "Contact Form Detected": {"Yes", "No"},
     "Estimate Form Detected": {"Yes", "No"},
@@ -438,7 +444,6 @@ def _infer_site_fields(text: str) -> Dict[str, str]:
     if "contact form" in lowered:
         fields["Contact Form Detected"] = "Yes" if "no contact form" not in lowered else "No"
     if any(term in lowered for term in ("ceramic", "paint correction", "ppf", "epoxy", "coating", "garage floor")):
-        fields["Money Signal"] = "High-ticket service mentioned"
         fields["Buyer Intent Signals"] = "High-ticket service term in manual notes"
     return fields
 
@@ -618,10 +623,10 @@ def build_manual_lead_card(
         "Status": status or "Manual Review",
         "Packet Eligible": "Yes",
         "Sendable": "Yes" if sendable else "No",
+        "Packet Tier": "Sendable Packet" if sendable else "Manual Review Packet",
         "Lead Priority": "C",
         "AI Confidence": "medium" if llm_fields else "low",
         "Recommended Action": "Manual review before sending",
-        "Next Action": "Review lead",
     }
     fields = _merge_fields(defaults, [regex_fields, llm_fields])
     if not clean_cell(fields.get("Outreach Channel")):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import csv
 import io
 import json
@@ -13,7 +14,11 @@ from unittest.mock import patch
 
 import upload_airtable
 from enrich_leads import detect_form_signals, scrape_site
-from lead_machine.airtable_sync import build_airtable_payload, plan_airtable_sync
+from lead_machine.airtable_sync import (
+    build_airtable_payload,
+    normalize_airtable_value,
+    plan_airtable_sync,
+)
 from lead_machine.buyer_signals import BUYER_INTENT_LOGIC_VERSION
 from lead_machine.evidence import build_evidence_profile
 from lead_machine.feedback import compute_feedback_metrics
@@ -110,6 +115,7 @@ class LeadMachineContractsTest(unittest.TestCase):
             "Packet Eligible": "Yes",
             "Packet Eligibility Reason": "A lead with Website Rebuild angle.",
             "Sendable": "Yes",
+            "Packet Tier": "Sendable Packet",
             "Commercial Fit State": "commercially-sendable",
             "Contact Eligibility": "contact-now",
             "Minimum Evidence Passed": "Yes",
@@ -180,17 +186,24 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(planned[0]["upsert_key"], "place:ChIJ123")
         fields = planned[0]["payload"]["fields"]  # type: ignore[index]
         self.assertEqual(fields["Business Name"], "A+ Landscaping LLC")
-        self.assertEqual(fields["Best Service Angle"], "Website Rebuild")
         self.assertEqual(fields["Status"], "Mockup Needed")
-        self.assertEqual(fields["Next Action"], "Build mockup")
         self.assertEqual(fields["Outreach Channel"], "Phone")
-        self.assertEqual(fields["Packet Eligible"], "Yes")
-        self.assertEqual(fields["Sendable"], "Yes")
-        self.assertEqual(fields["Contact Form Detected"], "No")
-        self.assertEqual(fields["Estimate Form Detected"], "No")
+        # Both were dropped from the schema: Best Service Angle duplicated
+        # Offer Fit, Next Action restated Status.
+        self.assertNotIn("Best Service Angle", fields)
+        self.assertNotIn("Next Action", fields)
+        self.assertEqual(fields["Packet Tier"], "Sendable Packet")
+        # Form Strength is the one form signal that still syncs; the rest of
+        # the scraper detail stays in the scored CSV and the packet.
         self.assertEqual(fields["Form Strength"], "None")
-        self.assertEqual(fields["Form Detection Method"], "none")
-        self.assertEqual(fields["CTA Strength"], "Weak")
+        for demoted in (
+            "Contact Form Detected",
+            "Estimate Form Detected",
+            "Form Detection Method",
+            "CTA Strength",
+            "Current Website Quality",
+        ):
+            self.assertNotIn(demoted, fields)
         self.assertEqual(fields["Visible Pain Score"], 35)
         self.assertEqual(fields["Visible Pain Reasons"], "No estimate form detected; No clear estimate CTA")
         self.assertEqual(fields["Send Trigger"], "No estimate form detected")
@@ -312,7 +325,7 @@ class LeadMachineContractsTest(unittest.TestCase):
         planned = self._dry_run_plan(stdout)
         fields = planned[0]["payload"]["fields"]  # type: ignore[index]
         self.assertEqual(fields["Offer Fit"], "No-Site Launch")
-        self.assertEqual(fields["Best Service Angle"], "No-Site Launch")
+        self.assertNotIn("Best Service Angle", fields)
         self.assertEqual(fields["Send Trigger"], "social_jobber_escape lane: no owned website")
 
     def test_airtable_payload_normalizes_all_internal_lane_labels_for_select_fields(self) -> None:
@@ -347,9 +360,9 @@ class LeadMachineContractsTest(unittest.TestCase):
                 fields = build_airtable_payload(card)["fields"]
 
                 self.assertEqual(fields["Offer Fit"], expected)
-                self.assertEqual(fields["Best Service Angle"], expected)
                 self.assertIn(fields["Offer Fit"], supported_select_values)
-                self.assertIn(fields["Best Service Angle"], supported_select_values)
+                # Offer Fit is now the only service-angle column that syncs.
+                self.assertNotIn("Best Service Angle", fields)
                 self.assertEqual(fields["Specific Observation"], f"Internal lane: {lane}")
                 self.assertEqual(fields["Visible Pain Reasons"], f"Internal lane: {lane}")
                 self.assertEqual(fields["Send Trigger"], f"Internal lane: {lane}")
@@ -428,10 +441,71 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(fields["Phone"], "(440) 637-5848")
         self.assertEqual(fields["Lead Priority"], "A")
         self.assertEqual(fields["Score Total"], 86)
-        self.assertEqual(fields["Sendable"], "Yes")
-        self.assertEqual(fields["Packet Eligible"], "Yes")
+        # No Packet Tier column in this legacy-shaped CSV, so it is derived. The
+        # row carries Sendable=Yes but no commercial fit or contact eligibility,
+        # so it fails the readiness contract and lands as a manual-review packet
+        # rather than inheriting the bare Sendable string it used to sync.
+        self.assertEqual(fields["Packet Tier"], "Manual Review Packet")
+        self.assertNotIn("Sendable", fields)
+        self.assertNotIn("Packet Eligible", fields)
         self.assertNotIn("Recommended Action", fields)
         self.assertNotIn("Place Key", fields)
+
+    def test_airtable_csv_dry_run_derives_no_packet_tier_rather_than_leaving_it_blank(self) -> None:
+        """A computed 'no packet' answer must not look like 'never computed'.
+
+        Blank Packet Tier is the state that silently emptied the send queue, so
+        it has to keep meaning exactly one thing: the pipeline never wrote a
+        tier for this record. A row the pipeline *did* judge, and judged as
+        unsendable, gets the explicit No Packet option instead.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "scored.csv"
+            self._write_airtable_csv(
+                csv_path,
+                [
+                    {
+                        "Business Name": "No Packet Landscaping",
+                        "Phone": "(440) 637-5849",
+                        "Lead Priority": "C",
+                        "Score Total": "41",
+                        "Sendable": "No",
+                        "Packet Eligible": "",
+                    }
+                ],
+            )
+
+            code, stdout, stderr = self._run_upload(["upload_airtable.py", "--input", str(csv_path)])
+
+        self.assertEqual(code, 0, stderr)
+        planned = self._dry_run_plan(stdout)
+        self.assertEqual(len(planned), 1)
+        fields = planned[0]["payload"]["fields"]  # type: ignore[index]
+        self.assertEqual(fields["Packet Tier"], "No Packet")
+
+    def test_airtable_derived_packet_tier_never_clobbers_an_existing_tier(self) -> None:
+        """A derived tier is a fallback for new records, not an overwrite.
+
+        The derivation only sees the CSV, so on a record that already exists it
+        could downgrade a tier the base got from a fuller scored run. Marking it
+        defaulted keeps it out of the PATCH payload.
+        """
+        card = {
+            "place_id_or_unique_key": "ChIJ-no-packet",
+            "airtable_fields": {
+                "Business Name": "No Packet Landscaping",
+                "Packet Tier": "No Packet",
+            },
+            "defaulted_airtable_fields": ["Packet Tier"],
+        }
+
+        posted = plan_airtable_sync([card])
+        patched = plan_airtable_sync([card], existing_records_by_key={"place:ChIJ-no-packet": "recExisting"})
+
+        self.assertEqual(posted[0]["method"], "POST")
+        self.assertEqual(posted[0]["payload"]["fields"]["Packet Tier"], "No Packet")
+        self.assertEqual(patched[0]["method"], "PATCH")
+        self.assertNotIn("Packet Tier", patched[0]["payload"]["fields"])
 
     def test_airtable_csv_dry_run_preserves_explicit_sendable_operational_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -442,7 +516,7 @@ class LeadMachineContractsTest(unittest.TestCase):
                     self._airtable_csv_row(
                         **{
                             "Status": "Contacted",
-                            "Next Action": "Follow up",
+                            "Outreach Channel": "Email",
                         }
                     )
                 ],
@@ -455,7 +529,7 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(len(planned), 1)
         fields = planned[0]["payload"]["fields"]  # type: ignore[index]
         self.assertEqual(fields["Status"], "Contacted")
-        self.assertEqual(fields["Next Action"], "Follow up")
+        self.assertEqual(fields["Outreach Channel"], "Email")
 
     def test_airtable_patch_does_not_send_defaulted_operational_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -468,7 +542,6 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(planned[0]["method"], "PATCH")
         fields = planned[0]["payload"]["fields"]  # type: ignore[index]
         self.assertNotIn("Status", fields)
-        self.assertNotIn("Next Action", fields)
         self.assertNotIn("Outreach Channel", fields)
 
     def test_make_packets_updates_scored_csv_with_current_batch_packet_path(self) -> None:
@@ -5679,6 +5752,72 @@ class LeadMachineContractsTest(unittest.TestCase):
         }
         score.update(overrides)
         return score
+
+
+class NoOwnedSiteOfferFitTest(unittest.TestCase):
+    """The deterministic scorer must draw the same no-owned-site line the LLM does.
+
+    There is nothing to rebuild for a business whose only web presence is a
+    Facebook page or a Jobber booking link, and the LLM path already labels that
+    No-Site Launch (via its "Social/Jobber Escape"). Before this, the
+    deterministic path called all of them Website Rebuild, so the No-Site Launch
+    select option was unreachable from it.
+    """
+
+    def _record(self, site_status: str, *, booking: bool = False) -> dict:
+        return {
+            "google": {
+                "business_name": "Acme Hardscaping", "rating": "4.9", "reviews": "130",
+                "city": "Cleveland", "phone": "(440) 637-5848", "place_id": "ChIJ1",
+                "website_url": "https://acme.example",
+            },
+            "website": {
+                "site_status": site_status, "form_strength": "None", "cta_strength": "Weak",
+                "contact_form_detected": "No", "estimate_form_detected": "No",
+                "high_ticket_terms": ["patio", "retaining wall"], "generic_copy_terms": [],
+                "combined_text": "patio retaining wall hardscape",
+            },
+            "derived": {
+                "phone_consistency": "matched", "has_email": False, "has_form": False,
+                "has_cta": False, "has_high_ticket_terms": True,
+                "non_standard_site_or_booking": booking,
+            },
+            "screenshots": {},
+        }
+
+    def test_no_owned_site_statuses_produce_no_site_launch(self) -> None:
+        for status in ("No Website", "Social Only", "Jobber Only"):
+            with self.subTest(site_status=status):
+                row = score_record(self._record(status), "hardscaping")
+                self.assertEqual(row["Offer Fit"], "No-Site Launch")
+                self.assertEqual(
+                    normalize_airtable_value("Offer Fit", row["Offer Fit"]), "No-Site Launch"
+                )
+
+    def test_booking_only_url_produces_no_site_launch(self) -> None:
+        row = score_record(self._record("Loaded", booking=True), "hardscaping")
+        self.assertEqual(row["Offer Fit"], "No-Site Launch")
+
+    def test_broken_owned_site_is_still_a_rebuild(self) -> None:
+        row = score_record(self._record("Broken Website"), "hardscaping")
+        self.assertEqual(row["Offer Fit"], "Website Rebuild")
+
+    def test_jobber_only_is_not_scored_as_a_healthy_site(self) -> None:
+        # Jobber Only was missing from both the offer-fit and grade paths, so a
+        # business with no owned site scored as Advanced Optimization / Good.
+        row = score_record(self._record("Jobber Only"), "hardscaping")
+        self.assertEqual(row["Current Website Quality"], "Poor")
+        self.assertNotEqual(row["Offer Fit"], "Advanced Optimization")
+
+    def test_no_site_launch_keeps_packet_eligibility_and_grade(self) -> None:
+        from score_leads import CONCRETE_PACKET_OFFERS, base_priority_from_delta
+
+        self.assertIn("No-Site Launch", CONCRETE_PACKET_OFFERS)
+        for status in ("No Website", "Social Only", "Jobber Only", "Broken Website"):
+            with self.subTest(site_status=status):
+                self.assertEqual(
+                    base_priority_from_delta(self._record(status), "No-Site Launch"), "A"
+                )
 
 
 if __name__ == "__main__":

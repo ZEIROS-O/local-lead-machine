@@ -20,8 +20,6 @@ AIRTABLE_ALLOWED_FIELDS = [
     "Google Maps URL",
     "Reviews",
     "Rating",
-    "Current Website Quality",
-    "Best Service Angle",
     "Specific Observation",
     "Mockup URL",
     "Video URL",
@@ -30,19 +28,13 @@ AIRTABLE_ALLOWED_FIELDS = [
     "Status",
     "Last Contacted",
     "Next Follow-Up",
-    "Assigned To",
     "Lead Priority",
     "Offer Fit",
     "Site Status",
-    "Contact Form Detected",
-    "Estimate Form Detected",
     "Form Strength",
-    "Form Detection Method",
-    "CTA Strength",
     "Visible Pain Score",
     "Visible Pain Reasons",
     "Send Trigger",
-    "Money Signal",
     "Buyer Intent Signals",
     "Commercial Fit State",
     "Commercial Materiality",
@@ -62,18 +54,15 @@ AIRTABLE_ALLOWED_FIELDS = [
     "Evidence Refs",
     "Safe Outreach Claims",
     "Evidence Snapshot",
-    "Review Demand Band",
     "AI Confidence",
     "Skip Reason",
     "Place Key",
     "Score Total",
-    "Sendable",
-    "Packet Eligible",
+    "Packet Tier",
     "Opener",
     "Recommended Action",
     "Send Blockers",
     "Packet Path",
-    "Next Action",
 ]
 
 INTEGER_FIELDS = {"Reviews", "Score Total", "Visible Pain Score"}
@@ -91,6 +80,10 @@ SITE_STATUS_FIELD = "Site Status"
 SITE_STATUS_LABELS = {
     "missing": "Missing",
     "broken": "Broken",
+    # enrich_leads emits "Broken Website"/"Jobber Only"; without these two the
+    # highest-value leads (broken or social-only sites, graded A by
+    # base_priority_from_delta) synced with Site Status blank.
+    "broken website": "Broken",
     "unknown": "Unknown",
     "no website": "No Website",
     "loaded": "Loaded",
@@ -98,10 +91,20 @@ SITE_STATUS_LABELS = {
     "redirect issue": "Redirect Issue",
     "social only": "Social Only",
     "facebook only": "Social Only",
+    "jobber only": "Social Only",
+    # evidence._status_from_site uses its own lowercase vocabulary, and
+    # manual_scores writes it straight into this column on the LLM path.
+    # "weak" and "okay" both mean the site loads; the severity is carried by
+    # Visible Pain Score / Reasons, which this select has no options for.
+    "weak": "Loaded",
+    "okay": "Loaded",
 }
 OFFER_FIT_FIELD = "Offer Fit"
-BEST_SERVICE_ANGLE_FIELD = "Best Service Angle"
-SERVICE_ANGLE_FIELDS = {OFFER_FIT_FIELD, BEST_SERVICE_ANGLE_FIELD}
+# Offer Fit is the only service-angle column that syncs. "Best Service Angle"
+# used to sit beside it here; it was a prose blurb no select option could ever
+# match, and on the manual path it was assigned from the same best_angle value
+# Offer Fit already carries.
+SERVICE_ANGLE_FIELDS = {OFFER_FIT_FIELD}
 SERVICE_ANGLE_LABELS = {
     "social/jobber escape": "No-Site Launch",
     "no-site launch": "No-Site Launch",
@@ -117,6 +120,17 @@ SERVICE_ANGLE_LABELS = {
     "automation/follow up": "Automation / Follow-Up",
     "automation / follow-up": "Automation / Follow-Up",
     "automation/follow-up": "Automation / Follow-Up",
+    # The seven labels below are what choose_offer_fit actually returns today.
+    # Until they were mapped, every lead on one of these branches synced with
+    # Offer Fit blank. Grouped by the deliverable the option names, not by the
+    # symptom that triggered the branch.
+    "portfolio rebuild": "Website Rebuild",
+    "review/trust proof upgrade": "Website Rebuild",
+    "service page cleanup": "Website Rebuild",
+    "website cleanup": "Website Rebuild",
+    "mobile quote path cleanup": "Estimate Funnel",
+    "advanced optimization": "Automation / Follow-Up",
+    "tracking / missed call": "Automation / Follow-Up",
 }
 TYPED_AIRTABLE_FIELDS = (
     INTEGER_FIELDS | FLOAT_FIELDS | {AI_CONFIDENCE_FIELD, VERTICAL_FIELD, SITE_STATUS_FIELD} | SERVICE_ANGLE_FIELDS

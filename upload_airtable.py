@@ -29,11 +29,20 @@ from lead_machine.airtable_sync import (
     plan_airtable_sync,
 )
 from lead_machine.schema import GENERIC_DOMAINS, normalize_domain, normalize_phone
-from lead_machine.sendability import is_contact_ready
+from lead_machine.sendability import (
+    PACKET_TIER_MANUAL,
+    PACKET_TIER_NONE,
+    PACKET_TIER_SENDABLE,
+    is_contact_ready,
+)
 
 
-_TIER_SENDABLE = "Sendable Packet"
-_TIER_MANUAL = "Manual Review Packet"
+# Alias the canonical tiers rather than restating the literals: sendability
+# owns these strings, and a silent divergence here is exactly the class of bug
+# this schema cut exists to remove.
+_TIER_SENDABLE = PACKET_TIER_SENDABLE
+_TIER_MANUAL = PACKET_TIER_MANUAL
+_TIER_NONE = PACKET_TIER_NONE
 
 # (field, airtable_type, notes)
 _FIELD_SCHEMA: List[tuple[str, str, str]] = [
@@ -48,23 +57,15 @@ _FIELD_SCHEMA: List[tuple[str, str, str]] = [
     ("Google Maps URL",        "URL",                ""),
     ("Reviews",                "Number",             "Integer; set field to 'Integer' precision"),
     ("Rating",                 "Number",             "Decimal; set field to 2 decimal places"),
-    ("Current Website Quality","Single line text",   ""),
-    ("Best Service Angle",     "Single select",      "Options: No-Site Launch, Website Rebuild, Estimate Funnel, Automation / Follow-Up"),
     ("Specific Observation",   "Long text",          ""),
-    ("Packet Eligible",        "Single select",      "Options: Yes, No"),
-    ("Sendable",               "Single select",      "Options: Yes, No"),
+    ("Packet Tier",            "Single select",      "Options: Sendable Packet, Manual Review Packet, Watchlist, No Packet"),
     ("Lead Priority",          "Single select",      "Options: A, B, C (grade)"),
     ("Offer Fit",              "Single select",      "Options: No-Site Launch, Website Rebuild, Estimate Funnel, Automation / Follow-Up"),
     ("Site Status",            "Single select",      "Options: Missing, Broken, No Website, Loaded, Redirect Issue, Social Only, Unknown"),
-    ("Contact Form Detected",  "Single select",      "Options: Yes, No"),
-    ("Estimate Form Detected", "Single select",      "Options: Yes, No"),
     ("Form Strength",          "Single line text",   ""),
-    ("Form Detection Method",  "Single line text",   ""),
-    ("CTA Strength",           "Single line text",   ""),
     ("Visible Pain Score",     "Number",             "Integer 0–5"),
     ("Visible Pain Reasons",   "Long text",          ""),
     ("Send Trigger",           "Single line text",   ""),
-    ("Money Signal",           "Single line text",   ""),
     ("Buyer Intent Signals",   "Long text",          "Comma-separated signals detected by LLM"),
     ("Commercial Fit State",   "Single select",      "Options: commercially-sendable, minor-fix/nurture, needs-broader-system-evidence, intentional-or-ambiguous, not-an-LPM-fit, unverified"),
     ("Commercial Materiality", "Long text",          "Evidence-backed commercial consequence"),
@@ -84,7 +85,6 @@ _FIELD_SCHEMA: List[tuple[str, str, str]] = [
     ("Evidence Refs",          "Long text",          "Structured evidence identifiers"),
     ("Safe Outreach Claims",   "Long text",          "Claims bound to evidence identifiers"),
     ("Evidence Snapshot",      "Long text",          "Structured bounded evidence used by the morning verifier"),
-    ("Review Demand Band",     "Single line text",   ""),
     ("AI Confidence",          "Single select",      "Options: low, medium, high"),
     ("Score Total",            "Number",             "Integer"),
     ("Opener",                 "Long text",          ""),
@@ -95,10 +95,8 @@ _FIELD_SCHEMA: List[tuple[str, str, str]] = [
     ("Status",                 "Single select",      "Options: New, Mockup Needed, Manual Review, Sent, Follow-Up, Closed"),
     ("Outreach Channel",       "Single select",      "Options: Email, Phone, Instagram DM, SMS"),
     ("Consent Posture",        "Single line text",   "Required and documented before any SMS draft can pass"),
-    ("Next Action",            "Single line text",   ""),
     ("Last Contacted",         "Date",               ""),
     ("Next Follow-Up",         "Date",               ""),
-    ("Assigned To",            "Single line text",   ""),
     ("Mockup URL",             "URL",                ""),
     ("Video URL",              "URL",                ""),
     ("Packet Path",            "Single line text",   "Local file path to the packet markdown file"),
@@ -194,23 +192,15 @@ CSV_AIRTABLE_FIELDS = [
     "Google Maps URL",
     "Reviews",
     "Rating",
-    "Current Website Quality",
-    "Best Service Angle",
     "Specific Observation",
-    "Packet Eligible",
-    "Sendable",
+    "Packet Tier",
     "Lead Priority",
     "Offer Fit",
     "Site Status",
-    "Contact Form Detected",
-    "Estimate Form Detected",
     "Form Strength",
-    "Form Detection Method",
-    "CTA Strength",
     "Visible Pain Score",
     "Visible Pain Reasons",
     "Send Trigger",
-    "Money Signal",
     "Buyer Intent Signals",
     "Commercial Fit State",
     "Commercial Materiality",
@@ -230,7 +220,6 @@ CSV_AIRTABLE_FIELDS = [
     "Evidence Refs",
     "Safe Outreach Claims",
     "Evidence Snapshot",
-    "Review Demand Band",
     "AI Confidence",
     "Skip Reason",
     "Score Total",
@@ -242,11 +231,10 @@ CSV_AIRTABLE_FIELDS = [
     "Video URL",
     "Last Contacted",
     "Next Follow-Up",
-    "Assigned To",
     "Consent Posture",
 ]
 
-OPERATIONAL_FIELDS = ["Status", "Next Action", "Outreach Channel"]
+OPERATIONAL_FIELDS = ["Status", "Outreach Channel"]
 OPTIONAL_FIELDS = ["Packet Path"]
 DEFAULT_PACKET_DIR = Path("packets_manual_existing_manual")
 
@@ -406,16 +394,38 @@ def csv_row_to_record(row: Dict[str, str], packet_dir: Path) -> Dict[str, Any]:
         if value:
             fields[field] = value
 
-    if is_sendable_record(fields):
+    # Judge readiness on the source row, not the filtered payload: Sendable and
+    # Packet Eligible are no longer Airtable columns, so they survive only in the
+    # CSV. This also keeps scored CSVs written before Packet Tier existed working.
+    source = {**row, **fields}
+    row_is_sendable = is_sendable_record(source)
+    if row_is_sendable:
         if not clean_cell(fields.get("Status")):
             fields["Status"] = "Mockup Needed"
             defaulted_fields.append("Status")
-        if not clean_cell(fields.get("Next Action")):
-            fields["Next Action"] = "Build mockup"
-            defaulted_fields.append("Next Action")
     elif clean_cell(row.get("Packet Tier", "")) == _TIER_MANUAL:
         fields["Status"] = "Manual Review"
         defaulted_fields.append("Status")
+
+    # Packet Tier is the only readiness column Airtable keeps, so a CSV without
+    # one would upload a record the send-queue filter can never match. Derive it
+    # from the booleans — the mirror of sendability.readiness_flags — and mark it
+    # defaulted so a PATCH does not clobber a tier already in the base.
+    #
+    # A row that is neither sendable nor packet-eligible falls through to
+    # _TIER_NONE rather than to a blank. Blank has to keep meaning "the pipeline
+    # never computed a tier for this record", which is the state that silently
+    # emptied the send queue; it must not also mean "computed, and the answer was
+    # no packet".
+    if not clean_cell(fields.get("Packet Tier")):
+        if row_is_sendable:
+            derived_tier = _TIER_SENDABLE
+        elif truthy_yes(source.get("Packet Eligible")):
+            derived_tier = _TIER_MANUAL
+        else:
+            derived_tier = _TIER_NONE
+        fields["Packet Tier"] = derived_tier
+        defaulted_fields.append("Packet Tier")
 
     # Filter platform/system emails before Airtable payload creation.
     if "Email" in fields:

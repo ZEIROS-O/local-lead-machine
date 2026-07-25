@@ -8,7 +8,45 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import upload_airtable as ua
-from lead_machine.airtable_sync import AIRTABLE_ALLOWED_FIELDS
+from lead_machine.airtable_sync import AIRTABLE_ALLOWED_FIELDS, normalize_airtable_value
+
+
+# Every label choose_offer_fit() can return (score_leads.py:784-869). A typed
+# select field whose value fails normalization is dropped from the payload
+# silently, so the column goes blank in Airtable for that whole branch.
+SCORER_OFFER_FITS = [
+    "Website Rebuild",
+    "Portfolio Rebuild",
+    "Premium Perception Gap",
+    "Mobile Quote Path Cleanup",
+    "Review/Trust Proof Upgrade",
+    "Service Page Cleanup",
+    "Website Cleanup",
+    "Advanced Optimization",
+    "Estimate Funnel",
+    "Tracking / Missed Call",
+]
+# Every site_status enrich_leads.py assigns (deterministic path) plus every
+# value evidence._status_from_site returns, which manual_scores writes straight
+# into the same column on the LLM path. The two use different vocabularies.
+ENRICHER_SITE_STATUSES = [
+    "No Website",
+    "Broken Website",
+    "Broken",
+    "Jobber Only",
+    "Social Only",
+    "Loaded",
+    "Unknown",
+]
+EVIDENCE_SITE_STATUSES = [
+    "missing",
+    "broken",
+    "weak",
+    "okay",
+    "social_only",
+    "jobber_only",
+    "unknown",
+]
 
 
 LEGACY_FIELDS = {
@@ -20,14 +58,20 @@ LEGACY_FIELDS = {
     "Legacy CTA Strength",
     "Legacy Skip Reason",
 }
+# Survivors of the Legacy* cutover that are still part of the active schema.
 CANONICAL_FIELDS = {
-    "Current Website Quality",
     "Send Trigger",
     "Last Contacted",
     "Recommended Action",
     "Form Strength",
-    "CTA Strength",
     "Skip Reason",
+}
+# Canonical halves of a Legacy* pair that have since been demoted off the
+# Airtable surface entirely. Their Legacy* counterparts are tracked as
+# airtable_schema_cutover.LEGACY_ORPHAN_FIELDS — deleted outright, not migrated.
+DEMOTED_CANONICAL_FIELDS = {
+    "Current Website Quality",
+    "CTA Strength",
 }
 
 
@@ -37,6 +81,7 @@ class SchemaReportContentTest(unittest.TestCase):
         for active_fields in (schema_fields, set(ua.CSV_AIRTABLE_FIELDS), set(AIRTABLE_ALLOWED_FIELDS)):
             self.assertTrue(CANONICAL_FIELDS.issubset(active_fields))
             self.assertTrue(LEGACY_FIELDS.isdisjoint(active_fields))
+            self.assertTrue(DEMOTED_CANONICAL_FIELDS.isdisjoint(active_fields))
 
     def test_schema_report_includes_buyer_intent_signals(self):
         report = ua.build_schema_report()
@@ -68,19 +113,67 @@ class SchemaReportContentTest(unittest.TestCase):
         expected = {
             "Business Name", "Owner Name", "Vertical", "City", "Phone", "Email",
             "Website URL", "Google Maps URL", "Reviews", "Rating",
-            "Current Website Quality", "Best Service Angle", "Specific Observation",
-            "Packet Eligible", "Sendable", "Lead Priority", "Offer Fit",
-            "Site Status", "Contact Form Detected", "Estimate Form Detected",
-            "Form Strength", "Form Detection Method", "CTA Strength",
+            "Specific Observation",
+            "Packet Tier", "Lead Priority", "Offer Fit",
+            "Site Status", "Form Strength",
             "Visible Pain Score", "Visible Pain Reasons", "Send Trigger",
-            "Money Signal", "Buyer Intent Signals", "Review Demand Band",
-            "AI Confidence", "Score Total", "Opener", "Recommended Action",
+            "Buyer Intent Signals", "AI Confidence", "Score Total",
+            "Opener", "Recommended Action",
             "Send Blockers", "Skip Reason", "Place Key", "Status",
-            "Outreach Channel", "Next Action", "Last Contacted", "Next Follow-Up",
-            "Assigned To", "Mockup URL", "Video URL", "Packet Path",
+            "Outreach Channel", "Last Contacted", "Next Follow-Up",
+            "Mockup URL", "Video URL", "Packet Path",
         }
         report_fields = {row["field"] for row in ua.build_schema_report()}
         self.assertTrue(expected.issubset(report_fields), f"Missing from report: {expected - report_fields}")
+
+
+class LegacyOrphanRegistrationTest(unittest.TestCase):
+    def test_every_demoted_canonical_has_its_legacy_half_registered_as_an_orphan(self):
+        from airtable_schema_cutover import LEGACY_FIELD_PAIRS, LEGACY_ORPHAN_FIELDS
+
+        for canonical in DEMOTED_CANONICAL_FIELDS:
+            with self.subTest(canonical=canonical):
+                self.assertNotIn(canonical, set(LEGACY_FIELD_PAIRS.values()))
+                self.assertIn(f"Legacy {canonical}", LEGACY_ORPHAN_FIELDS)
+
+    def test_every_surviving_pair_still_points_at_a_live_column(self):
+        from airtable_schema_cutover import LEGACY_FIELD_PAIRS
+
+        self.assertTrue(set(LEGACY_FIELD_PAIRS.values()).issubset(set(AIRTABLE_ALLOWED_FIELDS)))
+
+
+class TypedFieldNormalizationCoverageTest(unittest.TestCase):
+    """Every value the pipeline produces must survive the typed-field normalizer.
+
+    These are the fields where a miss is invisible: normalize_airtable_value
+    returns None, build_airtable_payload_with_drops discards the key, and the
+    column reads as empty in Airtable rather than wrong.
+    """
+
+    def test_every_scorer_offer_fit_normalizes(self):
+        for value in SCORER_OFFER_FITS:
+            with self.subTest(offer_fit=value):
+                self.assertIsNotNone(
+                    normalize_airtable_value("Offer Fit", value),
+                    f"choose_offer_fit returns {value!r} but it would be dropped from the payload",
+                )
+
+    def test_every_enricher_site_status_normalizes(self):
+        for value in ENRICHER_SITE_STATUSES:
+            with self.subTest(site_status=value):
+                self.assertIsNotNone(
+                    normalize_airtable_value("Site Status", value),
+                    f"enrich_leads emits {value!r} but it would be dropped from the payload",
+                )
+
+    def test_every_evidence_site_status_normalizes(self):
+        for value in EVIDENCE_SITE_STATUSES:
+            with self.subTest(site_status=value):
+                self.assertIsNotNone(
+                    normalize_airtable_value("Site Status", value),
+                    f"evidence._status_from_site returns {value!r} but it would be "
+                    "dropped from the payload",
+                )
 
 
 class SchemaReportNoUploadTest(unittest.TestCase):

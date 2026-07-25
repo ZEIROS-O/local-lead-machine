@@ -31,8 +31,7 @@ from lead_machine.sendability import is_contact_ready
 
 
 DISPLAY_FIELDS = [
-    "Sendable",
-    "Packet Eligible",
+    "Packet Tier",
     "Business Name",
     "Owner Name",
     "Vertical",
@@ -44,10 +43,8 @@ DISPLAY_FIELDS = [
     "Reviews",
     "Rating",
     "AI Confidence",
-    "Money Signal",
     "Buyer Intent Signals",
     "Send Trigger",
-    "Best Service Angle",
     "Offer Fit",
     "Specific Observation",
     "Site Status",
@@ -83,8 +80,7 @@ DISPLAY_FIELDS = [
 
 _PRIORITY_RANK = {"A": 0, "B": 1, "C": 2}
 REQUIRED_READINESS_FIELDS = {
-    "Sendable",
-    "Packet Eligible",
+    "Packet Tier",
     "Commercial Fit State",
     "Contact Eligibility",
 }
@@ -96,7 +92,7 @@ def airtable_base_url(base_id: str, table: str) -> str:
 
 def build_formula(vertical: str) -> str:
     formula = (
-        "AND({Sendable}='Yes',{Packet Eligible}='Yes',"
+        "AND({Packet Tier}='Sendable Packet',"
         "{Commercial Fit State}='commercially-sendable',{Contact Eligibility}='contact-now',"
         "OR({Status}='New',{Status}='Mockup Needed')"
     )

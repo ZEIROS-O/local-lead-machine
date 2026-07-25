@@ -14,11 +14,11 @@ from unittest.mock import MagicMock, patch
 
 import mark_sent
 import query_ready_to_send as qrs
+from lead_machine import sendability
 
 
 READY_FIELDS = {
-    "Sendable": "Yes",
-    "Packet Eligible": "Yes",
+    "Packet Tier": "Sendable Packet",
     "Commercial Fit State": "commercially-sendable",
     "Contact Eligibility": "contact-now",
     "Status": "New",
@@ -39,7 +39,7 @@ class TestBuildFormula(unittest.TestCase):
         formula = qrs.build_formula("")
         self.assertEqual(
             formula,
-            "AND({Sendable}='Yes',{Packet Eligible}='Yes',"
+            "AND({Packet Tier}='Sendable Packet',"
             "{Commercial Fit State}='commercially-sendable',{Contact Eligibility}='contact-now',"
             "OR({Status}='New',{Status}='Mockup Needed'))",
         )
@@ -180,6 +180,8 @@ class TestMarkSent(unittest.TestCase):
                 self._apply(suppression, {**READY_FIELDS, "Consent Posture": "unknown"})
             with self.assertRaisesRegex(mark_sent.MarkSentError, "Packet Eligible"):
                 self._apply(suppression, {**READY_FIELDS, "Packet Eligible": "No"}, channel="Email")
+            with self.assertRaisesRegex(mark_sent.MarkSentError, "Sendable"):
+                self._apply(suppression, {**READY_FIELDS, "Packet Tier": "Watchlist"}, channel="Email")
 
     def test_only_new_and_mockup_needed_may_transition_to_sent(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -301,3 +303,42 @@ class TestMarkSent(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReadinessFlagsFromPacketTier(unittest.TestCase):
+    """Packet Tier replaced Sendable + Packet Eligible on the Airtable surface.
+
+    Rows read back from the base carry only the tier, so the readiness contract
+    has to reconstruct the two booleans from it — and an explicit column, which
+    a hand-edit in the base can still produce, must always win.
+    """
+
+    def test_tier_derives_both_booleans(self):
+        cases = {
+            "Sendable Packet": ("Yes", "Yes"),
+            "Manual Review Packet": ("No", "Yes"),
+            "Watchlist": ("No", "No"),
+            "No Packet": ("No", "No"),
+        }
+        for tier, expected in cases.items():
+            with self.subTest(tier=tier):
+                self.assertEqual(sendability.readiness_flags({"Packet Tier": tier}), expected)
+
+    def test_explicit_columns_win_over_the_tier(self):
+        row = {"Packet Tier": "Sendable Packet", "Sendable": "No"}
+        self.assertEqual(sendability.readiness_flags(row), ("No", "Yes"))
+        self.assertFalse(sendability.is_contact_ready({**READY_FIELDS, "Sendable": "No"}))
+
+    def test_no_tier_and_no_columns_is_not_ready(self):
+        self.assertEqual(sendability.readiness_flags({}), ("", ""))
+        self.assertFalse(sendability.is_contact_ready({}))
+
+    def test_sendable_tier_alone_satisfies_the_readiness_contract(self):
+        # The other three clauses of the contract are cross-checks, so a row
+        # whose tier says Sendable Packet still has to carry them explicitly.
+        self.assertTrue(sendability.is_contact_ready(READY_FIELDS))
+        self.assertFalse(
+            sendability.is_contact_ready(
+                {**READY_FIELDS, "Commercial Fit State": "unverified"}
+            )
+        )
