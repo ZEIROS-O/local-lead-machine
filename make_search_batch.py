@@ -21,10 +21,15 @@ except ModuleNotFoundError:
 
 from enrich_leads import (
     SLOW_ENRICH_SECONDS,
+    JsonlAppender,
+    build_enrichment_error_record,
     elapsed_seconds,
     enrichment_log_fields,
     enrich_row,
+    enrich_rows_concurrently,
     format_elapsed,
+    resolve_enrich_workers,
+    resolve_per_lead_timeout,
 )
 from places_search import normalize_place, place_details, text_search_paged
 from lead_machine.compliance import ComplianceError, load_configured_suppression_index
@@ -605,13 +610,6 @@ def write_csv_rows(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
             writer.writerow({field: row.get(field, "") for field in fieldnames})
 
 
-def write_jsonl(path: Path, records: Iterable[Mapping[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        for record in records:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-
 def collect_raw_rows(
     config: SearchConfig,
     *,
@@ -809,41 +807,59 @@ def run_search_batch(
         if len(passed_rows) > len(rows_to_enrich):
             warnings.append(f"Hit --max-enrich={max_enrich}; skipped remaining enrichment rows")
             _progress(f"Enrichment cap active: {len(rows_to_enrich)} of {len(passed_rows)} rows")
-    for enrich_index, row in enumerate(rows_to_enrich, start=1):
-        business_name = _pick(row, "business_name", "Business Name") or "unknown"
-        website_url = _pick(row, "website_url", "Website URL")
-        lead_started_at = time.monotonic()
-        enriched: Dict[str, Any] | None = None
-        caught_error = ""
-        _progress(f"[ENRICH start {enrich_index}/{len(rows_to_enrich)}] {business_name}")
-        try:
-            enriched = enrich_row(
-                row,
-                screenshots_dir=screenshots_dir,
-                take_shots=not no_screenshots,
-                rendered_site_check=rendered_site_check,
-                suppression_index=suppression_index,
-                review_snapshot_store=review_snapshot_store,
-            )
-            enriched_records.append(enriched)
-        except Exception as exc:
-            caught_error = str(exc)
-            errors.append(f"Enrichment failed for {business_name}: {exc}")
-        finally:
-            elapsed = float(
-                (enriched or {}).get("enrichment", {}).get("elapsed_seconds") or elapsed_seconds(lead_started_at)
-            )
-            fields = enrichment_log_fields(enriched or {}, fallback_error=caught_error)
+
+    browser_work = not no_screenshots or rendered_site_check
+    workers = resolve_enrich_workers(browser_work=browser_work)
+    per_lead_timeout = resolve_per_lead_timeout(workers)
+    _progress(f"Enrichment workers: {workers} (per-lead timeout {per_lead_timeout:.0f}s)")
+
+    def _enrich(row: Dict[str, str]) -> Dict[str, Any]:
+        return enrich_row(
+            row,
+            screenshots_dir=screenshots_dir,
+            take_shots=not no_screenshots,
+            rendered_site_check=rendered_site_check,
+            suppression_index=suppression_index,
+            review_snapshot_store=review_snapshot_store,
+            per_lead_timeout=per_lead_timeout,
+        )
+
+    # Records stream to disk as they finish, so an interrupted run keeps the
+    # scraping it already paid for instead of losing the batch at the final
+    # write.
+    with JsonlAppender(enriched_path) as appender:
+
+        def _on_complete(
+            enrich_index: int,
+            row: Dict[str, str],
+            record: Dict[str, Any] | None,
+            error: str,
+            elapsed: float,
+        ) -> None:
+            business_name = _pick(row, "business_name", "Business Name") or "unknown"
+            website_url = _pick(row, "website_url", "Website URL")
+            if record is None:
+                errors.append(f"Enrichment failed for {business_name}: {error}")
+                # Keep the lead. This entry point used to drop it while
+                # enrich_leads kept an error record for the same failure.
+                record = build_enrichment_error_record(row, error=error, elapsed=elapsed)
+            appender.append(record)
+            enriched_records.append(record)
+            reported = float(record.get("enrichment", {}).get("elapsed_seconds") or elapsed)
+            fields = enrichment_log_fields(record, fallback_error=error)
             _progress(
                 f"[ENRICH {enrich_index}/{len(rows_to_enrich)}] {business_name} "
-                f"elapsed={format_elapsed(elapsed)}s "
+                f"elapsed={format_elapsed(reported)}s "
                 f"site_status={fields['site_status']} "
                 f"pages_checked={fields['pages_checked']} "
                 f"errors={fields['error']}"
             )
-            if elapsed > SLOW_ENRICH_SECONDS:
-                _progress(f"[SLOW ENRICH] {business_name} elapsed={format_elapsed(elapsed)}s website={website_url}")
-    write_jsonl(enriched_path, enriched_records)
+            if reported > SLOW_ENRICH_SECONDS:
+                _progress(f"[SLOW ENRICH] {business_name} elapsed={format_elapsed(reported)}s website={website_url}")
+
+        enrich_rows_concurrently(
+            rows_to_enrich, workers=workers, enrich=_enrich, on_complete=_on_complete
+        )
 
     top_candidate_names = [
         _pick(row, "business_name", "Business Name")

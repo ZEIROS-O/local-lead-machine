@@ -291,6 +291,7 @@ class EntryPointTests(unittest.TestCase):
             rendered_site_check=False,
             suppression_index=None,
             review_snapshot_store=None,
+            per_lead_timeout=None,
         ):
             received.append(suppression_index)
             return {"google": row, "website": {"site_status": "Loaded"}, "derived": {}, "screenshots": {}}

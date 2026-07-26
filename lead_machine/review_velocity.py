@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import re
 import sqlite3
+import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -12,6 +13,7 @@ from .review_pain_verifier import verify_review_pain
 
 
 REVIEW_VELOCITY_VERSION = 3
+SQLITE_BUSY_TIMEOUT_SECONDS = 10.0
 MIN_SNAPSHOT_SPAN_DAYS = 14
 MIN_COHORT_SIZE = 20
 DEFAULT_REVIEW_OBSERVATION_MAX_AGE_DAYS = 45
@@ -186,10 +188,16 @@ class ReviewSnapshotStore:
 
     def __init__(self, path: Path | str = "run_state/review_velocity.sqlite3") -> None:
         self.path = Path(path)
+        # Enrichment now runs leads concurrently, and a sqlite3 connection
+        # cannot be shared across threads — hence a fresh connection per call,
+        # a write lock so concurrent workers serialise instead of racing, and a
+        # busy timeout so a reader waiting on that write blocks briefly rather
+        # than raising "database is locked".
+        self._write_lock = threading.Lock()
 
     def _connect(self) -> sqlite3.Connection:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.path)
+        connection = sqlite3.connect(self.path, timeout=SQLITE_BUSY_TIMEOUT_SECONDS)
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS review_snapshots (
@@ -227,7 +235,7 @@ class ReviewSnapshotStore:
         if int(review_count) < 0:
             raise ValueError("review_count cannot be negative")
         timestamp = _iso_timestamp(observed_at or datetime.now(timezone.utc))
-        with self._connect() as connection:
+        with self._write_lock, self._connect() as connection:
             connection.execute(
                 "INSERT OR REPLACE INTO review_snapshots "
                 "(place_key, observed_at, review_count, rating, vertical, market, source) "
