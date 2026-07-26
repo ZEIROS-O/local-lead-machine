@@ -35,8 +35,11 @@ from dotenv import load_dotenv
 from import_llm_score_bundle import import_score_bundle, validate_bundle_scores
 from lead_machine.buyer_signals import (
     buyer_intent_summary,
+    demand_signal_state,
     ensure_buyer_intent,
     has_money_signal as buyer_has_money_signal,
+    money_signal_label,
+    money_signal_state,
     review_demand_band as buyer_review_demand_band,
 )
 from lead_machine.compliance import (
@@ -785,9 +788,14 @@ def score_buyer_intent(record: Dict[str, Any]) -> Tuple[int, List[str]]:
         score += 4
         evidence.append(f"ad signal detected ({', '.join(yes_ads)})")
 
-    if buyer_intent.get("money_signal"):
+    # money_signal is tri-state text, so a bare truthiness test would score
+    # "no" and "unknown" as if they were a detected paid stack.
+    money_state = money_signal_state(record)
+    if money_state == "yes":
         score += 2
         evidence.append("buyer-intent money signal present")
+    elif money_state == "unknown":
+        evidence.append("buyer-intent money signal not observable (no crawlable site text)")
     else:
         evidence.append("no buyer-intent money signal")
 
@@ -1319,7 +1327,8 @@ def score_record(record: Dict[str, Any], fallback_vertical: str) -> Dict[str, An
 
     evidence_profile = record.get("evidence", {}) or {}
     buyer_summary = buyer_intent_summary(record)
-    money_signal = "Yes" if has_money_signal(record) else "No"
+    money_signal = money_signal_label(record)
+    demand_signal = demand_signal_state(record).capitalize()
     visible_pain_reasons = evidence_profile.get("visible_pain_reasons") or []
     visible_pain_reasons_text = "; ".join(str(reason) for reason in visible_pain_reasons if str(reason).strip())
     send_trigger = str(evidence_profile.get("send_trigger") or "").strip()
@@ -1456,6 +1465,8 @@ def score_record(record: Dict[str, Any], fallback_vertical: str) -> Dict[str, An
         "send_trigger": send_trigger,
         "Money Signal": money_signal,
         "money_signal": money_signal,
+        "Demand Signal": demand_signal,
+        "demand_signal": demand_signal,
         "Buyer Intent Signals": buyer_summary,
         "buyer_intent_signals": buyer_summary,
         "Evidence Notes": evidence_notes,
@@ -2199,6 +2210,14 @@ def _compact_buyer_intent(buyer_intent: Dict[str, Any]) -> Dict[str, Any]:
     if money_signal not in (None, "", {}, []):
         compact["money_signal"] = money_signal
 
+    demand_signal = buyer_intent.get("demand_signal")
+    if isinstance(demand_signal, dict) and demand_signal.get("state"):
+        compact["demand_signal"] = {
+            key: demand_signal.get(key)
+            for key in ("state", "source", "velocity_band", "demand_band")
+            if demand_signal.get(key) not in (None, "")
+        }
+
     ads = buyer_intent.get("ads")
     if isinstance(ads, dict):
         known_ads = {
@@ -2208,6 +2227,15 @@ def _compact_buyer_intent(buyer_intent: Dict[str, Any]) -> Dict[str, Any]:
         }
         if known_ads:
             compact["ads"] = known_ads
+        # An unqualified absence of ad keys reads as "checked, found nothing".
+        # Name the checks that never ran so the rubric can tell the difference.
+        unimplemented = [
+            str(error).split(":", 1)[0].strip()
+            for error in ads.get("errors") or []
+            if str(error).strip().endswith("unimplemented")
+        ]
+        if unimplemented:
+            compact["ads_not_checked"] = sorted(set(unimplemented))
 
     for key in ("review_demand_signal", "review_profile"):
         value = buyer_intent.get(key)
@@ -2300,14 +2328,16 @@ def build_llm_scoring_record(record: Dict[str, Any], *, fallback_vertical: str =
         },
         "buyer_intent": _compact_buyer_intent(buyer_intent),
         "buyer_intent_summary": buyer_intent_summary(working),
-        "money_signal": "Yes" if has_money_signal(working) else "No",
+        "money_signal": money_signal_label(working),
+        "demand_signal": demand_signal_state(working).capitalize(),
         "safe_outreach_claims": working.get("safe_outreach_claims") or evidence.get("safe_outreach_claims") or [],
         "sendability_evidence": {
             "minimum_evidence_inputs": {
                 "visible_pain_score": evidence.get("visible_pain_score", ""),
                 "visible_pain_reasons": evidence.get("visible_pain_reasons") or [],
                 "send_trigger": evidence.get("send_trigger") or "",
-                "money_signal": "Yes" if has_money_signal(working) else "No",
+                "money_signal": money_signal_label(working),
+                "demand_signal": demand_signal_state(working).capitalize(),
                 "buyer_intent_summary": buyer_intent_summary(working),
             }
         },
@@ -2387,7 +2417,10 @@ Rules:
 {SHARED_COMMERCIAL_SCORING_RULES}
 - Buyer intent is required for A/B quality: look for fixable gap times money signal, not just a bad website.
 - Paid CRM/booking tools and known ad signals can support money intent.
-- Bad site alone without buyer_intent.money_signal should not be an A lead.
+- buyer_intent.money_signal is yes/no/unknown. "unknown" means there was no crawlable site text to read a paid stack from — it is an unanswered question, not evidence the business does not spend. Do not treat it as a negative.
+- Bad site with money_signal "no" should not be an A lead. Bad site with money_signal "unknown" may still be an A lead when demand_signal is yes and the visible pain is concrete.
+- buyer_intent.demand_signal is a separate claim from spend: it says the market is pulling on this business. Use it for demand, never as proof of budget.
+- buyer_intent.ads_not_checked lists ad checks that are not implemented. Their "unknown" carries no information; do not read it as "no ads found".
 - Visual claims require screenshot paths, visual-review flags, rendered browser evidence, DOM evidence, or explicit manual review notes in the capsule.
 - Do not infer missing forms if evidence is uncertain.
 - If rendered_site_status is Loaded, do not claim the website is broken.

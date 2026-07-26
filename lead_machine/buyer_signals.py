@@ -2,9 +2,6 @@ from __future__ import annotations
 
 import json
 from typing import Any, Dict, List
-from urllib.parse import quote_plus, urlparse
-
-import requests
 
 from .evidence import THIRD_PARTY_TOOLS, _detect_from_text
 from .review_velocity import build_review_velocity
@@ -16,6 +13,29 @@ UNKNOWN_ADS = {
     "lsa_badge": "unknown",
     "errors": [],
 }
+
+# money_signal is tri-state. "no" and "unknown" are not the same claim: paid-CRM
+# detection reads text scraped *from the website*, so for a business with no site
+# there was nothing to read. Collapsing that to False told the scorer "this
+# business does not spend" when the truth was "we never looked" — and the LLM
+# rubric rejected the lead for not connecting its gap to paid acquisition.
+MONEY_SIGNAL_YES = "yes"
+MONEY_SIGNAL_NO = "no"
+MONEY_SIGNAL_UNKNOWN = "unknown"
+
+DEMAND_SIGNAL_YES = "yes"
+DEMAND_SIGNAL_NO = "no"
+DEMAND_SIGNAL_UNKNOWN = "unknown"
+
+ACTIVE_VELOCITY_BANDS = frozenset({"surging", "active", "steady"})
+DEMAND_BANDS_WITH_PULL = frozenset({"ideal_growth", "established", "mature"})
+
+# Neither check has a parser. They used to issue a request, discard the response
+# and return "unknown" regardless — a real network round trip that could not
+# change the answer. They are named here so `_ads_signals` can say so out loud
+# in ads["errors"] instead of leaving an unqualified "unknown" that reads like a
+# check which ran and found nothing.
+UNIMPLEMENTED_AD_CHECKS = frozenset({"google_ad_transparency", "meta_ad_library"})
 
 REVIEW_DEMAND_THRESHOLDS = {
     "detailing": {
@@ -44,8 +64,7 @@ PAID_CRM = {
     "Mobile Tech RX",
 }
 
-ADS_TIMEOUT_SECONDS = 3
-BUYER_INTENT_LOGIC_VERSION = 3
+BUYER_INTENT_LOGIC_VERSION = 4
 
 
 def build_buyer_intent(record: Dict[str, Any], *, ads_check: bool = False) -> Dict[str, Any]:
@@ -62,7 +81,10 @@ def build_buyer_intent(record: Dict[str, Any], *, ads_check: bool = False) -> Di
         ads.get(field) == "yes"
         for field in ("google_ad_transparency", "meta_ad_library", "lsa_badge")
     )
-    money_signal = has_paid_crm or known_ad_yes
+    money_signal = _money_signal_state(
+        record, has_paid_crm=has_paid_crm, known_ad_yes=known_ad_yes
+    )
+    demand_signal = _demand_signal(review_profile, review_velocity)
 
     evidence: List[str] = []
     evidence.extend(crm_evidence)
@@ -71,6 +93,13 @@ def build_buyer_intent(record: Dict[str, Any], *, ads_check: bool = False) -> Di
     for field in ("google_ad_transparency", "meta_ad_library", "lsa_badge"):
         if ads.get(field) == "yes":
             evidence.append(f"{field.replace('_', ' ')} detected")
+    if money_signal == MONEY_SIGNAL_UNKNOWN:
+        evidence.append(
+            "Paid-acquisition spend was not observable: there was no crawlable site text "
+            "to read a CRM or booking stack from. This is absence of observation, not "
+            "evidence that the business does not spend."
+        )
+    evidence.extend(demand_signal.get("evidence") or [])
 
     buyer_intent = {
         "logic_version": BUYER_INTENT_LOGIC_VERSION,
@@ -83,7 +112,8 @@ def build_buyer_intent(record: Dict[str, Any], *, ads_check: bool = False) -> Di
         "review_demand_signal": review_profile,
         "review_velocity": review_velocity,
         "ads": ads,
-        "money_signal": bool(money_signal),
+        "money_signal": money_signal,
+        "demand_signal": demand_signal,
         "evidence": evidence,
     }
     record["buyer_intent"] = buyer_intent
@@ -98,17 +128,65 @@ def ensure_buyer_intent(record: Dict[str, Any], *, ads_check: bool = False) -> D
 
 
 def has_money_signal(record: Dict[str, Any]) -> bool:
+    """True only for a confirmed *yes*.
+
+    Every gate that reads this must treat "unknown" the way it used to treat
+    False. `sendability.required_visible_pain_score` drops the mature-band pain
+    threshold from 40 to 35 when money_signal is truthy, so an "unknown" leaking
+    through as True would loosen the gate on exactly the leads we know least
+    about.
+    """
+    return money_signal_state(record) == MONEY_SIGNAL_YES
+
+
+def money_signal_state(record: Dict[str, Any]) -> str:
+    """Return the tri-state money signal for *record*: yes / no / unknown."""
     buyer_intent = _buyer_intent_from_record(record)
     if not buyer_intent:
         raw = record.get("Money Signal") or record.get("money_signal")
-        return str(raw).strip().lower() in {"yes", "true", "1"}
-    return _buyer_intent_has_money_signal(buyer_intent)
+        return _normalize_money_signal(raw)
+    return _normalize_money_signal(buyer_intent.get("money_signal"))
+
+
+def money_signal_label(record: Dict[str, Any]) -> str:
+    """Title-cased tri-state for row columns and the LLM capsule."""
+    return money_signal_state(record).capitalize()
+
+
+def demand_signal_state(record: Dict[str, Any]) -> str:
+    buyer_intent = _buyer_intent_from_record(record)
+    signal = buyer_intent.get("demand_signal") if isinstance(buyer_intent, dict) else None
+    if isinstance(signal, dict):
+        state = str(signal.get("state") or "").strip().lower()
+        if state in {DEMAND_SIGNAL_YES, DEMAND_SIGNAL_NO, DEMAND_SIGNAL_UNKNOWN}:
+            return state
+    return DEMAND_SIGNAL_UNKNOWN
+
+
+def _normalize_money_signal(value: Any) -> str:
+    """Map any historical or current representation onto the tri-state.
+
+    Records written before logic_version 4 stored a bool. `ensure_buyer_intent`
+    rebuilds those, but rows read back from a CSV or the base still carry the
+    old "Yes"/"No" text, and those must keep meaning what they meant.
+    """
+    if isinstance(value, bool):
+        return MONEY_SIGNAL_YES if value else MONEY_SIGNAL_NO
+    text = str(value or "").strip().lower()
+    if text in {"yes", "true", "1"}:
+        return MONEY_SIGNAL_YES
+    if text in {"no", "false", "0"}:
+        return MONEY_SIGNAL_NO
+    return MONEY_SIGNAL_UNKNOWN
 
 
 def buyer_intent_summary(record: Dict[str, Any]) -> str:
     buyer_intent = _buyer_intent_from_record(record)
     if not buyer_intent:
-        return "money_signal=unknown; tools=none; review_demand_band=unknown; ads=unknown"
+        return (
+            "money_signal=unknown; demand_signal=unknown; tools=none; "
+            "review_demand_band=unknown; ads=unknown"
+        )
 
     stack = buyer_intent.get("crm_booking_stack") or {}
     review_signal = _review_signal_from_buyer_intent(buyer_intent)
@@ -122,8 +200,10 @@ def buyer_intent_summary(record: Dict[str, Any]) -> str:
         if key != "errors" and str(value or "").strip().lower() in {"yes", "no"}
     }
     ads_text = ", ".join(f"{key}={value}" for key, value in sorted(known_ads.items())) or "unknown"
+    demand = buyer_intent.get("demand_signal") if isinstance(buyer_intent.get("demand_signal"), dict) else {}
     return (
-        f"money_signal={'yes' if _buyer_intent_has_money_signal(buyer_intent) else 'no'}; "
+        f"money_signal={_normalize_money_signal(buyer_intent.get('money_signal'))}; "
+        f"demand_signal={str(demand.get('state') or 'unknown').lower()}; "
         f"tools={', '.join(str(tool) for tool in tools) or 'none'}; "
         f"review_demand_band={review_signal.get('demand_band') or 'unknown'}; "
         f"review_velocity={((buyer_intent.get('review_velocity') or {}).get('velocity_band') if isinstance(buyer_intent.get('review_velocity'), dict) else 'unknown') or 'unknown'}; "
@@ -151,7 +231,17 @@ def _valid_buyer_intent(value: Any) -> bool:
         return False
     if _buyer_intent_logic_version(value) < BUYER_INTENT_LOGIC_VERSION:
         return False
-    return all(key in value for key in ("crm_booking_stack", "review_velocity", "ads", "money_signal", "evidence"))
+    return all(
+        key in value
+        for key in (
+            "crm_booking_stack",
+            "review_velocity",
+            "ads",
+            "money_signal",
+            "demand_signal",
+            "evidence",
+        )
+    )
 
 
 def _buyer_intent_logic_version(value: Dict[str, Any]) -> int:
@@ -162,16 +252,100 @@ def _buyer_intent_logic_version(value: Dict[str, Any]) -> int:
         return 0
 
 
-def _buyer_intent_has_money_signal(buyer_intent: Dict[str, Any]) -> bool:
-    stack = buyer_intent.get("crm_booking_stack") or {}
-    if stack.get("has_paid_crm"):
+def _money_signal_state(
+    record: Dict[str, Any], *, has_paid_crm: bool, known_ad_yes: bool
+) -> str:
+    if has_paid_crm or known_ad_yes:
+        return MONEY_SIGNAL_YES
+    # "no" is only claimable where the observation was possible. Paid-CRM
+    # detection reads scraped site text; with no text there is no negative to
+    # report, only an unanswered question.
+    if _site_text_observed(record):
+        return MONEY_SIGNAL_NO
+    return MONEY_SIGNAL_UNKNOWN
+
+
+def _site_text_observed(record: Dict[str, Any]) -> bool:
+    """Did the crawl actually return text a CRM could be detected in?
+
+    A site that is missing, dead, or rendered nothing is indistinguishable here
+    from one never visited — in all three cases the paid-stack question went
+    unanswered.
+    """
+    website = record.get("website") if isinstance(record.get("website"), dict) else {}
+    if str(website.get("combined_text") or "").strip():
         return True
 
-    ads = buyer_intent.get("ads") or {}
-    return any(
-        ads.get(field) == "yes"
-        for field in ("google_ad_transparency", "meta_ad_library", "lsa_badge")
-    )
+    homepage = website.get("homepage") if isinstance(website.get("homepage"), dict) else {}
+    if any(str(homepage.get(key) or "").strip() for key in ("text", "title", "meta")):
+        return True
+
+    pages = website.get("pages") if isinstance(website.get("pages"), dict) else {}
+    for page in pages.values():
+        if isinstance(page, dict) and str(page.get("text") or "").strip():
+            return True
+
+    # Tools already detected upstream are themselves proof the site was read.
+    evidence = record.get("evidence") if isinstance(record.get("evidence"), dict) else {}
+    return bool(evidence.get("third_party_tools"))
+
+
+def _demand_signal(review_profile: Dict[str, Any], review_velocity: Dict[str, Any]) -> Dict[str, Any]:
+    """Whether the market is pulling on this business — kept apart from spend.
+
+    Deliberately *not* folded into `money_signal`: that value gates
+    `sendability.required_visible_pain_score`, where a false positive drops the
+    mature-band pain threshold from 40 to 35. Demand is a different claim from
+    willingness to pay, and only the latter belongs in that gate.
+    """
+    velocity_state = str(review_velocity.get("state") or "unknown").strip().lower()
+    velocity_band = str(review_velocity.get("velocity_band") or "unknown").strip().lower()
+    demand_band = str(review_profile.get("demand_band") or "").strip().lower()
+    reviews = _safe_int(review_profile.get("reviews"))
+    rating = _safe_float(review_profile.get("rating"))
+
+    if velocity_state == "present" and velocity_band in ACTIVE_VELOCITY_BANDS:
+        rate = review_velocity.get("reviews_per_30d")
+        return {
+            "state": DEMAND_SIGNAL_YES,
+            "source": "review_velocity",
+            "velocity_band": velocity_band,
+            "demand_band": demand_band,
+            "evidence": [
+                f"Reviews are still arriving ({rate} per 30 days, cohort band {velocity_band})."
+            ],
+        }
+    if velocity_state == "present" and velocity_band == "stale":
+        return {
+            "state": DEMAND_SIGNAL_NO,
+            "source": "review_velocity",
+            "velocity_band": velocity_band,
+            "demand_band": demand_band,
+            "evidence": ["Measured review velocity has gone flat against its cohort."],
+        }
+
+    if not reviews and not rating:
+        return {
+            "state": DEMAND_SIGNAL_UNKNOWN,
+            "source": "none",
+            "velocity_band": velocity_band,
+            "demand_band": demand_band,
+            "evidence": ["No review observation at all; demand is unmeasured, not absent."],
+        }
+
+    # Lifetime count is a weaker claim than velocity, and it is labelled as one:
+    # it says customers have arrived, not that they are arriving.
+    pulls = demand_band in DEMAND_BANDS_WITH_PULL
+    return {
+        "state": DEMAND_SIGNAL_YES if pulls else DEMAND_SIGNAL_NO,
+        "source": "review_count",
+        "velocity_band": velocity_band,
+        "demand_band": demand_band,
+        "evidence": [
+            f"Lifetime review count places this in the {demand_band or 'thin'} demand band "
+            f"({reviews} reviews); velocity is unmeasured."
+        ],
+    }
 
 
 def _review_signal_from_buyer_intent(buyer_intent: Dict[str, Any]) -> Dict[str, Any]:
@@ -299,6 +473,10 @@ def _ads_signals(record: Dict[str, Any], *, ads_check: bool) -> Dict[str, Any]:
         ("lsa_badge", _check_lsa_badge),
     )
     for field, check in checks:
+        if field in UNIMPLEMENTED_AD_CHECKS:
+            ads[field] = "unknown"
+            ads["errors"].append(f"{field}: unimplemented")
+            continue
         try:
             ads[field] = check(record)
         except Exception as exc:  # pragma: no cover - defensive path, behavior asserted via no-raise contract.
@@ -308,24 +486,18 @@ def _ads_signals(record: Dict[str, Any], *, ads_check: bool) -> Dict[str, Any]:
 
 
 def _check_google_ad_transparency(record: Dict[str, Any]) -> str:
-    domain = _record_domain(record)
-    if not domain:
-        return "unknown"
-    url = f"https://adstransparency.google.com/?region=US&domain={quote_plus(domain)}"
-    response = requests.get(url, timeout=ADS_TIMEOUT_SECONDS)
-    if response.status_code >= 500:
-        return "unknown"
+    """Not implemented. Listed in UNIMPLEMENTED_AD_CHECKS and never called.
+
+    The previous body fetched the Ad Transparency Center page, discarded the
+    response and returned "unknown" on every path — a live HTTP round trip per
+    lead that could not change the answer. Reading it needs a parser for the
+    page's rendered payload; until that exists, saying so costs nothing.
+    """
     return "unknown"
 
 
 def _check_meta_ad_library(record: Dict[str, Any]) -> str:
-    page = _first_social_link(record, "facebook.com")
-    if not page:
-        return "unknown"
-    url = f"https://www.facebook.com/ads/library/?active_status=active&ad_type=all&search_type=page&view_all_page_id={quote_plus(page)}"
-    response = requests.get(url, timeout=ADS_TIMEOUT_SECONDS)
-    if response.status_code >= 500:
-        return "unknown"
+    """Not implemented. See `_check_google_ad_transparency`."""
     return "unknown"
 
 
@@ -334,24 +506,6 @@ def _check_lsa_badge(record: Dict[str, Any]) -> str:
     if "google guaranteed" in text or "local services ads" in text:
         return "yes"
     return "unknown"
-
-
-def _record_domain(record: Dict[str, Any]) -> str:
-    google = record.get("google", {}) if isinstance(record.get("google"), dict) else {}
-    website = record.get("website", {}) if isinstance(record.get("website"), dict) else {}
-    url = str(website.get("final_url") or google.get("website_url") or record.get("Website URL") or "")
-    if not url:
-        return ""
-    parsed = urlparse(url if "://" in url else f"https://{url}")
-    return parsed.netloc.lower().replace("www.", "")
-
-
-def _first_social_link(record: Dict[str, Any], domain: str) -> str:
-    website = record.get("website", {}) if isinstance(record.get("website"), dict) else {}
-    for link in website.get("social_links") or []:
-        if domain in str(link).lower():
-            return str(link)
-    return ""
 
 
 def _safe_int(value: Any) -> int:

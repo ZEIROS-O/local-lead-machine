@@ -5,7 +5,13 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Set
 
-from .buyer_signals import buyer_intent_summary, ensure_buyer_intent, has_money_signal, review_demand_band
+from .buyer_signals import (
+    buyer_intent_summary,
+    demand_signal_state,
+    ensure_buyer_intent,
+    money_signal_label,
+    review_demand_band,
+)
 from .compliance import merge_suppression_disqualifiers
 from .email_hygiene import emails_text
 from .score_schema import (
@@ -449,8 +455,10 @@ def merge_manual_score(
         "visible_pain_categories": visible_pain_categories,
         "Send Trigger": send_trigger,
         "send_trigger": send_trigger,
-        "Money Signal": "Yes" if has_money_signal(enriched) else "No",
-        "money_signal": "Yes" if has_money_signal(enriched) else "No",
+        "Money Signal": money_signal_label(enriched),
+        "money_signal": money_signal_label(enriched),
+        "Demand Signal": demand_signal_state(enriched).capitalize(),
+        "demand_signal": demand_signal_state(enriched).capitalize(),
         "Buyer Intent Signals": buyer_intent_signals,
         "buyer_intent_signals": buyer_intent_signals,
         "Review Fit Band": demand_band,

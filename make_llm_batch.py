@@ -296,7 +296,9 @@ Rules:
 - Buyer intent is required for A/B quality: look for fixable gap times money signal, not just a bad website.
 - Use buyer_intent_summary as evidence for money/demand context.
 - Paid CRM/booking tools and known ad signals can support money intent.
-- Bad site alone without buyer_intent.money_signal should not be an A lead.
+- buyer_intent.money_signal is yes/no/unknown. "unknown" means there was no crawlable site text to read a paid stack from — it is an unanswered question, not evidence the business does not spend. Do not treat it as a negative.
+- Bad site with money_signal "no" should not be an A lead. Bad site with money_signal "unknown" may still be an A lead when demand_signal is yes and the visible pain is concrete.
+- buyer_intent.demand_signal is a separate claim from spend: it says the market is pulling on this business. Use it for demand, never as proof of budget.
 - Do not infer missing forms if evidence is uncertain.
 - Static fetch failure alone does not prove the website is broken.
 - If rendered_site_status is Loaded, do not claim the website is broken.

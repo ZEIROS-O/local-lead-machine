@@ -3473,8 +3473,14 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertNotIn("evidence", buyer_intent)
         self.assertNotIn("crm_booking_stack", buyer_intent)
         # money and demand signals still available to the scorer
-        self.assertEqual(buyer_intent.get("money_signal"), True)
+        self.assertEqual(buyer_intent.get("money_signal"), "yes")
         self.assertEqual(compact["money_signal"], "Yes")
+        self.assertEqual(buyer_intent.get("demand_signal", {}).get("state"), "yes")
+        # The rubric has to be able to tell an unrun check from a negative one.
+        self.assertEqual(
+            compact["buyer_intent"].get("ads_not_checked"),
+            ["google_ad_transparency", "meta_ad_library"],
+        )
         self.assertTrue(compact["buyer_intent_summary"])
         self.assertEqual(
             compact["provider_evidence"]["crm_booking_stack"].get("detected_tools"),
@@ -4931,7 +4937,10 @@ class LeadMachineContractsTest(unittest.TestCase):
         row = merge_manual_score(enriched, raw_score, fallback_vertical="hardscaping")
 
         self.assertEqual(row["Sendable"], "Yes")
-        self.assertEqual(row["Money Signal"], "No")
+        # "Unknown", not "No": site_status is missing, so there was no site text
+        # to read a paid stack out of. The lead is still sendable on real pain,
+        # which is the property this test exists to protect.
+        self.assertEqual(row["Money Signal"], "Unknown")
 
     def test_advanced_optimization_is_not_sendable_without_concrete_visible_pain(self) -> None:
         enriched = {
@@ -5689,17 +5698,28 @@ class LeadMachineContractsTest(unittest.TestCase):
                 "evidence": ["Detected paid CRM/booking tool: ServiceTitan"],
             },
             "review_velocity": {
-                "velocity_band": "steady",
-                "source": "count_only",
-                "evidence": ["18 Google reviews with 4.8 rating"],
+                "state": "unknown",
+                "velocity_band": "unknown",
+                "source": "insufficient_history",
+                "evidence": ["Review velocity needs at least two count snapshots 14 days apart."],
             },
             "ads": {
                 "google_ad_transparency": "unknown",
                 "meta_ad_library": "unknown",
                 "lsa_badge": "unknown",
-                "errors": [],
+                "errors": [
+                    "google_ad_transparency: unimplemented",
+                    "meta_ad_library: unimplemented",
+                ],
             },
-            "money_signal": True,
+            "money_signal": "yes",
+            "demand_signal": {
+                "state": "yes",
+                "source": "review_count",
+                "velocity_band": "unknown",
+                "demand_band": "ideal_growth",
+                "evidence": ["Lifetime review count places this in the ideal_growth demand band."],
+            },
             "evidence": ["Paid CRM/booking stack detected"],
         }
 

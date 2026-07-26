@@ -284,7 +284,14 @@ class EntryPointTests(unittest.TestCase):
         never ran on the path that actually produces leads."""
         received = []
 
-        def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False, suppression_index=None):
+        def fake_enrich(
+            row,
+            screenshots_dir,
+            take_shots,
+            rendered_site_check=False,
+            suppression_index=None,
+            review_snapshot_store=None,
+        ):
             received.append(suppression_index)
             return {"google": row, "website": {"site_status": "Loaded"}, "derived": {}, "screenshots": {}}
 

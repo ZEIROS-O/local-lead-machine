@@ -42,6 +42,7 @@ from lead_machine.email_hygiene import clean_emails
 from lead_machine.evidence import build_evidence_profile
 from lead_machine.icp import hard_icp_gate
 from lead_machine.schema import normalize_lead
+from lead_machine.scoring_profiles import infer_market, infer_vertical_key
 from lead_machine.verticals import resolve_profile
 from lead_machine.review_velocity import ReviewSnapshotStore
 from lead_machine.compliance import (  # re-exported: the enrichment entry points share these
@@ -1459,6 +1460,26 @@ def enrich_row(
     record["derived"]["hard_icp_reasons"] = hard_icp_reasons
 
     if review_snapshot_store is not None and lead.place_id_or_unique_key:
+        # Record before reading. Enrichment is the one stage every entry point
+        # runs, so this is where the observation has to be banked: without it
+        # the store never accumulates two counts 14 days apart and
+        # build_review_velocity is permanently stuck on "insufficient_history".
+        # A snapshot failure must not lose the lead, so it is logged, not raised.
+        if lead.google_review_count is not None:
+            try:
+                review_snapshot_store.record_snapshot(
+                    place_key=lead.place_id_or_unique_key,
+                    review_count=int(lead.google_review_count),
+                    rating=float(lead.google_rating) if lead.google_rating else None,
+                    vertical=infer_vertical_key(record, fallback=lead.vertical),
+                    market=infer_market(record),
+                    source="enrichment",
+                )
+            except Exception as exc:
+                print(
+                    f"[WARN] Review snapshot not recorded for {lead.business_name}: {exc}",
+                    file=sys.stderr,
+                )
         record["review_count_history"] = review_snapshot_store.history(lead.place_id_or_unique_key)
     total_elapsed = elapsed_seconds(started_at)
     record["enrichment"] = {"elapsed_seconds": round(total_elapsed, 1)}

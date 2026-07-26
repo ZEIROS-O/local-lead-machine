@@ -48,7 +48,7 @@ class BuyerSignalsTest(unittest.TestCase):
     def test_ads_check_false_sets_unknown_ads_without_network_calls(self) -> None:
         from lead_machine.buyer_signals import build_buyer_intent
 
-        with patch("lead_machine.buyer_signals.requests.get") as get:
+        with patch("requests.get") as get:
             buyer_intent = build_buyer_intent(self._record(), ads_check=False)
 
         get.assert_not_called()
@@ -62,6 +62,24 @@ class BuyerSignalsTest(unittest.TestCase):
             },
         )
 
+    def test_ads_check_true_makes_no_network_call_and_says_which_checks_are_missing(self) -> None:
+        # The two remote checks used to fetch a page, throw the response away and
+        # return "unknown" on every branch. An unqualified "unknown" is
+        # indistinguishable from a check that ran and found no ads, so the
+        # unimplemented state has to be stated in the record.
+        from lead_machine.buyer_signals import build_buyer_intent
+
+        with patch("requests.get") as get:
+            buyer_intent = build_buyer_intent(self._record(), ads_check=True)
+
+        get.assert_not_called()
+        self.assertEqual(buyer_intent["ads"]["google_ad_transparency"], "unknown")
+        self.assertEqual(buyer_intent["ads"]["meta_ad_library"], "unknown")
+        self.assertEqual(
+            sorted(buyer_intent["ads"]["errors"]),
+            ["google_ad_transparency: unimplemented", "meta_ad_library: unimplemented"],
+        )
+
     def test_lifetime_count_does_not_invent_review_velocity(self) -> None:
         from lead_machine.buyer_signals import build_buyer_intent
 
@@ -69,7 +87,7 @@ class BuyerSignalsTest(unittest.TestCase):
 
         self.assertEqual(buyer_intent["review_velocity"]["velocity_band"], "unknown")
         self.assertEqual(buyer_intent["review_velocity"]["source"], "insufficient_history")
-        self.assertFalse(buyer_intent["money_signal"])
+        self.assertNotEqual(buyer_intent["money_signal"], "yes")
 
     def test_strong_lifetime_count_still_has_unknown_velocity(self) -> None:
         from lead_machine.buyer_signals import build_buyer_intent
@@ -78,16 +96,109 @@ class BuyerSignalsTest(unittest.TestCase):
 
         self.assertEqual(buyer_intent["review_velocity"]["velocity_band"], "unknown")
         self.assertEqual(buyer_intent["review_demand_signal"]["demand_band"], "established")
-        self.assertFalse(buyer_intent["money_signal"])
+        self.assertNotEqual(buyer_intent["money_signal"], "yes")
 
     def test_review_count_alone_does_not_create_money_signal(self) -> None:
         from lead_machine.buyer_signals import build_buyer_intent
 
-        buyer_intent = build_buyer_intent(self._record(rating="5.0", reviews="100"), ads_check=False)
+        buyer_intent = build_buyer_intent(
+            self._record(rating="5.0", reviews="100", text="We wash cars."), ads_check=False
+        )
 
         self.assertEqual(buyer_intent["review_profile"]["source"], "count_only")
         self.assertEqual(buyer_intent["review_profile"]["demand_band"], "established")
-        self.assertFalse(buyer_intent["money_signal"])
+        self.assertEqual(buyer_intent["money_signal"], "no")
+
+    def test_readable_site_without_a_paid_stack_is_a_no_not_an_unknown(self) -> None:
+        from lead_machine.buyer_signals import build_buyer_intent, has_money_signal
+
+        record = self._record(text="Call us for a free estimate on ceramic coating.")
+
+        buyer_intent = build_buyer_intent(record, ads_check=False)
+
+        self.assertEqual(buyer_intent["money_signal"], "no")
+        self.assertFalse(has_money_signal(record))
+
+    def test_unreadable_site_makes_money_signal_unknown_not_no(self) -> None:
+        # The whole point of the tri-state: paid-CRM detection reads scraped site
+        # text, so a business with nothing to scrape has an unanswered question,
+        # not a negative answer. Reporting "no" told the rubric this business does
+        # not buy leads, which is a claim the pipeline never had evidence for.
+        from lead_machine.buyer_signals import build_buyer_intent, has_money_signal
+
+        record = self._record(text="")
+        record["website"] = {"site_status": "No Website"}
+
+        buyer_intent = build_buyer_intent(record, ads_check=False)
+
+        self.assertEqual(buyer_intent["money_signal"], "unknown")
+        self.assertFalse(has_money_signal(record))
+        self.assertTrue(
+            any("not observable" in str(item) for item in buyer_intent["evidence"]),
+            buyer_intent["evidence"],
+        )
+
+    def test_unknown_money_signal_is_never_truthy_for_a_gate(self) -> None:
+        # required_visible_pain_score drops the mature threshold from 40 to 35
+        # when money_signal is truthy. An "unknown" reaching that as True would
+        # loosen the gate on the leads with the least evidence behind them.
+        from lead_machine.buyer_signals import has_money_signal
+        from lead_machine.sendability import required_visible_pain_score
+
+        record = {"Money Signal": "Unknown"}
+
+        self.assertFalse(has_money_signal(record))
+        self.assertEqual(
+            required_visible_pain_score(300, review_band="mature", money_signal=has_money_signal(record)),
+            40,
+        )
+
+    def test_legacy_boolean_money_signal_still_reads_correctly(self) -> None:
+        from lead_machine.buyer_signals import money_signal_state
+
+        self.assertEqual(money_signal_state({"money_signal": True}), "yes")
+        self.assertEqual(money_signal_state({"Money Signal": "No"}), "no")
+        self.assertEqual(money_signal_state({}), "unknown")
+
+    def test_demand_signal_is_reported_separately_from_spend(self) -> None:
+        # Demand and willingness to pay are different claims. Only money_signal
+        # feeds required_visible_pain_score, so folding review pull into it would
+        # quietly relax that gate for any busy business.
+        from lead_machine.buyer_signals import build_buyer_intent
+
+        record = self._record(rating="4.9", reviews="130")
+        record["website"] = {"site_status": "No Website"}
+
+        buyer_intent = build_buyer_intent(record, ads_check=False)
+
+        self.assertEqual(buyer_intent["money_signal"], "unknown")
+        self.assertEqual(buyer_intent["demand_signal"]["state"], "yes")
+        self.assertEqual(buyer_intent["demand_signal"]["source"], "review_count")
+
+    def test_demand_signal_prefers_measured_velocity_over_lifetime_count(self) -> None:
+        from lead_machine.buyer_signals import build_buyer_intent
+
+        record = self._record(rating="4.9", reviews="130")
+        record["review_count_history"] = [
+            {"observed_at": "2026-05-01T00:00:00Z", "review_count": 100},
+            {"observed_at": "2026-06-01T00:00:00Z", "review_count": 130},
+        ]
+
+        buyer_intent = build_buyer_intent(record, ads_check=False)
+
+        self.assertEqual(buyer_intent["review_velocity"]["source"], "snapshot_delta")
+        self.assertEqual(buyer_intent["review_velocity"]["reviews_added"], 30)
+
+    def test_thin_review_count_reports_no_demand_rather_than_unknown(self) -> None:
+        # Review counts are always observable from the Google profile, so a thin
+        # count is a real negative — unlike money_signal, there is no "could not
+        # look" case to protect here.
+        from lead_machine.buyer_signals import build_buyer_intent
+
+        buyer_intent = build_buyer_intent(self._record(rating="4.2", reviews="1"), ads_check=False)
+
+        self.assertEqual(buyer_intent["demand_signal"]["state"], "no")
+        self.assertEqual(buyer_intent["demand_signal"]["demand_band"], "thin")
 
     def test_old_review_only_money_signal_is_rebuilt(self) -> None:
         from lead_machine.buyer_signals import BUYER_INTENT_LOGIC_VERSION, ensure_buyer_intent
@@ -119,7 +230,7 @@ class BuyerSignalsTest(unittest.TestCase):
 
         self.assertIsNot(buyer_intent, old_buyer_intent)
         self.assertEqual(buyer_intent["logic_version"], BUYER_INTENT_LOGIC_VERSION)
-        self.assertFalse(buyer_intent["money_signal"])
+        self.assertNotEqual(buyer_intent["money_signal"], "yes")
         self.assertEqual(buyer_intent["review_velocity"]["velocity_band"], "unknown")
         self.assertEqual(buyer_intent["review_demand_signal"]["demand_band"], "established")
 

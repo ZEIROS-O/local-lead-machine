@@ -28,8 +28,11 @@ from enrich_leads import (
 )
 from places_search import normalize_place, place_details, text_search_paged
 from lead_machine.compliance import ComplianceError, load_configured_suppression_index
+from lead_machine.review_velocity import ReviewSnapshotStore
 from lead_machine.schema import GENERIC_DOMAINS, normalize_domain, normalize_phone, slug
 
+
+DEFAULT_REVIEW_SNAPSHOT_DB = "run_state/review_velocity.sqlite3"
 
 REQUIRED_CONFIG_FIELDS = ["batch", "vertical", "location", "limit_per_query", "queries"]
 
@@ -744,6 +747,7 @@ def run_search_batch(
     max_details: Optional[int] = None,
     max_enrich: Optional[int] = None,
     suppression_index: Optional[AbstractSet[str]] = None,
+    review_snapshot_db: Optional[Path | str] = None,
 ) -> SearchRunResult:
     config = load_search_config(config_path)
     if batch and batch != config.batch:
@@ -803,6 +807,15 @@ def run_search_batch(
     _progress(f"ICP pass count: {len(passed_rows)}; skip count: {sum(skip_reason_counts.values())}")
     _progress(f"ICP skip reason counts: {_inline_counts(skip_reason_counts)}")
 
+    # Review velocity is only ever computable if something banks the counts.
+    # This entry point ran without a store, so run_state/review_velocity.sqlite3
+    # never accumulated history and every lead scored here reported
+    # velocity_band=unknown, source=insufficient_history — a whole signal the
+    # rubric asks for and the production path could not supply.
+    review_snapshot_store = ReviewSnapshotStore(
+        review_snapshot_db or os.getenv("REVIEW_SNAPSHOT_DB", DEFAULT_REVIEW_SNAPSHOT_DB)
+    )
+
     enriched_records: List[Dict[str, Any]] = []
     rows_to_enrich = passed_rows
     if max_enrich is not None:
@@ -824,6 +837,7 @@ def run_search_batch(
                 take_shots=not no_screenshots,
                 rendered_site_check=rendered_site_check,
                 suppression_index=suppression_index,
+                review_snapshot_store=review_snapshot_store,
             )
             enriched_records.append(enriched)
         except Exception as exc:
@@ -993,6 +1007,11 @@ def main() -> int:
     parser.add_argument("--max-searches", type=int, default=None, help="Optional cap on expanded query×geo searches")
     parser.add_argument("--max-details", type=int, default=None, help="Optional cap on Place Details calls")
     parser.add_argument("--max-enrich", type=int, default=None, help="Optional cap on enrichment rows")
+    parser.add_argument(
+        "--review-snapshot-db",
+        default=os.getenv("REVIEW_SNAPSHOT_DB", DEFAULT_REVIEW_SNAPSHOT_DB),
+        help="SQLite path containing longitudinal Google review-count observations",
+    )
     args = parser.parse_args()
 
     try:
@@ -1011,6 +1030,7 @@ def main() -> int:
             max_details=args.max_details,
             max_enrich=args.max_enrich,
             suppression_index=suppression_index,
+            review_snapshot_db=args.review_snapshot_db,
         )
     except (FileNotFoundError, RuntimeError, ValueError, ComplianceError) as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
