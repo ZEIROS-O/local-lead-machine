@@ -270,8 +270,52 @@ DEFAULT_MAX_LLM_CALLS_PER_RUN = 5
 DEFAULT_MAX_LLM_TOKENS_PER_RUN = 100_000
 DEFAULT_MAX_LLM_USD_PER_RUN = 5.0
 DEFAULT_LLM_SPEND_CONFIRM_USD = 0.50
-SONNET_4_6_INPUT_USD_PER_MILLION_TOKENS = 3.0
-SONNET_4_6_OUTPUT_USD_PER_MILLION_TOKENS = 15.0
+# Per-model list prices in USD per million tokens, as (input, output).
+#
+# Cost was previously computed from two constants named for Sonnet 4.6 while
+# DEFAULT_LLM_SCORING_MODEL had already moved to claude-sonnet-5 — so
+# MAX_LLM_USD_PER_RUN, --dry-run-llm-cost and the spend-confirm threshold were
+# all measuring a model the run was not using. An unknown model now raises
+# rather than being priced as if it were Sonnet, because a silently wrong price
+# on a spend cap is worse than a refusal.
+LLM_PRICING_USD_PER_MILLION_TOKENS: Dict[str, Tuple[float, float]] = {
+    "claude-opus-5": (15.0, 75.0),
+    "claude-sonnet-5": (3.0, 15.0),
+    "claude-fable-5": (3.0, 15.0),
+    "claude-haiku-4-5-20251001": (1.0, 5.0),
+    "claude-sonnet-4-6": (3.0, 15.0),
+    "claude-sonnet-4-5": (3.0, 15.0),
+    "claude-opus-4-1": (15.0, 75.0),
+    "claude-3-5-haiku-20241022": (0.8, 4.0),
+}
+
+
+class UnknownLlmModelError(ValueError):
+    pass
+
+
+def llm_pricing(model: str) -> Tuple[float, float]:
+    """(input, output) USD per million tokens for *model*.
+
+    Matches on the exact id first, then on the longest registered id that the
+    given model starts with, so a dated snapshot such as
+    "claude-sonnet-5-20260101" prices as claude-sonnet-5 rather than failing.
+    """
+    key = str(model or "").strip()
+    if not key:
+        raise UnknownLlmModelError("No LLM model configured; cannot price the run.")
+    if key in LLM_PRICING_USD_PER_MILLION_TOKENS:
+        return LLM_PRICING_USD_PER_MILLION_TOKENS[key]
+
+    prefixes = [name for name in LLM_PRICING_USD_PER_MILLION_TOKENS if key.startswith(name)]
+    if prefixes:
+        return LLM_PRICING_USD_PER_MILLION_TOKENS[max(prefixes, key=len)]
+
+    known = ", ".join(sorted(LLM_PRICING_USD_PER_MILLION_TOKENS))
+    raise UnknownLlmModelError(
+        f"No pricing registered for LLM model {key!r}; spend caps would be wrong. "
+        f"Add it to LLM_PRICING_USD_PER_MILLION_TOKENS. Known models: {known}"
+    )
 MAX_LLM_SCORING_STRING_CHARS = 1500
 MAX_LLM_SCORING_SNIPPET_CHARS = 300
 MAX_LLM_SCORING_SNIPPETS = 8
@@ -1984,13 +2028,11 @@ def score_records_manual(
     ).rows
 
 
-def estimate_llm_usd(usage: Dict[str, Any]) -> float:
+def estimate_llm_usd(usage: Dict[str, Any], *, model: str = DEFAULT_LLM_SCORING_MODEL) -> float:
+    input_price, output_price = llm_pricing(model)
     input_tokens = safe_int(usage.get("input_tokens"))
     output_tokens = safe_int(usage.get("output_tokens"))
-    return (
-        input_tokens * SONNET_4_6_INPUT_USD_PER_MILLION_TOKENS
-        + output_tokens * SONNET_4_6_OUTPUT_USD_PER_MILLION_TOKENS
-    ) / 1_000_000
+    return (input_tokens * input_price + output_tokens * output_price) / 1_000_000
 
 
 def estimate_prompt_tokens(prompt: str) -> int:
@@ -2575,6 +2617,7 @@ def _hit_projected_llm_cap(
     usd: float,
     max_tokens_per_run: int,
     max_usd_per_run: float,
+    model: str = DEFAULT_LLM_SCORING_MODEL,
 ) -> str:
     projected_input_tokens = estimate_prompt_tokens(prompt)
     projected_output_tokens = max(0, max_tokens)
@@ -2587,7 +2630,8 @@ def _hit_projected_llm_cap(
         {
             "input_tokens": projected_input_tokens,
             "output_tokens": projected_output_tokens,
-        }
+        },
+        model=model,
     )
     if max_usd_per_run > 0 and usd + projected_usd > max_usd_per_run:
         return "MAX_LLM_USD_PER_RUN"
@@ -2615,8 +2659,12 @@ def _print_llm_cap_check(
     )
 
 
-def _projected_usd_for_prompt(prompt_tokens: int, max_tokens: int) -> float:
-    return estimate_llm_usd({"input_tokens": prompt_tokens, "output_tokens": max(0, max_tokens)})
+def _projected_usd_for_prompt(
+    prompt_tokens: int, max_tokens: int, *, model: str = DEFAULT_LLM_SCORING_MODEL
+) -> float:
+    return estimate_llm_usd(
+        {"input_tokens": prompt_tokens, "output_tokens": max(0, max_tokens)}, model=model
+    )
 
 
 def _lead_name_for_skip(record: Dict[str, Any], *, fallback_vertical: str) -> str:
@@ -2910,6 +2958,7 @@ def estimate_api_llm_cost(
     batch_size: int = 5,
     max_tokens: int = DEFAULT_LLM_MAX_TOKENS,
     resume_scored_keys: set[str] | None = None,
+    model: str = DEFAULT_LLM_SCORING_MODEL,
 ) -> LlmCostEstimate:
     """
     Estimate API-LLM cost without making any Anthropic call.
@@ -2941,7 +2990,7 @@ def estimate_api_llm_cost(
     max_output_tokens = batches * max(0, max_tokens)
     projected_total_tokens = prompt_tokens + max_output_tokens
     projected_usd = estimate_llm_usd(
-        {"input_tokens": prompt_tokens, "output_tokens": max_output_tokens}
+        {"input_tokens": prompt_tokens, "output_tokens": max_output_tokens}, model=model
     )
     return LlmCostEstimate(
         records_selected=len(selected),
@@ -3051,7 +3100,7 @@ def score_records_api_run(
             remaining_exceeds_run_cap = (
                 max_tokens_per_run > 0 and tokens + projected_total_tokens > max_tokens_per_run
             )
-            projected_usd = _projected_usd_for_prompt(estimated_prompt_tokens, max_tokens)
+            projected_usd = _projected_usd_for_prompt(estimated_prompt_tokens, max_tokens, model=model)
             remaining_exceeds_usd_cap = max_usd_per_run > 0 and usd + projected_usd > max_usd_per_run
 
             if (chunk_exceeds_run_cap or remaining_exceeds_run_cap or remaining_exceeds_usd_cap) and current_batch_size > 1:
@@ -3109,7 +3158,7 @@ def score_records_api_run(
             input_tokens += batch_input_tokens
             output_tokens += batch_output_tokens
             tokens += batch_total_tokens
-            usd += estimate_llm_usd(usage)
+            usd += estimate_llm_usd(usage, model=model)
             if usage_output_path is not None:
                 _write_llm_usage_payload(
                     usage_output_path,
@@ -3142,7 +3191,7 @@ def score_records_api_run(
         input_tokens += batch_input_tokens
         output_tokens += batch_output_tokens
         tokens += batch_total_tokens
-        usd += estimate_llm_usd(usage)
+        usd += estimate_llm_usd(usage, model=model)
 
         bundle_dir.mkdir(parents=True, exist_ok=True)
         bundle_path = bundle_dir / f"{batch_id}_response.json"
@@ -3419,13 +3468,20 @@ def main() -> int:
         max_tokens_per_run = getenv_int("MAX_LLM_TOKENS_PER_RUN", DEFAULT_MAX_LLM_TOKENS_PER_RUN)
         max_usd_per_run = getenv_float("MAX_LLM_USD_PER_RUN", DEFAULT_MAX_LLM_USD_PER_RUN)
 
-        estimate = estimate_api_llm_cost(
-            records,
-            fallback_vertical=args.vertical,
-            batch_size=args.llm_batch_size,
-            max_tokens=args.llm_max_tokens,
-        )
+        llm_model = (os.getenv("LLM_SCORING_MODEL") or DEFAULT_LLM_SCORING_MODEL).strip()
+        try:
+            estimate = estimate_api_llm_cost(
+                records,
+                fallback_vertical=args.vertical,
+                batch_size=args.llm_batch_size,
+                max_tokens=args.llm_max_tokens,
+                model=llm_model,
+            )
+        except UnknownLlmModelError as exc:
+            print(f"[ERROR] {exc}", file=sys.stderr)
+            return 1
 
+        print(f"[LLM COST] model={llm_model}")
         print(
             f"[LLM COST] records_selected={estimate.records_selected} "
             f"batches={estimate.batches} "
@@ -3474,7 +3530,7 @@ def main() -> int:
             scores_dir=scores_dir_path,
             fallback_vertical=args.vertical,
             batch_size=args.llm_batch_size,
-            model=(os.getenv("LLM_SCORING_MODEL") or DEFAULT_LLM_SCORING_MODEL).strip(),
+            model=llm_model,
             max_tokens=args.llm_max_tokens,
             max_calls=max_calls,
             max_tokens_per_run=max_tokens_per_run,

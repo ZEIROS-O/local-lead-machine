@@ -7,8 +7,10 @@ import json
 import os
 import re
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import AbstractSet, Any, Dict, Iterable, List, Sequence
 from urllib.parse import quote
 
 import requests
@@ -650,26 +652,189 @@ def print_plan_diagnostics(planned: Iterable[Dict[str, Any]]) -> None:
             )
 
 
-def send_airtable_plan(base_id: str, table: str, token: str, planned: List[Dict[str, Any]]) -> None:
+AIRTABLE_TRANSIENT_HTTP_STATUSES = {429, 500, 502, 503, 504}
+AIRTABLE_MAX_RETRIES = 4
+AIRTABLE_RETRY_BACKOFF_SECONDS = 1.0
+# Airtable's documented limit is 5 requests per second per base.
+AIRTABLE_MIN_SECONDS_BETWEEN_WRITES = 0.21
+DEFAULT_AIRTABLE_RECEIPTS_PATH = "run_state/airtable_writes.jsonl"
+
+
+def _airtable_write_with_retry(
+    session: requests.Session,
+    *,
+    method: str,
+    url: str,
+    headers: Dict[str, str],
+    payload: Dict[str, Any],
+    label: str,
+) -> requests.Response:
+    """Send one Airtable write, retrying only what is worth retrying.
+
+    A 422 for an unknown field will fail identically every time; retrying it
+    just delays the error. 429 and 5xx are the ones that clear on their own, and
+    Airtable rate-limits a base at 5 requests per second, so a burst of writes
+    hits 429 as a matter of course rather than as an exception.
+    """
+    last_error = ""
+    for attempt in range(1, AIRTABLE_MAX_RETRIES + 1):
+        try:
+            response = session.request(method, url, headers=headers, json=payload, timeout=30)
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            if attempt >= AIRTABLE_MAX_RETRIES:
+                raise RuntimeError(
+                    f"Airtable {method} failed for {label} after {attempt} attempts: {last_error}"
+                ) from exc
+        else:
+            if response.status_code < 400:
+                return response
+            last_error = f"{response.status_code}: {response.text[:1000]}"
+            if response.status_code not in AIRTABLE_TRANSIENT_HTTP_STATUSES:
+                raise RuntimeError(f"Airtable {method} failed for {label} {last_error}")
+            if attempt >= AIRTABLE_MAX_RETRIES:
+                raise RuntimeError(
+                    f"Airtable {method} failed for {label} after {attempt} attempts, {last_error}"
+                )
+        sleeping = AIRTABLE_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+        print(
+            f"[AIRTABLE RETRY] attempt={attempt} {method} {label} "
+            f"reason={last_error[:120]} sleeping={sleeping:.1f}s",
+            file=sys.stderr,
+        )
+        time.sleep(sleeping)
+    raise RuntimeError(f"Airtable {method} failed for {label}: {last_error}")
+
+
+def send_airtable_plan(
+    base_id: str,
+    table: str,
+    token: str,
+    planned: List[Dict[str, Any]],
+    *,
+    receipts_path: Path | str | None = None,
+    applied_keys: AbstractSet[str] | None = None,
+) -> int:
+    """Apply *planned* writes, recording each one that lands.
+
+    This used to write sequentially and raise on the first status >= 400, which
+    left the base half-synced with no record of which writes had applied — the
+    operator could neither trust the base nor safely re-run. Every applied write
+    is now appended to a receipts file before the next one is attempted, so a
+    re-run can skip what already landed.
+    """
     base_url = airtable_base_url(base_id, table)
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    already_applied = set(applied_keys or ())
+    receipts = _open_receipts(receipts_path)
+    applied = 0
+    last_write_at = 0.0
 
-    for item in planned:
-        if item["method"] == "SKIP":
-            print(f"[SKIP] {item.get('upsert_key')}: {item.get('warning', 'manual review required')}")
+    try:
+        with requests.Session() as session:
+            for item in planned:
+                if item["method"] == "SKIP":
+                    print(f"[SKIP] {item.get('upsert_key')}: {item.get('warning', 'manual review required')}")
+                    continue
+
+                label = str(item.get("upsert_key") or item.get("place_key") or "")
+                if label and label in already_applied:
+                    print(f"[RESUME] {item['method']} {label} already applied; skipping")
+                    continue
+
+                # Airtable caps a base at 5 writes/second. Pacing here turns a
+                # predictable 429 into no request at all.
+                wait = AIRTABLE_MIN_SECONDS_BETWEEN_WRITES - (time.monotonic() - last_write_at)
+                if wait > 0:
+                    time.sleep(wait)
+
+                if item["method"] == "PATCH":
+                    url = f"{base_url}/{item['record_id']}"
+                    method = "PATCH"
+                else:
+                    url = base_url
+                    method = "POST"
+
+                response = _airtable_write_with_retry(
+                    session,
+                    method=method,
+                    url=url,
+                    headers=headers,
+                    payload=item["payload"],
+                    label=label or "unknown",
+                )
+                last_write_at = time.monotonic()
+                applied += 1
+                _append_receipt(
+                    receipts,
+                    {
+                        "method": method,
+                        "upsert_key": label,
+                        "record_id": item.get("record_id") or _response_record_id(response),
+                        "base_id": base_id,
+                        "table": table,
+                    },
+                )
+                print(f"[SYNC] {method} {label}")
+    finally:
+        if receipts is not None:
+            receipts.close()
+
+    return applied
+
+
+def _response_record_id(response: requests.Response) -> str:
+    try:
+        return str((response.json() or {}).get("id") or "")
+    except Exception:
+        return ""
+
+
+def _open_receipts(receipts_path: Path | str | None):
+    if receipts_path is None:
+        return None
+    path = Path(receipts_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path.open("a", encoding="utf-8")
+
+
+def _append_receipt(handle, receipt: Dict[str, Any]) -> None:
+    if handle is None:
+        return
+    handle.write(json.dumps({**receipt, "written_at": _utc_now_iso()}, ensure_ascii=False) + "\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def load_applied_write_keys(receipts_path: Path | str, *, base_id: str, table: str) -> set[str]:
+    """Keys already written to *base_id*/*table*, per the receipts file.
+
+    Scoped to the base and table so a receipts file from a different target
+    cannot make a run silently skip writes it never performed.
+    """
+    path = Path(receipts_path)
+    if not path.is_file():
+        return set()
+    applied: set[str] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
             continue
-        if item["method"] == "PATCH":
-            url = f"{base_url}/{item['record_id']}"
-            resp = requests.patch(url, headers=headers, json=item["payload"], timeout=30)
-        else:
-            resp = requests.post(base_url, headers=headers, json=item["payload"], timeout=30)
-
-        if resp.status_code >= 400:
-            raise RuntimeError(
-                f"Airtable {item['method']} failed for {item.get('upsert_key') or item.get('place_key')} "
-                f"{resp.status_code}: {resp.text[:1000]}"
-            )
-        print(f"[SYNC] {item['method']} {item.get('upsert_key') or item.get('place_key')}")
+        try:
+            receipt = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(receipt, dict):
+            continue
+        if receipt.get("base_id") != base_id or receipt.get("table") != table:
+            continue
+        key = str(receipt.get("upsert_key") or "").strip()
+        if key:
+            applied.add(key)
+    return applied
 
 
 def main() -> int:
@@ -690,6 +855,16 @@ def main() -> int:
     )
     parser.add_argument("--dry-run", action="store_true", help="Print planned Airtable writes without sending")
     parser.add_argument("--live", action="store_true", help="Send planned writes to Airtable")
+    parser.add_argument(
+        "--receipts",
+        default=os.getenv("AIRTABLE_RECEIPTS_PATH", DEFAULT_AIRTABLE_RECEIPTS_PATH),
+        help="JSONL path recording each applied Airtable write, so a failed run can be resumed",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip writes already recorded in the receipts file for this base and table",
+    )
     parser.add_argument(
         "--packet-dir",
         default="",
@@ -774,8 +949,24 @@ def main() -> int:
         existing = fetch_existing_records(args.base_id, args.table, args.token)
         planned = plan_airtable_sync(records, existing_records_by_key=existing)
         print_plan_diagnostics(planned)
-        send_airtable_plan(args.base_id, args.table, args.token, planned)
-        print(f"[DONE] Synced records: {len(planned)}")
+        receipts_path = Path(args.receipts)
+        applied_keys: set[str] = set()
+        if args.resume:
+            applied_keys = load_applied_write_keys(
+                receipts_path, base_id=args.base_id, table=args.table
+            )
+            if applied_keys:
+                print(f"[RESUME] {len(applied_keys)} writes already applied per {receipts_path}")
+        applied = send_airtable_plan(
+            args.base_id,
+            args.table,
+            args.token,
+            planned,
+            receipts_path=receipts_path,
+            applied_keys=applied_keys,
+        )
+        print(f"[DONE] Synced records: {applied} of {len(planned)} planned")
+        print(f"[DONE] Write receipts: {receipts_path}")
         return 0
     except (FileNotFoundError, RuntimeError, ValueError) as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)

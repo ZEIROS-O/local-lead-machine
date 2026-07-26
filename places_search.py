@@ -36,6 +36,27 @@ from lead_machine.scoring_profiles import infer_market, infer_vertical_key
 TEXT_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText"
 PLACE_DETAILS_URL = "https://places.googleapis.com/v1/places/{place_id}"
 
+# Mirrors llm_client.TRANSIENT_HTTP_STATUSES: the statuses a retry can actually
+# change. Everything else — a malformed query, a disabled key, an exhausted
+# quota — will fail the same way however many times it is sent.
+TRANSIENT_HTTP_STATUSES = {429, 500, 502, 503, 504}
+
+
+class GoogleApiError(RuntimeError):
+    """A non-2xx response from the Places API, carrying its status.
+
+    Subclasses RuntimeError so existing `except RuntimeError` handlers up the
+    call stack keep working unchanged.
+    """
+
+    def __init__(self, message: str, *, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+    @property
+    def is_transient(self) -> bool:
+        return self.status_code in TRANSIENT_HTTP_STATUSES
+
 # Search uses places.* field paths. "nextPageToken" is a top-level field (not
 # places.*) and must be in the mask to paginate; it does not raise the billing SKU.
 TEXT_SEARCH_FIELD_MASK = ",".join(
@@ -134,6 +155,18 @@ def extract_city(address: str) -> str:
     return ""
 
 
+def _distinct_business(kept: "Lead", candidate: "Lead") -> bool:
+    """Are these plausibly two businesses rather than one listed twice?
+
+    A distinct place_id with a different name is the signal. Google lists the
+    same business more than once often enough that name equality alone would
+    make this warn constantly.
+    """
+    if kept.place_id and candidate.place_id and kept.place_id == candidate.place_id:
+        return False
+    return slug(kept.business_name) != slug(candidate.business_name)
+
+
 def make_duplicate_key(name: str, city: str, phone: str, website_url: str, place_id: str) -> str:
     phone_digits = normalize_phone(phone)
     if phone_digits:
@@ -187,7 +220,10 @@ def request_json(method: str, url: str, *, headers: Dict[str, str], json_body: O
         raise RuntimeError(f"HTTP request failed: {exc}") from exc
 
     if resp.status_code >= 400:
-        raise RuntimeError(f"Google API error {resp.status_code}: {resp.text[:1000]}")
+        raise GoogleApiError(
+            f"Google API error {resp.status_code}: {resp.text[:1000]}",
+            status_code=resp.status_code,
+        )
 
     return resp.json()
 
@@ -195,13 +231,27 @@ def request_json(method: str, url: str, *, headers: Dict[str, str], json_body: O
 def _text_search_page(
     headers: Dict[str, str], body: Dict[str, Any], *, retries: int = 2, backoff: float = 1.5
 ) -> Dict[str, Any]:
-    """POST one Text Search page, retrying transient errors (e.g. a not-yet-ready
-    pageToken) with linear backoff. Mocked request_json in tests never retries."""
+    """POST one Text Search page, retrying only what a retry can fix.
+
+    This caught every RuntimeError, and `request_json` raises on any status at
+    or above 400 — so a 400 for a malformed query, a 403 for a disabled key, or
+    a quota error was retried three times with backoff before failing anyway.
+    Only the statuses that clear on their own are retried now, plus a
+    not-yet-ready pageToken, which is the transient case this existed for.
+    Mocked request_json in tests never retries.
+    """
     last_exc: Optional[Exception] = None
     for attempt in range(retries + 1):
         try:
             return request_json("POST", TEXT_SEARCH_URL, headers=headers, json_body=body)
+        except GoogleApiError as exc:
+            if not exc.is_transient:
+                raise
+            last_exc = exc
+            if attempt < retries:
+                time.sleep(backoff * (attempt + 1))
         except RuntimeError as exc:
+            # A transport failure with no status attached; worth another try.
             last_exc = exc
             if attempt < retries:
                 time.sleep(backoff * (attempt + 1))
@@ -436,6 +486,18 @@ def main() -> int:
                 continue
 
             if lead.duplicate_key in leads_by_key:
+                kept = leads_by_key[lead.duplicate_key]
+                if lead.duplicate_key.startswith("phone:") and _distinct_business(kept, lead):
+                    # Phone-first dedupe collapses anything sharing a number, so
+                    # two genuinely different businesses behind one answering
+                    # service or shared front desk silently become one lead.
+                    # Name the collision rather than hiding it in a [DUP] line.
+                    print(
+                        f"[DUP COLLISION] {lead.duplicate_key} merged "
+                        f"{lead.business_name!r} into {kept.business_name!r}; "
+                        "different names share this phone number",
+                        file=sys.stderr,
+                    )
                 print(f"[DUP] {lead.business_name} ({lead.duplicate_key})")
             else:
                 leads_by_key[lead.duplicate_key] = lead
