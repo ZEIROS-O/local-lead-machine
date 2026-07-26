@@ -35,5 +35,10 @@
       "North Royalton OH",
       "Strongsville OH"
     ]
-  }
+  },
+  "service_area_terms": [
+    "northeast ohio",
+    "greater cleveland",
+    "cuyahoga"
+  ]
 }

@@ -32,5 +32,9 @@
       "Silver Lake OH",
       "Fairlawn OH"
     ]
-  }
+  },
+  "service_area_terms": [
+    "northeast ohio",
+    "summit county"
+  ]
 }

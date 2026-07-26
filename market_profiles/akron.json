@@ -35,5 +35,11 @@
       "Tallmadge OH",
       "Wadsworth OH"
     ]
-  }
+  },
+  "service_area_terms": [
+    "northeast ohio",
+    "greater akron",
+    "summit county",
+    "portage county"
+  ]
 }

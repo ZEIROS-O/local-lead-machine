@@ -32,5 +32,9 @@
       "Alexandria OH",
       "Buckeye Lake OH"
     ]
-  }
+  },
+  "service_area_terms": [
+    "central ohio",
+    "licking county"
+  ]
 }

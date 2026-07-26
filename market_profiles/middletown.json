@@ -32,5 +32,10 @@
       "Mason OH",
       "West Chester OH"
     ]
-  }
+  },
+  "service_area_terms": [
+    "southwest ohio",
+    "butler county",
+    "warren county"
+  ]
 }

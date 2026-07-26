@@ -162,6 +162,34 @@ class SearchWorkflowTest(unittest.TestCase):
         self.assertFalse(strong_no_site.should_skip)
         self.assertIn("patio", strong_no_site.boost_terms)
 
+    def test_green_industry_exclusions_do_not_apply_outside_hardscaping(self) -> None:
+        """These five term lists were applied to every vertical.
+
+        "property maintenance" and "facility maintenance" are ordinary
+        vocabulary for a plumber or a restoration firm describing its commercial
+        customers, but the prefilter dropped those leads before enrichment ever
+        ran. The terms only mean "wrong trade" next to hardscaping, so they now
+        live on that profile.
+        """
+        hardscaping = _config()
+        plumbing = _config(
+            vertical="plumbing",
+            boost_terms=["plumber", "plumbing", "sewer", "water heater"],
+            exclude_terms=[],
+        )
+
+        row = _row(
+            business_name="Wilson Plumbing - property maintenance",
+            category="plumber",
+            source_query="emergency plumber Cleveland OH",
+        )
+
+        skipped = make_search_batch.prefilter_row(row, hardscaping)
+        kept = make_search_batch.prefilter_row(row, plumbing)
+
+        self.assertEqual(skipped.reason, "commercial_maintenance_only")
+        self.assertFalse(kept.should_skip, kept.reason)
+
     def test_search_report_generation_lists_counts_outputs_and_next_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

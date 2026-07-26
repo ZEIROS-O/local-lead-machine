@@ -30,6 +30,7 @@ from places_search import normalize_place, place_details, text_search_paged
 from lead_machine.compliance import ComplianceError, load_configured_suppression_index
 from lead_machine.review_velocity import ReviewSnapshotStore
 from lead_machine.schema import GENERIC_DOMAINS, normalize_domain, normalize_phone, slug
+from lead_machine.verticals import resolve_profile
 
 
 DEFAULT_REVIEW_SNAPSHOT_DB = "run_state/review_velocity.sqlite3"
@@ -94,16 +95,11 @@ FRANCHISE_OR_CHAIN_TERMS = [
     "davey tree",
 ]
 
-NURSERY_GARDEN_TERMS = ["nursery", "garden center", "landscape supply", "mulch supply", "stone yard"]
-TREE_ONLY_TERMS = ["tree service", "tree removal", "arborist", "stump grinding"]
-SNOW_ONLY_TERMS = ["snow removal only", "snow-only", "snow plowing only", "snow removal"]
-FERTILIZATION_ONLY_TERMS = ["lawn fertilization", "fertilization", "weed control", "turf care"]
-COMMERCIAL_MAINTENANCE_TERMS = [
-    "commercial maintenance only",
-    "commercial maintenance",
-    "facility maintenance",
-    "property maintenance",
-]
+# The nursery / tree / snow / fertilization / commercial-maintenance exclusions
+# that used to be module constants here are now `adjacency_exclusions` on the
+# hardscaping profile. They were applied to every vertical, so a plumber or a
+# water-restoration firm saying "property maintenance" or "facility maintenance"
+# — ordinary vocabulary in those markets — was dropped before enrichment.
 
 
 def _load_geo_slices_ref(ref: str, *, source_path: Path) -> List[str]:
@@ -564,20 +560,10 @@ def prefilter_row(row: Mapping[str, Any], config: SearchConfig) -> PrefilterResu
     if _contains_any(text, FRANCHISE_OR_CHAIN_TERMS) or _contains_any(text, ["franchise", "national chain"]):
         return PrefilterResult(True, "franchise_or_chain", boosts)
 
-    if _contains_any(text, NURSERY_GARDEN_TERMS) and not boosts:
-        return PrefilterResult(True, "nursery_or_garden_center", boosts)
-
-    if _contains_any(text, TREE_ONLY_TERMS) and not boosts:
-        return PrefilterResult(True, "tree_service_only", boosts)
-
-    if _contains_any(text, SNOW_ONLY_TERMS) and not boosts:
-        return PrefilterResult(True, "snow_only", boosts)
-
-    if _contains_any(text, FERTILIZATION_ONLY_TERMS) and not boosts:
-        return PrefilterResult(True, "lawn_fertilization_only", boosts)
-
-    if _contains_any(text, COMMERCIAL_MAINTENANCE_TERMS) and not boosts:
-        return PrefilterResult(True, "commercial_maintenance_only", boosts)
+    profile = resolve_profile(config.vertical, source_query=_pick(row, "source_query", "Source Query"))
+    for exclusion in profile.adjacency_exclusions:
+        if _contains_any(text, list(exclusion.terms)) and not boosts:
+            return PrefilterResult(True, exclusion.reason, boosts)
 
     for term in config.exclude_terms or []:
         lowered = term.lower()

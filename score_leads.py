@@ -61,7 +61,8 @@ from lead_machine.schema import normalize_lead
 from lead_machine.scoring_rules import SHARED_SENDABILITY_RULES
 from lead_machine.scoring_v3 import attach_scoring_v3
 from lead_machine.sendability import apply_sendability, normalize_evidence_refs
-from lead_machine.verticals import VerticalProfile, resolve_profile
+from lead_machine.scoring_profiles import market_service_area_terms
+from lead_machine.verticals import VERTICAL_PROFILES, VerticalProfile, resolve_profile
 from make_llm_batch import score_file_for_record
 
 
@@ -105,13 +106,16 @@ FRANCHISE_DENYLIST = [
     "window world",
 ]
 
-CORPORATE_HINTS = [
-    " of cleveland",
-    " of akron",
-    " of columbus",
-    " of brecksville",
-    " of northeast ohio",
-]
+# Phrasings that show service-area clarity without naming a place. The place
+# names themselves come from the lead's own market profile via
+# `market_service_area_terms`, because this scorer now runs 11 metros and
+# naming Cleveland's suburbs here penalised every business in the other ten.
+GENERIC_SERVICE_AREA_TERMS = (
+    "service area",
+    "areas we serve",
+    "serving",
+    "county",
+)
 
 COMMERCIAL_TERMS = [
     "commercial roofing",
@@ -472,23 +476,65 @@ def has_estimate_path_weakness(record: Dict[str, Any]) -> bool:
     return current_form_strength in {"weak", "basic"}
 
 
+def is_corporate_location_name(name: str, record: Dict[str, Any]) -> bool:
+    """Does the business name read as "Brand of <place>"?
+
+    In roofing that pattern usually marks a vendorised location page rather than
+    an owner-led shop. The place list used to be five hardcoded Ohio names, so
+    the check simply did not exist for the other ten metros. It now reads the
+    lead's own market profile.
+    """
+    if " of " not in name:
+        return False
+    places = market_service_area_terms(record)
+    return any(f" of {place}" in name for place in places)
+
+
 def infer_vertical(record: Dict[str, Any], fallback: str) -> str:
+    """Resolve the display vertical through the profile registry.
+
+    This used to be four hardcoded substring rules that knew only roofing,
+    hardscaping, masonry and landscaping — every other vertical fell through to
+    `fallback.title()`, and any copy containing "concrete" or "brick" was
+    relabelled "Masonry / Hardscaping". A detailing shop advertising work on
+    concrete floors was reported as a masonry lead. AGENTS.md asks for verticals
+    as data, not code, and `resolve_profile` already holds that data.
+    """
+    google = record.get("google", {}) if isinstance(record.get("google"), dict) else {}
+    declared = google.get("vertical") or record.get("vertical") or record.get("Vertical") or ""
+    profile = resolve_profile(
+        str(declared or fallback),
+        source_query=_record_source_query(record),
+        fallback=fallback,
+    )
+
+    # A declared vertical is the operator's own statement about the batch and
+    # outranks anything inferred from scraped copy.
+    if str(declared or "").strip():
+        return profile.label
+
     blob = text_blob(record)
-    name = record.get("google", {}).get("business_name", "").lower()
+    name = str(google.get("business_name") or "").lower()
+    text = f"{blob} {name}"
 
-    if "roof" in blob or "roof" in name:
-        return "Roofing"
+    # Only consider profiles the resolver actually knows, and require a match on
+    # the profile's own batch terms — the terms that define the vertical, rather
+    # than incidental service words that several verticals share.
+    matches = [
+        candidate
+        for candidate in VERTICAL_PROFILES.values()
+        if any(term in text for term in candidate.batch_terms)
+    ]
+    if len(matches) == 1:
+        return matches[0].label
+    if matches:
+        # Ambiguous copy: prefer the batch's own vertical if it is one of the
+        # candidates, rather than letting term ordering decide.
+        for candidate in matches:
+            if candidate.key == profile.key:
+                return candidate.label
 
-    if any(t in blob for t in ["hardscape", "paver", "patio", "retaining wall", "outdoor living"]):
-        return "Hardscaping"
-
-    if any(t in blob for t in ["masonry", "brick", "concrete"]):
-        return "Masonry / Hardscaping"
-
-    if "landscape" in blob or "landscap" in name:
-        return "Landscaping / Hardscaping"
-
-    return fallback.title()
+    return profile.label
 
 
 def vertical_family(vertical: str) -> str:
@@ -531,7 +577,7 @@ def fit_ceiling(
         return "Skip", flags
 
     # "X of City" is not always franchise, but in roofing/home services it often indicates a vendorized location page.
-    if family == "roofing" and any(h in name for h in CORPORATE_HINTS):
+    if family == "roofing" and is_corporate_location_name(name, record):
         flags.append("possible corporate/location-brand naming")
         return "C", flags
 
@@ -739,7 +785,8 @@ def score_online_weakness(record: Dict[str, Any]) -> Tuple[int, List[str]]:
         score += 5
         evidence.append("services page weak/missing")
 
-    if not any(t in blob for t in ["service area", "areas we serve", "serving", "county", "cleveland", "akron", "chardon", "northeast ohio"]):
+    service_area_terms = (*GENERIC_SERVICE_AREA_TERMS, *market_service_area_terms(record))
+    if not any(t in blob for t in service_area_terms):
         score += 4
         evidence.append("weak location/service-area clarity")
 

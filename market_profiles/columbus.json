@@ -38,5 +38,11 @@
       "Powell OH",
       "New Albany OH"
     ]
-  }
+  },
+  "service_area_terms": [
+    "central ohio",
+    "greater columbus",
+    "franklin county",
+    "delaware county"
+  ]
 }

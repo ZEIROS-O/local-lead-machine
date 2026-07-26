@@ -39,5 +39,12 @@
       "Florence KY",
       "Covington KY"
     ]
-  }
+  },
+  "service_area_terms": [
+    "southwest ohio",
+    "greater cincinnati",
+    "tri-state",
+    "hamilton county",
+    "butler county"
+  ]
 }

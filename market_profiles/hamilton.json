@@ -35,5 +35,10 @@
       "Monroe OH",
       "Mason OH"
     ]
-  }
+  },
+  "service_area_terms": [
+    "southwest ohio",
+    "greater cincinnati",
+    "butler county"
+  ]
 }

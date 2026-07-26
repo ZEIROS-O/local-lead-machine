@@ -32,5 +32,10 @@
       "Fairborn OH",
       "London OH"
     ]
-  }
+  },
+  "service_area_terms": [
+    "southwest ohio",
+    "clark county",
+    "miami valley"
+  ]
 }

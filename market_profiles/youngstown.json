@@ -32,5 +32,10 @@
       "Girard OH",
       "Struthers OH"
     ]
-  }
+  },
+  "service_area_terms": [
+    "northeast ohio",
+    "mahoning valley",
+    "trumbull county"
+  ]
 }

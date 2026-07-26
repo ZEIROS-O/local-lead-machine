@@ -326,6 +326,47 @@ def infer_vertical_key(record: Mapping[str, Any], *, fallback: str = "") -> str:
     return resolve_profile(str(value or ""), source_query=source_query, fallback=fallback or "").key
 
 
+def market_service_area_terms(
+    record: Mapping[str, Any], *, market_dir: Path | None = None
+) -> tuple[str, ...]:
+    """Place names that count as service-area clarity for *record*'s metro.
+
+    The scorer used to hardcode Cleveland/Akron/Chardon/Northeast Ohio in the
+    weakness check, so a Columbus or Cincinnati business naming its own suburbs
+    took a false weakness penalty. Weakness gates the offer-fit branches at
+    10/12/16/18, so 4 stray points can change the offer a lead is pitched.
+
+    Returns an empty tuple when the market cannot be resolved: the caller then
+    falls back to the generic phrasings only, which is the behaviour a lead with
+    no known metro had before.
+    """
+    market = infer_market(record, market_dir=market_dir)
+    if not market:
+        return ()
+
+    root = market_dir or Path(__file__).resolve().parents[1] / "market_profiles"
+    profile = _market_profiles(root).get(market)
+    if not isinstance(profile, Mapping):
+        return ()
+
+    terms = {market.replace("_", " ")}
+    display_name = str(profile.get("display_name") or "").strip()
+    if display_name:
+        terms.add(display_name)
+    for geo in profile.get("geos", []) or []:
+        if isinstance(geo, str):
+            city = _geo_city(geo).strip()
+            if city:
+                terms.add(city)
+    # Regional phrasings a business uses instead of a city list ("northeast
+    # ohio", "greater cleveland"). Optional per market.
+    for term in profile.get("service_area_terms", []) or []:
+        if isinstance(term, str) and term.strip():
+            terms.add(term.strip())
+
+    return tuple(sorted(term.casefold() for term in terms if term))
+
+
 def _market_profiles(root: Path) -> Dict[str, Dict[str, Any]]:
     profiles: Dict[str, Dict[str, Any]] = {}
     for path in root.glob("*.json"):
