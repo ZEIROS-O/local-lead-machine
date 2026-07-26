@@ -1802,6 +1802,54 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(profile["send_trigger"], "No estimate form detected")
         self.assertTrue(any(item["field"] == "send_trigger" for item in profile["evidence_items"]))
 
+    def test_send_trigger_is_the_strongest_leak_not_the_first_rule_to_fire(self) -> None:
+        """The trigger is the line the packet leads with and the one
+        `sendability` requires, so it has to be the worst problem found. It used
+        to be `reasons[0]` — whichever rule the function happened to evaluate
+        first, which is an implementation detail of the rule ordering."""
+        profile = build_evidence_profile(
+            {
+                "google": self._google_fixture(),
+                "website": {
+                    # "Phone number hard to find" (8) is added before the
+                    # broken-form rule in source order via the flag loop, and a
+                    # weak CTA (14) before it too, but a broken estimate form
+                    # (30) is the real reason to call.
+                    "site_status": "Loads",
+                    "final_url": "https://example.com",
+                    "homepage": {"url": "https://example.com", "text": "Patios."},
+                    "site_issue_flags": ["no_clear_cta_detected", "broken_form"],
+                    "contact_form_detected": "Yes",
+                    "estimate_form_detected": "Yes",
+                    "form_strength": "Weak",
+                    "cta_strength": "Weak",
+                    "emails_found": [],
+                    "phones_found": [],
+                },
+            }
+        )
+
+        self.assertIn("No clear estimate CTA", profile["visible_pain_reasons"])
+        self.assertIn("Estimate form appears broken", profile["visible_pain_reasons"])
+        self.assertEqual(profile["send_trigger"], "Estimate form appears broken")
+
+    def test_send_trigger_ties_keep_the_earlier_reason(self) -> None:
+        # The status-derived triggers all score 40, so a tie must not reorder
+        # them; "No owned website found" stays the headline for a missing site.
+        profile = build_evidence_profile(
+            {
+                "google": self._google_fixture(),
+                "website": {
+                    "site_status": "No Website",
+                    "site_issue_flags": ["http_error"],
+                    "emails_found": [],
+                    "phones_found": [],
+                },
+            }
+        )
+
+        self.assertEqual(profile["send_trigger"], "No owned website found")
+
     def test_evidence_profile_classifies_non_form_visible_pain_categories(self) -> None:
         profile = build_evidence_profile(
             {
@@ -5474,7 +5522,16 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(row["Lead Priority"], "Skip")
         self.assertIn("franchise/brand denylist", row["Fit Flags"])
 
-    def test_no_money_bad_site_cannot_be_deterministic_a(self) -> None:
+    def test_no_site_lead_is_not_demoted_for_an_unobservable_money_signal(self) -> None:
+        """The inverse of the rule this replaced.
+
+        `no_site and not money_signal -> C` could not do anything but fire:
+        money_signal is read from paid-CRM text scraped off the website, so a
+        business with no website could never satisfy it. Across two real
+        batches 25/25 and 13/13 no-site leads went base=A -> ceiling=C -> C,
+        which is below the A/B floor Sendable requires — the pipeline was built
+        to find these leads and then graded every one of them out.
+        """
         row = score_record(
             {
                 "google": {
@@ -5488,25 +5545,38 @@ class LeadMachineContractsTest(unittest.TestCase):
                     "combined_text": "hardscape patio retaining wall",
                     "high_ticket_terms": ["hardscape", "patio", "retaining wall"],
                 },
-                "buyer_intent": {
-                    "crm_booking_stack": {"detected_tools": [], "has_paid_crm": False, "evidence": []},
-                    "review_velocity": {"velocity_band": "steady", "source": "count_only", "evidence": []},
-                    "ads": {
-                        "google_ad_transparency": "unknown",
-                        "meta_ad_library": "unknown",
-                        "lsa_badge": "unknown",
-                        "errors": [],
-                    },
-                    "money_signal": False,
-                    "evidence": [],
+                "derived": {"has_high_ticket_terms": True},
+            },
+            "hardscaping",
+        )
+
+        self.assertEqual(row["Money Signal"], "Unknown")
+        self.assertEqual(row["Lead Priority"], "A")
+
+    def test_readable_site_with_a_real_money_negative_is_still_graded_on_its_merits(self) -> None:
+        # Removing the demotion must not silently promote every lead: a site we
+        # *could* read and found no paid stack in still grades off offer fit and
+        # the review band, not off money_signal.
+        row = score_record(
+            {
+                "google": {
+                    **self._google_fixture(),
+                    "rating": "4.9",
+                    "reviews": "18",
+                },
+                "website": {
+                    "site_status": "Okay",
+                    "site_issue_flags": [],
+                    "combined_text": "hardscape patio retaining wall free estimate",
+                    "high_ticket_terms": ["hardscape", "patio", "retaining wall"],
                 },
                 "derived": {"has_high_ticket_terms": True},
             },
             "hardscaping",
         )
 
-        self.assertNotEqual(row["Lead Priority"], "A")
-        self.assertIn(row["Lead Priority"], {"C", "Skip"})
+        self.assertEqual(row["Money Signal"], "No")
+        self.assertIn(row["Lead Priority"], {"A", "B", "C", "Skip"})
 
     def test_money_signal_defends_high_review_bad_site_deterministic_tier(self) -> None:
         base_record = {

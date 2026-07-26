@@ -554,9 +554,16 @@ def fit_ceiling(
             return "B", flags
         return "C", flags
 
-    if no_site and not money_signal:
-        flags.append("bad site without buyer-intent money signal")
-        return "C", flags
+    # The no-site demotion used to live here: `no_site and not money_signal -> C`.
+    # It could not do anything but fire. money_signal comes from paid-CRM text
+    # scraped off the website, so a business with no website could never satisfy
+    # it — measured across two real batches, 25/25 and 13/13 no-site leads went
+    # base=A -> ceiling=C -> final=C, which put them below the A/B floor for
+    # Sendable. That inverted the product thesis: no-site businesses are the
+    # easiest sell, and every search config sets allow_missing_website: true to
+    # go and find them. Batch 2 made money_signal honest about the difference
+    # between "no spend" and "not looked"; this removes the rule that punished
+    # the lead for the pipeline's own blind spot.
 
     # Inverted-U review logic.
     # 5-20 reviews = best first-wave owner-led band. More reviews need clearer visible pain.
@@ -980,6 +987,48 @@ def classify_priority(
         priority = "Skip"
 
     return priority, ceiling, fit_flags
+
+
+ICP_CEILING_SHADOW_FIELDS = ("ICP Ceiling", "ICP Ceiling Flags", "Grade Disagreement")
+
+
+def attach_icp_ceiling_shadow(
+    row: Dict[str, Any],
+    record: Dict[str, Any],
+    *,
+    fallback_vertical: str,
+) -> Dict[str, Any]:
+    """Record what the closeability layer *would* have said, without enforcing it.
+
+    `fit_ceiling` runs only inside `score_record`, so in `--mode api-llm` — the
+    mode production actually uses — the grade is a bare threshold on the LLM
+    total and the ICP layer never runs at all. Measured across 161 leads, 15
+    carried a sendable-eligible B against a C ceiling, so the two graders
+    disagree often enough to matter and neither has been shown right.
+
+    These are CSV and packet columns only. They are deliberately not added to
+    the Airtable surface, which PR #9 just cut from 65 columns to 54 and which
+    four separate lists have to agree on.
+    """
+    vertical = _record_vertical(record) or fallback_vertical
+    try:
+        profile = resolve_profile(vertical, source_query=_record_source_query(record))
+        ceiling, fit_flags = fit_ceiling(record, vertical, profile=profile)
+    except Exception as exc:
+        # A shadow measurement must never be able to fail a scoring run.
+        row["ICP Ceiling"] = ""
+        row["ICP Ceiling Flags"] = f"ceiling_unavailable: {exc}"
+        row["Grade Disagreement"] = ""
+        return row
+
+    grade = str(row.get("Lead Priority") or "").strip()
+    row["ICP Ceiling"] = ceiling
+    row["ICP Ceiling Flags"] = "; ".join(str(flag) for flag in fit_flags)
+    # Only a grade *better* than the ceiling is a disagreement. A grade at or
+    # below it is the ceiling doing nothing, which is not a finding.
+    disagrees = bool(grade) and bool(ceiling) and more_restrictive(grade, ceiling) != grade
+    row["Grade Disagreement"] = f"{grade}_vs_{ceiling}" if disagrees else ""
+    return row
 
 
 def best_service_angle(record: Dict[str, Any], vertical: str, offer_fit: str) -> str:
@@ -1860,6 +1909,7 @@ def score_records_manual_run(
                 )
                 raise ValueError(f"{exc}; API merge validation debug written to {debug_path}") from exc
             raise
+        attach_icp_ceiling_shadow(row, record, fallback_vertical=fallback_vertical)
         if "Known Evidence IDs" in row or "known_evidence_ids" in row:
             has_known_evidence_ids = True
         scored.append(row)

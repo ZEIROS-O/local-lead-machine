@@ -27,6 +27,16 @@ DEMAND_SIGNAL_YES = "yes"
 DEMAND_SIGNAL_NO = "no"
 DEMAND_SIGNAL_UNKNOWN = "unknown"
 
+# Statuses meaning there was nothing of the business's own to read. Normalized
+# to lowercase with underscores as spaces before lookup, so both the scorer's
+# vocabulary ("No Website", "Broken Website") and the evidence profile's
+# ("missing", "broken") land here.
+# An absent status is not in the set: it means "not stated", so the text check
+# below still gets to answer.
+UNREADABLE_SITE_STATUSES = frozenset(
+    {"no website", "missing", "none", "broken", "broken website", "unknown"}
+)
+
 ACTIVE_VELOCITY_BANDS = frozenset({"surging", "active", "steady"})
 DEMAND_BANDS_WITH_PULL = frozenset({"ideal_growth", "established", "mature"})
 
@@ -271,7 +281,16 @@ def _site_text_observed(record: Dict[str, Any]) -> bool:
     A site that is missing, dead, or rendered nothing is indistinguishable here
     from one never visited — in all three cases the paid-stack question went
     unanswered.
+
+    Site status wins over leftover text. A record can carry `combined_text` from
+    a Google listing or a redirect while its status says there is no owned site,
+    and text that is not the business's own site cannot answer what the business
+    runs on. Social-only and Jobber-only pages are deliberately *not* in this
+    set: those are readable, and Jobber is itself one of the paid tools.
     """
+    if _site_status(record) in UNREADABLE_SITE_STATUSES:
+        return False
+
     website = record.get("website") if isinstance(record.get("website"), dict) else {}
     if str(website.get("combined_text") or "").strip():
         return True
@@ -288,6 +307,19 @@ def _site_text_observed(record: Dict[str, Any]) -> bool:
     # Tools already detected upstream are themselves proof the site was read.
     evidence = record.get("evidence") if isinstance(record.get("evidence"), dict) else {}
     return bool(evidence.get("third_party_tools"))
+
+
+def _site_status(record: Dict[str, Any]) -> str:
+    evidence = record.get("evidence") if isinstance(record.get("evidence"), dict) else {}
+    website = record.get("website") if isinstance(record.get("website"), dict) else {}
+    raw = (
+        record.get("Site Status")
+        or record.get("site_status")
+        or evidence.get("site_status")
+        or website.get("site_status")
+        or ""
+    )
+    return " ".join(str(raw).strip().lower().replace("_", " ").split())
 
 
 def _demand_signal(review_profile: Dict[str, Any], review_velocity: Dict[str, Any]) -> Dict[str, Any]:
