@@ -394,9 +394,28 @@ def write_csv(path: Path, leads: Iterable[Lead]) -> None:
 
 
 def main() -> int:
+    """LEGACY entry point. Not part of the current pipeline.
+
+    Reads `data/searches.csv`, a hand-maintained query list that nothing in the
+    current flow produces. The pipeline runs `make_search_batch.py`, which takes
+    a JSON search config with geo slices, applies the ICP prefilter and enriches
+    in the same pass. This is kept because it is still the simplest way to run a
+    one-off ad-hoc query list, but it does not prefilter, dedupe against a batch,
+    or enrich — do not extend it. New search behaviour belongs in
+    `make_search_batch.py`.
+    """
     load_dotenv()
 
-    parser = argparse.ArgumentParser()
+    print(
+        "[LEGACY] places_search.py is not the pipeline entry point; "
+        "use make_search_batch.py --config <search config>.",
+        file=sys.stderr,
+    )
+
+    parser = argparse.ArgumentParser(
+        description="LEGACY ad-hoc Places search from a hand-written CSV. "
+        "The pipeline uses make_search_batch.py."
+    )
     parser.add_argument("--searches", default="data/searches.csv", help="CSV with query,max_results columns")
     parser.add_argument("--output", default="output/raw_places.csv", help="Output CSV path")
     parser.add_argument("--sleep", type=float, default=0.15, help="Seconds between Google calls")

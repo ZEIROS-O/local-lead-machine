@@ -255,3 +255,60 @@ class LlmPricingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ArchivedPacketDirTest(unittest.TestCase):
+    """49 packets_*/review_queue_* directories sat at the repo root.
+
+    Archiving them under runs/ would have broken packet-path resolution, which
+    derives `packets_<batch>_manual` relative to the working directory. The
+    lookup falls back to the archive so an old batch still resolves, and prefers
+    the root so a live run is never shadowed by a stale archived copy.
+    """
+
+    def test_a_live_run_at_the_root_wins(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "packets_epoxy_001_manual").mkdir()
+            (root / "runs" / "packets_epoxy_001_manual").mkdir(parents=True)
+            with patch("upload_airtable.Path.cwd", return_value=root), patch(
+                "upload_airtable.os.chdir"
+            ):
+                import os as _os
+
+                cwd = _os.getcwd()
+                _os.chdir(root)
+                try:
+                    resolved = upload_airtable.infer_packet_dir(Path("scored_epoxy_001_manual.csv"))
+                finally:
+                    _os.chdir(cwd)
+
+        self.assertEqual(resolved, Path("packets_epoxy_001_manual"))
+
+    def test_an_archived_run_is_still_found(self) -> None:
+        import os as _os
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "runs" / "packets_epoxy_001_manual").mkdir(parents=True)
+            cwd = _os.getcwd()
+            _os.chdir(root)
+            try:
+                resolved = upload_airtable.infer_packet_dir(Path("scored_epoxy_001_manual.csv"))
+            finally:
+                _os.chdir(cwd)
+
+        self.assertEqual(resolved, Path("runs/packets_epoxy_001_manual"))
+
+    def test_a_batch_with_no_packets_anywhere_keeps_the_root_path(self) -> None:
+        import os as _os
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = _os.getcwd()
+            _os.chdir(tmp)
+            try:
+                resolved = upload_airtable.infer_packet_dir(Path("scored_new_batch_manual.csv"))
+            finally:
+                _os.chdir(cwd)
+
+        self.assertEqual(resolved, Path("packets_new_batch_manual"))

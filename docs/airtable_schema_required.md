@@ -19,7 +19,7 @@
 | Offer Fit | Single select | ? | Options: No-Site Launch, Website Rebuild, Estimate Funnel, Automation / Follow-Up |
 | Site Status | Single select | ? | Options: Missing, Broken, No Website, Loaded, Redirect Issue, Social Only, Unknown |
 | Form Strength | Single line text | ? |  |
-| Visible Pain Score | Number | ? | Integer 0–5 |
+| Visible Pain Score | Number | ? | Integer 0–100 (sendability thresholds fire at 10/16/30/35/40) |
 | Visible Pain Reasons | Long text | ? |  |
 | Send Trigger | Single line text | ? |  |
 | Buyer Intent Signals | Long text | ? | Comma-separated signals detected by LLM |

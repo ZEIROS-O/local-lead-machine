@@ -33,18 +33,35 @@ order; each loop is independently revertible.
 into 4 sequenced groups (G1→G4) with tasks, "Done when", and verification. Work groups in order;
 respect the blocking links; keep each group a small, independently-revertible batch.
 
-Key in-flight facts (2026-06-20):
-- **Live vertical is migrating hardscaping → car detailing** (high-ticket: ceramic coating / paint
-  correction / PPF / mobile detailing — NOT basic car washes). Epoxy is a planned fast-follow, so
-  per-vertical terms are being centralized in `lead_machine/verticals.py` — add verticals as **data, not code**.
-- **Scoring is being automated** off the manual clipboard onto the Anthropic Messages API
-  (Sonnet 4.6, `LLM_SCORING_MODEL` in `.env`, no SDK — uses `requests`).
-- A **buyer-intent / money signal** is being added to enrichment + scoring + the sendability gate.
+Key in-flight facts (2026-07-26):
+- **Six live verticals across eleven metros**: hardscaping, car detailing, epoxy, plumbing, water
+  restoration, garage doors. Per-vertical terms live in `lead_machine/verticals.py` and per-metro
+  place names in `market_profiles/*.json` — add verticals and metros as **data, not code**. Nothing
+  in scoring should name Cleveland or a single trade; `resolve_profile` and `infer_market` exist
+  for that.
+- **Scoring runs on the Anthropic Messages API** (`claude-sonnet-5`, `LLM_SCORING_MODEL` in `.env`,
+  no SDK — uses `requests`). Spend caps price the resolved model from
+  `score_leads.LLM_PRICING_USD_PER_MILLION_TOKENS`; an unpriced model fails the run rather than
+  being costed as something else, so a new model needs a table entry.
+- **`buyer_intent.money_signal` is tri-state** (`yes`/`no`/`unknown`). "unknown" means there was no
+  crawlable site text to read a paid stack from, which is not the same claim as "does not spend".
+  Only `yes` may count as truthy in a gate — `sendability.required_visible_pain_score` drops the
+  mature-band threshold from 40 to 35 on a truthy value. `demand_signal` is deliberately separate.
+- **Enrichment runs concurrently** (`ENRICH_WORKERS`, default 6; 3 when screenshots or rendered
+  checks are on, since each launches its own Chromium) and streams records to disk as they finish.
+  The per-lead ceiling scales with the worker count — it is wall-clock, and contention inflates it.
+- **Review velocity needs two observations ≥14 days apart** in `run_state/review_velocity.sqlite3`
+  (`REVIEW_SNAPSHOT_DB`). `enrich_row` banks one per lead per run; until a batch has been run twice,
+  `velocity_band` is legitimately `unknown`.
 
 ## Conventions
 - Config/secrets via `.env` (`python-dotenv`); env vars include `GOOGLE_PLACES_API_KEY`, `AIRTABLE_*`,
-  and (new) `ANTHROPIC_API_KEY`, `LLM_SCORING_MODEL`, `MAX_LLM_*` caps.
-  **Compliance requires `SUPPRESSION_SOURCE` (or `LPM_OUTCOMES_JSONL`) to be set** or it will fail closed.
+  `ANTHROPIC_API_KEY`, `LLM_SCORING_MODEL`, `MAX_LLM_*` caps, `ENRICH_WORKERS`,
+  `REVIEW_SNAPSHOT_DB`, `AIRTABLE_RECEIPTS_PATH`.
+  **Compliance requires `SUPPRESSION_SOURCE` (or `LPM_OUTCOMES_JSONL`) to be set** or search,
+  enrichment and scoring all fail closed with `[ERROR]` and exit 1. `ALLOW_MISSING_SUPPRESSION_INDEX=1`
+  bypasses it loudly; there is deliberately no silent empty-index fallback, because an empty index
+  disables every opt-out.
 - HTTP via `requests` (see `places_search.py:170` `request_json`). No new heavy deps without reason.
 - Tests are stdlib `unittest` in `tests/`. Run `python -m unittest discover -s tests`
   (bare `python -m unittest` discovers 0 tests here; esp. cover `tests.test_icp_lanes` +

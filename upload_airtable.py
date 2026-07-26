@@ -65,7 +65,7 @@ _FIELD_SCHEMA: List[tuple[str, str, str]] = [
     ("Offer Fit",              "Single select",      "Options: No-Site Launch, Website Rebuild, Estimate Funnel, Automation / Follow-Up"),
     ("Site Status",            "Single select",      "Options: Missing, Broken, No Website, Loaded, Redirect Issue, Social Only, Unknown"),
     ("Form Strength",          "Single line text",   ""),
-    ("Visible Pain Score",     "Number",             "Integer 0–5"),
+    ("Visible Pain Score",     "Number",             "Integer 0–100"),
     ("Visible Pain Reasons",   "Long text",          ""),
     ("Send Trigger",           "Single line text",   ""),
     ("Buyer Intent Signals",   "Long text",          "Comma-separated signals detected by LLM"),
@@ -285,14 +285,29 @@ def safe_slug(text: str) -> str:
     return text.strip("-")
 
 
+ARCHIVED_RUNS_DIR = Path("runs")
+
+
 def infer_packet_dir(input_path: Path) -> Path:
+    """Locate the packet directory for a scored CSV.
+
+    Completed runs are archived under `runs/` to keep the repo root navigable,
+    so a directory that is not at the root may still exist one level down. New
+    runs keep writing to the root, which is why the root is checked first.
+    """
     stem = input_path.stem
     prefix = "scored_"
     suffix = "_manual"
     if stem.startswith(prefix) and stem.endswith(suffix):
         batch = stem[len(prefix) : -len(suffix)]
         if batch:
-            return Path(f"packets_{batch}_manual")
+            name = f"packets_{batch}_manual"
+            candidate = Path(name)
+            if candidate.is_dir() or not (ARCHIVED_RUNS_DIR / name).is_dir():
+                return candidate
+            return ARCHIVED_RUNS_DIR / name
+    if not DEFAULT_PACKET_DIR.is_dir() and (ARCHIVED_RUNS_DIR / DEFAULT_PACKET_DIR.name).is_dir():
+        return ARCHIVED_RUNS_DIR / DEFAULT_PACKET_DIR.name
     return DEFAULT_PACKET_DIR
 
 
