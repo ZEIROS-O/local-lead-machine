@@ -22,6 +22,7 @@ import score_leads
 from lead_machine.compliance import (
     ComplianceError,
     has_suppression_match,
+    is_suppressed,
     is_suppressed_record,
     load_configured_suppression_index,
     merge_suppression_disqualifiers,
@@ -127,6 +128,27 @@ class SuppressionIndexTests(unittest.TestCase):
 
         self.assertIn("phone:1111111111", index)
         self.assertNotIn("phone:2222222222", index)
+
+    def test_a_ledger_written_opt_out_resolves_instead_of_failing_the_run(self) -> None:
+        """operator-agent's STATE/outcomes.jsonl — which this file *is*, in
+        production — spells the Airtable record id `lead_id`, not `record_id`
+        (STATE/README.md). A row keyed that way used to raise "suppression event
+        without an identifier", and because compliance fails closed that single
+        opt_out would take search, enrichment and scoring down with it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "outcomes.jsonl"
+            path.write_text(
+                '{"ts": "2026-07-27T00:00:00Z", "business": "lpm", '
+                '"lead_id": "recABC", "event": "opt_out", "phone": "(216) 555-0100"}\n',
+                encoding="utf-8",
+            )
+            os.environ["SUPPRESSION_SOURCE"] = str(path)
+
+            index = load_configured_suppression_index()
+
+        self.assertIn("record_id:recabc", index)
+        self.assertIn("phone:2165550100", index)
+        self.assertTrue(is_suppressed({"record_id": "recABC"}, index))
 
 
 class EnrichRowSuppressionTests(unittest.TestCase):

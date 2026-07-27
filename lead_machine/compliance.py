@@ -57,7 +57,13 @@ def record_suppression_identifiers(record: dict[str, Any]) -> set[str]:
     fields = record.get("fields") if isinstance(record.get("fields"), dict) else record
     assert isinstance(fields, dict)
     values = {
-        "record_id": record.get("record_id") or record.get("id") or fields.get("record_id"),
+        "record_id": (
+            record.get("record_id")
+            or record.get("id")
+            or record.get("lead_id")
+            or fields.get("record_id")
+            or fields.get("lead_id")
+        ),
         "phone": fields.get("phone") or fields.get("Phone"),
         "email": fields.get("email") or fields.get("Email"),
     }
@@ -100,10 +106,20 @@ def load_suppression_index(value: Path | str) -> set[str]:
         event = str(row.get("event") or "").strip().casefold().replace("-", "_").replace(" ", "_")
         if event not in SUPPRESSION_EVENTS:
             continue
+        # `lead_id` is the key operator-agent's STATE/outcomes.jsonl writes for
+        # the Airtable record id (STATE/README.md); this file is read as LPM's
+        # suppression source, so both spellings have to resolve or every
+        # ledger-written opt_out either fails the run below or silently
+        # suppresses nobody.
         identifiers = {
             identifier
-            for key in ("record_id", "phone", "email")
-            if (identifier := suppression_identifier(key, row.get(key)))
+            for key, kind in (
+                ("record_id", "record_id"),
+                ("lead_id", "record_id"),
+                ("phone", "phone"),
+                ("email", "email"),
+            )
+            if (identifier := suppression_identifier(kind, row.get(key)))
         }
         if not identifiers:
             raise ComplianceError(

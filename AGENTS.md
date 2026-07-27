@@ -54,6 +54,22 @@ Key in-flight facts (2026-07-26):
   (`REVIEW_SNAPSHOT_DB`). `enrich_row` banks one per lead per run; until a batch has been run twice,
   `velocity_band` is legitimately `unknown`.
 
+## The write-back half (post-send CRM)
+
+The pipeline ends at Airtable; three small scripts move a lead through the funnel afterwards, and
+every one of them logs something a human already did. **None of them send anything.**
+
+- `query_ready_to_send.py` — read-only queue of leads passing the readiness contract.
+- `mark_sent.py` — `Status=Sent`, `Last Contacted`, `Outreach Channel`, and arms `Next Follow-Up`
+  one cadence step out.
+- `mark_outcome.py` — everything after that: `replied` / `meeting_booked` → `Follow-Up` (re-arms the
+  cadence), `closed_won` / `closed_lost` → `Closed` (clears it), plus a `Sales Activities` row and,
+  on a win, a `Deals` row.
+
+The cadence itself lives in `lead_machine/follow_up.py` (`FOLLOW_UP_CADENCE_DAYS`, default 4) so the
+two writers cannot disagree about it. Table names and the exact select vocabularies these scripts
+write are in [`docs/airtable_schema_required.md`](docs/airtable_schema_required.md).
+
 ## Conventions
 - Config/secrets via `.env` (`python-dotenv`); env vars include `GOOGLE_PLACES_API_KEY`, `AIRTABLE_*`,
   `ANTHROPIC_API_KEY`, `LLM_SCORING_MODEL`, `MAX_LLM_*` caps, `ENRICH_WORKERS`,
@@ -63,8 +79,9 @@ Key in-flight facts (2026-07-26):
   bypasses it loudly; there is deliberately no silent empty-index fallback, because an empty index
   disables every opt-out.
 - HTTP via `requests` (see `places_search.py:170` `request_json`). No new heavy deps without reason.
-- Tests are stdlib `unittest` in `tests/`. Run `python -m unittest discover -s tests`
-  (bare `python -m unittest` discovers 0 tests here; esp. cover `tests.test_icp_lanes` +
+- Tests are stdlib `unittest` in `tests/`. Run `.venv/bin/python -m unittest discover -s tests`
+  (bare `python -m unittest` discovers 0 tests here, and the system interpreter has none of the
+  deps — a dozen modules fail to import; esp. cover `tests.test_icp_lanes` +
   `tests.test_lead_machine_contracts`) after changes to scoring/ICP/enrichment.
 - Per-run caps follow the `getenv_int(...)` + `[STOP] Hit MAX_*` pattern in `places_search.py`.
 

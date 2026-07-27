@@ -18,15 +18,6 @@ from urllib.parse import quote
 
 import requests
 
-
-def follow_up_cadence_days() -> int:
-    # Day 0 -> Day 4: first follow-up cadence step (SKILLS/outreach in
-    # operator-agent documents Day 0/4/11/14; only Day 4 applies here since
-    # mark_sent only ever fires once per lead — later touches are Loop C's
-    # job, not built yet). Read lazily so a .env value picked up by
-    # load_dotenv() in main() is honored.
-    return int(os.getenv("FOLLOW_UP_CADENCE_DAYS", "4"))
-
 from lead_machine.compliance import (
     ComplianceError,
     has_acceptable_sms_consent,
@@ -35,6 +26,7 @@ from lead_machine.compliance import (
     load_suppression_index,
     record_suppression_identifiers,
 )
+from lead_machine.follow_up import next_follow_up_date
 from lead_machine.sendability import contact_readiness_failures
 
 try:
@@ -102,9 +94,7 @@ def apply_mark_sent(
         raise MarkSentError("Airtable GET response has no fields object")
     fields = dict(raw_fields)
 
-    next_follow_up = (
-        dt.date.fromisoformat(last_contacted) + dt.timedelta(days=follow_up_cadence_days())
-    ).isoformat()
+    next_follow_up = next_follow_up_date(last_contacted)
 
     # Exact recovery is safe even if readiness changed after the original
     # PATCH. It never performs another external mutation.

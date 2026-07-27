@@ -9,13 +9,24 @@ already observed, mirroring mark_sent.py's guarded-PATCH conventions.
 
 Writes:
   - Prospects.Status -> Follow-Up (replied / meeting_booked) or Closed (closed_won / closed_lost)
+  - Prospects.Next Follow-Up -> re-armed one cadence step out while the lead is
+    still open, and cleared on a close so a closed lead leaves the follow-up queue
   - a new row in Sales Activities, linked back to the prospect
   - on closed_won only: a new row in Deals, linked back to the prospect
 
-Uses Airtable's `typecast` on the two create calls so a not-yet-listed
-Activity Type/Outcome/Deal Status choice is added to the select field
-automatically instead of 422ing, matching mark_sent.py's Outreach Channel
-handling.
+`typecast` is used on the Sales Activities create and *only* there. That table's
+Activity Type/Outcome vocabularies were built for meeting logistics
+(Completed/Scheduled/No Show) and cannot express a funnel outcome, and Airtable's
+Meta API refuses to add select choices to an existing field — typecast on write
+is the only mechanism that can. What keeps that from becoming open-ended drift is
+that the vocabulary is closed: `ACTIVITY_TYPE`/`ACTIVITY_OUTCOME` below are the
+complete set of values this script can ever emit, they are pinned by
+`tests/test_mark_outcome.py`, and they are declared in
+`docs/airtable_schema_required.md`.
+
+The Prospects PATCH and the Deals create write only values that already exist in
+the base, so neither uses typecast: an unknown Status or Deal Status is a bug and
+must 422 loudly rather than silently minting a fourteenth Status choice.
 """
 from __future__ import annotations
 
@@ -29,6 +40,7 @@ from urllib.parse import quote
 import requests
 
 from lead_machine.compliance import normalize_airtable_status
+from lead_machine.follow_up import next_follow_up_date
 
 try:
     from dotenv import load_dotenv
@@ -59,6 +71,15 @@ ACTIVITY_OUTCOME = {
     "closed_won": "Won",
     "closed_lost": "Lost",
 }
+
+# A close ends the outreach cadence; anything else re-arms it. Keyed off the
+# same map as the status so a new event can never quietly skip this decision.
+CLOSING_EVENTS = frozenset({"closed_won", "closed_lost"})
+
+# A closed_won creates the Deal at the point the prospect said yes — before any
+# money has moved. "Proposed" is the state of an outstanding proposal, not of a
+# win; the deposit is the next thing that has to happen.
+CLOSED_WON_DEAL_STATUS = "Deposit Pending"
 
 OUTCOME_EVENTS = frozenset(TARGET_STATUS)
 
@@ -106,6 +127,11 @@ def apply_mark_outcome(
     if event not in OUTCOME_EVENTS:
         raise MarkOutcomeError(f"unknown event {event!r}; expected one of {sorted(OUTCOME_EVENTS)}")
 
+    try:
+        occurred_on = dt.datetime.fromisoformat(occurred_at).date().isoformat()
+    except ValueError as exc:
+        raise MarkOutcomeError(f"occurred_at {occurred_at!r} is not an ISO 8601 timestamp") from exc
+
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     prospect_url = airtable_record_url(base_id, prospects_table, record_id)
     current = _request_json(session.get(prospect_url, headers=headers, timeout=30), "GET")
@@ -122,11 +148,19 @@ def apply_mark_outcome(
         )
 
     target_status = TARGET_STATUS[event]
+
+    # A closed lead must leave the follow-up queue: Airtable clears a date on an
+    # explicit null, and leaving the stale mark_sent Day-4 date behind would keep
+    # a won or lost prospect surfacing as due forever. An open lead re-arms one
+    # cadence step out from the event that was just observed.
+    closing = event in CLOSING_EVENTS
+    next_follow_up = None if closing else next_follow_up_date(occurred_on)
+
     patch_response = _request_json(
         session.patch(
             prospect_url,
             headers=headers,
-            json={"fields": {"Status": target_status}, "typecast": True},
+            json={"fields": {"Status": target_status, "Next Follow-Up": next_follow_up}},
             timeout=30,
         ),
         "PATCH prospect",
@@ -134,6 +168,9 @@ def apply_mark_outcome(
     patched_fields = patch_response.get("fields")
     if not isinstance(patched_fields, dict) or str(patched_fields.get("Status") or "").strip() != target_status:
         raise MarkOutcomeError("Airtable PATCH response does not confirm the requested Status")
+    applied_follow_up = str(patched_fields.get("Next Follow-Up") or "").strip()
+    if applied_follow_up != (next_follow_up or ""):
+        raise MarkOutcomeError("Airtable PATCH response does not confirm the requested Next Follow-Up")
 
     business_name = str(fields.get("Business Name") or record_id)
     activities_url = airtable_table_url(base_id, activities_table)
@@ -150,6 +187,7 @@ def apply_mark_outcome(
                 }
             }
         ],
+        # See the module docstring: bounded, documented vocabulary only.
         "typecast": True,
     }
     activity_response = _request_json(
@@ -166,16 +204,19 @@ def apply_mark_outcome(
         "record_id": record_id,
         "event": event,
         "status": target_status,
+        "next_follow_up": next_follow_up,
         "activity_record_id": activity_record_id,
     }
 
     if event == "closed_won":
+        # Package is the Deals primary field: leaving it empty makes the deal
+        # show as a blank chip everywhere it is linked, including on the
+        # prospect that just closed. Fall back to the business name.
         deal_fields = {
-            "Deal Status": "Proposed",
+            "Package": deal_package or business_name,
+            "Deal Status": CLOSED_WON_DEAL_STATUS,
             "Prospect": [record_id],
         }
-        if deal_package:
-            deal_fields["Package"] = deal_package
         if deal_setup_price is not None:
             deal_fields["Setup Price"] = deal_setup_price
         if deal_retainer_price is not None:
@@ -185,7 +226,7 @@ def apply_mark_outcome(
             session.post(
                 deals_url,
                 headers=headers,
-                json={"records": [{"fields": deal_fields}], "typecast": True},
+                json={"records": [{"fields": deal_fields}]},
                 timeout=30,
             ),
             "POST deal",
