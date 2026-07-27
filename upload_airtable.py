@@ -94,7 +94,7 @@ _FIELD_SCHEMA: List[tuple[str, str, str]] = [
     ("Send Blockers",          "Long text",          ""),
     ("Skip Reason",            "Single line text",   ""),
     ("Place Key",              "Single line text",   "Used as upsert key; must be unique per business"),
-    ("Status",                 "Single select",      "Options: New, Mockup Needed, Manual Review, Sent, Follow-Up, Closed"),
+    ("Status",                 "Single select",      "Options: New, Mockup Needed, Manual Review, Not Fit, Sent, Follow-Up, Closed"),
     ("Outreach Channel",       "Single select",      "Options: Email, Phone, Instagram DM, SMS"),
     ("Consent Posture",        "Single line text",   "Required and documented before any SMS draft can pass"),
     ("Last Contacted",         "Date",               ""),

@@ -54,7 +54,7 @@ the pipeline — nothing here reads or writes it.
 | Send Blockers | Long text | ? |  |
 | Skip Reason | Single line text | ? |  |
 | Place Key | Single line text | ? | Used as upsert key; must be unique per business |
-| Status | Single select | ? | Options: New, Mockup Needed, Manual Review, Sent, Follow-Up, Closed |
+| Status | Single select | ? | Options: New, Mockup Needed, Manual Review, Not Fit, Sent, Follow-Up, Closed. `Not Fit` is applied by hand, never by code. These seven are the whole vocabulary — a choice outside it is drift, not a variant |
 | Outreach Channel | Single select | ? | Options: Email, Phone, Instagram DM, SMS |
 | Consent Posture | Single line text | ? | Required and documented before any SMS draft can pass |
 | Last Contacted | Date | ? |  |
