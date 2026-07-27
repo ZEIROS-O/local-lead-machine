@@ -1037,6 +1037,12 @@ def main() -> int:
     except (FileNotFoundError, RuntimeError, ValueError, ComplianceError) as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         return 1
+    except KeyboardInterrupt:
+        # Enrichment streams each record to output/enriched_<batch>.jsonl as it
+        # completes, so an interrupt here still keeps everything scraped before
+        # it landed -- there is just no final report/CSV for this run.
+        print("[STOP] Interrupted; partial enriched output was kept on disk.", file=sys.stderr)
+        return 1
 
     print(f"[DONE] Raw results: {result.raw_count} -> {result.raw_path}")
     print(f"[DONE] Deduped: {result.deduped_count} -> {result.deduped_path}")

@@ -1647,18 +1647,32 @@ def enrich_rows_concurrently(
         return
 
     started_at_by_index: Dict[int, float] = {}
-    with ThreadPoolExecutor(max_workers=workers) as pool:
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
         futures = {}
         for index, row in enumerate(rows, start=1):
             started_at_by_index[index] = time.monotonic()
             futures[pool.submit(enrich, row)] = (index, row)
-        for future in as_completed(futures):
-            index, row = futures[future]
-            elapsed = elapsed_seconds(started_at_by_index[index])
-            try:
-                on_complete(index, row, future.result(), "", elapsed)
-            except Exception as exc:
-                on_complete(index, row, None, str(exc), elapsed)
+        try:
+            for future in as_completed(futures):
+                index, row = futures[future]
+                elapsed = elapsed_seconds(started_at_by_index[index])
+                try:
+                    on_complete(index, row, future.result(), "", elapsed)
+                except Exception as exc:
+                    on_complete(index, row, None, str(exc), elapsed)
+        except KeyboardInterrupt:
+            # All rows are submitted up front, so the pool's default shutdown
+            # (wait=True, cancel_futures=False) would block here until every
+            # queued lead finishes -- the whole remaining batch, not just what
+            # is already running. cancel_futures drops anything not yet
+            # started so the interrupt is prompt; the up to `workers` leads
+            # already mid-enrichment are left to finish in the `finally`
+            # below, since a thread cannot be killed mid-request.
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+    finally:
+        pool.shutdown(wait=True)
 
 
 def main() -> int:
