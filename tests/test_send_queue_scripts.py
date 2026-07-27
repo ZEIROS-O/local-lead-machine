@@ -159,7 +159,13 @@ class TestMarkSent(unittest.TestCase):
     def _apply(self, suppression: str, fields: dict, *, channel: str = "SMS", patch_fields: dict | None = None):
         session = MagicMock()
         session.get.return_value = _response(200, {"id": "rec42", "fields": fields})
-        confirmed = patch_fields or {**fields, "Status": "Sent", "Last Contacted": "2026-07-10", "Outreach Channel": channel}
+        confirmed = patch_fields or {
+            **fields,
+            "Status": "Sent",
+            "Last Contacted": "2026-07-10",
+            "Outreach Channel": channel,
+            "Next Follow-Up": "2026-07-14",
+        }
         session.patch.return_value = _response(200, {"id": "rec42", "fields": confirmed})
         receipt = mark_sent.apply_mark_sent(
             record_id="rec42",
@@ -232,7 +238,13 @@ class TestMarkSent(unittest.TestCase):
                 )
             receipt, session = self._apply(
                 suppression,
-                {**READY_FIELDS, "Status": "Sent", "Last Contacted": "2026-07-10", "Outreach Channel": "SMS"},
+                {
+                    **READY_FIELDS,
+                    "Status": "Sent",
+                    "Last Contacted": "2026-07-10",
+                    "Outreach Channel": "SMS",
+                    "Next Follow-Up": "2026-07-14",
+                },
             )
             self.assertEqual(receipt["result"], "already_applied")
             session.patch.assert_not_called()
@@ -251,7 +263,19 @@ class TestMarkSent(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             suppression = self._suppression(tmp)
             current = _response(200, {"id": "rec42", "fields": dict(READY_FIELDS)})
-            applied = _response(200, {"id": "rec42", "fields": {**READY_FIELDS, "Status": "Sent", "Last Contacted": "2026-07-10", "Outreach Channel": "SMS"}})
+            applied = _response(
+                200,
+                {
+                    "id": "rec42",
+                    "fields": {
+                        **READY_FIELDS,
+                        "Status": "Sent",
+                        "Last Contacted": "2026-07-10",
+                        "Outreach Channel": "SMS",
+                        "Next Follow-Up": "2026-07-14",
+                    },
+                },
+            )
             with patch.object(mark_sent, "load_dotenv", lambda: False), \
                  patch.dict(os.environ, self.ENV, clear=True), \
                  patch("requests.get", return_value=current), \
@@ -265,7 +289,12 @@ class TestMarkSent(unittest.TestCase):
         self.assertTrue(payload["typecast"])
         self.assertEqual(
             payload["fields"],
-            {"Status": "Sent", "Last Contacted": "2026-07-10", "Outreach Channel": "SMS"},
+            {
+                "Status": "Sent",
+                "Last Contacted": "2026-07-10",
+                "Next Follow-Up": "2026-07-14",
+                "Outreach Channel": "SMS",
+            },
         )
 
     def test_channel_omitted_when_not_given(self):
@@ -274,7 +303,7 @@ class TestMarkSent(unittest.TestCase):
             with patch.object(mark_sent, "load_dotenv", lambda: False), \
                  patch.dict(os.environ, self.ENV, clear=True), \
                  patch("requests.get", return_value=_response(200, {"id": "rec42", "fields": dict(READY_FIELDS)})), \
-                 patch("requests.patch", return_value=_response(200, {"id": "rec42", "fields": {**READY_FIELDS, "Status": "Sent", "Last Contacted": "2026-07-10"}})) as mock_patch, \
+                 patch("requests.patch", return_value=_response(200, {"id": "rec42", "fields": {**READY_FIELDS, "Status": "Sent", "Last Contacted": "2026-07-10", "Next Follow-Up": "2026-07-14"}})) as mock_patch, \
                  patch("sys.argv", ["mark_sent.py", "--record-id", "rec42", "--date", "2026-07-10", "--suppression-source", suppression]), \
                  patch("sys.stdout", io.StringIO()):
                 self.assertEqual(mark_sent.main(), 0)
@@ -299,6 +328,34 @@ class TestMarkSent(unittest.TestCase):
              patch("sys.stderr", io.StringIO()):
             self.assertEqual(mark_sent.main(), 1)
         self.assertFalse(mock_patch.called)
+
+    def test_next_follow_up_defaults_to_four_days_out(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            suppression = self._suppression(tmp)
+            with patch.dict(os.environ, {}, clear=True):
+                receipt, session = self._apply(suppression, dict(READY_FIELDS), channel="Email")
+        self.assertEqual(receipt["next_follow_up"], "2026-07-14")
+        self.assertEqual(
+            session.patch.call_args.kwargs["json"]["fields"]["Next Follow-Up"], "2026-07-14"
+        )
+
+    def test_next_follow_up_cadence_is_configurable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            suppression = self._suppression(tmp)
+            with patch.dict(os.environ, {"FOLLOW_UP_CADENCE_DAYS": "7"}, clear=True):
+                receipt, _session = self._apply(
+                    suppression,
+                    dict(READY_FIELDS),
+                    channel="Email",
+                    patch_fields={
+                        **READY_FIELDS,
+                        "Status": "Sent",
+                        "Last Contacted": "2026-07-10",
+                        "Outreach Channel": "Email",
+                        "Next Follow-Up": "2026-07-17",
+                    },
+                )
+        self.assertEqual(receipt["next_follow_up"], "2026-07-17")
 
 
 if __name__ == "__main__":

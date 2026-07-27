@@ -18,6 +18,15 @@ from urllib.parse import quote
 
 import requests
 
+
+def follow_up_cadence_days() -> int:
+    # Day 0 -> Day 4: first follow-up cadence step (SKILLS/outreach in
+    # operator-agent documents Day 0/4/11/14; only Day 4 applies here since
+    # mark_sent only ever fires once per lead — later touches are Loop C's
+    # job, not built yet). Read lazily so a .env value picked up by
+    # load_dotenv() in main() is honored.
+    return int(os.getenv("FOLLOW_UP_CADENCE_DAYS", "4"))
+
 from lead_machine.compliance import (
     ComplianceError,
     has_acceptable_sms_consent,
@@ -55,10 +64,14 @@ def _request_json(response: requests.Response, operation: str) -> dict:
     return payload
 
 
-def _exact_requested_state(fields: dict, *, channel: str, last_contacted: str) -> bool:
+def _exact_requested_state(
+    fields: dict, *, channel: str, last_contacted: str, next_follow_up: str
+) -> bool:
     if str(fields.get("Status") or "").strip().casefold() != "sent":
         return False
     if str(fields.get("Last Contacted") or "").strip() != last_contacted:
+        return False
+    if str(fields.get("Next Follow-Up") or "").strip() != next_follow_up:
         return False
     return not channel or str(fields.get("Outreach Channel") or "").strip() == channel
 
@@ -89,15 +102,22 @@ def apply_mark_sent(
         raise MarkSentError("Airtable GET response has no fields object")
     fields = dict(raw_fields)
 
+    next_follow_up = (
+        dt.date.fromisoformat(last_contacted) + dt.timedelta(days=follow_up_cadence_days())
+    ).isoformat()
+
     # Exact recovery is safe even if readiness changed after the original
     # PATCH. It never performs another external mutation.
-    if _exact_requested_state(fields, channel=channel, last_contacted=last_contacted):
+    if _exact_requested_state(
+        fields, channel=channel, last_contacted=last_contacted, next_follow_up=next_follow_up
+    ):
         return {
             "result": "already_applied",
             "record_id": record_id,
             "status": "Sent",
             "channel": channel,
             "date": last_contacted,
+            "next_follow_up": next_follow_up,
         }
 
     status = str(fields.get("Status") or "").strip().casefold()
@@ -120,7 +140,11 @@ def apply_mark_sent(
     if channel.casefold() == "sms" and not has_acceptable_sms_consent(fields.get("Consent Posture")):
         raise MarkSentError("current Airtable Consent Posture does not permit SMS")
 
-    requested_fields = {"Status": "Sent", "Last Contacted": last_contacted}
+    requested_fields = {
+        "Status": "Sent",
+        "Last Contacted": last_contacted,
+        "Next Follow-Up": next_follow_up,
+    }
     if channel:
         requested_fields["Outreach Channel"] = channel
     response = _request_json(
@@ -136,11 +160,12 @@ def apply_mark_sent(
         raise MarkSentError("Airtable PATCH did not confirm the requested record id")
     applied_fields = response.get("fields")
     if not isinstance(applied_fields, dict) or not _exact_requested_state(
-        applied_fields, channel=channel, last_contacted=last_contacted
+        applied_fields, channel=channel, last_contacted=last_contacted, next_follow_up=next_follow_up
     ):
         raise MarkSentError("Airtable PATCH response does not confirm the requested status, channel, and date")
     return {
         "result": "applied",
+        "next_follow_up": next_follow_up,
         "record_id": record_id,
         "status": "Sent",
         "channel": channel,
