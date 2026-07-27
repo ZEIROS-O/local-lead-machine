@@ -11,7 +11,7 @@ import time
 from collections import Counter
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import AbstractSet, Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 try:
     from dotenv import load_dotenv
@@ -21,14 +21,24 @@ except ModuleNotFoundError:
 
 from enrich_leads import (
     SLOW_ENRICH_SECONDS,
+    JsonlAppender,
+    build_enrichment_error_record,
     elapsed_seconds,
     enrichment_log_fields,
     enrich_row,
+    enrich_rows_concurrently,
     format_elapsed,
+    resolve_enrich_workers,
+    resolve_per_lead_timeout,
 )
 from places_search import normalize_place, place_details, text_search_paged
+from lead_machine.compliance import ComplianceError, load_configured_suppression_index
+from lead_machine.review_velocity import ReviewSnapshotStore
 from lead_machine.schema import GENERIC_DOMAINS, normalize_domain, normalize_phone, slug
+from lead_machine.verticals import resolve_profile
 
+
+DEFAULT_REVIEW_SNAPSHOT_DB = "run_state/review_velocity.sqlite3"
 
 REQUIRED_CONFIG_FIELDS = ["batch", "vertical", "location", "limit_per_query", "queries"]
 
@@ -90,16 +100,11 @@ FRANCHISE_OR_CHAIN_TERMS = [
     "davey tree",
 ]
 
-NURSERY_GARDEN_TERMS = ["nursery", "garden center", "landscape supply", "mulch supply", "stone yard"]
-TREE_ONLY_TERMS = ["tree service", "tree removal", "arborist", "stump grinding"]
-SNOW_ONLY_TERMS = ["snow removal only", "snow-only", "snow plowing only", "snow removal"]
-FERTILIZATION_ONLY_TERMS = ["lawn fertilization", "fertilization", "weed control", "turf care"]
-COMMERCIAL_MAINTENANCE_TERMS = [
-    "commercial maintenance only",
-    "commercial maintenance",
-    "facility maintenance",
-    "property maintenance",
-]
+# The nursery / tree / snow / fertilization / commercial-maintenance exclusions
+# that used to be module constants here are now `adjacency_exclusions` on the
+# hardscaping profile. They were applied to every vertical, so a plumber or a
+# water-restoration firm saying "property maintenance" or "facility maintenance"
+# — ordinary vocabulary in those markets — was dropped before enrichment.
 
 
 def _load_geo_slices_ref(ref: str, *, source_path: Path) -> List[str]:
@@ -560,20 +565,10 @@ def prefilter_row(row: Mapping[str, Any], config: SearchConfig) -> PrefilterResu
     if _contains_any(text, FRANCHISE_OR_CHAIN_TERMS) or _contains_any(text, ["franchise", "national chain"]):
         return PrefilterResult(True, "franchise_or_chain", boosts)
 
-    if _contains_any(text, NURSERY_GARDEN_TERMS) and not boosts:
-        return PrefilterResult(True, "nursery_or_garden_center", boosts)
-
-    if _contains_any(text, TREE_ONLY_TERMS) and not boosts:
-        return PrefilterResult(True, "tree_service_only", boosts)
-
-    if _contains_any(text, SNOW_ONLY_TERMS) and not boosts:
-        return PrefilterResult(True, "snow_only", boosts)
-
-    if _contains_any(text, FERTILIZATION_ONLY_TERMS) and not boosts:
-        return PrefilterResult(True, "lawn_fertilization_only", boosts)
-
-    if _contains_any(text, COMMERCIAL_MAINTENANCE_TERMS) and not boosts:
-        return PrefilterResult(True, "commercial_maintenance_only", boosts)
+    profile = resolve_profile(config.vertical, source_query=_pick(row, "source_query", "Source Query"))
+    for exclusion in profile.adjacency_exclusions:
+        if _contains_any(text, list(exclusion.terms)) and not boosts:
+            return PrefilterResult(True, exclusion.reason, boosts)
 
     for term in config.exclude_terms or []:
         lowered = term.lower()
@@ -613,13 +608,6 @@ def write_csv_rows(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
         writer.writeheader()
         for row in rows:
             writer.writerow({field: row.get(field, "") for field in fieldnames})
-
-
-def write_jsonl(path: Path, records: Iterable[Mapping[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        for record in records:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def collect_raw_rows(
@@ -742,6 +730,8 @@ def run_search_batch(
     max_searches: Optional[int] = None,
     max_details: Optional[int] = None,
     max_enrich: Optional[int] = None,
+    suppression_index: Optional[AbstractSet[str]] = None,
+    review_snapshot_db: Optional[Path | str] = None,
 ) -> SearchRunResult:
     config = load_search_config(config_path)
     if batch and batch != config.batch:
@@ -801,6 +791,15 @@ def run_search_batch(
     _progress(f"ICP pass count: {len(passed_rows)}; skip count: {sum(skip_reason_counts.values())}")
     _progress(f"ICP skip reason counts: {_inline_counts(skip_reason_counts)}")
 
+    # Review velocity is only ever computable if something banks the counts.
+    # This entry point ran without a store, so run_state/review_velocity.sqlite3
+    # never accumulated history and every lead scored here reported
+    # velocity_band=unknown, source=insufficient_history — a whole signal the
+    # rubric asks for and the production path could not supply.
+    review_snapshot_store = ReviewSnapshotStore(
+        review_snapshot_db or os.getenv("REVIEW_SNAPSHOT_DB", DEFAULT_REVIEW_SNAPSHOT_DB)
+    )
+
     enriched_records: List[Dict[str, Any]] = []
     rows_to_enrich = passed_rows
     if max_enrich is not None:
@@ -808,39 +807,59 @@ def run_search_batch(
         if len(passed_rows) > len(rows_to_enrich):
             warnings.append(f"Hit --max-enrich={max_enrich}; skipped remaining enrichment rows")
             _progress(f"Enrichment cap active: {len(rows_to_enrich)} of {len(passed_rows)} rows")
-    for enrich_index, row in enumerate(rows_to_enrich, start=1):
-        business_name = _pick(row, "business_name", "Business Name") or "unknown"
-        website_url = _pick(row, "website_url", "Website URL")
-        lead_started_at = time.monotonic()
-        enriched: Dict[str, Any] | None = None
-        caught_error = ""
-        _progress(f"[ENRICH start {enrich_index}/{len(rows_to_enrich)}] {business_name}")
-        try:
-            enriched = enrich_row(
-                row,
-                screenshots_dir=screenshots_dir,
-                take_shots=not no_screenshots,
-                rendered_site_check=rendered_site_check,
-            )
-            enriched_records.append(enriched)
-        except Exception as exc:
-            caught_error = str(exc)
-            errors.append(f"Enrichment failed for {business_name}: {exc}")
-        finally:
-            elapsed = float(
-                (enriched or {}).get("enrichment", {}).get("elapsed_seconds") or elapsed_seconds(lead_started_at)
-            )
-            fields = enrichment_log_fields(enriched or {}, fallback_error=caught_error)
+
+    browser_work = not no_screenshots or rendered_site_check
+    workers = resolve_enrich_workers(browser_work=browser_work)
+    per_lead_timeout = resolve_per_lead_timeout(workers)
+    _progress(f"Enrichment workers: {workers} (per-lead timeout {per_lead_timeout:.0f}s)")
+
+    def _enrich(row: Dict[str, str]) -> Dict[str, Any]:
+        return enrich_row(
+            row,
+            screenshots_dir=screenshots_dir,
+            take_shots=not no_screenshots,
+            rendered_site_check=rendered_site_check,
+            suppression_index=suppression_index,
+            review_snapshot_store=review_snapshot_store,
+            per_lead_timeout=per_lead_timeout,
+        )
+
+    # Records stream to disk as they finish, so an interrupted run keeps the
+    # scraping it already paid for instead of losing the batch at the final
+    # write.
+    with JsonlAppender(enriched_path) as appender:
+
+        def _on_complete(
+            enrich_index: int,
+            row: Dict[str, str],
+            record: Dict[str, Any] | None,
+            error: str,
+            elapsed: float,
+        ) -> None:
+            business_name = _pick(row, "business_name", "Business Name") or "unknown"
+            website_url = _pick(row, "website_url", "Website URL")
+            if record is None:
+                errors.append(f"Enrichment failed for {business_name}: {error}")
+                # Keep the lead. This entry point used to drop it while
+                # enrich_leads kept an error record for the same failure.
+                record = build_enrichment_error_record(row, error=error, elapsed=elapsed)
+            appender.append(record)
+            enriched_records.append(record)
+            reported = float(record.get("enrichment", {}).get("elapsed_seconds") or elapsed)
+            fields = enrichment_log_fields(record, fallback_error=error)
             _progress(
                 f"[ENRICH {enrich_index}/{len(rows_to_enrich)}] {business_name} "
-                f"elapsed={format_elapsed(elapsed)}s "
+                f"elapsed={format_elapsed(reported)}s "
                 f"site_status={fields['site_status']} "
                 f"pages_checked={fields['pages_checked']} "
                 f"errors={fields['error']}"
             )
-            if elapsed > SLOW_ENRICH_SECONDS:
-                _progress(f"[SLOW ENRICH] {business_name} elapsed={format_elapsed(elapsed)}s website={website_url}")
-    write_jsonl(enriched_path, enriched_records)
+            if reported > SLOW_ENRICH_SECONDS:
+                _progress(f"[SLOW ENRICH] {business_name} elapsed={format_elapsed(reported)}s website={website_url}")
+
+        enrich_rows_concurrently(
+            rows_to_enrich, workers=workers, enrich=_enrich, on_complete=_on_complete
+        )
 
     top_candidate_names = [
         _pick(row, "business_name", "Business Name")
@@ -990,9 +1009,18 @@ def main() -> int:
     parser.add_argument("--max-searches", type=int, default=None, help="Optional cap on expanded query×geo searches")
     parser.add_argument("--max-details", type=int, default=None, help="Optional cap on Place Details calls")
     parser.add_argument("--max-enrich", type=int, default=None, help="Optional cap on enrichment rows")
+    parser.add_argument(
+        "--review-snapshot-db",
+        default=os.getenv("REVIEW_SNAPSHOT_DB", DEFAULT_REVIEW_SNAPSHOT_DB),
+        help="SQLite path containing longitudinal Google review-count observations",
+    )
     args = parser.parse_args()
 
     try:
+        # This is the entry point the pipeline actually runs, so it is the one
+        # that has to fail closed. Loading here rather than inside
+        # run_search_batch keeps the refusal ahead of the first paid Places call.
+        suppression_index = load_configured_suppression_index()
         result = run_search_batch(
             config_path=Path(args.config),
             batch=args.batch,
@@ -1003,9 +1031,17 @@ def main() -> int:
             max_searches=args.max_searches,
             max_details=args.max_details,
             max_enrich=args.max_enrich,
+            suppression_index=suppression_index,
+            review_snapshot_db=args.review_snapshot_db,
         )
-    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+    except (FileNotFoundError, RuntimeError, ValueError, ComplianceError) as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        # Enrichment streams each record to output/enriched_<batch>.jsonl as it
+        # completes, so an interrupt here still keeps everything scraped before
+        # it landed -- there is just no final report/CSV for this run.
+        print("[STOP] Interrupted; partial enriched output was kept on disk.", file=sys.stderr)
         return 1
 
     print(f"[DONE] Raw results: {result.raw_count} -> {result.raw_path}")

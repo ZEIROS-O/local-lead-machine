@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -192,6 +193,72 @@ class ReviewVelocityTest(unittest.TestCase):
 
             self.assertEqual(len(store.history("place-1")), 2)
             self.assertEqual(len(store.cohort_rates(vertical="detailing", market="cleveland")), 20)
+
+    def test_enrichment_banks_the_observation_it_reads_history_from(self) -> None:
+        """Enrichment used to read the store and never write to it.
+
+        `record_snapshot` was called only from `places_search.main`, so on every
+        other path the store could not accumulate a second count 14 days later
+        and velocity was structurally unmeasurable. Enrichment is the one stage
+        every entry point runs, so the observation has to be banked here.
+        """
+        import enrich_leads
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = ReviewSnapshotStore(Path(temp_dir) / "velocity.sqlite3")
+            row = {
+                "business_name": "Patio Pros",
+                "place_id": "place-xyz",
+                "city": "Cleveland",
+                "rating": "4.8",
+                "reviews": "28",
+                "website_url": "",
+                "phone": "(216) 555-0100",
+                "category": "hardscaping",
+            }
+
+            record = enrich_leads.enrich_row(
+                row,
+                screenshots_dir=Path(temp_dir) / "shots",
+                take_shots=False,
+                review_snapshot_store=store,
+            )
+
+            history = store.history("place-xyz")
+            self.assertEqual(len(history), 1)
+            self.assertEqual(history[0]["review_count"], 28)
+            self.assertEqual(history[0]["source"], "enrichment")
+            # The record carries the history it just contributed to, so a later
+            # run has a prior count to measure a delta against.
+            self.assertEqual(len(record["review_count_history"]), 1)
+
+    def test_a_snapshot_failure_does_not_lose_the_lead(self) -> None:
+        import enrich_leads
+
+        class ExplodingStore(ReviewSnapshotStore):
+            def record_snapshot(self, **kwargs):
+                raise sqlite3.OperationalError("database is locked")
+
+            def history(self, place_key):
+                return []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            record = enrich_leads.enrich_row(
+                {
+                    "business_name": "Patio Pros",
+                    "place_id": "place-xyz",
+                    "city": "Cleveland",
+                    "rating": "4.8",
+                    "reviews": "28",
+                    "website_url": "",
+                    "category": "hardscaping",
+                },
+                screenshots_dir=Path(temp_dir) / "shots",
+                take_shots=False,
+                review_snapshot_store=ExplodingStore(Path(temp_dir) / "velocity.sqlite3"),
+            )
+
+        self.assertEqual(record["google"]["business_name"], "Patio Pros")
 
 
 class ReviewPainTest(unittest.TestCase):

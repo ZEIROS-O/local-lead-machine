@@ -35,9 +35,19 @@ from dotenv import load_dotenv
 from import_llm_score_bundle import import_score_bundle, validate_bundle_scores
 from lead_machine.buyer_signals import (
     buyer_intent_summary,
+    demand_signal_state,
     ensure_buyer_intent,
     has_money_signal as buyer_has_money_signal,
+    money_signal_label,
+    money_signal_state,
     review_demand_band as buyer_review_demand_band,
+)
+from lead_machine.compliance import (
+    ComplianceError,
+    is_suppressed_record,
+    load_configured_suppression_index,
+    merge_suppression_disqualifiers,
+    record_matches_suppression,
 )
 from lead_machine.email_hygiene import emails_text, sanitize_record_emails
 from lead_machine.evidence import build_evidence_profile
@@ -51,7 +61,8 @@ from lead_machine.schema import normalize_lead
 from lead_machine.scoring_rules import SHARED_SENDABILITY_RULES
 from lead_machine.scoring_v3 import attach_scoring_v3
 from lead_machine.sendability import apply_sendability, normalize_evidence_refs
-from lead_machine.verticals import VerticalProfile, resolve_profile
+from lead_machine.scoring_profiles import market_service_area_terms
+from lead_machine.verticals import VERTICAL_PROFILES, VerticalProfile, resolve_profile
 from make_llm_batch import score_file_for_record
 
 
@@ -95,13 +106,16 @@ FRANCHISE_DENYLIST = [
     "window world",
 ]
 
-CORPORATE_HINTS = [
-    " of cleveland",
-    " of akron",
-    " of columbus",
-    " of brecksville",
-    " of northeast ohio",
-]
+# Phrasings that show service-area clarity without naming a place. The place
+# names themselves come from the lead's own market profile via
+# `market_service_area_terms`, because this scorer now runs 11 metros and
+# naming Cleveland's suburbs here penalised every business in the other ten.
+GENERIC_SERVICE_AREA_TERMS = (
+    "service area",
+    "areas we serve",
+    "serving",
+    "county",
+)
 
 COMMERCIAL_TERMS = [
     "commercial roofing",
@@ -256,8 +270,52 @@ DEFAULT_MAX_LLM_CALLS_PER_RUN = 5
 DEFAULT_MAX_LLM_TOKENS_PER_RUN = 100_000
 DEFAULT_MAX_LLM_USD_PER_RUN = 5.0
 DEFAULT_LLM_SPEND_CONFIRM_USD = 0.50
-SONNET_4_6_INPUT_USD_PER_MILLION_TOKENS = 3.0
-SONNET_4_6_OUTPUT_USD_PER_MILLION_TOKENS = 15.0
+# Per-model list prices in USD per million tokens, as (input, output).
+#
+# Cost was previously computed from two constants named for Sonnet 4.6 while
+# DEFAULT_LLM_SCORING_MODEL had already moved to claude-sonnet-5 — so
+# MAX_LLM_USD_PER_RUN, --dry-run-llm-cost and the spend-confirm threshold were
+# all measuring a model the run was not using. An unknown model now raises
+# rather than being priced as if it were Sonnet, because a silently wrong price
+# on a spend cap is worse than a refusal.
+LLM_PRICING_USD_PER_MILLION_TOKENS: Dict[str, Tuple[float, float]] = {
+    "claude-opus-5": (15.0, 75.0),
+    "claude-sonnet-5": (3.0, 15.0),
+    "claude-fable-5": (3.0, 15.0),
+    "claude-haiku-4-5-20251001": (1.0, 5.0),
+    "claude-sonnet-4-6": (3.0, 15.0),
+    "claude-sonnet-4-5": (3.0, 15.0),
+    "claude-opus-4-1": (15.0, 75.0),
+    "claude-3-5-haiku-20241022": (0.8, 4.0),
+}
+
+
+class UnknownLlmModelError(ValueError):
+    pass
+
+
+def llm_pricing(model: str) -> Tuple[float, float]:
+    """(input, output) USD per million tokens for *model*.
+
+    Matches on the exact id first, then on the longest registered id that the
+    given model starts with, so a dated snapshot such as
+    "claude-sonnet-5-20260101" prices as claude-sonnet-5 rather than failing.
+    """
+    key = str(model or "").strip()
+    if not key:
+        raise UnknownLlmModelError("No LLM model configured; cannot price the run.")
+    if key in LLM_PRICING_USD_PER_MILLION_TOKENS:
+        return LLM_PRICING_USD_PER_MILLION_TOKENS[key]
+
+    prefixes = [name for name in LLM_PRICING_USD_PER_MILLION_TOKENS if key.startswith(name)]
+    if prefixes:
+        return LLM_PRICING_USD_PER_MILLION_TOKENS[max(prefixes, key=len)]
+
+    known = ", ".join(sorted(LLM_PRICING_USD_PER_MILLION_TOKENS))
+    raise UnknownLlmModelError(
+        f"No pricing registered for LLM model {key!r}; spend caps would be wrong. "
+        f"Add it to LLM_PRICING_USD_PER_MILLION_TOKENS. Known models: {known}"
+    )
 MAX_LLM_SCORING_STRING_CHARS = 1500
 MAX_LLM_SCORING_SNIPPET_CHARS = 300
 MAX_LLM_SCORING_SNIPPETS = 8
@@ -462,23 +520,65 @@ def has_estimate_path_weakness(record: Dict[str, Any]) -> bool:
     return current_form_strength in {"weak", "basic"}
 
 
+def is_corporate_location_name(name: str, record: Dict[str, Any]) -> bool:
+    """Does the business name read as "Brand of <place>"?
+
+    In roofing that pattern usually marks a vendorised location page rather than
+    an owner-led shop. The place list used to be five hardcoded Ohio names, so
+    the check simply did not exist for the other ten metros. It now reads the
+    lead's own market profile.
+    """
+    if " of " not in name:
+        return False
+    places = market_service_area_terms(record)
+    return any(f" of {place}" in name for place in places)
+
+
 def infer_vertical(record: Dict[str, Any], fallback: str) -> str:
+    """Resolve the display vertical through the profile registry.
+
+    This used to be four hardcoded substring rules that knew only roofing,
+    hardscaping, masonry and landscaping — every other vertical fell through to
+    `fallback.title()`, and any copy containing "concrete" or "brick" was
+    relabelled "Masonry / Hardscaping". A detailing shop advertising work on
+    concrete floors was reported as a masonry lead. AGENTS.md asks for verticals
+    as data, not code, and `resolve_profile` already holds that data.
+    """
+    google = record.get("google", {}) if isinstance(record.get("google"), dict) else {}
+    declared = google.get("vertical") or record.get("vertical") or record.get("Vertical") or ""
+    profile = resolve_profile(
+        str(declared or fallback),
+        source_query=_record_source_query(record),
+        fallback=fallback,
+    )
+
+    # A declared vertical is the operator's own statement about the batch and
+    # outranks anything inferred from scraped copy.
+    if str(declared or "").strip():
+        return profile.label
+
     blob = text_blob(record)
-    name = record.get("google", {}).get("business_name", "").lower()
+    name = str(google.get("business_name") or "").lower()
+    text = f"{blob} {name}"
 
-    if "roof" in blob or "roof" in name:
-        return "Roofing"
+    # Only consider profiles the resolver actually knows, and require a match on
+    # the profile's own batch terms — the terms that define the vertical, rather
+    # than incidental service words that several verticals share.
+    matches = [
+        candidate
+        for candidate in VERTICAL_PROFILES.values()
+        if any(term in text for term in candidate.batch_terms)
+    ]
+    if len(matches) == 1:
+        return matches[0].label
+    if matches:
+        # Ambiguous copy: prefer the batch's own vertical if it is one of the
+        # candidates, rather than letting term ordering decide.
+        for candidate in matches:
+            if candidate.key == profile.key:
+                return candidate.label
 
-    if any(t in blob for t in ["hardscape", "paver", "patio", "retaining wall", "outdoor living"]):
-        return "Hardscaping"
-
-    if any(t in blob for t in ["masonry", "brick", "concrete"]):
-        return "Masonry / Hardscaping"
-
-    if "landscape" in blob or "landscap" in name:
-        return "Landscaping / Hardscaping"
-
-    return fallback.title()
+    return profile.label
 
 
 def vertical_family(vertical: str) -> str:
@@ -521,7 +621,7 @@ def fit_ceiling(
         return "Skip", flags
 
     # "X of City" is not always franchise, but in roofing/home services it often indicates a vendorized location page.
-    if family == "roofing" and any(h in name for h in CORPORATE_HINTS):
+    if family == "roofing" and is_corporate_location_name(name, record):
         flags.append("possible corporate/location-brand naming")
         return "C", flags
 
@@ -544,9 +644,16 @@ def fit_ceiling(
             return "B", flags
         return "C", flags
 
-    if no_site and not money_signal:
-        flags.append("bad site without buyer-intent money signal")
-        return "C", flags
+    # The no-site demotion used to live here: `no_site and not money_signal -> C`.
+    # It could not do anything but fire. money_signal comes from paid-CRM text
+    # scraped off the website, so a business with no website could never satisfy
+    # it — measured across two real batches, 25/25 and 13/13 no-site leads went
+    # base=A -> ceiling=C -> final=C, which put them below the A/B floor for
+    # Sendable. That inverted the product thesis: no-site businesses are the
+    # easiest sell, and every search config sets allow_missing_website: true to
+    # go and find them. Batch 2 made money_signal honest about the difference
+    # between "no spend" and "not looked"; this removes the rule that punished
+    # the lead for the pipeline's own blind spot.
 
     # Inverted-U review logic.
     # 5-20 reviews = best first-wave owner-led band. More reviews need clearer visible pain.
@@ -722,7 +829,8 @@ def score_online_weakness(record: Dict[str, Any]) -> Tuple[int, List[str]]:
         score += 5
         evidence.append("services page weak/missing")
 
-    if not any(t in blob for t in ["service area", "areas we serve", "serving", "county", "cleveland", "akron", "chardon", "northeast ohio"]):
+    service_area_terms = (*GENERIC_SERVICE_AREA_TERMS, *market_service_area_terms(record))
+    if not any(t in blob for t in service_area_terms):
         score += 4
         evidence.append("weak location/service-area clarity")
 
@@ -778,9 +886,14 @@ def score_buyer_intent(record: Dict[str, Any]) -> Tuple[int, List[str]]:
         score += 4
         evidence.append(f"ad signal detected ({', '.join(yes_ads)})")
 
-    if buyer_intent.get("money_signal"):
+    # money_signal is tri-state text, so a bare truthiness test would score
+    # "no" and "unknown" as if they were a detected paid stack.
+    money_state = money_signal_state(record)
+    if money_state == "yes":
         score += 2
         evidence.append("buyer-intent money signal present")
+    elif money_state == "unknown":
+        evidence.append("buyer-intent money signal not observable (no crawlable site text)")
     else:
         evidence.append("no buyer-intent money signal")
 
@@ -965,6 +1078,48 @@ def classify_priority(
         priority = "Skip"
 
     return priority, ceiling, fit_flags
+
+
+ICP_CEILING_SHADOW_FIELDS = ("ICP Ceiling", "ICP Ceiling Flags", "Grade Disagreement")
+
+
+def attach_icp_ceiling_shadow(
+    row: Dict[str, Any],
+    record: Dict[str, Any],
+    *,
+    fallback_vertical: str,
+) -> Dict[str, Any]:
+    """Record what the closeability layer *would* have said, without enforcing it.
+
+    `fit_ceiling` runs only inside `score_record`, so in `--mode api-llm` — the
+    mode production actually uses — the grade is a bare threshold on the LLM
+    total and the ICP layer never runs at all. Measured across 161 leads, 15
+    carried a sendable-eligible B against a C ceiling, so the two graders
+    disagree often enough to matter and neither has been shown right.
+
+    These are CSV and packet columns only. They are deliberately not added to
+    the Airtable surface, which PR #9 just cut from 65 columns to 54 and which
+    four separate lists have to agree on.
+    """
+    vertical = _record_vertical(record) or fallback_vertical
+    try:
+        profile = resolve_profile(vertical, source_query=_record_source_query(record))
+        ceiling, fit_flags = fit_ceiling(record, vertical, profile=profile)
+    except Exception as exc:
+        # A shadow measurement must never be able to fail a scoring run.
+        row["ICP Ceiling"] = ""
+        row["ICP Ceiling Flags"] = f"ceiling_unavailable: {exc}"
+        row["Grade Disagreement"] = ""
+        return row
+
+    grade = str(row.get("Lead Priority") or "").strip()
+    row["ICP Ceiling"] = ceiling
+    row["ICP Ceiling Flags"] = "; ".join(str(flag) for flag in fit_flags)
+    # Only a grade *better* than the ceiling is a disagreement. A grade at or
+    # below it is the ceiling doing nothing, which is not a finding.
+    disagrees = bool(grade) and bool(ceiling) and more_restrictive(grade, ceiling) != grade
+    row["Grade Disagreement"] = f"{grade}_vs_{ceiling}" if disagrees else ""
+    return row
 
 
 def best_service_angle(record: Dict[str, Any], vertical: str, offer_fit: str) -> str:
@@ -1312,7 +1467,8 @@ def score_record(record: Dict[str, Any], fallback_vertical: str) -> Dict[str, An
 
     evidence_profile = record.get("evidence", {}) or {}
     buyer_summary = buyer_intent_summary(record)
-    money_signal = "Yes" if has_money_signal(record) else "No"
+    money_signal = money_signal_label(record)
+    demand_signal = demand_signal_state(record).capitalize()
     visible_pain_reasons = evidence_profile.get("visible_pain_reasons") or []
     visible_pain_reasons_text = "; ".join(str(reason) for reason in visible_pain_reasons if str(reason).strip())
     send_trigger = str(evidence_profile.get("send_trigger") or "").strip()
@@ -1449,6 +1605,8 @@ def score_record(record: Dict[str, Any], fallback_vertical: str) -> Dict[str, An
         "send_trigger": send_trigger,
         "Money Signal": money_signal,
         "money_signal": money_signal,
+        "Demand Signal": demand_signal,
+        "demand_signal": demand_signal,
         "Buyer Intent Signals": buyer_summary,
         "buyer_intent_signals": buyer_summary,
         "Evidence Notes": evidence_notes,
@@ -1485,6 +1643,7 @@ def score_record(record: Dict[str, Any], fallback_vertical: str) -> Dict[str, An
         "Packet Eligible": packet_eligible(priority, offer_fit),
         "Packet Eligibility Reason": packet_eligibility_reason(priority, offer_fit),
     }
+    merge_suppression_disqualifiers(row, record)
     governed = apply_sendability(row)
     return attach_scoring_v3(record, governed, fallback_vertical=fallback_vertical)
 
@@ -1841,6 +2000,7 @@ def score_records_manual_run(
                 )
                 raise ValueError(f"{exc}; API merge validation debug written to {debug_path}") from exc
             raise
+        attach_icp_ceiling_shadow(row, record, fallback_vertical=fallback_vertical)
         if "Known Evidence IDs" in row or "known_evidence_ids" in row:
             has_known_evidence_ids = True
         scored.append(row)
@@ -1868,13 +2028,11 @@ def score_records_manual(
     ).rows
 
 
-def estimate_llm_usd(usage: Dict[str, Any]) -> float:
+def estimate_llm_usd(usage: Dict[str, Any], *, model: str = DEFAULT_LLM_SCORING_MODEL) -> float:
+    input_price, output_price = llm_pricing(model)
     input_tokens = safe_int(usage.get("input_tokens"))
     output_tokens = safe_int(usage.get("output_tokens"))
-    return (
-        input_tokens * SONNET_4_6_INPUT_USD_PER_MILLION_TOKENS
-        + output_tokens * SONNET_4_6_OUTPUT_USD_PER_MILLION_TOKENS
-    ) / 1_000_000
+    return (input_tokens * input_price + output_tokens * output_price) / 1_000_000
 
 
 def estimate_prompt_tokens(prompt: str) -> int:
@@ -2191,6 +2349,14 @@ def _compact_buyer_intent(buyer_intent: Dict[str, Any]) -> Dict[str, Any]:
     if money_signal not in (None, "", {}, []):
         compact["money_signal"] = money_signal
 
+    demand_signal = buyer_intent.get("demand_signal")
+    if isinstance(demand_signal, dict) and demand_signal.get("state"):
+        compact["demand_signal"] = {
+            key: demand_signal.get(key)
+            for key in ("state", "source", "velocity_band", "demand_band")
+            if demand_signal.get(key) not in (None, "")
+        }
+
     ads = buyer_intent.get("ads")
     if isinstance(ads, dict):
         known_ads = {
@@ -2200,6 +2366,15 @@ def _compact_buyer_intent(buyer_intent: Dict[str, Any]) -> Dict[str, Any]:
         }
         if known_ads:
             compact["ads"] = known_ads
+        # An unqualified absence of ad keys reads as "checked, found nothing".
+        # Name the checks that never ran so the rubric can tell the difference.
+        unimplemented = [
+            str(error).split(":", 1)[0].strip()
+            for error in ads.get("errors") or []
+            if str(error).strip().endswith("unimplemented")
+        ]
+        if unimplemented:
+            compact["ads_not_checked"] = sorted(set(unimplemented))
 
     for key in ("review_demand_signal", "review_profile"):
         value = buyer_intent.get(key)
@@ -2292,14 +2467,16 @@ def build_llm_scoring_record(record: Dict[str, Any], *, fallback_vertical: str =
         },
         "buyer_intent": _compact_buyer_intent(buyer_intent),
         "buyer_intent_summary": buyer_intent_summary(working),
-        "money_signal": "Yes" if has_money_signal(working) else "No",
+        "money_signal": money_signal_label(working),
+        "demand_signal": demand_signal_state(working).capitalize(),
         "safe_outreach_claims": working.get("safe_outreach_claims") or evidence.get("safe_outreach_claims") or [],
         "sendability_evidence": {
             "minimum_evidence_inputs": {
                 "visible_pain_score": evidence.get("visible_pain_score", ""),
                 "visible_pain_reasons": evidence.get("visible_pain_reasons") or [],
                 "send_trigger": evidence.get("send_trigger") or "",
-                "money_signal": "Yes" if has_money_signal(working) else "No",
+                "money_signal": money_signal_label(working),
+                "demand_signal": demand_signal_state(working).capitalize(),
                 "buyer_intent_summary": buyer_intent_summary(working),
             }
         },
@@ -2379,7 +2556,10 @@ Rules:
 {SHARED_COMMERCIAL_SCORING_RULES}
 - Buyer intent is required for A/B quality: look for fixable gap times money signal, not just a bad website.
 - Paid CRM/booking tools and known ad signals can support money intent.
-- Bad site alone without buyer_intent.money_signal should not be an A lead.
+- buyer_intent.money_signal is yes/no/unknown. "unknown" means there was no crawlable site text to read a paid stack from — it is an unanswered question, not evidence the business does not spend. Do not treat it as a negative.
+- Bad site with money_signal "no" should not be an A lead. Bad site with money_signal "unknown" may still be an A lead when demand_signal is yes and the visible pain is concrete.
+- buyer_intent.demand_signal is a separate claim from spend: it says the market is pulling on this business. Use it for demand, never as proof of budget.
+- buyer_intent.ads_not_checked lists ad checks that are not implemented. Their "unknown" carries no information; do not read it as "no ads found".
 - Visual claims require screenshot paths, visual-review flags, rendered browser evidence, DOM evidence, or explicit manual review notes in the capsule.
 - Do not infer missing forms if evidence is uncertain.
 - If rendered_site_status is Loaded, do not claim the website is broken.
@@ -2437,6 +2617,7 @@ def _hit_projected_llm_cap(
     usd: float,
     max_tokens_per_run: int,
     max_usd_per_run: float,
+    model: str = DEFAULT_LLM_SCORING_MODEL,
 ) -> str:
     projected_input_tokens = estimate_prompt_tokens(prompt)
     projected_output_tokens = max(0, max_tokens)
@@ -2449,7 +2630,8 @@ def _hit_projected_llm_cap(
         {
             "input_tokens": projected_input_tokens,
             "output_tokens": projected_output_tokens,
-        }
+        },
+        model=model,
     )
     if max_usd_per_run > 0 and usd + projected_usd > max_usd_per_run:
         return "MAX_LLM_USD_PER_RUN"
@@ -2477,8 +2659,12 @@ def _print_llm_cap_check(
     )
 
 
-def _projected_usd_for_prompt(prompt_tokens: int, max_tokens: int) -> float:
-    return estimate_llm_usd({"input_tokens": prompt_tokens, "output_tokens": max(0, max_tokens)})
+def _projected_usd_for_prompt(
+    prompt_tokens: int, max_tokens: int, *, model: str = DEFAULT_LLM_SCORING_MODEL
+) -> float:
+    return estimate_llm_usd(
+        {"input_tokens": prompt_tokens, "output_tokens": max(0, max_tokens)}, model=model
+    )
 
 
 def _lead_name_for_skip(record: Dict[str, Any], *, fallback_vertical: str) -> str:
@@ -2772,6 +2958,7 @@ def estimate_api_llm_cost(
     batch_size: int = 5,
     max_tokens: int = DEFAULT_LLM_MAX_TOKENS,
     resume_scored_keys: set[str] | None = None,
+    model: str = DEFAULT_LLM_SCORING_MODEL,
 ) -> LlmCostEstimate:
     """
     Estimate API-LLM cost without making any Anthropic call.
@@ -2803,7 +2990,7 @@ def estimate_api_llm_cost(
     max_output_tokens = batches * max(0, max_tokens)
     projected_total_tokens = prompt_tokens + max_output_tokens
     projected_usd = estimate_llm_usd(
-        {"input_tokens": prompt_tokens, "output_tokens": max_output_tokens}
+        {"input_tokens": prompt_tokens, "output_tokens": max_output_tokens}, model=model
     )
     return LlmCostEstimate(
         records_selected=len(selected),
@@ -2913,7 +3100,7 @@ def score_records_api_run(
             remaining_exceeds_run_cap = (
                 max_tokens_per_run > 0 and tokens + projected_total_tokens > max_tokens_per_run
             )
-            projected_usd = _projected_usd_for_prompt(estimated_prompt_tokens, max_tokens)
+            projected_usd = _projected_usd_for_prompt(estimated_prompt_tokens, max_tokens, model=model)
             remaining_exceeds_usd_cap = max_usd_per_run > 0 and usd + projected_usd > max_usd_per_run
 
             if (chunk_exceeds_run_cap or remaining_exceeds_run_cap or remaining_exceeds_usd_cap) and current_batch_size > 1:
@@ -2971,7 +3158,7 @@ def score_records_api_run(
             input_tokens += batch_input_tokens
             output_tokens += batch_output_tokens
             tokens += batch_total_tokens
-            usd += estimate_llm_usd(usage)
+            usd += estimate_llm_usd(usage, model=model)
             if usage_output_path is not None:
                 _write_llm_usage_payload(
                     usage_output_path,
@@ -3004,7 +3191,7 @@ def score_records_api_run(
         input_tokens += batch_input_tokens
         output_tokens += batch_output_tokens
         tokens += batch_total_tokens
-        usd += estimate_llm_usd(usage)
+        usd += estimate_llm_usd(usage, model=model)
 
         bundle_dir.mkdir(parents=True, exist_ok=True)
         bundle_path = bundle_dir / f"{batch_id}_response.json"
@@ -3219,6 +3406,26 @@ def main() -> int:
     if args.offset > 0:
         records = records[args.offset :]
 
+    # Drop suppressed leads before anything is spent on them. Two checks, and
+    # both are needed: the stored flag covers businesses already suppressed when
+    # they were enriched, and the live index covers the ordinary case where the
+    # opt-out arrived after enrichment and the flag on disk is a stale "clean".
+    # merge_suppression_disqualifiers still backstops this at the sendability
+    # gate, but in api-llm mode that happens after the tokens are paid for.
+    try:
+        suppression_index = load_configured_suppression_index()
+    except ComplianceError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+
+    def _suppressed(record: Dict[str, Any]) -> bool:
+        return is_suppressed_record(record) or record_matches_suppression(record, suppression_index)
+
+    kept = [record for record in records if not _suppressed(record)]
+    if len(kept) != len(records):
+        print(f"[SKIP] Suppressed leads dropped before scoring: {len(records) - len(kept)}")
+        records = kept
+
     existing_scored_rows: List[Dict[str, Any]] = []
     append_existing_scored_rows = False
 
@@ -3261,13 +3468,20 @@ def main() -> int:
         max_tokens_per_run = getenv_int("MAX_LLM_TOKENS_PER_RUN", DEFAULT_MAX_LLM_TOKENS_PER_RUN)
         max_usd_per_run = getenv_float("MAX_LLM_USD_PER_RUN", DEFAULT_MAX_LLM_USD_PER_RUN)
 
-        estimate = estimate_api_llm_cost(
-            records,
-            fallback_vertical=args.vertical,
-            batch_size=args.llm_batch_size,
-            max_tokens=args.llm_max_tokens,
-        )
+        llm_model = (os.getenv("LLM_SCORING_MODEL") or DEFAULT_LLM_SCORING_MODEL).strip()
+        try:
+            estimate = estimate_api_llm_cost(
+                records,
+                fallback_vertical=args.vertical,
+                batch_size=args.llm_batch_size,
+                max_tokens=args.llm_max_tokens,
+                model=llm_model,
+            )
+        except UnknownLlmModelError as exc:
+            print(f"[ERROR] {exc}", file=sys.stderr)
+            return 1
 
+        print(f"[LLM COST] model={llm_model}")
         print(
             f"[LLM COST] records_selected={estimate.records_selected} "
             f"batches={estimate.batches} "
@@ -3316,7 +3530,7 @@ def main() -> int:
             scores_dir=scores_dir_path,
             fallback_vertical=args.vertical,
             batch_size=args.llm_batch_size,
-            model=(os.getenv("LLM_SCORING_MODEL") or DEFAULT_LLM_SCORING_MODEL).strip(),
+            model=llm_model,
             max_tokens=args.llm_max_tokens,
             max_calls=max_calls,
             max_tokens_per_run=max_tokens_per_run,

@@ -92,7 +92,7 @@ class ManualLeadInsertTest(unittest.TestCase):
 
         self.assertEqual(fields["Website URL"], "https://detailing-101090.square.site")
         self.assertNotIn("Google Maps URL", fields)
-        self.assertEqual(fields["Current Website Quality"], "Poor")
+        self.assertNotIn("Current Website Quality", fields)
         self.assertEqual(fields["Site Status"], "Social Only")
         self.assertIn("No standalone website", fields["Specific Observation"])
         self.assertIn("Boundless Car Care – Detailing & Ceramic Coatings", fields["Specific Observation"])
@@ -114,19 +114,12 @@ class ManualLeadInsertTest(unittest.TestCase):
         self.assertEqual(fields["Lead Priority"], "C")
         self.assertEqual(fields["AI Confidence"], "low")
 
-    def test_weak_website_quality_maps_to_airtable_vocab(self) -> None:
+    def test_weak_website_quality_is_not_synced(self) -> None:
+        # Current Website Quality was removed from the Airtable surface (PR #9):
+        # syncing it here would silently drop before ever reaching the base.
         card = mli.build_manual_lead_card(MARKDOWN_RAW_LEAD, vertical="detailing")
 
-        self.assertEqual(card["airtable_fields"]["Current Website Quality"], "Poor")
-
-    def test_website_quality_normalizes_variants_and_passes_unknown_text(self) -> None:
-        self.assertEqual(mli.normalize_manual_field_value("Current Website Quality", "Weak"), "Poor")
-        self.assertEqual(mli.normalize_manual_field_value("Current Website Quality", "OK"), "Okay")
-        # The Airtable column stays free text; unrecognized values pass through unchanged.
-        self.assertEqual(
-            mli.normalize_manual_field_value("Current Website Quality", "Template-looking"),
-            "Template-looking",
-        )
+        self.assertNotIn("Current Website Quality", card["airtable_fields"])
 
     def test_vertical_validation_uses_shared_registry_for_new_lanes(self) -> None:
         for raw, slug in (

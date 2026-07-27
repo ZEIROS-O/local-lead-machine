@@ -49,7 +49,6 @@ MANUAL_FIELDS = [
     "Google Maps URL",
     "Reviews",
     "Rating",
-    "Current Website Quality",
     "Site Status",
     "Specific Observation",
     "Packet Eligible",
@@ -57,10 +56,7 @@ MANUAL_FIELDS = [
     "Packet Tier",
     "Lead Priority",
     "Offer Fit",
-    "Contact Form Detected",
-    "Estimate Form Detected",
     "Form Strength",
-    "CTA Strength",
     "Visible Pain Score",
     "Visible Pain Reasons",
     "Send Trigger",
@@ -97,27 +93,12 @@ CONTROLLED_SELECT_LABELS = {
     "Sendable": {"Yes", "No"},
     "Packet Tier": {"Sendable Packet", "Manual Review Packet", "Watchlist", "No Packet"},
     "Lead Priority": {"A", "B", "C"},
-    "Contact Form Detected": {"Yes", "No"},
-    "Estimate Form Detected": {"Yes", "No"},
     "Status": {"Mockup Needed", "Manual Review", "Sent", "Follow-Up", "Closed"},
     "Outreach Channel": {"Email", "Phone", "Instagram DM", "SMS"},
 }
 # Vertical is validated through the shared registry (VERTICAL_LABELS), not a
 # hardcoded list, so new lanes work here the moment they exist in verticals.py
 # or the identity aliases.
-WEBSITE_QUALITY_FIELD = "Current Website Quality"
-# Airtable keeps this column as free text; manual input still normalizes the
-# common variants so pipeline and manual rows share one vocabulary.
-WEBSITE_QUALITY_LABELS = {
-    "n/a": "N/A",
-    "na": "N/A",
-    "none": "N/A",
-    "poor": "Poor",
-    "weak": "Poor",
-    "okay": "Okay",
-    "ok": "Okay",
-    "good": "Good",
-}
 
 
 def resolve_manual_vertical(value: str) -> str:
@@ -428,21 +409,17 @@ def _infer_site_fields(text: str) -> Dict[str, str]:
     fields: Dict[str, str] = {}
     no_site_fact = _no_standalone_site_fact(text)
     if no_site_fact:
-        fields["Current Website Quality"] = "Poor"
         if re.search(r"\b(facebook only|google business profile links to facebook)\b", text, re.IGNORECASE):
             fields["Site Status"] = "Social Only"
         else:
             fields["Site Status"] = "Missing"
-    if "old looking" in lowered or "outdated" in lowered or "weak" in lowered:
-        fields["Current Website Quality"] = "Poor"
     if "no estimate form" in lowered:
-        fields["Estimate Form Detected"] = "No"
+        # Contact/Estimate Form Detected and CTA Strength were removed from the
+        # Airtable surface (PR #9): Form Strength is the one form signal that
+        # still syncs, and it already carries this fact.
         fields["Form Strength"] = "None"
-        fields["CTA Strength"] = "Weak"
         fields["Visible Pain Reasons"] = "No estimate form detected"
         fields["Send Trigger"] = "No estimate form detected"
-    if "contact form" in lowered:
-        fields["Contact Form Detected"] = "Yes" if "no contact form" not in lowered else "No"
     if any(term in lowered for term in ("ceramic", "paint correction", "ppf", "epoxy", "coating", "garage floor")):
         fields["Buyer Intent Signals"] = "High-ticket service term in manual notes"
     return fields
@@ -502,9 +479,6 @@ def normalize_manual_field_value(field: str, value: Any) -> str:
         return normalized_url
     if field in EMAIL_FIELDS:
         return normalize_email_value(cleaned)
-    if field == WEBSITE_QUALITY_FIELD:
-        label = " ".join(cleaned.casefold().replace("_", " ").split())
-        return WEBSITE_QUALITY_LABELS.get(label, cleaned)
     if field in TYPED_AIRTABLE_FIELDS:
         normalized = normalize_airtable_value(field, cleaned)
         return "" if normalized in ("", None, [], {}) else str(normalized)

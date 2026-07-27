@@ -5,9 +5,10 @@ import argparse
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Mapping
 
 from lead_machine.buyer_signals import buyer_intent_summary, ensure_buyer_intent
+from lead_machine.compliance import is_suppressed_record
 from lead_machine.evidence import build_evidence_profile
 from lead_machine.icp import hard_icp_gate
 from lead_machine.icp_lanes import SELECTABLE_LANES, classify_icp_lane, lane_sort_key
@@ -120,7 +121,24 @@ def candidate_records(records: Iterable[Dict[str, Any]], *, fallback_vertical: s
     for record in records:
         google = record.get("google", {}) or {}
         lead = normalize_lead(google, fallback_vertical=fallback_vertical, source_batch=google.get("source_query", ""))
-        if not hard_icp_gate(lead).should_skip:
+
+        derived = record.get("derived")
+        derived = derived if isinstance(derived, Mapping) else {}
+        derived_skip = derived.get("hard_icp_skip")
+
+        if derived_skip is not None and not isinstance(derived_skip, bool):
+            raise ValueError(f"Invalid derived.hard_icp_skip value: {derived_skip!r}")
+
+        # Suppression is checked separately from hard_icp_skip: a record written
+        # before the enricher set that flag still carries the reason, and a
+        # suppressed lead must never reach a scoring prompt.
+        is_skipped = (
+            hard_icp_gate(lead).should_skip
+            or derived_skip is True
+            or is_suppressed_record(record)
+        )
+
+        if not is_skipped:
             candidates.append(record)
     return candidates
 
@@ -278,7 +296,9 @@ Rules:
 - Buyer intent is required for A/B quality: look for fixable gap times money signal, not just a bad website.
 - Use buyer_intent_summary as evidence for money/demand context.
 - Paid CRM/booking tools and known ad signals can support money intent.
-- Bad site alone without buyer_intent.money_signal should not be an A lead.
+- buyer_intent.money_signal is yes/no/unknown. "unknown" means there was no crawlable site text to read a paid stack from — it is an unanswered question, not evidence the business does not spend. Do not treat it as a negative.
+- Bad site with money_signal "no" should not be an A lead. Bad site with money_signal "unknown" may still be an A lead when demand_signal is yes and the visible pain is concrete.
+- buyer_intent.demand_signal is a separate claim from spend: it says the market is pulling on this business. Use it for demand, never as proof of budget.
 - Do not infer missing forms if evidence is uncertain.
 - Static fetch failure alone does not prove the website is broken.
 - If rendered_site_status is Loaded, do not claim the website is broken.

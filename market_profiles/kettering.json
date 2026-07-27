@@ -32,5 +32,11 @@
       "Miamisburg OH",
       "West Carrollton OH"
     ]
-  }
+  },
+  "service_area_terms": [
+    "southwest ohio",
+    "miami valley",
+    "greater dayton",
+    "montgomery county"
+  ]
 }

@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence
 
+from .compliance import suppression_disqualifiers
 from .review_velocity import ReviewSnapshotStore, build_review_velocity, mine_review_pain
 from .scoring_profiles import (
     SCORING_POLICY_VERSION,
@@ -76,6 +77,15 @@ def score_v3(
         supported = set(supported_scoring_cells())
         supported_verticals = {cell.split("__", 1)[0] for cell in supported}
         outside_target = bool(vertical in supported_verticals and market and cohort_key not in supported)
+        # A compliance disqualifier has to survive a missing profile. This
+        # branch used to report no disqualifiers at all, so a suppressed lead in
+        # a vertical/market with no scoring profile came back clean.
+        fallback_disqualifiers = tuple(
+            sorted(
+                ({"outside_target_geography"} if outside_target else set())
+                | set(suppression_disqualifiers(enriched))
+            )
+        )
         return ScoreV3Result(
             policy_version=SCORING_POLICY_VERSION,
             profile_id="",
@@ -90,7 +100,7 @@ def score_v3(
             named_leak=_named_leak(row, review_pain),
             reason_codes=(("outside_target_geography",) if outside_target else ("missing_exact_profile",)),
             blocking_gates=(str(exc),),
-            hard_disqualifiers=(("outside_target_geography",) if outside_target else ()),
+            hard_disqualifiers=fallback_disqualifiers,
             reputation_risks=tuple(review_pain.get("reputation_risk_categories") or ()),
             review_velocity=review_velocity,
             review_pain=review_pain,
@@ -437,6 +447,7 @@ def _hard_disqualifiers(
     suppression = str(row.get("Suppressed") or row.get("Opt Out") or row.get("Do Not Contact") or "").strip().lower()
     if suppression in {"yes", "true", "1"}:
         result.append("suppressed_or_opted_out")
+    result.extend(suppression_disqualifiers(enriched))
     return sorted(set(result))
 
 

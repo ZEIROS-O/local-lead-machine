@@ -5,6 +5,20 @@ from typing import Mapping
 
 
 @dataclass(frozen=True)
+class AdjacencyExclusion:
+    """A neighbouring trade that looks like this vertical but does not buy like it.
+
+    Scoped per profile because the terms are only exclusions in context: a
+    plumber or a water-restoration firm advertising "property maintenance" is
+    describing its actual customer, while a hardscaper doing so is a commercial
+    maintenance contractor and a different sale.
+    """
+
+    reason: str
+    terms: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class VerticalProfile:
     key: str
     label: str
@@ -16,10 +30,43 @@ class VerticalProfile:
     low_ticket_terms: tuple[str, ...]
     franchise_denylist: tuple[str, ...]
     exclude_terms: tuple[str, ...]
-    geo_terms: tuple[str, ...]
     aliases: tuple[str, ...] = ()
     min_reviews: int = 10
     max_reviews: int | None = None
+    adjacency_exclusions: tuple[AdjacencyExclusion, ...] = ()
+
+
+# The green-industry neighbours of hardscaping. These were applied to every
+# vertical by `make_search_batch.prefilter_row`, so a plumbing or water
+# restoration lead could be dropped for saying "property maintenance" or
+# "facility maintenance" — a phrase in its own market's vocabulary.
+GREEN_INDUSTRY_ADJACENCY_EXCLUSIONS = (
+    AdjacencyExclusion(
+        "nursery_or_garden_center",
+        ("nursery", "garden center", "landscape supply", "mulch supply", "stone yard"),
+    ),
+    AdjacencyExclusion(
+        "tree_service_only",
+        ("tree service", "tree removal", "arborist", "stump grinding"),
+    ),
+    AdjacencyExclusion(
+        "snow_only",
+        ("snow removal only", "snow-only", "snow plowing only", "snow removal"),
+    ),
+    AdjacencyExclusion(
+        "lawn_fertilization_only",
+        ("lawn fertilization", "fertilization", "weed control", "turf care"),
+    ),
+    AdjacencyExclusion(
+        "commercial_maintenance_only",
+        (
+            "commercial maintenance only",
+            "commercial maintenance",
+            "facility maintenance",
+            "property maintenance",
+        ),
+    ),
+)
 
 
 HARDSCAPE_BATCH_TERMS = (
@@ -108,22 +155,6 @@ HARDSCAPE_LOW_TICKET_TERMS = (
     "cleaning",
     "pressure washing",
     "junk removal",
-)
-
-CLEVELAND_METRO_TERMS = (
-    "oh",
-    "ohio",
-    "cleveland",
-    "akron",
-    "chagrin",
-    "kirtland",
-    "solon",
-    "mentor",
-    "willoughby",
-    "lakewood",
-    "middlefield",
-    "east cleveland",
-    "brecksville",
 )
 
 DETAILING_TERMS = (
@@ -326,9 +357,9 @@ VERTICAL_PROFILES: Mapping[str, VerticalProfile] = {
         low_ticket_terms=HARDSCAPE_LOW_TICKET_TERMS,
         franchise_denylist=HARDSCAPE_FRANCHISE_DENYLIST,
         exclude_terms=(),
-        geo_terms=CLEVELAND_METRO_TERMS,
         min_reviews=10,
         max_reviews=None,
+        adjacency_exclusions=GREEN_INDUSTRY_ADJACENCY_EXCLUSIONS,
     ),
     "detailing": VerticalProfile(
         key="detailing",
@@ -341,7 +372,6 @@ VERTICAL_PROFILES: Mapping[str, VerticalProfile] = {
         low_ticket_terms=DETAILING_DENY_TERMS,
         franchise_denylist=DETAILING_FRANCHISE_DENYLIST,
         exclude_terms=(),
-        geo_terms=CLEVELAND_METRO_TERMS,
         aliases=("car detailing", "auto detailing", "mobile detailing", "detailing", "detailer"),
         min_reviews=10,
         max_reviews=130,
@@ -357,7 +387,6 @@ VERTICAL_PROFILES: Mapping[str, VerticalProfile] = {
         low_ticket_terms=WATER_RESTORATION_DENY_TERMS,
         franchise_denylist=WATER_RESTORATION_FRANCHISE_DENYLIST,
         exclude_terms=(),
-        geo_terms=CLEVELAND_METRO_TERMS,
         aliases=(
             "water restoration",
             "water damage restoration",
@@ -382,7 +411,6 @@ VERTICAL_PROFILES: Mapping[str, VerticalProfile] = {
         low_ticket_terms=GARAGE_DOOR_DENY_TERMS,
         franchise_denylist=GARAGE_DOOR_FRANCHISE_DENYLIST,
         exclude_terms=(),
-        geo_terms=CLEVELAND_METRO_TERMS,
         aliases=(
             "garage doors",
             "garage door",
@@ -406,7 +434,6 @@ VERTICAL_PROFILES: Mapping[str, VerticalProfile] = {
         low_ticket_terms=PLUMBING_DENY_TERMS,
         franchise_denylist=PLUMBING_FRANCHISE_DENYLIST,
         exclude_terms=(),
-        geo_terms=CLEVELAND_METRO_TERMS,
         aliases=("plumber", "plumbers", "plumbing contractor", "plumbing company"),
         min_reviews=5,
         max_reviews=None,

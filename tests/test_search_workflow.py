@@ -162,6 +162,34 @@ class SearchWorkflowTest(unittest.TestCase):
         self.assertFalse(strong_no_site.should_skip)
         self.assertIn("patio", strong_no_site.boost_terms)
 
+    def test_green_industry_exclusions_do_not_apply_outside_hardscaping(self) -> None:
+        """These five term lists were applied to every vertical.
+
+        "property maintenance" and "facility maintenance" are ordinary
+        vocabulary for a plumber or a restoration firm describing its commercial
+        customers, but the prefilter dropped those leads before enrichment ever
+        ran. The terms only mean "wrong trade" next to hardscaping, so they now
+        live on that profile.
+        """
+        hardscaping = _config()
+        plumbing = _config(
+            vertical="plumbing",
+            boost_terms=["plumber", "plumbing", "sewer", "water heater"],
+            exclude_terms=[],
+        )
+
+        row = _row(
+            business_name="Wilson Plumbing - property maintenance",
+            category="plumber",
+            source_query="emergency plumber Cleveland OH",
+        )
+
+        skipped = make_search_batch.prefilter_row(row, hardscaping)
+        kept = make_search_batch.prefilter_row(row, plumbing)
+
+        self.assertEqual(skipped.reason, "commercial_maintenance_only")
+        self.assertFalse(kept.should_skip, kept.reason)
+
     def test_search_report_generation_lists_counts_outputs_and_next_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -243,7 +271,7 @@ class SearchWorkflowTest(unittest.TestCase):
                     "userRatingCount": 28,
                 }
 
-            def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False):
+            def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False, suppression_index=None, review_snapshot_store=None, per_lead_timeout=None):
                 return {"google": row, "website": {"site_status": "No Website"}, "derived": {}, "screenshots": {}}
 
             with patch("make_search_batch.text_search_paged", side_effect=fake_paged), patch(
@@ -349,7 +377,7 @@ class SearchWorkflowTest(unittest.TestCase):
                 },
             }
 
-            def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False):
+            def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False, suppression_index=None, review_snapshot_store=None, per_lead_timeout=None):
                 return {"google": row, "website": {"site_status": "No Website"}, "derived": {}, "screenshots": {}}
 
             with patch("make_search_batch.text_search_paged", return_value=(text_results, 1)), patch(
@@ -372,6 +400,65 @@ class SearchWorkflowTest(unittest.TestCase):
             self.assertTrue(result.deduped_path.exists())
             self.assertTrue(result.enriched_path.exists())
             self.assertTrue(result.report_path.exists())
+
+    def test_runner_gives_enrichment_a_review_snapshot_store(self) -> None:
+        """Review velocity is only computable if something banks the counts.
+
+        `record_snapshot` was called from `places_search.main` alone — the legacy
+        `data/searches.csv` entry point. This runner never passed a store, so
+        run_state/review_velocity.sqlite3 stayed empty, `build_review_velocity`
+        was permanently stuck on `insufficient_history`, and a signal the rubric
+        asks for could never be supplied for any lead the pipeline produced.
+        """
+        from lead_machine.review_velocity import ReviewSnapshotStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "search_configs/test_hardscaping_001.json"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(json.dumps(_config().to_dict()), encoding="utf-8")
+
+            snapshot_db = root / "run_state" / "review_velocity.sqlite3"
+            received: list = []
+
+            def fake_enrich(
+                row,
+                screenshots_dir,
+                take_shots,
+                rendered_site_check=False,
+                suppression_index=None,
+                review_snapshot_store=None,
+                per_lead_timeout=None,
+            ):
+                received.append(review_snapshot_store)
+                return {"google": row, "website": {"site_status": "No Website"}, "derived": {}, "screenshots": {}}
+
+            details = {
+                "id": "place-1",
+                "displayName": {"text": "Patio Pros"},
+                "formattedAddress": "123 Main St, Cleveland, OH 44101, USA",
+                "nationalPhoneNumber": "(216) 555-0100",
+                "websiteUri": "https://patiopros.example",
+                "googleMapsUri": "https://maps.google.com/?cid=1",
+                "rating": 4.8,
+                "userRatingCount": 28,
+                "primaryType": "landscaper",
+            }
+
+            with patch("make_search_batch.text_search_paged", return_value=([{"id": "place-1"}], 1)), patch(
+                "make_search_batch.place_details", return_value=details
+            ), patch("make_search_batch.enrich_row", side_effect=fake_enrich), redirect_stdout(io.StringIO()):
+                make_search_batch.run_search_batch(
+                    config_path=config_path,
+                    batch="test_hardscaping_001",
+                    root=root,
+                    api_key="test-key",
+                    review_snapshot_db=snapshot_db,
+                )
+
+            self.assertEqual(len(received), 1)
+            self.assertIsInstance(received[0], ReviewSnapshotStore)
+            self.assertEqual(received[0].path, snapshot_db)
 
     def test_runner_can_pass_rendered_site_check_to_enrichment(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -396,7 +483,7 @@ class SearchWorkflowTest(unittest.TestCase):
             }
             calls = []
 
-            def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False):
+            def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False, suppression_index=None, review_snapshot_store=None, per_lead_timeout=None):
                 calls.append(
                     {
                         "take_shots": take_shots,
@@ -445,7 +532,7 @@ class SearchWorkflowTest(unittest.TestCase):
                 "primaryType": "landscaper",
             }
 
-            def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False):
+            def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False, suppression_index=None, review_snapshot_store=None, per_lead_timeout=None):
                 return {
                     "google": row,
                     "website": {
@@ -496,7 +583,7 @@ class SearchWorkflowTest(unittest.TestCase):
                 "primaryType": "landscaper",
             }
 
-            def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False):
+            def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False, suppression_index=None, review_snapshot_store=None, per_lead_timeout=None):
                 return {"google": row, "website": {"site_status": "No Website"}, "derived": {}, "screenshots": {}}
 
             with patch("make_search_batch.text_search_paged", return_value=(text_results, 1)), patch(
@@ -540,7 +627,7 @@ class SearchWorkflowTest(unittest.TestCase):
                     "primaryType": "patio contractor",
                 }
 
-            def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False):
+            def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False, suppression_index=None, review_snapshot_store=None, per_lead_timeout=None):
                 return {"google": row, "website": {"site_status": "No Website"}, "derived": {}, "screenshots": {}}
 
             with patch("make_search_batch.text_search_paged", side_effect=fake_text_search) as search_call, patch(
@@ -586,7 +673,7 @@ class SearchWorkflowTest(unittest.TestCase):
                 "primaryType": "patio contractor",
             }
 
-            def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False):
+            def fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False, suppression_index=None, review_snapshot_store=None, per_lead_timeout=None):
                 return {"google": row, "website": {"site_status": "No Website"}, "derived": {}, "screenshots": {}}
 
             progress = io.StringIO()

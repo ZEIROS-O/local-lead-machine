@@ -41,6 +41,9 @@ packets/
 lead_packets/
 packets_*/
 
+# Archived completed runs (packets_* / review_queue_* moved off the repo root)
+runs/
+
 # Local runtime state (queue history, manual lead inbox) — never commit lead contents
 run_state/
 manual_leads/

@@ -248,6 +248,10 @@ def _derive_visible_pain_profile(
     score = 0
     reasons: List[str] = []
     categories: List[str] = []
+    # Points are tracked per reason so the send trigger can be the strongest
+    # leak rather than whichever rule happened to run first. The reason list
+    # keeps insertion order for display; only the trigger is re-ranked.
+    reason_points: Dict[str, int] = {}
 
     def add(points: int, reason: str, pain_categories: List[str] | None = None) -> None:
         nonlocal score
@@ -258,6 +262,7 @@ def _derive_visible_pain_profile(
             return
         score += points
         reasons.append(reason)
+        reason_points[reason] = points
         for category in pain_categories or []:
             if category not in categories:
                 categories.append(category)
@@ -323,11 +328,17 @@ def _derive_visible_pain_profile(
     if _clean(phone_consistency).lower() == "different":
         add(12, "Phone/routing signal differs across Google and site", ["followup_or_missed_call_pain"])
 
+    # The send trigger is the line the packet leads with and the one
+    # `sendability` requires, so it should be the worst leak found, not the
+    # first rule to fire. Ties keep the earlier reason, which preserves the
+    # existing ordering for the status-derived triggers that all score 40.
+    send_trigger = max(reasons, key=lambda reason: reason_points[reason]) if reasons else ""
+
     return {
         "visible_pain_score": min(score, 100),
         "visible_pain_reasons": reasons,
         "visible_pain_categories": categories,
-        "send_trigger": reasons[0] if reasons else "",
+        "send_trigger": send_trigger,
     }
 
 

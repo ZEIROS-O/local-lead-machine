@@ -32,5 +32,9 @@
       "Amherst OH",
       "Oberlin OH"
     ]
-  }
+  },
+  "service_area_terms": [
+    "northeast ohio",
+    "lorain county"
+  ]
 }

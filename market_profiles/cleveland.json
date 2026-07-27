@@ -44,5 +44,13 @@
       "Parma OH",
       "Strongsville OH"
     ]
-  }
+  },
+  "service_area_terms": [
+    "northeast ohio",
+    "greater cleveland",
+    "chardon",
+    "cuyahoga",
+    "geauga",
+    "lake county"
+  ]
 }

@@ -4,7 +4,13 @@ import json
 import re
 from typing import Any, Dict, Iterable, List, Sequence, Set
 
-from .buyer_signals import buyer_intent_summary, has_money_signal as buyer_has_money_signal, review_demand_band
+from .buyer_signals import (
+    buyer_intent_summary,
+    demand_signal_state,
+    has_money_signal as buyer_has_money_signal,
+    money_signal_state,
+    review_demand_band,
+)
 from .score_schema import (
     ASSET_STATES,
     COMMERCIAL_FIT_STATES,
@@ -422,6 +428,9 @@ def evaluate_sendability(row: Dict[str, Any]) -> Dict[str, Any]:
     if reviews < 5 and not is_exceptional_low_review_fit(row):
         blockers.append(REVIEW_COUNT_BLOCKER)
 
+    # Only a confirmed "yes" relaxes the mature-band pain threshold below. An
+    # "unknown" must behave exactly as False did, or the gate loosens on the
+    # leads we have the least evidence about.
     money_signal = has_money_signal(row)
     review_band = _review_demand_band(row)
     required_pain = required_visible_pain_score(reviews, review_band=review_band, money_signal=money_signal)
@@ -469,6 +478,8 @@ def evaluate_sendability(row: Dict[str, Any]) -> Dict[str, Any]:
         "visible_pain_score": visible_pain_score,
         "visible_pain_reasons": visible_pain_reasons,
         "money_signal": money_signal,
+        "money_signal_state": money_signal_state(row),
+        "demand_signal_state": demand_signal_state(row),
         "buyer_intent_signals": buyer_intent_summary(row),
         **commercial_fit,
     }
@@ -694,8 +705,13 @@ def apply_sendability(row: Dict[str, Any]) -> Dict[str, Any]:
     updated["visible_pain_score"] = result["visible_pain_score"]
     updated["Visible Pain Reasons"] = "; ".join(result["visible_pain_reasons"])
     updated["visible_pain_reasons"] = result["visible_pain_reasons"]
-    updated["Money Signal"] = "Yes" if result["money_signal"] else "No"
+    updated["Money Signal"] = result["money_signal_state"].capitalize()
     updated["money_signal"] = updated["Money Signal"]
+    # Demand is reported separately from spend on purpose: only Money Signal
+    # feeds required_visible_pain_score. Both are CSV/packet columns, not
+    # Airtable fields.
+    updated["Demand Signal"] = result["demand_signal_state"].capitalize()
+    updated["demand_signal"] = updated["Demand Signal"]
     updated["Buyer Intent Signals"] = result["buyer_intent_signals"]
     updated["buyer_intent_signals"] = result["buyer_intent_signals"]
     updated["Commercial Fit State"] = result["commercial_fit_state"]

@@ -23,11 +23,13 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import warnings
 import datetime as dt
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import AbstractSet, Any, Dict, Iterable, List, Tuple
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -42,8 +44,15 @@ from lead_machine.email_hygiene import clean_emails
 from lead_machine.evidence import build_evidence_profile
 from lead_machine.icp import hard_icp_gate
 from lead_machine.schema import normalize_lead
+from lead_machine.scoring_profiles import infer_market, infer_vertical_key
 from lead_machine.verticals import resolve_profile
 from lead_machine.review_velocity import ReviewSnapshotStore
+from lead_machine.compliance import (  # re-exported: the enrichment entry points share these
+    DNC_SUPPRESSED_REASON,
+    ComplianceError,
+    has_suppression_match,
+    load_configured_suppression_index,
+)
 
 
 USER_AGENT = (
@@ -57,6 +66,9 @@ HOMEPAGE_FETCH_TIMEOUT = 12
 CANDIDATE_PAGE_FETCH_TIMEOUT = 8
 SLOW_ENRICH_SECONDS = 30.0
 PER_LEAD_ENRICH_TIMEOUT_SECONDS = 45.0
+# A single lead may never stall a run for longer than this, however many
+# workers are running.
+MAX_PER_LEAD_ENRICH_TIMEOUT_SECONDS = 180.0
 TLD_EXTRACTOR = tldextract.TLDExtract(cache_dir=False, suffix_list_urls=())
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
@@ -215,6 +227,10 @@ NON_STANDARD_SITE_HINTS = [
     "facebook.com",
     "instagram.com",
 ]
+
+
+DEFAULT_ENRICH_WORKERS = 6
+DEFAULT_BROWSER_ENRICH_WORKERS = 3
 
 
 def getenv_int(name: str, default: int) -> int:
@@ -1331,6 +1347,8 @@ def enrich_row(
     rendered_site_check: bool = False,
     buyer_intent_ads_check: bool = False,
     review_snapshot_store: ReviewSnapshotStore | None = None,
+    suppression_index: AbstractSet[str] | None = None,
+    per_lead_timeout: float = PER_LEAD_ENRICH_TIMEOUT_SECONDS,
 ) -> Dict[str, Any]:
     started_at = time.monotonic()
     lead = normalize_lead(row, fallback_vertical=row.get("category", "") or "service")
@@ -1338,17 +1356,35 @@ def enrich_row(
     gate = hard_icp_gate(lead)
 
     website_url = row.get("website_url", "") or ""
-    site = scrape_site(
-        website_url,
-        rendered_form_check=rendered_form_check,
-        high_ticket_terms=profile.high_ticket_terms,
-        started_at=started_at,
+    google_phone = row.get("phone", "")
+
+    # Check the phone Google already gave us before spending anything. The full
+    # crawl costs page fetches and, with screenshots on, a browser launch — all
+    # of it wasted on a business we are not allowed to contact. The scraped
+    # emails and phones still get checked below for leads that survive this.
+    suppressed_before_crawl = bool(suppression_index) and has_suppression_match(
+        phones=[google_phone],
+        suppression_index=suppression_index,
     )
+
+    if suppressed_before_crawl:
+        # "Unknown", not a new "Suppressed" status: Site Status is a typed
+        # Airtable select, and an unmapped value normalizes to None and is
+        # dropped silently. The dnc_suppressed flag carries the meaning.
+        site = empty_site_result("Unknown", [DNC_SUPPRESSED_REASON], url=website_url)
+    else:
+        site = scrape_site(
+            website_url,
+            rendered_form_check=rendered_form_check,
+            high_ticket_terms=profile.high_ticket_terms,
+            started_at=started_at,
+            per_lead_timeout=per_lead_timeout,
+        )
 
     screenshots = {"desktop": "", "mobile": "", "error": ""}
     screenshot_url = site.get("final_url") or normalize_url(website_url)
     elapsed_after_static = elapsed_seconds(started_at)
-    per_lead_timed_out = elapsed_after_static > PER_LEAD_ENRICH_TIMEOUT_SECONDS or "per_lead_enrichment_timeout" in set(
+    per_lead_timed_out = elapsed_after_static > per_lead_timeout or "per_lead_enrichment_timeout" in set(
         site.get("site_issue_flags") or []
     )
 
@@ -1364,7 +1400,7 @@ def enrich_row(
     )
 
     if should_check_rendered:
-        remaining_timeout_ms = max(1000, int((PER_LEAD_ENRICH_TIMEOUT_SECONDS - elapsed_seconds(started_at)) * 1000))
+        remaining_timeout_ms = max(1000, int((per_lead_timeout - elapsed_seconds(started_at)) * 1000))
         rendered_timeout_ms = min(25000, remaining_timeout_ms)
         if take_shots:
             desktop_path, mobile_path = screenshot_paths(
@@ -1377,7 +1413,6 @@ def enrich_row(
             screenshots = check_rendered_site(screenshot_url, timeout_ms=rendered_timeout_ms)
         site = apply_rendered_site_result(site, screenshots)
 
-    google_phone = row.get("phone", "")
     website_phones = site.get("phones_found", [])
 
     google_digits = normalize_digits(google_phone)
@@ -1411,11 +1446,51 @@ def enrich_row(
             "has_high_ticket_terms": bool(site.get("high_ticket_terms")),
             "non_standard_site_or_booking": is_non_standard_site_or_booking_url(website_url)
             or is_non_standard_site_or_booking_url(site.get("final_url", "")),
-            "hard_icp_skip": gate.should_skip,
-            "hard_icp_reasons": gate.reasons,
         },
     }
+
+    hard_icp_skip = gate.should_skip
+    hard_icp_reasons = list(gate.reasons)
+
+    # Re-check against everything the crawl turned up. The pre-crawl check only
+    # saw the Google phone; a business can be suppressed under an address or a
+    # second line that only appears on the site.
+    if suppression_index and (
+        suppressed_before_crawl
+        or has_suppression_match(
+            emails=site.get("emails_found") or [],
+            phones=(site.get("phones_found") or []) + [google_phone],
+            suppression_index=suppression_index,
+        )
+    ):
+        hard_icp_skip = True
+        if DNC_SUPPRESSED_REASON not in hard_icp_reasons:
+            hard_icp_reasons.append(DNC_SUPPRESSED_REASON)
+
+    record["derived"]["hard_icp_skip"] = hard_icp_skip
+    record["derived"]["hard_icp_reasons"] = hard_icp_reasons
+
     if review_snapshot_store is not None and lead.place_id_or_unique_key:
+        # Record before reading. Enrichment is the one stage every entry point
+        # runs, so this is where the observation has to be banked: without it
+        # the store never accumulates two counts 14 days apart and
+        # build_review_velocity is permanently stuck on "insufficient_history".
+        # A snapshot failure must not lose the lead, so it is logged, not raised.
+        if lead.google_review_count is not None:
+            try:
+                review_snapshot_store.record_snapshot(
+                    place_key=lead.place_id_or_unique_key,
+                    review_count=int(lead.google_review_count),
+                    rating=float(lead.google_rating) if lead.google_rating else None,
+                    vertical=infer_vertical_key(record, fallback=lead.vertical),
+                    market=infer_market(record),
+                    source="enrichment",
+                )
+            except Exception as exc:
+                print(
+                    f"[WARN] Review snapshot not recorded for {lead.business_name}: {exc}",
+                    file=sys.stderr,
+                )
         record["review_count_history"] = review_snapshot_store.history(lead.place_id_or_unique_key)
     total_elapsed = elapsed_seconds(started_at)
     record["enrichment"] = {"elapsed_seconds": round(total_elapsed, 1)}
@@ -1433,6 +1508,171 @@ def write_jsonl(path: Path, records: List[Dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8") as f:
         for record in records:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+class JsonlAppender:
+    """Append records to a JSONL file as they complete, flushing each one.
+
+    Enrichment used to hold every record in memory and write once at the end,
+    so a Ctrl-C or a failure in the final write threw away the whole run's
+    scraping — the expensive part. Each line is flushed and fsynced, so an
+    interrupted run leaves a valid, complete-as-far-as-it-got file.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._handle = self.path.open("w", encoding="utf-8")
+        self.count = 0
+
+    def append(self, record: Dict[str, Any]) -> None:
+        line = json.dumps(record, ensure_ascii=False)
+        with self._lock:
+            self._handle.write(line + "\n")
+            self._handle.flush()
+            os.fsync(self._handle.fileno())
+            self.count += 1
+
+    def close(self) -> None:
+        with self._lock:
+            if not self._handle.closed:
+                self._handle.close()
+
+    def __enter__(self) -> "JsonlAppender":
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        self.close()
+
+
+def build_enrichment_error_record(
+    row: Dict[str, str],
+    *,
+    error: str,
+    elapsed: float,
+    review_snapshot_store: ReviewSnapshotStore | None = None,
+    buyer_intent_ads_check: bool = False,
+) -> Dict[str, Any]:
+    """A record for a lead whose enrichment raised, so the lead is not lost.
+
+    `enrich_leads.main` built one of these inline while `make_search_batch` only
+    appended to its `errors` list and dropped the lead — the same failure with
+    two different outcomes depending on which entry point you happened to run.
+    A lead that failed to scrape still has a Google profile worth scoring, and
+    site_status "Unknown" says honestly that nothing was observed.
+    """
+    record: Dict[str, Any] = {
+        "google": row,
+        "website": {
+            "site_status": "Unknown",
+            "site_issue_flags": ["enrichment_exception"],
+            "error": error,
+            "pages": {},
+        },
+        "screenshots": {},
+        "derived": {},
+        "enrichment": {"elapsed_seconds": round(elapsed, 1), "error": error},
+    }
+    place_key = str(row.get("place_id") or row.get("place_id_or_unique_key") or "").strip()
+    if review_snapshot_store is not None and place_key:
+        record["review_count_history"] = review_snapshot_store.history(place_key)
+    record["evidence"] = build_evidence_profile(record)
+    build_buyer_intent(record, ads_check=buyer_intent_ads_check)
+    return record
+
+
+def resolve_per_lead_timeout(workers: int) -> float:
+    """Scale the per-lead ceiling to the number of concurrent workers.
+
+    PER_LEAD_ENRICH_TIMEOUT_SECONDS is a wall-clock budget, and it was
+    calibrated when leads ran one at a time, so wall-clock and work time were
+    the same thing. Under concurrency they are not: bandwidth, CPU for parsing
+    and the GIL inflate each lead's wall-clock without its actual work growing.
+    Measured on 20 real plumbing leads, two sites that finished comfortably
+    serially blew the 45s ceiling at 6 workers and were truncated mid-crawl —
+    one lost 4 pages and 12k of text, and gained a false
+    `manual_visual_review_needed` flag.
+
+    Scaling by the worker count keeps the invariant the ceiling was protecting:
+    the worst-case wall-clock for a whole run is no worse than the serial run it
+    replaced. MAX_PER_LEAD_ENRICH_TIMEOUT_SECONDS still stops one hung site from
+    holding a worker indefinitely.
+    """
+    if workers <= 1:
+        return PER_LEAD_ENRICH_TIMEOUT_SECONDS
+    return min(
+        PER_LEAD_ENRICH_TIMEOUT_SECONDS * workers, MAX_PER_LEAD_ENRICH_TIMEOUT_SECONDS
+    )
+
+
+def resolve_enrich_workers(*, browser_work: bool) -> int:
+    """How many leads to enrich at once.
+
+    Enrichment is pure I/O with a 45s per-lead timeout, so it ran one lead at a
+    time against a wall of network latency. Browser work is the exception: each
+    rendered check or screenshot launches its own Chromium, so six at once is a
+    memory problem rather than a throughput win. An explicit ENRICH_WORKERS is
+    always honoured — the cap only applies to the default.
+    """
+    explicit = os.getenv("ENRICH_WORKERS", "").strip()
+    if explicit:
+        return max(1, getenv_int("ENRICH_WORKERS", DEFAULT_ENRICH_WORKERS))
+    return DEFAULT_BROWSER_ENRICH_WORKERS if browser_work else DEFAULT_ENRICH_WORKERS
+
+
+def enrich_rows_concurrently(
+    rows: List[Dict[str, str]],
+    *,
+    workers: int,
+    enrich: Any,
+    on_complete: Any,
+) -> None:
+    """Enrich *rows* with a bounded pool, calling ``on_complete`` per finished lead.
+
+    ``on_complete(index, row, record, error, elapsed)`` runs on the main thread
+    in completion order, so callers do not need their own locking to log or
+    persist. Records therefore land in completion order, not input order.
+    """
+    total = len(rows)
+    if total == 0:
+        return
+    if workers <= 1:
+        for index, row in enumerate(rows, start=1):
+            started_at = time.monotonic()
+            try:
+                on_complete(index, row, enrich(row), "", elapsed_seconds(started_at))
+            except Exception as exc:
+                on_complete(index, row, None, str(exc), elapsed_seconds(started_at))
+        return
+
+    started_at_by_index: Dict[int, float] = {}
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
+        futures = {}
+        for index, row in enumerate(rows, start=1):
+            started_at_by_index[index] = time.monotonic()
+            futures[pool.submit(enrich, row)] = (index, row)
+        try:
+            for future in as_completed(futures):
+                index, row = futures[future]
+                elapsed = elapsed_seconds(started_at_by_index[index])
+                try:
+                    on_complete(index, row, future.result(), "", elapsed)
+                except Exception as exc:
+                    on_complete(index, row, None, str(exc), elapsed)
+        except KeyboardInterrupt:
+            # All rows are submitted up front, so the pool's default shutdown
+            # (wait=True, cancel_futures=False) would block here until every
+            # queued lead finishes -- the whole remaining batch, not just what
+            # is already running. cancel_futures drops anything not yet
+            # started so the interrupt is prompt; the up to `workers` leads
+            # already mid-enrichment are left to finish in the `finally`
+            # below, since a thread cannot be killed mid-request.
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+    finally:
+        pool.shutdown(wait=True)
 
 
 def main() -> int:
@@ -1461,6 +1701,15 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    # After parse_args, so --help works, and reported as an [ERROR] rather than
+    # an unhandled traceback — this fires on every run until the operator
+    # configures a suppression source, so it has to read as a config problem.
+    try:
+        suppression_index = load_configured_suppression_index()
+    except ComplianceError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+
     input_path = Path(args.input)
     output_path = Path(args.output)
     screenshots_dir = Path(args.screenshots_dir)
@@ -1476,7 +1725,12 @@ def main() -> int:
     if args.limit > 0:
         rows = rows[: args.limit]
 
-    rows = rows[:max_websites]
+    if len(rows) > max_websites:
+        # This used to truncate silently, so a run could drop leads with no
+        # trace. The cap counts every lead, not only those with a website,
+        # despite its name.
+        print(f"[STOP] Hit MAX_WEBSITES_PER_RUN={max_websites} (dropped {len(rows) - max_websites} leads)")
+        rows = rows[:max_websites]
 
     print(f"[INFO] Loaded {len(rows)} leads from {input_path}")
     print(f"[INFO] MAX_WEBSITES_PER_RUN={max_websites}")
@@ -1486,72 +1740,74 @@ def main() -> int:
     buyer_intent_ads_check = getenv_bool("BUYER_INTENT_ADS_CHECK", False)
     print(f"[INFO] Buyer-intent ads check={'on' if buyer_intent_ads_check else 'off'}")
 
-    records: List[Dict[str, Any]] = []
     review_snapshot_store = ReviewSnapshotStore(args.review_snapshot_db)
+    browser_work = not args.no_screenshots or args.rendered_form_check or args.rendered_site_check
+    workers = resolve_enrich_workers(browser_work=browser_work)
+    per_lead_timeout = resolve_per_lead_timeout(workers)
+    print(f"[INFO] Enrichment workers={workers} per_lead_timeout={per_lead_timeout:.0f}s")
 
-    for i, row in enumerate(rows, start=1):
-        name = row.get("business_name", "")
-        website = row.get("website_url", "")
-        lead_started_at = time.monotonic()
-        enriched: Dict[str, Any] | None = None
-        caught_error = ""
+    def enrich(row: Dict[str, str]) -> Dict[str, Any]:
+        return enrich_row(
+            row,
+            screenshots_dir,
+            take_shots=not args.no_screenshots,
+            rendered_form_check=args.rendered_form_check,
+            rendered_site_check=args.rendered_site_check,
+            buyer_intent_ads_check=buyer_intent_ads_check,
+            review_snapshot_store=review_snapshot_store,
+            suppression_index=suppression_index,
+            per_lead_timeout=per_lead_timeout,
+        )
 
-        print(f"[{i}/{len(rows)}] {name} | {website or 'NO WEBSITE'}")
+    # Records are written as they finish rather than accumulated, so an
+    # interrupted run keeps the scraping it already paid for.
+    with JsonlAppender(output_path) as appender:
+
+        def on_complete(
+            index: int,
+            row: Dict[str, str],
+            record: Dict[str, Any] | None,
+            error: str,
+            elapsed: float,
+        ) -> None:
+            name = row.get("business_name", "")
+            website = row.get("website_url", "")
+            if record is None:
+                print(f"[ERROR] Enrichment failed for {name}: {error}", file=sys.stderr)
+                record = build_enrichment_error_record(
+                    row,
+                    error=error,
+                    elapsed=elapsed,
+                    review_snapshot_store=review_snapshot_store,
+                    buyer_intent_ads_check=buyer_intent_ads_check,
+                )
+            appender.append(record)
+            reported = float(record.get("enrichment", {}).get("elapsed_seconds") or elapsed)
+            fields = enrichment_log_fields(record, fallback_error=error)
+            print(
+                f"[ENRICH {index}/{len(rows)}] {name or 'unknown'} "
+                f"elapsed={format_elapsed(reported)}s "
+                f"site_status={fields['site_status']} "
+                f"pages_checked={fields['pages_checked']} "
+                f"errors={fields['error']}",
+                flush=True,
+            )
+            if reported > SLOW_ENRICH_SECONDS:
+                print(
+                    f"[SLOW ENRICH] {name or 'unknown'} elapsed={format_elapsed(reported)}s website={website}",
+                    flush=True,
+                )
 
         try:
-            enriched = enrich_row(
-                row,
-                screenshots_dir,
-                take_shots=not args.no_screenshots,
-                rendered_form_check=args.rendered_form_check,
-                rendered_site_check=args.rendered_site_check,
-                buyer_intent_ads_check=buyer_intent_ads_check,
-                review_snapshot_store=review_snapshot_store,
+            enrich_rows_concurrently(rows, workers=workers, enrich=enrich, on_complete=on_complete)
+        except KeyboardInterrupt:
+            print(
+                f"[STOP] Interrupted; kept {appender.count} of {len(rows)} enriched leads in {output_path}",
+                file=sys.stderr,
             )
-            records.append(enriched)
+            return 1
 
-        except Exception as exc:
-            caught_error = str(exc)
-            print(f"[ERROR] Enrichment failed for {name}: {exc}", file=sys.stderr)
-            error_record = {
-                "google": row,
-                "website": {
-                    "site_status": "Unknown",
-                    "site_issue_flags": ["enrichment_exception"],
-                    "error": caught_error,
-                    "pages": {},
-                },
-                "screenshots": {},
-                "derived": {},
-                "enrichment": {"elapsed_seconds": round(elapsed_seconds(lead_started_at), 1), "error": caught_error},
-            }
-            place_key = str(row.get("place_id") or row.get("place_id_or_unique_key") or "").strip()
-            if place_key:
-                error_record["review_count_history"] = review_snapshot_store.history(place_key)
-            error_record["evidence"] = build_evidence_profile(error_record)
-            build_buyer_intent(error_record, ads_check=buyer_intent_ads_check)
-            error_record["enrichment"]["elapsed_seconds"] = round(elapsed_seconds(lead_started_at), 1)
-            records.append(error_record)
-            enriched = error_record
-
-        elapsed = float((enriched or {}).get("enrichment", {}).get("elapsed_seconds") or elapsed_seconds(lead_started_at))
-        fields = enrichment_log_fields(enriched or {}, fallback_error=caught_error)
-        print(
-            f"[ENRICH {i}/{len(rows)}] {name or 'unknown'} "
-            f"elapsed={format_elapsed(elapsed)}s "
-            f"site_status={fields['site_status']} "
-            f"pages_checked={fields['pages_checked']} "
-            f"errors={fields['error']}",
-            flush=True,
-        )
-        if elapsed > SLOW_ENRICH_SECONDS:
-            print(f"[SLOW ENRICH] {name or 'unknown'} elapsed={format_elapsed(elapsed)}s website={website}", flush=True)
-
-        time.sleep(0.2)
-
-    write_jsonl(output_path, records)
-
-    print(f"[DONE] Enriched leads: {len(records)}")
+    print(f"[DONE] Enriched leads: {appender.count}")
     print(f"[DONE] Wrote: {output_path}")
 
     return 0

@@ -32,5 +32,9 @@
       "Avon Lake OH",
       "Avon OH"
     ]
-  }
+  },
+  "service_area_terms": [
+    "northeast ohio",
+    "lorain county"
+  ]
 }

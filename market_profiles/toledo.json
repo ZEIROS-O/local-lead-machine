@@ -35,5 +35,11 @@
       "Waterville OH",
       "Bowling Green OH"
     ]
-  }
+  },
+  "service_area_terms": [
+    "northwest ohio",
+    "greater toledo",
+    "lucas county",
+    "wood county"
+  ]
 }

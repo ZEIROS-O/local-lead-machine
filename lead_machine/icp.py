@@ -4,19 +4,12 @@ from dataclasses import dataclass
 from typing import List
 
 from .schema import CanonicalLead
-from .verticals import (
-    HARDSCAPE_DENY_TERMS,
-    HARDSCAPE_FRANCHISE_DENYLIST,
-    HARDSCAPE_LOW_TICKET_TERMS,
-    CLEVELAND_METRO_TERMS,
-    resolve_profile,
-)
+from .verticals import resolve_profile
 
-
-FRANCHISE_DENYLIST = HARDSCAPE_FRANCHISE_DENYLIST
-MEDICAL_AESTHETIC_TERMS = HARDSCAPE_DENY_TERMS
-LOW_TICKET_TERMS = HARDSCAPE_LOW_TICKET_TERMS
-TARGET_GEO_TERMS = CLEVELAND_METRO_TERMS
+# The HARDSCAPE_*/CLEVELAND_METRO re-export aliases that used to sit here had no
+# callers. They dated from when hardscaping was the only vertical and named it
+# as the default for every gate; `resolve_profile` supplies the right terms per
+# lead now.
 
 
 @dataclass(frozen=True)
@@ -25,7 +18,16 @@ class GateResult:
     reasons: List[str]
 
 
-def hard_icp_gate(lead: CanonicalLead, *, enforce_target_geo: bool = False) -> GateResult:
+def hard_icp_gate(lead: CanonicalLead) -> GateResult:
+    """Vertical-level disqualifiers only; geography is not one of them.
+
+    An `enforce_target_geo` flag used to live here, checking the lead against a
+    Cleveland-only term list carried on every profile. No caller ever passed
+    True, and had one done so it would have rejected every lead in the other ten
+    metros. Geography is decided upstream by the search configs' geo slices and
+    assessed downstream by `scoring_v3`, which resolves the market properly and
+    raises `outside_target_geography` itself.
+    """
     profile = resolve_profile(lead.vertical, source_query=lead.source_query)
     text = " ".join(
         [
@@ -68,8 +70,5 @@ def hard_icp_gate(lead: CanonicalLead, *, enforce_target_geo: bool = False) -> G
         and lead.google_review_count > profile.max_reviews
     ):
         reasons.append("high_review_count")
-
-    if enforce_target_geo and not any(term in text for term in profile.geo_terms):
-        reasons.append("outside_target_geo")
 
     return GateResult(should_skip=bool(reasons), reasons=reasons)
