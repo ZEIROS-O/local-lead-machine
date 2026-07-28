@@ -73,6 +73,7 @@ REQUIRED_READINESS_FIELDS = {
     "Packet Tier",
     "Commercial Fit State",
     "Contact Eligibility",
+    "Status",
 }
 
 
@@ -81,10 +82,7 @@ def airtable_base_url(base_id: str, table: str) -> str:
 
 
 def build_formula(vertical: str) -> str:
-    formula = (
-        f"AND({queue_state.READINESS_FILTER_CLAUSES},"
-        "OR({Status}='New',{Status}='Mockup Needed')"
-    )
+    formula = f"AND({queue_state.QUEUE_FILTER_CLAUSES}"
     if vertical:
         escaped = vertical.replace("'", "\\'")
         formula += f",{{Vertical}}='{escaped}'"

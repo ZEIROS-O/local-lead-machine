@@ -17,6 +17,17 @@ class ReadinessClause:
         return f"{{{self.field}}}='{self.expected}'"
 
 
+@dataclass(frozen=True)
+class QueueStatusClause:
+    field: str
+    allowed: tuple[str, ...]
+    failure: str
+
+    @property
+    def airtable_condition(self) -> str:
+        return "OR(" + ",".join(f"{{{self.field}}}='{value}'" for value in self.allowed) + ")"
+
+
 READINESS_CLAUSES = (
     ReadinessClause("Packet Tier", "Sendable Packet", "Sendable must be Yes"),
     ReadinessClause(
@@ -30,16 +41,23 @@ READINESS_CLAUSES = (
         "Contact Eligibility must be contact-now",
     ),
 )
+QUEUE_STATUS_CLAUSE = QueueStatusClause(
+    "Status",
+    ("New", "Mockup Needed"),
+    "Status must be New or Mockup Needed",
+)
 
 READINESS_FILTER_CLAUSES = ",".join(
     clause.airtable_condition for clause in READINESS_CLAUSES
 )
 READINESS_FILTER_FORMULA = f"AND({READINESS_FILTER_CLAUSES})"
+QUEUE_FILTER_CLAUSES = f"{READINESS_FILTER_CLAUSES},{QUEUE_STATUS_CLAUSE.airtable_condition}"
+QUEUE_FILTER_FORMULA = f"AND({QUEUE_FILTER_CLAUSES})"
 
 
 def queue_state_formula() -> str:
     expression = '"Ready to Dial"'
-    for clause in reversed(READINESS_CLAUSES):
+    for clause in reversed((*READINESS_CLAUSES, QUEUE_STATUS_CLAUSE)):
         expression = f'IF({clause.airtable_condition},{expression},"Blocked: {clause.failure}")'
     return expression
 
@@ -49,6 +67,8 @@ def queue_state_for_row(row: Mapping[str, Any]) -> str:
     for clause in READINESS_CLAUSES:
         if str(row.get(clause.field) or "").strip() != clause.expected:
             return f"Blocked: {clause.failure}"
+    if str(row.get(QUEUE_STATUS_CLAUSE.field) or "").strip() not in QUEUE_STATUS_CLAUSE.allowed:
+        return f"Blocked: {QUEUE_STATUS_CLAUSE.failure}"
     return "Ready to Dial"
 
 

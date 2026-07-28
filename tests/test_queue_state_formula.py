@@ -31,12 +31,13 @@ class TestQueueStateFormulaCli(unittest.TestCase):
 
 
 class TestQueueStateFormula(unittest.TestCase):
-    def test_filter_formula_is_the_canonical_three_clause_expression(self):
+    def test_filter_formula_is_the_canonical_static_queue_expression(self):
         self.assertEqual(
-            getattr(queue_state, "READINESS_FILTER_FORMULA", None),
+            getattr(queue_state, "QUEUE_FILTER_FORMULA", None),
             "AND({Packet Tier}='Sendable Packet',"
             "{Commercial Fit State}='commercially-sendable',"
-            "{Contact Eligibility}='contact-now')",
+            "{Contact Eligibility}='contact-now',"
+            "OR({Status}='New',{Status}='Mockup Needed'))",
         )
 
     def test_generated_formula_reports_the_first_failed_clause(self):
@@ -44,7 +45,9 @@ class TestQueueStateFormula(unittest.TestCase):
             queue_state.queue_state_formula(),
             "IF({Packet Tier}='Sendable Packet',"
             "IF({Commercial Fit State}='commercially-sendable',"
-            "IF({Contact Eligibility}='contact-now',\"Ready to Dial\","
+            "IF({Contact Eligibility}='contact-now',"
+            "IF(OR({Status}='New',{Status}='Mockup Needed'),\"Ready to Dial\","
+            "\"Blocked: Status must be New or Mockup Needed\"),"
             "\"Blocked: Contact Eligibility must be contact-now\"),"
             "\"Blocked: Commercial Fit State must be commercially-sendable\"),"
             "\"Blocked: Sendable must be Yes\")",
@@ -69,7 +72,21 @@ class TestQueueStateFormula(unittest.TestCase):
             ),
         )
 
-    def test_python_formula_evaluator_matches_contact_readiness_failure_order(self):
+    def test_queue_status_clause_is_canonical(self):
+        clause = getattr(queue_state, "QUEUE_STATUS_CLAUSE", None)
+        if clause is None:
+            self.fail("QUEUE_STATUS_CLAUSE is required for static Airtable queue eligibility")
+        self.assertEqual(
+            (clause.field, clause.allowed, clause.failure, clause.airtable_condition),
+            (
+                "Status",
+                ("New", "Mockup Needed"),
+                "Status must be New or Mockup Needed",
+                "OR({Status}='New',{Status}='Mockup Needed')",
+            ),
+        )
+
+    def test_literal_queue_state_and_readiness_failure_matrix(self):
         evaluator = getattr(queue_state, "queue_state_for_row", None)
         if not callable(evaluator):
             self.fail("queue_state_for_row is required to evaluate formula logic in Python")
@@ -78,19 +95,40 @@ class TestQueueStateFormula(unittest.TestCase):
             "Packet Tier": "Sendable Packet",
             "Commercial Fit State": "commercially-sendable",
             "Contact Eligibility": "contact-now",
+            "Status": "New",
         }
         cases = (
-            ("packet tier", {"Packet Tier": "Manual Review Packet"}),
-            ("commercial fit", {"Commercial Fit State": "minor-fix/nurture"}),
-            ("contact eligibility", {"Contact Eligibility": "contact-after-asset"}),
-            ("all pass", {}),
+            (
+                "packet tier",
+                {"Packet Tier": "Manual Review Packet"},
+                ["Sendable must be Yes"],
+                "Blocked: Sendable must be Yes",
+            ),
+            (
+                "commercial fit",
+                {"Commercial Fit State": "minor-fix/nurture"},
+                ["Commercial Fit State must be commercially-sendable"],
+                "Blocked: Commercial Fit State must be commercially-sendable",
+            ),
+            (
+                "contact eligibility",
+                {"Contact Eligibility": "contact-after-asset"},
+                ["Contact Eligibility must be contact-now"],
+                "Blocked: Contact Eligibility must be contact-now",
+            ),
+            (
+                "status",
+                {"Status": "Sent"},
+                [],
+                "Blocked: Status must be New or Mockup Needed",
+            ),
+            ("all pass", {}, [], "Ready to Dial"),
         )
-        for name, overrides in cases:
+        for name, overrides, readiness_failures, queue_state_value in cases:
             with self.subTest(name=name):
                 row = {**ready, **overrides}
-                failures = contact_readiness_failures(row)
-                expected = "Ready to Dial" if not failures else f"Blocked: {failures[0]}"
-                self.assertEqual(evaluator(row), expected)
+                self.assertEqual(contact_readiness_failures(row), readiness_failures)
+                self.assertEqual(evaluator(row), queue_state_value)
 
     def test_sendability_uses_the_shared_commercial_clause_reason(self):
         clauses = list(queue_state.READINESS_CLAUSES)

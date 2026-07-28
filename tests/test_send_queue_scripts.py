@@ -36,11 +36,11 @@ def _response(status_code=200, payload=None, text=""):
 
 
 class TestBuildFormula(unittest.TestCase):
-    def test_formula_reads_the_shared_readiness_expression(self):
-        with patch.object(queue_state, "READINESS_FILTER_CLAUSES", "CANONICAL_READINESS", create=True):
+    def test_formula_reads_the_shared_static_queue_expression(self):
+        with patch.object(queue_state, "QUEUE_FILTER_CLAUSES", "CANONICAL_QUEUE", create=True):
             self.assertEqual(
                 qrs.build_formula(""),
-                "AND(CANONICAL_READINESS,OR({Status}='New',{Status}='Mockup Needed'))",
+                "AND(CANONICAL_QUEUE)",
             )
 
     def test_base_formula_without_vertical(self):
@@ -122,6 +122,16 @@ class TestFetchReadyRecords(unittest.TestCase):
         response = _response(
             422,
             text='{"error": {"message": "Unknown field name: \\"Contact Eligibility\\""}}',
+        )
+        with patch("requests.get", return_value=response) as mock_get:
+            with self.assertRaises(RuntimeError):
+                qrs.fetch_ready_records("app123", "Prospects", "tok")
+        self.assertEqual(mock_get.call_count, 1)
+
+    def test_missing_queue_status_field_fails_closed(self):
+        response = _response(
+            422,
+            text='{"error": {"message": "Unknown field name: \\"Status\\""}}',
         )
         with patch("requests.get", return_value=response) as mock_get:
             with self.assertRaises(RuntimeError):
