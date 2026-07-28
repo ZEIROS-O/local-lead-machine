@@ -293,7 +293,7 @@ def load_fields_config(path: Path) -> tuple[str, ...]:
 
 def resolve_cutover(args: argparse.Namespace) -> FieldCutover:
     """The cutover a CLI invocation asked for; the default when no override."""
-    if getattr(args, "fields", ""):
+    if getattr(args, "fields", None) is not None:
         return FieldCutover(plain=parse_field_list(args.fields))
     if getattr(args, "fields_config", None):
         return FieldCutover(plain=load_fields_config(args.fields_config))
@@ -439,7 +439,10 @@ def run_verify(args: argparse.Namespace) -> int:
         raise ValueError("snapshot table does not match configured Airtable table")
     # A CLI override wins; otherwise verify the set the snapshot was prepared
     # with (older snapshots predate the section and fall back to the default).
-    if getattr(args, "fields", "") or getattr(args, "fields_config", None):
+    if (
+        getattr(args, "fields", None) is not None
+        or getattr(args, "fields_config", None) is not None
+    ):
         cutover = resolve_cutover(args)
     else:
         cutover = cutover_from_snapshot(snapshot)
@@ -454,7 +457,7 @@ def _add_field_override_args(subparser: argparse.ArgumentParser) -> None:
     group = subparser.add_mutually_exclusive_group()
     group.add_argument(
         "--fields",
-        default="",
+        default=None,
         help="comma-separated field names to delete outright (backed up first); "
         "overrides the default Legacy* set",
     )

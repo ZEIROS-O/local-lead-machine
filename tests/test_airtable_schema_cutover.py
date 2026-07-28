@@ -18,6 +18,7 @@ from airtable_schema_cutover import (
     cutover_from_snapshot,
     fetch_records,
     load_fields_config,
+    main,
     parse_args,
     parse_field_list,
     prepare_cutover,
@@ -188,6 +189,29 @@ class FieldOverrideTest(unittest.TestCase):
             with self.subTest(bad=bad):
                 with self.assertRaises(ValueError):
                     parse_field_list(bad)
+
+    def test_cli_refuses_an_explicit_empty_fields_override(self) -> None:
+        args = [
+            "--base-id",
+            "appX",
+            "--table",
+            "Prospects",
+            "--token",
+            "pat",
+            "prepare",
+            "--fields",
+            "",
+        ]
+        with patch("airtable_schema_cutover.fetch_table_schema") as schema, patch(
+            "airtable_schema_cutover.fetch_records", return_value=[]
+        ):
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(args)
+
+        self.assertEqual(code, 2)
+        self.assertIn("--fields must name at least one field", stdout.getvalue())
+        schema.assert_not_called()
 
     def test_shipped_config_covers_this_cutovers_field_set(self) -> None:
         fields = load_fields_config(SHIPPED_CONFIG)
