@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""Back up and verify removal of redundant Airtable legacy fields.
+"""Back up and verify removal of fields from an Airtable table.
 
 This tool is deliberately read-only against Airtable. It prepares a local
 snapshot/checklist before manual schema deletion in the Airtable UI, then
 verifies that fields and records survived the cutover.
+
+The default cutover targets the redundant Legacy* fields below; any other
+field set can be backed up the same way via ``--fields`` or
+``--fields-config`` (see ``parse_args``).
 """
 
 from __future__ import annotations
@@ -12,6 +16,7 @@ import argparse
 import hashlib
 import json
 import os
+from dataclasses import dataclass, field as dataclass_field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -42,8 +47,38 @@ LEGACY_ORPHAN_FIELDS = (
 )
 
 
+@dataclass(frozen=True)
+class FieldCutover:
+    """The set of fields one cutover deletes.
+
+    ``pairs`` maps a legacy column to the canonical column its values must
+    already live in; deletion is refused until the two reconcile. ``plain``
+    fields have no canonical half: they are backed up and deleted outright,
+    and their populated-row counts are reported so the operator sees how
+    much data the deletion drops.
+    """
+
+    pairs: dict[str, str] = dataclass_field(default_factory=dict)
+    plain: tuple[str, ...] = ()
+
+    @property
+    def delete_fields(self) -> list[str]:
+        return [*self.pairs, *self.plain]
+
+    @property
+    def canonical_fields(self) -> list[str]:
+        return list(self.pairs.values())
+
+    @property
+    def backup_fields(self) -> list[str]:
+        return ["Place Key", *self.delete_fields, *self.canonical_fields]
+
+
+DEFAULT_CUTOVER = FieldCutover(dict(LEGACY_FIELD_PAIRS), LEGACY_ORPHAN_FIELDS)
+
+
 def all_legacy_fields() -> list[str]:
-    return [*LEGACY_FIELD_PAIRS, *LEGACY_ORPHAN_FIELDS]
+    return DEFAULT_CUTOVER.delete_fields
 
 
 def schema_field_names(schema: dict[str, Any]) -> set[str]:
@@ -63,27 +98,29 @@ def comparable(field: str, value: Any) -> str:
 
 
 def prepare_cutover(
-    schema: dict[str, Any], records: list[dict[str, Any]]
+    schema: dict[str, Any],
+    records: list[dict[str, Any]],
+    cutover: FieldCutover = DEFAULT_CUTOVER,
 ) -> dict[str, Any]:
     names = schema_field_names(schema)
-    missing_legacy = sorted(set(all_legacy_fields()) - names)
-    missing_canonical = sorted(set(LEGACY_FIELD_PAIRS.values()) - names)
-    legacy_only = {field: [] for field in LEGACY_FIELD_PAIRS}
-    conflicts = {field: [] for field in LEGACY_FIELD_PAIRS}
-    orphan_populated = {field: 0 for field in LEGACY_ORPHAN_FIELDS}
+    missing_legacy = sorted(set(cutover.delete_fields) - names)
+    missing_canonical = sorted(set(cutover.canonical_fields) - names)
+    legacy_only = {field: [] for field in cutover.pairs}
+    conflicts = {field: [] for field in cutover.pairs}
+    orphan_populated = {field: 0 for field in cutover.plain}
     for record in records:
         fields = record.get("fields") or {}
         if not isinstance(fields, dict):
             fields = {}
         record_id = str(record.get("id") or "<missing-record-id>")
-        for legacy, current in LEGACY_FIELD_PAIRS.items():
+        for legacy, current in cutover.pairs.items():
             old = comparable(legacy, fields.get(legacy))
             new = comparable(legacy, fields.get(current))
             if old and not new:
                 legacy_only[legacy].append(record_id)
             elif old and new and old != new:
                 conflicts[legacy].append(record_id)
-        for orphan in LEGACY_ORPHAN_FIELDS:
+        for orphan in cutover.plain:
             if comparable(orphan, fields.get(orphan)):
                 orphan_populated[orphan] += 1
     populated_legacy_only = {key: value for key, value in legacy_only.items() if value}
@@ -104,7 +141,10 @@ def prepare_cutover(
 
 
 def verify_cutover(
-    snapshot: dict[str, Any], schema: dict[str, Any], record_count: int
+    snapshot: dict[str, Any],
+    schema: dict[str, Any],
+    record_count: int,
+    cutover: FieldCutover = DEFAULT_CUTOVER,
 ) -> list[str]:
     names = schema_field_names(schema)
     errors: list[str] = []
@@ -113,10 +153,11 @@ def verify_cutover(
         errors.append(
             f"record count changed: expected {expected_count}, found {record_count}"
         )
-    remaining = sorted(set(all_legacy_fields()) & names)
+    remaining = sorted(set(cutover.delete_fields) & names)
     if remaining:
-        errors.append("legacy fields still present: " + ", ".join(remaining))
-    missing_current = sorted(set(LEGACY_FIELD_PAIRS.values()) - names)
+        label = "legacy fields" if cutover is DEFAULT_CUTOVER else "cutover fields"
+        errors.append(f"{label} still present: " + ", ".join(remaining))
+    missing_current = sorted(set(cutover.canonical_fields) - names)
     if missing_current:
         errors.append("canonical fields missing: " + ", ".join(missing_current))
     return errors
@@ -200,8 +241,10 @@ def write_text_atomic(path: Path, value: str) -> None:
     temporary.replace(path)
 
 
-def backup_records(records: list[dict[str, Any]]) -> dict[str, Any]:
-    names = ["Place Key", *all_legacy_fields(), *LEGACY_FIELD_PAIRS.values()]
+def backup_records(
+    records: list[dict[str, Any]], cutover: FieldCutover = DEFAULT_CUTOVER
+) -> dict[str, Any]:
+    names = cutover.backup_fields
     return {
         "records": [
             {
@@ -214,6 +257,70 @@ def backup_records(records: list[dict[str, Any]]) -> dict[str, Any]:
             for record in records
         ]
     }
+
+
+def parse_field_list(value: str) -> tuple[str, ...]:
+    """Parse a comma-separated ``--fields`` value into exact field names."""
+    fields = tuple(
+        dict.fromkeys(part.strip() for part in value.split(",") if part.strip())
+    )
+    if not fields:
+        raise ValueError("--fields must name at least one field")
+    return fields
+
+
+def load_fields_config(path: Path) -> tuple[str, ...]:
+    """Load a JSON fields config: an object with a non-empty ``fields`` list."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"cannot read fields config {path}: {exc}") from exc
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"fields config {path} is not valid JSON: {exc}") from exc
+    if not isinstance(value, dict) or not isinstance(value.get("fields"), list):
+        raise ValueError(
+            f'fields config {path} must be a JSON object with a "fields" list'
+        )
+    fields = value["fields"]
+    if not fields or not all(isinstance(item, str) and item.strip() for item in fields):
+        raise ValueError(
+            f'fields config {path} "fields" must name at least one non-empty string'
+        )
+    return tuple(dict.fromkeys(item.strip() for item in fields))
+
+
+def resolve_cutover(args: argparse.Namespace) -> FieldCutover:
+    """The cutover a CLI invocation asked for; the default when no override."""
+    if getattr(args, "fields", ""):
+        return FieldCutover(plain=parse_field_list(args.fields))
+    if getattr(args, "fields_config", None):
+        return FieldCutover(plain=load_fields_config(args.fields_config))
+    return DEFAULT_CUTOVER
+
+
+def cutover_from_snapshot(snapshot: dict[str, Any]) -> FieldCutover:
+    """The cutover recorded in a snapshot; the default for older snapshots."""
+    stored = snapshot.get("cutover")
+    if stored is None:
+        return DEFAULT_CUTOVER
+    if not isinstance(stored, dict):
+        raise ValueError("snapshot cutover section must be an object")
+    pairs = stored.get("pairs")
+    plain = stored.get("plain")
+    if (
+        not isinstance(pairs, dict)
+        or not all(
+            isinstance(k, str) and k.strip() and isinstance(v, str) and v.strip()
+            for k, v in pairs.items()
+        )
+        or not isinstance(plain, list)
+        or not all(isinstance(item, str) and item.strip() for item in plain)
+        or not (pairs or plain)
+    ):
+        raise ValueError("snapshot cutover section is malformed")
+    return FieldCutover(dict(pairs), tuple(plain))
 
 
 def _credentials(args: argparse.Namespace) -> tuple[str, str, str]:
@@ -249,18 +356,21 @@ def _timestamp() -> str:
 
 def run_prepare(args: argparse.Namespace) -> int:
     base_id, table, token = _credentials(args)
+    cutover = resolve_cutover(args)
     schema = fetch_table_schema(base_id, table, token)
-    paired_fields = ["Place Key", *all_legacy_fields(), *LEGACY_FIELD_PAIRS.values()]
-    records = fetch_records(base_id, str(schema.get("id") or table), token, paired_fields)
-    report = prepare_cutover(schema, records)
+    records = fetch_records(
+        base_id, str(schema.get("id") or table), token, cutover.backup_fields
+    )
+    report = prepare_cutover(schema, records, cutover)
     output_dir = args.output_dir or Path("run_state/airtable_schema_cutover") / _timestamp()
     backup_path = output_dir / "backup.json"
-    backup = backup_records(records)
+    backup = backup_records(records, cutover)
     write_json_atomic(backup_path, backup)
     snapshot = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "base_id": base_id,
         "table": {"id": schema.get("id", ""), "name": schema.get("name", "")},
+        "cutover": {"pairs": dict(cutover.pairs), "plain": list(cutover.plain)},
         "record_count": len(records),
         "fields": [
             {"id": field.get("id", ""), "name": field.get("name", "")}
@@ -274,20 +384,20 @@ def run_prepare(args: argparse.Namespace) -> int:
     write_json_atomic(snapshot_path, snapshot)
     if report["safe_to_delete"]:
         checklist = [
-            "# Airtable legacy field deletion checklist",
+            "# Airtable field deletion checklist",
             "",
             "Delete these fields manually in the Airtable UI:",
             "",
-            *[f"- [ ] `{name}`" for name in all_legacy_fields()],
+            *[f"- [ ] `{name}`" for name in cutover.delete_fields],
             "",
         ]
         orphan_counts = report.get("orphan_populated_counts") or {}
         if orphan_counts:
             checklist += [
-                "## Read before deleting the orphans",
+                "## Read before deleting",
                 "",
-                "These have no canonical column left to migrate into, so deleting them",
-                f"drops their values from Airtable. `{backup_path.name}` is the only copy.",
+                "These fields have no canonical column to migrate into, so deleting",
+                f"them drops their values from Airtable. `{backup_path.name}` is the only copy.",
                 "",
                 *[
                     f"- `{name}` holds data on {count} of {len(records)} records"
@@ -327,16 +437,37 @@ def run_verify(args: argparse.Namespace) -> int:
     }
     if not configured_matches_snapshot:
         raise ValueError("snapshot table does not match configured Airtable table")
+    # A CLI override wins; otherwise verify the set the snapshot was prepared
+    # with (older snapshots predate the section and fall back to the default).
+    if getattr(args, "fields", "") or getattr(args, "fields_config", None):
+        cutover = resolve_cutover(args)
+    else:
+        cutover = cutover_from_snapshot(snapshot)
     schema = fetch_table_schema(base_id, table, token)
     records = fetch_records(base_id, str(schema.get("id") or table), token, fields=[])
-    errors = verify_cutover(snapshot, schema, len(records))
+    errors = verify_cutover(snapshot, schema, len(records), cutover)
     print(json.dumps({"ok": not errors, "errors": errors}, indent=2))
     return 0 if not errors else 2
 
 
+def _add_field_override_args(subparser: argparse.ArgumentParser) -> None:
+    group = subparser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--fields",
+        default="",
+        help="comma-separated field names to delete outright (backed up first); "
+        "overrides the default Legacy* set",
+    )
+    group.add_argument(
+        "--fields-config",
+        type=Path,
+        help='path to a JSON object with a "fields" list, same effect as --fields',
+    )
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Prepare and verify manual Airtable legacy-field deletion (GET-only)."
+        description="Prepare and verify manual Airtable field deletion (GET-only)."
     )
     parser.add_argument("--base-id", default="")
     parser.add_argument("--table", default="")
@@ -344,8 +475,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     subparsers = parser.add_subparsers(dest="command", required=True)
     prepare = subparsers.add_parser("prepare")
     prepare.add_argument("--output-dir", type=Path)
+    _add_field_override_args(prepare)
     verify = subparsers.add_parser("verify")
     verify.add_argument("snapshot", type=Path)
+    _add_field_override_args(verify)
     return parser.parse_args(argv)
 
 

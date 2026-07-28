@@ -1,0 +1,24 @@
+{
+  "description": "Fields removed from the Prospects table in the 2026-07 CRM rebuild. Snapshot with: .venv/bin/python airtable_schema_cutover.py prepare --fields-config airtable_cutover_fields_2026-07.json",
+  "fields": [
+    "Commercial Materiality",
+    "Recurring Consequence",
+    "Root Cause Confidence",
+    "Packageable Solution",
+    "Value Mechanism",
+    "Beyond Free Fix",
+    "Self Fix Risk",
+    "Intentionality",
+    "Evidence Snapshot",
+    "Form Strength",
+    "Recommended Action",
+    "Asset ID",
+    "Asset Verifier Verdict",
+    "Sales — Stage",
+    "Sales — Attempts",
+    "Sales — Last Activity",
+    "Sales — Opener Arm",
+    "Sales — Consent to Text",
+    "Sales — Notes"
+  ]
+}

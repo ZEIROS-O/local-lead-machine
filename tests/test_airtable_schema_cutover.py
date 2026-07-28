@@ -1,20 +1,42 @@
 from __future__ import annotations
 
+import contextlib
+import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from airtable_schema_cutover import (
+    DEFAULT_CUTOVER,
     LEGACY_FIELD_PAIRS,
     LEGACY_ORPHAN_FIELDS,
+    FieldCutover,
     all_legacy_fields,
     backup_records,
+    cutover_from_snapshot,
     fetch_records,
+    load_fields_config,
+    parse_args,
+    parse_field_list,
     prepare_cutover,
+    resolve_cutover,
+    run_prepare,
+    run_verify,
     verify_cutover,
     write_json_atomic,
 )
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SHIPPED_CONFIG = REPO_ROOT / "airtable_cutover_fields_2026-07.json"
+
+
+def json_response(payload: dict) -> MagicMock:
+    response = MagicMock()
+    response.raise_for_status.return_value = None
+    response.json.return_value = payload
+    return response
 
 
 def schema_with_all_pairs() -> dict:
@@ -154,6 +176,255 @@ class AirtableSchemaCutoverTest(unittest.TestCase):
             write_json_atomic(path, {"ok": True})
             self.assertEqual(path.read_text(encoding="utf-8"), '{\n  "ok": true\n}\n')
             self.assertFalse((path.parent / ".snapshot.json.tmp").exists())
+
+
+class FieldOverrideTest(unittest.TestCase):
+    def test_parse_field_list_strips_dedupes_and_requires_a_name(self) -> None:
+        self.assertEqual(
+            parse_field_list("Form Strength, Asset ID ,Form Strength"),
+            ("Form Strength", "Asset ID"),
+        )
+        for bad in ("", " , ,"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    parse_field_list(bad)
+
+    def test_shipped_config_covers_this_cutovers_field_set(self) -> None:
+        fields = load_fields_config(SHIPPED_CONFIG)
+        self.assertEqual(
+            fields,
+            (
+                "Commercial Materiality",
+                "Recurring Consequence",
+                "Root Cause Confidence",
+                "Packageable Solution",
+                "Value Mechanism",
+                "Beyond Free Fix",
+                "Self Fix Risk",
+                "Intentionality",
+                "Evidence Snapshot",
+                "Form Strength",
+                "Recommended Action",
+                "Asset ID",
+                "Asset Verifier Verdict",
+                "Sales — Stage",
+                "Sales — Attempts",
+                "Sales — Last Activity",
+                "Sales — Opener Arm",
+                "Sales — Consent to Text",
+                "Sales — Notes",
+            ),
+        )
+
+    def test_load_fields_config_rejects_bad_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaises(ValueError):
+                load_fields_config(root / "missing.json")
+            cases = {
+                "not_json.json": "{nope",
+                "list.json": '["A"]',
+                "wrong_type.json": '{"fields": "A"}',
+                "empty.json": '{"fields": []}',
+                "blank.json": '{"fields": ["  "]}',
+                "non_string.json": '{"fields": ["A", 3]}',
+            }
+            for name, content in cases.items():
+                with self.subTest(name=name):
+                    path = root / name
+                    path.write_text(content, encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        load_fields_config(path)
+
+    def test_resolve_cutover_defaults_and_overrides(self) -> None:
+        args = parse_args(["prepare"])
+        self.assertIs(resolve_cutover(args), DEFAULT_CUTOVER)
+        args = parse_args(["prepare", "--fields", "Asset ID, Form Strength"])
+        self.assertEqual(
+            resolve_cutover(args), FieldCutover({}, ("Asset ID", "Form Strength"))
+        )
+        args = parse_args(["prepare", "--fields-config", str(SHIPPED_CONFIG)])
+        self.assertEqual(
+            resolve_cutover(args), FieldCutover({}, load_fields_config(SHIPPED_CONFIG))
+        )
+
+    def test_field_override_args_are_mutually_exclusive(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parse_args(["prepare", "--fields", "A", "--fields-config", "x.json"])
+
+    def test_prepare_with_plain_fields_reports_populated_but_never_blocks(self) -> None:
+        cutover = FieldCutover(plain=("Form Strength", "Asset ID"))
+        schema = {
+            "fields": [
+                {"id": "f1", "name": "Place Key"},
+                {"id": "f2", "name": "Form Strength"},
+                {"id": "f3", "name": "Asset ID"},
+            ]
+        }
+        records = [
+            {"id": "rec1", "fields": {"Form Strength": "weak", "Asset ID": "a1"}},
+            {"id": "rec2", "fields": {}},
+        ]
+        report = prepare_cutover(schema, records, cutover)
+        self.assertTrue(report["safe_to_delete"])
+        self.assertEqual(
+            report["orphan_populated_counts"], {"Form Strength": 1, "Asset ID": 1}
+        )
+        self.assertEqual(report["legacy_only"], {})
+        self.assertEqual(report["conflicts"], {})
+
+    def test_prepare_refuses_an_overridden_field_missing_from_the_schema(self) -> None:
+        # Typo protection: silently backing up nothing would lose the values.
+        cutover = FieldCutover(plain=("Form Strenth",))
+        report = prepare_cutover(schema_with_all_pairs(), [], cutover)
+        self.assertFalse(report["safe_to_delete"])
+        self.assertEqual(report["missing_legacy_fields"], ["Form Strenth"])
+
+    def test_backup_includes_plain_fields(self) -> None:
+        cutover = FieldCutover(plain=("Asset ID",))
+        records = [{"id": "rec1", "fields": {"Place Key": "p1", "Asset ID": "a1"}}]
+        backup = backup_records(records, cutover)
+        self.assertEqual(backup["records"][0]["Asset ID"], "a1")
+        self.assertNotIn("Send Trigger", backup["records"][0])
+
+    def test_verify_with_plain_fields_checks_absence_not_canonicals(self) -> None:
+        cutover = FieldCutover(plain=("Asset ID",))
+        surviving = {"fields": [{"id": "f1", "name": "Asset ID"}]}
+        errors = verify_cutover({"record_count": 1}, surviving, 1, cutover)
+        self.assertIn("cutover fields still present: Asset ID", errors)
+        deleted = {"fields": [{"id": "f1", "name": "Place Key"}]}
+        self.assertEqual(verify_cutover({"record_count": 1}, deleted, 1, cutover), [])
+
+    def test_cutover_from_snapshot_round_trips_and_validates(self) -> None:
+        self.assertIs(cutover_from_snapshot({}), DEFAULT_CUTOVER)
+        stored = {"cutover": {"pairs": {"Legacy A": "A"}, "plain": ["B"]}}
+        self.assertEqual(cutover_from_snapshot(stored), FieldCutover({"Legacy A": "A"}, ("B",)))
+        for bad in (
+            {"cutover": "B"},
+            {"cutover": {"pairs": {}, "plain": []}},
+            {"cutover": {"pairs": [], "plain": []}},
+            {"cutover": {"pairs": {"A": 1}, "plain": []}},
+            {"cutover": {"pairs": {}, "plain": [1]}},
+        ):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    cutover_from_snapshot(bad)
+
+    def test_prepare_with_fields_override_stays_get_only(self) -> None:
+        schema_payload = {
+            "tables": [
+                {
+                    "id": "tblX",
+                    "name": "Prospects",
+                    "fields": [
+                        {"id": "f1", "name": "Place Key"},
+                        {"id": "f2", "name": "Form Strength"},
+                        {"id": "f3", "name": "Asset ID"},
+                    ],
+                }
+            ]
+        }
+        records_payload = {
+            "records": [
+                {
+                    "id": "rec1",
+                    "fields": {"Place Key": "p1", "Form Strength": "weak", "Asset ID": "a1"},
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            args = parse_args(
+                [
+                    "--base-id", "appX",
+                    "--table", "Prospects",
+                    "--token", "pat",
+                    "prepare",
+                    "--fields", "Form Strength, Asset ID",
+                    "--output-dir", tmp,
+                ]
+            )
+            with patch("airtable_schema_cutover.requests") as mock_requests:
+                mock_requests.get.side_effect = [
+                    json_response(schema_payload),
+                    json_response(records_payload),
+                ]
+                with contextlib.redirect_stdout(io.StringIO()):
+                    code = run_prepare(args)
+            self.assertEqual(code, 0)
+            mock_requests.get.assert_called()
+            for verb in ("post", "put", "patch", "delete"):
+                getattr(mock_requests, verb).assert_not_called()
+            # The fetch asked Airtable for exactly the override's backup fields.
+            params = mock_requests.get.call_args_list[1].kwargs["params"]
+            self.assertEqual(
+                [value for key, value in params if key == "fields[]"],
+                ["Place Key", "Form Strength", "Asset ID"],
+            )
+            snapshot = json.loads((Path(tmp) / "pre_cutover.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                snapshot["cutover"], {"pairs": {}, "plain": ["Form Strength", "Asset ID"]}
+            )
+            backup = json.loads((Path(tmp) / "backup.json").read_text(encoding="utf-8"))
+            self.assertEqual(backup["records"][0]["Form Strength"], "weak")
+            checklist = (Path(tmp) / "delete_checklist.md").read_text(encoding="utf-8")
+            self.assertIn("- [ ] `Form Strength`", checklist)
+            self.assertIn("- [ ] `Asset ID`", checklist)
+
+    def _run_verify(self, tmp: str, schema_fields: list[str]) -> tuple[int, MagicMock]:
+        snapshot_path = Path(tmp) / "pre_cutover.json"
+        snapshot_path.write_text(
+            json.dumps(
+                {
+                    "base_id": "appX",
+                    "table": {"id": "tblX", "name": "Prospects"},
+                    "record_count": 1,
+                    "cutover": {"pairs": {}, "plain": ["Asset ID"]},
+                }
+            ),
+            encoding="utf-8",
+        )
+        args = parse_args(
+            [
+                "--base-id", "appX",
+                "--table", "Prospects",
+                "--token", "pat",
+                "verify",
+                str(snapshot_path),
+            ]
+        )
+        schema_payload = {
+            "tables": [
+                {
+                    "id": "tblX",
+                    "name": "Prospects",
+                    "fields": [
+                        {"id": f"f{i}", "name": name}
+                        for i, name in enumerate(schema_fields, start=1)
+                    ],
+                }
+            ]
+        }
+        with patch("airtable_schema_cutover.requests") as mock_requests:
+            mock_requests.get.side_effect = [
+                json_response(schema_payload),
+                json_response({"records": [{"id": "rec1"}]}),
+            ]
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = run_verify(args)
+        return code, mock_requests
+
+    def test_verify_uses_the_snapshot_cutover_and_stays_get_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            code, mock_requests = self._run_verify(tmp, ["Place Key"])
+        self.assertEqual(code, 0)
+        for verb in ("post", "put", "patch", "delete"):
+            getattr(mock_requests, verb).assert_not_called()
+
+    def test_verify_fails_while_a_snapshot_field_survives(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            code, _ = self._run_verify(tmp, ["Place Key", "Asset ID"])
+        self.assertEqual(code, 2)
 
 
 if __name__ == "__main__":
