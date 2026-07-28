@@ -27,6 +27,7 @@ except ModuleNotFoundError:
 
 from lead_machine.airtable_sync import resolve_vertical_label
 from lead_machine.compliance import is_mark_sent_source_status
+from lead_machine import queue_state
 from lead_machine.sendability import is_contact_ready
 
 
@@ -51,22 +52,11 @@ DISPLAY_FIELDS = [
     "Opener",
     "Safe Outreach Claims",
     "Evidence Refs",
-    "Evidence Snapshot",
     "Commercial Fit State",
-    "Commercial Materiality",
-    "Recurring Consequence",
-    "Root Cause Confidence",
     "LPM Offer Component",
-    "Packageable Solution",
-    "Value Mechanism",
-    "Beyond Free Fix",
-    "Self Fix Risk",
-    "Intentionality",
     "Contact Eligibility",
     "Asset State",
     "Promise State",
-    "Asset ID",
-    "Asset Verifier Verdict",
     "Outreach Channel",
     "Consent Posture",
     "Mockup URL",
@@ -92,8 +82,7 @@ def airtable_base_url(base_id: str, table: str) -> str:
 
 def build_formula(vertical: str) -> str:
     formula = (
-        "AND({Packet Tier}='Sendable Packet',"
-        "{Commercial Fit State}='commercially-sendable',{Contact Eligibility}='contact-now',"
+        f"AND({queue_state.READINESS_FILTER_CLAUSES},"
         "OR({Status}='New',{Status}='Mockup Needed')"
     )
     if vertical:
@@ -111,9 +100,10 @@ def fetch_ready_records(base_id: str, table: str, token: str, *, vertical: str =
     headers = {"Authorization": f"Bearer {token}"}
 
     # A column that exists in DISPLAY_FIELDS but not (yet) in the base 422s the
-    # whole query; drop it with a warning instead so the morning queue degrades
-    # to an empty value rather than a dead digest.
+    # whole query. Keep the queue available before the schema rollout, but make
+    # every missing expected field explicit once the probe has finished.
     requested = list(DISPLAY_FIELDS)
+    missing_display_fields: List[str] = []
     while True:
         params: List[tuple[str, Any]] = [("filterByFormula", build_formula(vertical))]
         for field in requested:
@@ -128,10 +118,19 @@ def fetch_ready_records(base_id: str, table: str, token: str, *, vertical: str =
             and match.group(1) in requested
             and match.group(1) not in REQUIRED_READINESS_FIELDS
         ):
-            print(f"[WARN] Airtable has no column '{match.group(1)}'; querying without it", file=sys.stderr)
+            missing_display_fields.append(match.group(1))
             requested.remove(match.group(1))
             continue
         raise RuntimeError(f"Airtable list failed {probe.status_code}: {probe.text[:1000]}")
+
+    if missing_display_fields:
+        missing = ", ".join(repr(field) for field in missing_display_fields)
+        print(
+            "[WARN] Airtable schema mismatch: expected display field(s) missing: "
+            f"{missing}. Continuing without them for this read-only queue query; "
+            "update the Airtable schema or DISPLAY_FIELDS.",
+            file=sys.stderr,
+        )
 
     params = [("filterByFormula", build_formula(vertical))]
     for field in requested:

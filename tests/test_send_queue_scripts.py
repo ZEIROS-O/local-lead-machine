@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 
 import mark_sent
 import query_ready_to_send as qrs
+from lead_machine import queue_state
 from lead_machine import sendability
 
 
@@ -35,6 +36,13 @@ def _response(status_code=200, payload=None, text=""):
 
 
 class TestBuildFormula(unittest.TestCase):
+    def test_formula_reads_the_shared_readiness_expression(self):
+        with patch.object(queue_state, "READINESS_FILTER_CLAUSES", "CANONICAL_READINESS", create=True):
+            self.assertEqual(
+                qrs.build_formula(""),
+                "AND(CANONICAL_READINESS,OR({Status}='New',{Status}='Mockup Needed'))",
+            )
+
     def test_base_formula_without_vertical(self):
         formula = qrs.build_formula("")
         self.assertEqual(
@@ -50,6 +58,24 @@ class TestBuildFormula(unittest.TestCase):
 
 
 class TestFetchReadyRecords(unittest.TestCase):
+    def test_display_fields_exclude_removed_machine_reasoning_columns(self):
+        removed = {
+            "Commercial Materiality",
+            "Recurring Consequence",
+            "Root Cause Confidence",
+            "Packageable Solution",
+            "Value Mechanism",
+            "Beyond Free Fix",
+            "Self Fix Risk",
+            "Intentionality",
+            "Evidence Snapshot",
+            "Form Strength",
+            "Recommended Action",
+            "Asset ID",
+            "Asset Verifier Verdict",
+        }
+        self.assertFalse(removed & set(qrs.DISPLAY_FIELDS))
+
     def test_paginates_and_sorts_by_priority_then_score(self):
         page1 = {
             "records": [
@@ -83,6 +109,7 @@ class TestFetchReadyRecords(unittest.TestCase):
 
         self.assertEqual(records, [])
         self.assertIn("Safe Outreach Claims", captured.getvalue())
+        self.assertIn("Airtable schema mismatch", captured.getvalue())
         final_fields = [v for k, v in mock_get.call_args.kwargs.get("params", mock_get.call_args[1]["params"]) if k == "fields[]"]
         self.assertNotIn("Safe Outreach Claims", final_fields)
 

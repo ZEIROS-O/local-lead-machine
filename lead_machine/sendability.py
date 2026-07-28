@@ -11,6 +11,7 @@ from .buyer_signals import (
     money_signal_state,
     review_demand_band,
 )
+from . import queue_state
 from .score_schema import (
     ASSET_STATES,
     COMMERCIAL_FIT_STATES,
@@ -517,13 +518,13 @@ def contact_readiness_failures(row: Dict[str, Any]) -> List[str]:
     failures: List[str] = []
     sendable, packet_eligible = readiness_flags(row)
     if sendable.casefold() != "yes":
-        failures.append("Sendable must be Yes")
+        failures.append(queue_state.READINESS_CLAUSES[0].failure)
     if packet_eligible.casefold() != "yes":
         failures.append("Packet Eligible must be Yes")
-    if _pick(row, "Commercial Fit State", "commercial_fit_state").strip().casefold() != "commercially-sendable":
-        failures.append("Commercial Fit State must be commercially-sendable")
-    if _pick(row, "Contact Eligibility", "contact_eligibility").strip().casefold() != "contact-now":
-        failures.append("Contact Eligibility must be contact-now")
+    for clause in queue_state.READINESS_CLAUSES[1:]:
+        snake_case = clause.field.casefold().replace(" ", "_")
+        if _pick(row, clause.field, snake_case).strip().casefold() != clause.expected.casefold():
+            failures.append(clause.failure)
     return failures
 
 
