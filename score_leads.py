@@ -62,7 +62,12 @@ from lead_machine.scoring_rules import SHARED_SENDABILITY_RULES
 from lead_machine.scoring_v3 import attach_scoring_v3
 from lead_machine.sendability import apply_sendability, normalize_evidence_refs
 from lead_machine.scoring_profiles import market_service_area_terms
-from lead_machine.verticals import VERTICAL_PROFILES, VerticalProfile, resolve_profile
+from lead_machine.verticals import (
+    VERTICAL_PROFILES,
+    VerticalProfile,
+    matches_any_term,
+    resolve_profile,
+)
 from make_llm_batch import score_file_for_record
 
 
@@ -567,7 +572,7 @@ def infer_vertical(record: Dict[str, Any], fallback: str) -> str:
     matches = [
         candidate
         for candidate in VERTICAL_PROFILES.values()
-        if any(term in text for term in candidate.batch_terms)
+        if matches_any_term(text, candidate.batch_terms)
     ]
     if len(matches) == 1:
         return matches[0].label

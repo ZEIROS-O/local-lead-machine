@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
-from typing import Mapping
+from functools import lru_cache
+from typing import Iterable, Mapping
 
 
 @dataclass(frozen=True)
@@ -344,6 +346,189 @@ PLUMBING_FRANCHISE_DENYLIST = (
     "zoom drain",
 )
 
+# Every term here names a coating *job*, never the bare material. "epoxy" and
+# "concrete" on their own belong to resin hobbyists and to hardscapers
+# respectively, and `_infer_profile_key`/`infer_vertical` match by substring —
+# so a one-word term would pull both into this vertical.
+EPOXY_BATCH_TERMS = (
+    "epoxy flooring",
+    "epoxy floor",
+    "garage floor epoxy",
+    "garage floor coating",
+    "concrete floor coating",
+    "concrete coating",
+    "polyaspartic floor coating",
+    "polyurea floor coating",
+    "metallic epoxy",
+    "industrial floor coating",
+)
+
+EPOXY_SERVICE_TERMS = (
+    *EPOXY_BATCH_TERMS,
+    "epoxy floor contractor",
+    "concrete coating contractor",
+    "commercial epoxy flooring",
+    "shop floor coating",
+    "warehouse floor coating",
+    "basement floor coating",
+    "floor resurfacing",
+    "concrete polishing",
+    "flake floor",
+)
+
+# Mirrors `vertical_profiles/epoxy.json`'s boost list, which the live epoxy
+# batches were built from — generate_search_config now sources boost terms from
+# here, so drifting from it would silently re-cut the queries that are already
+# running.
+EPOXY_HIGH_TICKET_TERMS = (
+    "epoxy flooring",
+    "garage floor epoxy",
+    "garage floor coating",
+    "concrete floor coating",
+    "polyaspartic floor coating",
+    "polyurea floor coating",
+    "epoxy floor contractor",
+    "concrete coating contractor",
+    "commercial epoxy flooring",
+    "industrial floor coating",
+    "decorative concrete coatings",
+    "metallic epoxy flooring",
+)
+
+# Resin retail, countertop/craft work and the big boxes. They rank for the same
+# queries as a floor-coating contractor and buy nothing.
+EPOXY_DENY_TERMS = (
+    "resin art",
+    "epoxy supplies",
+    "epoxy supply",
+    "epoxy resin store",
+    "countertop epoxy",
+    "epoxy countertops",
+    "diy kit",
+    "powder coating",
+    "auto ceramic coating",
+    "flooring store",
+    "home depot",
+    "lowe's",
+    "lowes",
+    "menards",
+)
+
+EPOXY_LOW_TICKET_TERMS = (
+    "floor stripping",
+    "floor waxing",
+    "carpet cleaning",
+    "janitorial",
+    "pressure washing",
+    "junk removal",
+    "handyman",
+)
+
+EPOXY_FRANCHISE_DENYLIST = (
+    "garageexperts",
+    "garage experts",
+    "garage force",
+    "premiergarage",
+    "premier garage",
+    "tailored living",
+    "granite garage floors",
+    "concrete craft",
+    "footprints floors",
+)
+
+ROOFING_BATCH_TERMS = (
+    "roofing",
+    "roofing contractor",
+    "roof replacement",
+    "roof repair",
+    "metal roofing",
+    "storm damage roof",
+    "commercial roofing",
+    "shingle roof",
+    "flat roof",
+)
+
+ROOFING_SERVICE_TERMS = (
+    *ROOFING_BATCH_TERMS,
+    "roof inspection",
+    "siding",
+    "gutters",
+    "gutter installation",
+    "soffit",
+    "fascia",
+    "skylight",
+    "storm damage restoration",
+    "insurance claim",
+    "exterior remodeling",
+)
+
+# Mirrors `vertical_profiles/roofing.json`'s boost list, and matches the roofing
+# terms that were living inside HARDSCAPE_HIGH_TICKET_TERMS back when roofing
+# resolved to the hardscaping profile.
+ROOFING_HIGH_TICKET_TERMS = (
+    "roofing",
+    "roof replacement",
+    "roof repair",
+    "metal roofing",
+    "storm damage",
+    "insurance claim",
+    "commercial roofing",
+    "siding",
+    "gutter",
+)
+
+# Supply houses and lumber yards, not contractors. Each entry qualifies
+# "roofing" with a retail word, so `hard_icp_gate` — which matches this list
+# against text that already contains the lead's own vertical name — does not
+# skip every roofer for saying "roofing".
+ROOFING_DENY_TERMS = (
+    "roofing supplies",
+    "roofing supply",
+    "roofing wholesale",
+    "diy roofing",
+    "home depot",
+    "lowe's",
+    "lowes",
+    "menards",
+    "84 lumber",
+    "abc supply",
+    "beacon building products",
+)
+
+ROOFING_LOW_TICKET_TERMS = (
+    "roof cleaning",
+    "moss removal",
+    "gutter cleaning",
+    "pressure washing",
+    "handyman",
+    "junk removal",
+    "snow removal",
+    "christmas lights",
+)
+
+# Written out rather than reused from HARDSCAPE_FRANCHISE_DENYLIST even though
+# they overlap: that list is only exterior-remodel franchises because roofing
+# used to resolve to the hardscaping profile, and pruning it is a separate change
+# that must not silently empty this one.
+ROOFING_FRANCHISE_DENYLIST = (
+    "storm guard",
+    "mr. roof",
+    "mr roof",
+    "erie home",
+    "erie construction",
+    "power home",
+    "leaffilter",
+    "leaf filter",
+    "renewal by andersen",
+    "west shore",
+    "long roofing",
+    "groundworks",
+    "window world",
+    "roof maxx",
+    "1-800-hansons",
+    "1800 hansons",
+)
+
 
 VERTICAL_PROFILES: Mapping[str, VerticalProfile] = {
     "hardscaping": VerticalProfile(
@@ -438,11 +623,114 @@ VERTICAL_PROFILES: Mapping[str, VerticalProfile] = {
         min_reviews=5,
         max_reviews=None,
     ),
+    "epoxy": VerticalProfile(
+        key="epoxy",
+        label="Epoxy Flooring",
+        family="epoxy",
+        batch_terms=EPOXY_BATCH_TERMS,
+        service_terms=EPOXY_SERVICE_TERMS,
+        high_ticket_terms=EPOXY_HIGH_TICKET_TERMS,
+        deny_terms=EPOXY_DENY_TERMS,
+        low_ticket_terms=EPOXY_LOW_TICKET_TERMS,
+        franchise_denylist=EPOXY_FRANCHISE_DENYLIST,
+        exclude_terms=(),
+        aliases=(
+            "epoxy",
+            "epoxy flooring",
+            "epoxy floors",
+            "epoxy floor coating",
+            "garage floor coating",
+            "garage floor coatings",
+            "concrete coating",
+            "concrete coatings",
+            "floor coating",
+            "floor coatings",
+        ),
+        # Must equal `vertical_profiles/epoxy.json`'s min_reviews: that file is
+        # what generate_search_config writes into the search config (the
+        # search-time floor) while `icp.hard_icp_gate` reads this one (the
+        # score-time floor). Two numbers here means a lead can be searched for
+        # and then skipped, or skipped before it is ever searched.
+        min_reviews=10,
+        max_reviews=None,
+    ),
+    "roofing": VerticalProfile(
+        key="roofing",
+        label="Roofing",
+        family="roofing",
+        batch_terms=ROOFING_BATCH_TERMS,
+        service_terms=ROOFING_SERVICE_TERMS,
+        high_ticket_terms=ROOFING_HIGH_TICKET_TERMS,
+        deny_terms=ROOFING_DENY_TERMS,
+        low_ticket_terms=ROOFING_LOW_TICKET_TERMS,
+        franchise_denylist=ROOFING_FRANCHISE_DENYLIST,
+        exclude_terms=(),
+        aliases=(
+            "roofing",
+            "roofer",
+            "roofers",
+            "roofing contractor",
+            "roofing company",
+            "roof replacement",
+            "roof repair",
+        ),
+        # Kept in step with `vertical_profiles/roofing.json` for the same reason
+        # as epoxy above: search-time and score-time read different files.
+        min_reviews=10,
+        max_reviews=None,
+    ),
 }
+
+
+# Not a member of VERTICAL_PROFILES: it is the *absence* of a vertical, and the
+# registry is iterated (search-config generation, Airtable label maps, display
+# inference) as the list of niches we actually prospect.
+UNRESOLVED_PROFILE = VerticalProfile(
+    key="",
+    label="",
+    family="",
+    batch_terms=(),
+    service_terms=(),
+    high_ticket_terms=(),
+    deny_terms=(),
+    low_ticket_terms=(),
+    franchise_denylist=(),
+    exclude_terms=(),
+)
 
 
 def clean_vertical_label(value: str) -> str:
     return " ".join(str(value or "").strip().lower().replace("_", " ").replace("-", " ").split())
+
+
+@lru_cache(maxsize=4096)
+def _left_boundary_pattern(term: str) -> "re.Pattern[str]":
+    return re.compile(rf"(?<![a-z0-9]){re.escape(term)}")
+
+
+def matches_term(text: str, term: str) -> bool:
+    """Does *text* contain *term* as the start of a word?
+
+    Plain `term in text` reads a term that is merely the TAIL of a longer word
+    as a hit. That is not hypothetical: "roofing" is a suffix of
+    "waterproofing", so every basement/foundation waterproofing business
+    matched ROOFING_BATCH_TERMS and was classified — and written to Airtable —
+    as roofing. "sunroofing" and "sunroof repair" land the same way.
+
+    The boundary is deliberately LEFT-ONLY. Requiring a right boundary too
+    would be the obvious `\\b...\\b`, but it would silently stop "gutter"
+    matching "gutters" and "paver" matching "pavers"; these lists are written
+    in the singular and rely on suffix growth. A term that is a prefix of a
+    longer word is nearly always the same trade ("roofing" -> "roofings"),
+    while a term that is a suffix of one usually is not ("waterproofing").
+    """
+    if not term:
+        return False
+    return _left_boundary_pattern(term).search(text) is not None
+
+
+def matches_any_term(text: str, terms: Iterable[str]) -> bool:
+    return any(matches_term(text, term) for term in terms)
 
 
 PROFILE_ALIAS_TO_KEY: Mapping[str, str] = {
@@ -454,10 +742,26 @@ PROFILE_ALIAS_TO_KEY: Mapping[str, str] = {
 
 
 def resolve_profile(vertical: str, *, source_query: str = "", fallback: str = "hardscaping") -> VerticalProfile:
-    for candidate in (_normalize_key(vertical), _infer_profile_key(source_query), _normalize_key(fallback)):
+    """Resolve a lead to its profile; `fallback=""` means "do not guess".
+
+    The last line used to hand back hardscaping unconditionally, which ignored
+    the one thing an empty fallback is for. Scoring v3 asks with `fallback=""`
+    because it needs the exact vertical it was given or nothing — its
+    "exact vertical and market are required" guard was unreachable while an
+    unknown niche silently arrived as hardscaping and got scored against
+    hardscaping's terms and thresholds.
+
+    Refusing returns `UNRESOLVED_PROFILE` rather than None so the return type
+    stays a VerticalProfile: callers read `.key` straight off the result, and a
+    keyless profile surfaces the refusal as an empty key instead of an
+    AttributeError. Any non-empty fallback still ends at hardscaping exactly as
+    before.
+    """
+    fallback_key = _normalize_key(fallback)
+    for candidate in (_normalize_key(vertical), _infer_profile_key(source_query), fallback_key):
         if candidate in VERTICAL_PROFILES:
             return VERTICAL_PROFILES[candidate]
-    return VERTICAL_PROFILES["hardscaping"]
+    return VERTICAL_PROFILES["hardscaping"] if fallback_key else UNRESOLVED_PROFILE
 
 
 def _normalize_key(value: str) -> str:
@@ -490,12 +794,19 @@ def _infer_profile_key(source_query: str) -> str:
     text = str(source_query or "").strip().lower().replace("_", " ")
     if not text:
         return ""
-    if any(term in text for term in DETAILING_TERMS):
+    if matches_any_term(text, DETAILING_TERMS):
         return "detailing"
-    if any(term in text for term in WATER_RESTORATION_TERMS):
+    if matches_any_term(text, WATER_RESTORATION_TERMS):
         return "water_restoration"
-    if any(term in text for term in GARAGE_DOOR_TERMS):
+    if matches_any_term(text, GARAGE_DOOR_TERMS):
         return "garage_doors"
-    if any(term in text for term in HARDSCAPE_BATCH_TERMS + HARDSCAPE_SERVICE_TERMS):
+    # Both of these must be tested before hardscaping: "concrete floor coating"
+    # contains "concrete" and hardscaping claims that word, so an epoxy query
+    # would resolve to hardscaping if the order were reversed.
+    if matches_any_term(text, EPOXY_BATCH_TERMS):
+        return "epoxy"
+    if matches_any_term(text, ROOFING_BATCH_TERMS):
+        return "roofing"
+    if matches_any_term(text, HARDSCAPE_BATCH_TERMS + HARDSCAPE_SERVICE_TERMS):
         return "hardscaping"
     return ""

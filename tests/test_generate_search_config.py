@@ -53,7 +53,8 @@ class GenerateSearchConfigTest(unittest.TestCase):
         self.assertEqual(len(cfg["geo_slices"]), 6)
         self.assertIn("Cleveland OH", cfg["geo_slices"])
         self.assertNotIn("Akron OH", cfg["geo_slices"])  # full-only slice excluded
-        # epoxy is not in verticals.py -> boost/exclude come from the JSON profile.
+        # epoxy IS in verticals.py now, so boost/exclude come from there — the
+        # JSON profile's own exclude_terms are merged in rather than replaced.
         self.assertIn("metallic epoxy flooring", cfg["boost_terms"])
         self.assertIn("resin art", cfg["exclude_terms"])
         self.assertEqual(cfg["min_rating"], 4.3)
@@ -197,6 +198,81 @@ class GenerateSearchConfigTest(unittest.TestCase):
         )
         self.assertIn("plumbing supply", cfg["exclude_terms"])
         self.assertIn("roto-rooter", cfg["exclude_terms"])
+
+    def test_generate_roofing_cleveland_medium(self) -> None:
+        path = self._generate(vertical="roofing", market="cleveland", size="medium")
+        self.assertEqual(path.name, "roofing_cleveland_medium_001.json")
+        cfg = self._load(path)
+        self.assertEqual(cfg["vertical"], "roofing")
+        self.assertEqual(cfg["airtable_vertical"], "Roofing")
+        self.assertIn("roof replacement Cleveland OH", cfg["queries"])
+        self.assertEqual(len(cfg["geo_slices"]), 6)
+        self.assertEqual(cfg["min_rating"], 4.3)
+        self.assertEqual(cfg["min_reviews"], 10)
+        self.assertEqual(
+            cfg["boost_terms"],
+            list(VERTICAL_PROFILES["roofing"].high_ticket_terms),
+        )
+        # Supply houses (deny) and low-ticket roof work both get excluded.
+        self.assertIn("abc supply", cfg["exclude_terms"])
+        self.assertIn("gutter cleaning", cfg["exclude_terms"])
+
+    def test_the_checked_in_roofing_config_still_matches_a_fresh_generation(self) -> None:
+        # roofing_cleveland_medium_001.json was generated, not hand-authored, so
+        # it must survive regeneration byte-for-byte. If this fails, either the
+        # config was edited by hand or verticals.py/roofing.json drifted apart.
+        generated = self._generate(vertical="roofing", market="cleveland", size="medium")
+        checked_in = REPO_ROOT / "search_configs" / "roofing_cleveland_medium_001.json"
+
+        self.assertEqual(generated.read_text(encoding="utf-8"), checked_in.read_text(encoding="utf-8"))
+
+    def test_a_canonical_verticals_review_floor_comes_from_one_number(self) -> None:
+        # The generated config's min_reviews is read from the JSON profile while
+        # `icp.hard_icp_gate` reads VerticalProfile.min_reviews. epoxy and roofing
+        # shipped 10 in the JSON and 8 in verticals.py, so the same lead could be
+        # searched for and then skipped for having too few reviews. One number.
+        for vertical in ("epoxy", "roofing", "detailing", "garage_doors", "plumbing", "water_restoration"):
+            with self.subTest(vertical=vertical):
+                path = self._generate(vertical=vertical, market="cleveland", size="medium")
+                cfg = self._load(path)
+                self.assertEqual(cfg["min_reviews"], VERTICAL_PROFILES[vertical].min_reviews)
+
+    def test_epoxy_exclude_terms_are_the_canonical_deny_plus_low_ticket_plus_json(self) -> None:
+        # Pinned deliberately: once epoxy joined verticals.py, regeneration went
+        # from the JSON's 7 exclude terms to 21. The extra 14 are exactly the
+        # deny + low-ticket terms `icp.hard_icp_gate` already skips as
+        # `low_ticket_economics`, so search-time now refuses to pay for leads
+        # score-time would throw away. The three live epoxy_cleveland_medium_*
+        # configs still carry the old 7 and are stale relative to this.
+        path = self._generate(vertical="epoxy", market="cleveland", size="medium")
+        cfg = self._load(path)
+        profile = VERTICAL_PROFILES["epoxy"]
+        json_excludes = json.loads(
+            (REAL_VERTICAL_DIR / "epoxy.json").read_text(encoding="utf-8")
+        )["exclude_terms"]
+
+        self.assertEqual(len(cfg["exclude_terms"]), 21)
+        self.assertEqual(
+            set(cfg["exclude_terms"]),
+            set(profile.deny_terms) | set(profile.low_ticket_terms) | set(json_excludes),
+        )
+        # Boost terms are untouched by the merge — still the canonical 12.
+        self.assertEqual(cfg["boost_terms"], list(profile.high_ticket_terms))
+
+    def test_no_exclude_term_can_cancel_the_batchs_own_queries(self) -> None:
+        # `make_search_batch.prefilter_row` matches exclude terms against a text
+        # blob that includes source_query and source_geo. An exclude term that is
+        # a substring of the batch's own queries or geos would drop every
+        # unboosted row in the batch — the failure mode that makes widening the
+        # exclude list dangerous.
+        for vertical in ("epoxy", "roofing"):
+            with self.subTest(vertical=vertical):
+                path = self._generate(vertical=vertical, market="cleveland", size="medium")
+                cfg = self._load(path)
+                haystacks = [q.lower() for q in cfg["queries"]] + [g.lower() for g in cfg["geo_slices"]]
+                for term in cfg["exclude_terms"]:
+                    for haystack in haystacks:
+                        self.assertNotIn(term.lower(), haystack)
 
     def test_refreshes_geo_slices_file(self) -> None:
         self._generate(vertical="epoxy", market="cleveland", size="small")

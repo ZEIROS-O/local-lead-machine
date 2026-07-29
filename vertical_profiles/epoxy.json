@@ -47,5 +47,5 @@
   ],
   "min_rating": 4.3,
   "min_reviews": 10,
-  "notes": "Target high-ticket garage/commercial/industrial floor coating contractors; deny retail resin/supply/countertop/DIY noise. Not yet in lead_machine/verticals.py, so boost + exclude terms are sourced from this profile until a VerticalProfile is added there."
+  "notes": "Target high-ticket garage/commercial/industrial floor coating contractors; deny retail resin/supply/countertop/DIY noise. epoxy now has a VerticalProfile in lead_machine/verticals.py, so generate_search_config sources boost terms from there and merges its deny + low-ticket terms on top of the exclude_terms below. min_reviews must stay equal to that profile's min_reviews: this file sets the search-time floor, verticals.py sets the score-time floor."
 }

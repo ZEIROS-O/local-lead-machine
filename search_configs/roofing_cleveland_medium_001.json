@@ -1,0 +1,62 @@
+{
+  "batch": "roofing_cleveland_medium_001",
+  "vertical": "roofing",
+  "location": "Cleveland OH",
+  "limit_per_query": 20,
+  "page_size": 20,
+  "max_pages_per_query": 2,
+  "queries": [
+    "roofing contractor Cleveland OH",
+    "roof replacement Cleveland OH",
+    "roof repair Cleveland OH",
+    "metal roofing Cleveland OH",
+    "storm damage roof Cleveland OH",
+    "commercial roofing Cleveland OH",
+    "insurance claim roof Cleveland OH"
+  ],
+  "geo_slices": [
+    "Cleveland OH",
+    "Cleveland east side OH",
+    "Cleveland west side OH",
+    "Lakewood OH",
+    "Parma OH",
+    "Strongsville OH"
+  ],
+  "geo_slices_ref": "cleveland",
+  "min_rating": 4.3,
+  "min_reviews": 10,
+  "allow_missing_website": true,
+  "exclude_terms": [
+    "roofing supplies",
+    "roofing supply",
+    "roofing wholesale",
+    "diy roofing",
+    "home depot",
+    "lowe's",
+    "lowes",
+    "menards",
+    "84 lumber",
+    "abc supply",
+    "beacon building products",
+    "roof cleaning",
+    "moss removal",
+    "gutter cleaning",
+    "pressure washing",
+    "handyman",
+    "junk removal",
+    "snow removal",
+    "christmas lights"
+  ],
+  "boost_terms": [
+    "roofing",
+    "roof replacement",
+    "roof repair",
+    "metal roofing",
+    "storm damage",
+    "insurance claim",
+    "commercial roofing",
+    "siding",
+    "gutter"
+  ],
+  "airtable_vertical": "Roofing"
+}
