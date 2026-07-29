@@ -63,12 +63,12 @@ def hard_icp_gate(lead: CanonicalLead) -> GateResult:
     ):
         reasons.append("too_few_reviews")
 
-    if (
-        lead.website
-        and profile.max_reviews is not None
-        and lead.google_review_count is not None
-        and lead.google_review_count > profile.max_reviews
-    ):
-        reasons.append("high_review_count")
-
+    # There is no upper bound. `detailing` carried max_reviews=130 and raised a
+    # `high_review_count` skip above it, which read a busy business as a bad fit.
+    # It is the opposite: reviews are the demand signal this offer is sold on,
+    # and the one booked call to date (2026-07-28) was a 222-review garage-door
+    # business pitched on missed-call text-back — a lead the ceiling would have
+    # thrown away. Maturity is banded, not gated: `buyer_signals`'
+    # REVIEW_DEMAND_THRESHOLDS is the separate axis that decides how much visible
+    # pain an established business has to show before it is worth contacting.
     return GateResult(should_skip=bool(reasons), reasons=reasons)

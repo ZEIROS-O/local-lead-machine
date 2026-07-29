@@ -35,6 +35,7 @@ from .airtable_sync import (
 )
 from .email_hygiene import clean_airtable_email
 from .schema import normalize_phone
+from .sendability import MANUAL_CARD_UNVERIFIED_BLOCKER, admit
 from .verticals import clean_vertical_label
 
 
@@ -592,12 +593,21 @@ def build_manual_lead_card(
     if not no_llm and openai_api_key:
         llm_fields = extract_with_openai(raw_text, openai_api_key, model=openai_model)
 
+    # The operator flag says whether there is anything to admit; `admit` says
+    # whether it may be. Hand-entering a lead used to skip sendability entirely
+    # and write the verdict itself, which is a second sendable path — and one
+    # that never saw the hard ICP gate.
+    admission = admit(
+        {**regex_fields, **llm_fields},
+        () if sendable else (MANUAL_CARD_UNVERIFIED_BLOCKER,),
+    )
+
     defaults = {
         "Vertical": vertical,
         "Status": status or "Manual Review",
         "Packet Eligible": "Yes",
-        "Sendable": "Yes" if sendable else "No",
-        "Packet Tier": "Sendable Packet" if sendable else "Manual Review Packet",
+        "Sendable": admission.sendable_flag,
+        "Packet Tier": "Sendable Packet" if admission.admitted else "Manual Review Packet",
         "Lead Priority": "C",
         "AI Confidence": "medium" if llm_fields else "low",
         "Recommended Action": "Manual review before sending",

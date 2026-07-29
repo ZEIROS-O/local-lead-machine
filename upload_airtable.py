@@ -35,6 +35,9 @@ from lead_machine.sendability import (
     PACKET_TIER_MANUAL,
     PACKET_TIER_NONE,
     PACKET_TIER_SENDABLE,
+    SCORER_WITHHELD_BLOCKER,
+    admit,
+    hard_icp_skip_blockers,
     is_contact_ready,
 )
 
@@ -254,13 +257,24 @@ def truthy_yes(value: Any) -> bool:
 
 
 def is_sendable_record(record: Dict[str, Any]) -> bool:
+    """Readiness for upload, re-derived through `admit` rather than trusted.
+
+    A packet card's `sendable` is a snapshot of what the scorer decided, and this
+    is the last read before the record reaches Airtable. The hard ICP verdict is
+    re-checked here for the same reason suppression is re-checked at every stage
+    that can still stop a lead: a scored row carries it in Raw Evidence, and a
+    stage that only reads a stored boolean cannot notice when the two disagree.
+    """
     fields = record.get("airtable_fields") or record
     readiness = dict(fields)
     if record.get("sendable") is not None:
-        readiness.setdefault("Sendable", "Yes" if truthy_yes(record.get("sendable")) else "No")
+        blockers = () if truthy_yes(record.get("sendable")) else (SCORER_WITHHELD_BLOCKER,)
+        readiness.setdefault("Sendable", admit(record, blockers).sendable_flag)
     if record.get("packet_eligible") is not None:
         readiness.setdefault("Packet Eligible", "Yes" if truthy_yes(record.get("packet_eligible")) else "No")
-    return is_contact_ready(readiness)
+    # Unconditional, unlike the setdefault above: a row that already carries
+    # Sendable=Yes from an older CSV would otherwise keep it.
+    return not hard_icp_skip_blockers(record) and is_contact_ready(readiness)
 
 
 def clean_cell(value: Any) -> str:

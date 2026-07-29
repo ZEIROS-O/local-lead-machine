@@ -58,7 +58,7 @@ class GenerateSearchConfigTest(unittest.TestCase):
         self.assertIn("metallic epoxy flooring", cfg["boost_terms"])
         self.assertIn("resin art", cfg["exclude_terms"])
         self.assertEqual(cfg["min_rating"], 4.3)
-        self.assertEqual(cfg["min_reviews"], 10)
+        self.assertEqual(cfg["min_reviews"], 8)
         # page_size defaults to 20; limit_per_query mirrors it for legacy readers;
         # medium depth = 2 pages per query.
         self.assertEqual(cfg["page_size"], 20)
@@ -111,7 +111,7 @@ class GenerateSearchConfigTest(unittest.TestCase):
             self.assertIn(f"water damage restoration {cfg['location']}", cfg["queries"])
             self.assertIn(primary_geo, cfg["geo_slices"])
             self.assertEqual(cfg["min_rating"], 4.3)
-            self.assertEqual(cfg["min_reviews"], 10)
+            self.assertEqual(cfg["min_reviews"], 8)
 
             canonical = list(VERTICAL_PROFILES["water_restoration"].high_ticket_terms)
             self.assertEqual(cfg["boost_terms"], canonical)
@@ -139,7 +139,7 @@ class GenerateSearchConfigTest(unittest.TestCase):
             self.assertIn(f"water damage restoration {cfg['location']}", cfg["queries"])
             self.assertIn(primary_geo, cfg["geo_slices"])
             self.assertEqual(cfg["min_rating"], 4.3)
-            self.assertEqual(cfg["min_reviews"], 10)
+            self.assertEqual(cfg["min_reviews"], 8)
 
             canonical = list(VERTICAL_PROFILES["water_restoration"].high_ticket_terms)
             self.assertEqual(cfg["boost_terms"], canonical)
@@ -174,7 +174,7 @@ class GenerateSearchConfigTest(unittest.TestCase):
             self.assertIn(f"garage door repair {cfg['location']}", cfg["queries"])
             self.assertIn(primary_geo, cfg["geo_slices"])
             self.assertEqual(cfg["min_rating"], 4.3)
-            self.assertEqual(cfg["min_reviews"], 10)
+            self.assertEqual(cfg["min_reviews"], 8)
 
             canonical = list(VERTICAL_PROFILES["garage_doors"].high_ticket_terms)
             self.assertEqual(cfg["boost_terms"], canonical)
@@ -191,7 +191,10 @@ class GenerateSearchConfigTest(unittest.TestCase):
         self.assertEqual(len(cfg["geo_slices"]), 6)
         self.assertEqual(cfg["max_pages_per_query"], 2)
         self.assertEqual(cfg["min_rating"], 4.3)
-        self.assertEqual(cfg["min_reviews"], 5)
+        # 8, not the 5 plumbing used to carry alone. The floor is one number for
+        # every vertical now, and a per-vertical exception is exactly the drift
+        # the two-surface floor test exists to stop.
+        self.assertEqual(cfg["min_reviews"], 8)
         self.assertEqual(
             cfg["boost_terms"],
             list(VERTICAL_PROFILES["plumbing"].high_ticket_terms),
@@ -208,7 +211,7 @@ class GenerateSearchConfigTest(unittest.TestCase):
         self.assertIn("roof replacement Cleveland OH", cfg["queries"])
         self.assertEqual(len(cfg["geo_slices"]), 6)
         self.assertEqual(cfg["min_rating"], 4.3)
-        self.assertEqual(cfg["min_reviews"], 10)
+        self.assertEqual(cfg["min_reviews"], 8)
         self.assertEqual(
             cfg["boost_terms"],
             list(VERTICAL_PROFILES["roofing"].high_ticket_terms),
@@ -221,10 +224,22 @@ class GenerateSearchConfigTest(unittest.TestCase):
         # roofing_cleveland_medium_001.json was generated, not hand-authored, so
         # it must survive regeneration byte-for-byte. If this fails, either the
         # config was edited by hand or verticals.py/roofing.json drifted apart.
+        #
+        # min_reviews is the one exempt field. Regenerating a live config changes
+        # what we pay Places for, so the floor move to 8 is sequenced by the
+        # operator and every checked-in config still carries the floor it was cut
+        # with. Rebasing that single number keeps the drift check on everything
+        # else, and stops exempting anything the moment the config is regenerated.
         generated = self._generate(vertical="roofing", market="cleveland", size="medium")
         checked_in = REPO_ROOT / "search_configs" / "roofing_cleveland_medium_001.json"
 
-        self.assertEqual(generated.read_text(encoding="utf-8"), checked_in.read_text(encoding="utf-8"))
+        checked_in_text = checked_in.read_text(encoding="utf-8")
+        rebased = checked_in_text.replace(
+            f'"min_reviews": {json.loads(checked_in_text)["min_reviews"]},',
+            f'"min_reviews": {VERTICAL_PROFILES["roofing"].min_reviews},',
+        )
+
+        self.assertEqual(generated.read_text(encoding="utf-8"), rebased)
 
     def test_a_canonical_verticals_review_floor_comes_from_one_number(self) -> None:
         # The generated config's min_reviews is read from the JSON profile while

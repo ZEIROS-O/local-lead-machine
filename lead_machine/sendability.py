@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Sequence, Set
 
 from .buyer_signals import (
@@ -53,9 +54,16 @@ SAFE_CLAIM_REF_BLOCKER = "Safe outreach claim missing evidence reference"
 INVALID_REF_BLOCKER = "Invalid evidence reference"
 COMMERCIAL_FIT_BLOCKER = "Commercial fit gate failed"
 CONTACT_ELIGIBILITY_BLOCKER = "Contact eligibility is not contact-now"
+HARD_ICP_SKIP_BLOCKER = "Hard ICP gate skipped this lead"
+# The two non-scoring paths that used to mint their own verdict, expressed as
+# blockers so they go through `admit` like everything else.
+SCORER_WITHHELD_BLOCKER = "Scorer did not mark this lead sendable"
+MANUAL_CARD_UNVERIFIED_BLOCKER = "Manual lead card not marked sendable by the operator"
+PACKET_TIER_NOT_SENDABLE_BLOCKER = "Packet Tier is not the sendable tier"
 
 EVIDENCE_BLOCKERS = {
     HARD_DISQUALIFIER_BLOCKER,
+    HARD_ICP_SKIP_BLOCKER,
     CONVERSION_ISSUE_BLOCKER,
     SEND_TRIGGER_BLOCKER,
     VISIBLE_PAIN_BLOCKER,
@@ -365,6 +373,70 @@ def flatten_unsafe_claims(value: Any) -> str:
     return "; ".join(normalize_unsafe_claims(value))
 
 
+def hard_icp_skip_blockers(row: Dict[str, Any]) -> List[str]:
+    """The enricher's ICP verdict, read off wherever a scored row still carries it.
+
+    `hard_icp_skip` is not a column. `enrich_leads` writes it to
+    `derived.hard_icp_skip` on the enriched record, and both scorers dump that
+    whole record into `Raw Evidence` before calling `apply_sendability` — so the
+    verdict is already on every scored row and needs no new field, only a reader.
+
+    Fails closed on an unparseable verdict. `make_llm_batch` raises on one because
+    a malformed batch is worth stopping; here a raise would take down a whole
+    scoring run over one hand-edited row, and refusing to send is the same answer
+    at lower cost. Absent or explicitly false is the only clearance.
+    """
+    derived = row.get("derived")
+    if not isinstance(derived, dict):
+        derived = _raw_evidence(row).get("derived")
+    if not isinstance(derived, dict):
+        return []
+
+    skip = derived.get("hard_icp_skip")
+    if skip is None or skip is False or skip == "":
+        return []
+
+    reasons = derived.get("hard_icp_reasons")
+    if not isinstance(reasons, (list, tuple)):
+        reasons = []
+    named = ", ".join(str(reason).strip() for reason in reasons if str(reason).strip())
+    return [f"{HARD_ICP_SKIP_BLOCKER}: {named}" if named else HARD_ICP_SKIP_BLOCKER]
+
+
+@dataclass(frozen=True)
+class Admission:
+    """A lead's permission to be contacted, and the only thing that can grant it.
+
+    Sendability used to be a bare bool that each caller turned into its own
+    `Sendable` string, so the enricher's `hard_icp_skip` verdict was only as
+    binding as whichever path happened to remember it — and `apply_sendability`
+    never did. 31 rows across 14 businesses shipped `Sendable=Yes` on top of a
+    hard ICP skip. Routing every verdict through one object is what makes that
+    combination unreachable rather than merely absent.
+    """
+
+    blockers: tuple[str, ...]
+
+    @property
+    def admitted(self) -> bool:
+        return not self.blockers
+
+    @property
+    def sendable_flag(self) -> str:
+        return "Yes" if self.admitted else "No"
+
+
+def admit(row: Dict[str, Any], blockers: Iterable[str] = ()) -> Admission:
+    """The one place a lead may be declared sendable.
+
+    The ICP verdict is re-read from *row* rather than taken from *blockers* on
+    purpose: a caller that computed its own clean blocker list still cannot get
+    an admission for a skipped lead, because the check belongs to the choke point
+    and not to the caller. Any new sendable path has to come through here.
+    """
+    return Admission(tuple(blockers) + tuple(hard_icp_skip_blockers(row)))
+
+
 def evaluate_sendability(row: Dict[str, Any]) -> Dict[str, Any]:
     blockers: List[str] = []
     total_score = _parse_score(row)
@@ -462,14 +534,19 @@ def evaluate_sendability(row: Dict[str, Any]) -> Dict[str, Any]:
     if has_invalid_refs(evidence_refs, safe_claims, known_refs):
         blockers.append(INVALID_REF_BLOCKER)
 
+    admission = admit(row, blockers)
+
     minimum_evidence_passed = not any(
-        blocker in EVIDENCE_BLOCKERS or blocker.startswith(f"{COMMERCIAL_FIT_BLOCKER}:")
-        for blocker in blockers
+        blocker in EVIDENCE_BLOCKERS
+        or blocker.startswith(f"{COMMERCIAL_FIT_BLOCKER}:")
+        or blocker.startswith(f"{HARD_ICP_SKIP_BLOCKER}:")
+        for blocker in admission.blockers
     )
 
     return {
-        "sendable": not blockers,
-        "send_blockers": blockers,
+        "sendable": admission.admitted,
+        "sendable_flag": admission.sendable_flag,
+        "send_blockers": list(admission.blockers),
         "minimum_evidence_passed": minimum_evidence_passed,
         "safe_outreach_claims": safe_claims,
         "unsafe_claims": normalize_unsafe_claims(row),
@@ -492,13 +569,27 @@ def readiness_flags(row: Dict[str, Any]) -> tuple[str, str]:
     Airtable stores Packet Tier instead of the two booleans — it separates
     Watchlist from No Packet, which the booleans could not. Rows read back from
     the base therefore carry only the tier, while internal pipeline rows still
-    carry all three; explicit values always win so a hand-edited No is honoured.
+    carry all three.
+
+    Explicit values win in the TIGHTENING direction only. A hand-edited "No" is
+    honoured, because a human withdrawing a lead never needs the gate's
+    permission. A stored "Yes" does not win: it is a snapshot taken before the
+    ICP verdict was known, and honouring it is what let a hard-skipped lead ride
+    a stale cell all the way into the send queue.
     """
     tier = _pick(row, "Packet Tier", "packet_tier").strip()
     sendable = _pick(row, "Sendable", "sendable").strip()
     packet_eligible = _pick(row, "Packet Eligible", "packet_eligible").strip()
     if not sendable and tier:
-        sendable = "Yes" if tier == PACKET_TIER_SENDABLE else "No"
+        # Reconstructing the flag from the tier is still a way to declare a lead
+        # sendable, so it goes through `admit` like every other one.
+        sendable = admit(
+            row, () if tier == PACKET_TIER_SENDABLE else (PACKET_TIER_NOT_SENDABLE_BLOCKER,)
+        ).sendable_flag
+    elif sendable.casefold() == "yes":
+        # Re-run the admission over a stored Yes so the ICP verdict can withdraw
+        # it. Never upgrades a No.
+        sendable = admit(row, ()).sendable_flag
     if not packet_eligible and tier:
         packet_eligible = "Yes" if tier in PACKET_TIERS_WITH_PACKET else "No"
     return sendable, packet_eligible
@@ -693,7 +784,9 @@ def apply_sendability(row: Dict[str, Any]) -> Dict[str, Any]:
     result = evaluate_sendability(updated)
     blockers = "; ".join(result["send_blockers"])
 
-    updated["Sendable"] = "Yes" if result["sendable"] else "No"
+    # The literal comes from the Admission, not from here: `admit` is the only
+    # thing allowed to spell the verdict, so a new sendable path cannot mint one.
+    updated["Sendable"] = result["sendable_flag"]
     updated["Minimum Evidence Passed"] = "Yes" if result["minimum_evidence_passed"] else "No"
     updated["Send Blockers"] = blockers
     updated["Sendability Blockers"] = blockers

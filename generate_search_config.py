@@ -43,7 +43,10 @@ CONFIGS_DIR = Path("search_configs")
 VALID_SIZES = ("small", "medium", "full")
 DEFAULT_LIMIT_PER_QUERY = 10
 DEFAULT_MIN_RATING = 4.3
-DEFAULT_MIN_REVIEWS = 10
+# Matches VerticalProfile.min_reviews' default. A JSON profile that omits the
+# floor would otherwise be searched at one number and scored at another, which
+# is the drift the two-surface floor test exists to catch.
+DEFAULT_MIN_REVIEWS = 8
 # Per-call result page size (API hard-caps at 20). Pagination depth carries volume.
 DEFAULT_PAGE_SIZE = 20
 # Size-based search depth: deeper paging where appropriate, single page for small.

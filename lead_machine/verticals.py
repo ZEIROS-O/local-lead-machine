@@ -33,8 +33,12 @@ class VerticalProfile:
     franchise_denylist: tuple[str, ...]
     exclude_terms: tuple[str, ...]
     aliases: tuple[str, ...] = ()
-    min_reviews: int = 10
-    max_reviews: int | None = None
+    # One floor for every vertical, and it must equal the matching
+    # `vertical_profiles/<key>.json` min_reviews: that file is the search-time
+    # floor, this is the score-time floor, and two numbers means a lead can be
+    # paid for and then skipped. There is deliberately no ceiling — see
+    # `icp.hard_icp_gate`.
+    min_reviews: int = 8
     adjacency_exclusions: tuple[AdjacencyExclusion, ...] = ()
 
 
@@ -542,8 +546,7 @@ VERTICAL_PROFILES: Mapping[str, VerticalProfile] = {
         low_ticket_terms=HARDSCAPE_LOW_TICKET_TERMS,
         franchise_denylist=HARDSCAPE_FRANCHISE_DENYLIST,
         exclude_terms=(),
-        min_reviews=10,
-        max_reviews=None,
+        min_reviews=8,
         adjacency_exclusions=GREEN_INDUSTRY_ADJACENCY_EXCLUSIONS,
     ),
     "detailing": VerticalProfile(
@@ -558,8 +561,7 @@ VERTICAL_PROFILES: Mapping[str, VerticalProfile] = {
         franchise_denylist=DETAILING_FRANCHISE_DENYLIST,
         exclude_terms=(),
         aliases=("car detailing", "auto detailing", "mobile detailing", "detailing", "detailer"),
-        min_reviews=10,
-        max_reviews=130,
+        min_reviews=8,
     ),
     "water_restoration": VerticalProfile(
         key="water_restoration",
@@ -582,8 +584,7 @@ VERTICAL_PROFILES: Mapping[str, VerticalProfile] = {
             "flood cleanup",
             "restoration",
         ),
-        min_reviews=10,
-        max_reviews=None,
+        min_reviews=8,
     ),
     "garage_doors": VerticalProfile(
         key="garage_doors",
@@ -605,8 +606,7 @@ VERTICAL_PROFILES: Mapping[str, VerticalProfile] = {
             "overhead doors",
             "overhead door",
         ),
-        min_reviews=10,
-        max_reviews=None,
+        min_reviews=8,
     ),
     "plumbing": VerticalProfile(
         key="plumbing",
@@ -620,8 +620,7 @@ VERTICAL_PROFILES: Mapping[str, VerticalProfile] = {
         franchise_denylist=PLUMBING_FRANCHISE_DENYLIST,
         exclude_terms=(),
         aliases=("plumber", "plumbers", "plumbing contractor", "plumbing company"),
-        min_reviews=5,
-        max_reviews=None,
+        min_reviews=8,
     ),
     "epoxy": VerticalProfile(
         key="epoxy",
@@ -651,8 +650,7 @@ VERTICAL_PROFILES: Mapping[str, VerticalProfile] = {
         # search-time floor) while `icp.hard_icp_gate` reads this one (the
         # score-time floor). Two numbers here means a lead can be searched for
         # and then skipped, or skipped before it is ever searched.
-        min_reviews=10,
-        max_reviews=None,
+        min_reviews=8,
     ),
     "roofing": VerticalProfile(
         key="roofing",
@@ -676,8 +674,7 @@ VERTICAL_PROFILES: Mapping[str, VerticalProfile] = {
         ),
         # Kept in step with `vertical_profiles/roofing.json` for the same reason
         # as epoxy above: search-time and score-time read different files.
-        min_reviews=10,
-        max_reviews=None,
+        min_reviews=8,
     ),
 }
 

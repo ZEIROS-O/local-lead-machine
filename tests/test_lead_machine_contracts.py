@@ -28,6 +28,7 @@ from lead_machine.llm_queue import build_llm_prompt, write_review_queue
 from lead_machine.manual_scores import load_manual_score, merge_manual_score, validate_manual_score
 from lead_machine.schema import normalize_lead, row_dedupe_keys
 from lead_machine.sendability import apply_sendability, flatten_safe_outreach_claims, normalize_evidence_refs
+from lead_machine.verticals import VERTICAL_PROFILES
 from make_packets import is_eligible, main as make_packets_main, packet_markdown
 from make_llm_batch import build_batch_prompt, write_llm_batches
 from import_llm_score_bundle import import_score_bundle
@@ -1219,7 +1220,7 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertIn("franchise_or_chain", hard_icp_gate(franchise).reasons)
         self.assertFalse(hard_icp_gate(no_site).should_skip)
 
-    def test_hard_icp_gate_uses_per_vertical_review_bounds(self) -> None:
+    def test_hard_icp_gate_has_a_floor_and_no_ceiling(self) -> None:
         low_review_with_site = normalize_lead(
             {
                 "business_name": "Five Star Detailing",
@@ -1272,27 +1273,64 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertFalse(hard_icp_gate(low_review_no_site).should_skip)
         self.assertFalse(hard_icp_gate(mature_garage_doors).should_skip)
 
-        detailing_gate = hard_icp_gate(mature_detailing)
-        self.assertTrue(detailing_gate.should_skip)
-        self.assertIn("high_review_count", detailing_gate.reasons)
+        # detailing used to skip this one at max_reviews=130. There is no upper
+        # bound any more, in any vertical.
+        self.assertFalse(hard_icp_gate(mature_detailing).should_skip)
 
-    def test_hard_icp_gate_keeps_no_site_lead_over_max_reviews(self) -> None:
-        mature_no_site = normalize_lead(
+    def test_hard_icp_gate_admits_the_review_count_that_booked_a_call(self) -> None:
+        # 2026-07-28: the only booked call to date came from a 222-review
+        # garage-door business pitched on missed-call text-back. Under the old
+        # detailing ceiling of 130 a lead like this was skipped as
+        # `high_review_count`, so the one profile that has ever converted was the
+        # profile the gate threw away. Reviews are demand, not disqualification.
+        booked = normalize_lead(
             {
-                "business_name": "No Site Ceramic Coating",
+                "business_name": "Northcoast Overhead Door",
                 "city": "Cleveland",
                 "rating": "4.9",
-                "reviews": "200",
-                "website_url": "",
+                "reviews": "222",
+                "website_url": "https://example.com",
+                "source_query": "garage door repair Cleveland OH",
+            },
+            fallback_vertical="garage_doors",
+            source_batch="round1",
+        )
+        detailing_twin = normalize_lead(
+            {
+                "business_name": "Cleveland Ceramic Coating",
+                "city": "Cleveland",
+                "rating": "4.9",
+                "reviews": "222",
+                "website_url": "https://example.com",
             },
             fallback_vertical="detailing",
             source_batch="round1",
         )
 
-        gate = hard_icp_gate(mature_no_site)
+        for lead in (booked, detailing_twin):
+            with self.subTest(vertical=lead.vertical):
+                gate = hard_icp_gate(lead)
+                self.assertFalse(gate.should_skip)
+                self.assertNotIn("high_review_count", gate.reasons)
 
-        self.assertFalse(gate.should_skip)
-        self.assertNotIn("high_review_count", gate.reasons)
+    def test_the_review_floor_bites_at_seven_and_admits_at_eight(self) -> None:
+        # One floor, 8, for every vertical — plumbing included, which sat at 5.
+        for vertical in sorted(VERTICAL_PROFILES):
+            for reviews, expected_skip in ((7, True), (8, False)):
+                with self.subTest(vertical=vertical, reviews=reviews):
+                    lead = normalize_lead(
+                        {
+                            "business_name": "Buckeye Service Co",
+                            "city": "Cleveland",
+                            "rating": "4.9",
+                            "reviews": str(reviews),
+                            "website_url": "https://example.com",
+                        },
+                        fallback_vertical=vertical,
+                        source_batch="round1",
+                    )
+                    gate = hard_icp_gate(lead)
+                    self.assertEqual("too_few_reviews" in gate.reasons, expected_skip)
 
     def test_airtable_vertical_select_accepts_hyphenated_slugs(self) -> None:
         from lead_machine.airtable_sync import normalize_airtable_value, resolve_vertical_label

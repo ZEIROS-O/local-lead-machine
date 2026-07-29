@@ -21,6 +21,6 @@
     "dealer service"
   ],
   "min_rating": 4.3,
-  "min_reviews": 10,
+  "min_reviews": 8,
   "notes": "Target high-ticket ceramic/PPF/paint-correction detailers; deny express/tunnel/self-serve washes. Boost + base exclude terms come from lead_machine/verticals.py (canonical scoring layer); this profile only adds search-query phrasing, high-intent terms, and metadata."
 }

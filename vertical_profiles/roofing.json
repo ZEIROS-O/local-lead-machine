@@ -35,6 +35,6 @@
     "lowes"
   ],
   "min_rating": 4.3,
-  "min_reviews": 10,
+  "min_reviews": 8,
   "notes": "Target high-ticket replacement/storm/commercial roofers; deny supply houses and big-box retail. roofing now has its own VerticalProfile in lead_machine/verticals.py, so generate_search_config sources boost terms from there and merges its deny + low-ticket terms on top of the exclude_terms below. min_reviews must stay equal to that profile's min_reviews: this file sets the search-time floor, verticals.py sets the score-time floor."
 }

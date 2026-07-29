@@ -1,0 +1,531 @@
+"""`Sendable=Yes` on a lead the hard ICP gate skipped has to be unreachable.
+
+It was not. `enrich_leads` wrote `derived.hard_icp_skip` and `apply_sendability`
+never read it, so the two decisions could disagree — and did, on 31 rows across
+14 businesses in `output/scored_*.csv`. Twenty-nine of those carried
+`high_review_count`, a reason that no longer exists now the review ceiling is
+gone; the two `too_few_reviews` rows were the genuine leak.
+
+Asserting the combination is absent today would not stop the next path from
+reintroducing it, so these tests are about shape rather than values: one
+`admit()` owns the verdict, nothing else may spell one, and the ICP check is
+admit's own rather than something a caller supplies.
+"""
+from __future__ import annotations
+
+import ast
+import json
+import unittest
+from pathlib import Path
+from typing import Any
+
+from lead_machine.buyer_signals import REVIEW_DEMAND_THRESHOLDS
+from lead_machine.manual_scores import merge_manual_score
+from lead_machine.sendability import (
+    HARD_ICP_SKIP_BLOCKER,
+    Admission,
+    admit,
+    apply_sendability,
+    evaluate_packet_tier,
+    evaluate_sendability,
+    is_contact_ready,
+    readiness_flags,
+)
+from refresh_packet_tiers import refresh_row
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# The row key that reaches the CSV and Airtable, plus its lowercase alias.
+SENDABLE_KEYS = frozenset({"Sendable", "sendable"})
+# The verdict itself. The same keys also carry counts on the dashboard and
+# booleans on a lead card, which are readings of a verdict rather than one being
+# minted; only the "Yes"/"No" string is the declaration.
+VERDICT_LITERALS = frozenset({"Yes", "No"})
+
+
+def production_sources() -> list[Path]:
+    """Every module the pipeline runs. Tests are excluded deliberately.
+
+    A fixture row that hardcodes `Sendable: Yes` is an input to the gate, not a
+    path around it, so scanning `tests/` would only forbid writing tests.
+    """
+    paths = sorted(REPO_ROOT.glob("*.py"))
+    paths.extend(sorted((REPO_ROOT / "lead_machine").rglob("*.py")))
+    return paths
+
+
+def _mints_a_verdict(value: ast.AST) -> bool:
+    """True when *value* is a hardcoded "Yes"/"No", directly or via a ternary."""
+    if isinstance(value, ast.Constant):
+        return value.value in VERDICT_LITERALS
+    if isinstance(value, ast.IfExp):
+        return _mints_a_verdict(value.body) or _mints_a_verdict(value.orelse)
+    return False
+
+
+def sendable_verdict_writes(source: str, *, label: str) -> list[tuple[str, str, ast.AST]]:
+    """Return (label:function, key, value_node) for every minted verdict.
+
+    Covers the three ways a value lands under the key: subscript assignment,
+    a dict literal (which also covers `row.update({...})` and `{**row, ...}`),
+    and `setdefault`.
+    """
+    tree = ast.parse(source)
+    enclosing: dict[ast.AST, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for child in ast.walk(node):
+                enclosing.setdefault(child, node.name)
+
+    found: list[tuple[str, str, ast.AST]] = []
+
+    def record(node: ast.AST, key: str, value: ast.AST) -> None:
+        if _mints_a_verdict(value):
+            found.append((f"{label}:{enclosing.get(node, '<module>')}", key, value))
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if (
+                    isinstance(target, ast.Subscript)
+                    and isinstance(target.slice, ast.Constant)
+                    and target.slice.value in SENDABLE_KEYS
+                ):
+                    record(node, target.slice.value, node.value)
+        elif isinstance(node, ast.Dict):
+            for key_node, value_node in zip(node.keys, node.values):
+                if isinstance(key_node, ast.Constant) and key_node.value in SENDABLE_KEYS:
+                    record(node, key_node.value, value_node)
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "setdefault"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and node.args[0].value in SENDABLE_KEYS
+        ):
+            record(node, node.args[0].value, node.args[1] if len(node.args) > 1 else node)
+
+    return found
+
+
+def verdict_spellers(source: str) -> list[str]:
+    """Functions that bind a verdict literal to something named for sendability.
+
+    Covers `sendable = "Yes"`, `self.sendable = "No"`, `d["sendable_flag"] = ...`
+    and a bare `return "Yes"` from a function whose own name says sendable.
+    """
+    tree = ast.parse(source)
+    spellers: list[str] = []
+
+    def names(target: ast.AST) -> str:
+        if isinstance(target, ast.Name):
+            return target.id
+        if isinstance(target, ast.Attribute):
+            return target.attr
+        if isinstance(target, ast.Subscript) and isinstance(target.slice, ast.Constant):
+            return str(target.slice.value)
+        return ""
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for child in ast.walk(node):
+            if isinstance(child, ast.Assign) and _mints_a_verdict(child.value):
+                if any("sendable" in names(target).lower() for target in child.targets):
+                    spellers.append(node.name)
+                    break
+            if (
+                isinstance(child, ast.Return)
+                and child.value is not None
+                and _mints_a_verdict(child.value)
+                and "sendable" in node.name.lower()
+            ):
+                spellers.append(node.name)
+                break
+
+    return spellers
+
+
+def apply_sendability_call_sites() -> set[str]:
+    sites: set[str] = set()
+    for path in production_sources():
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        enclosing: dict[ast.AST, str] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for child in ast.walk(node):
+                    enclosing.setdefault(child, node.name)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "apply_sendability":
+                label = path.relative_to(REPO_ROOT).as_posix()
+                sites.add(f"{label}:{enclosing.get(node, '<module>')}")
+    return sites
+
+
+class AdmissionIsTheOnlyRouteToSendableTest(unittest.TestCase):
+    def test_no_production_module_mints_a_sendable_verdict(self) -> None:
+        # The structural half of the invariant, and it has no exemptions —
+        # `sendability.py` included. `hard_icp_skip` was only ever advisory
+        # because any module could write its own `Sendable`, and two of them did:
+        # `manual_lead_insert.build_manual_lead_card` turned an operator boolean
+        # straight into a verdict, and `upload_airtable.is_sendable_record`
+        # trusted a packet card's stored one. Neither passed through the gate.
+        # A new sendable path has to fail here before it can ship, and the only
+        # way to make it pass is to get the string from an Admission.
+        offenders = sorted(
+            f"{path.relative_to(REPO_ROOT).as_posix()} line {value.lineno} ({site})"
+            for path in production_sources()
+            for site, _, value in sendable_verdict_writes(
+                path.read_text(encoding="utf-8"),
+                label=path.relative_to(REPO_ROOT).as_posix(),
+            )
+        )
+
+        self.assertEqual(offenders, [])
+
+    def test_exactly_one_function_spells_the_verdict(self) -> None:
+        # The counterpart to the scan above. That scan only sees the moment a
+        # verdict lands on a row, so `flag = "Yes"` followed by
+        # `row["Sendable"] = flag` would slip past it. This closes the honest
+        # version of that laundering — anything named for sendability — and
+        # leaves one sanctioned speller, so a reviewer has one place to look.
+        #
+        # Not a blanket ban on the string: "Yes"/"No" is how this codebase spells
+        # every Airtable boolean, and Packet Eligible is not this decision.
+        self.assertEqual(
+            sorted(
+                f"{path.relative_to(REPO_ROOT).as_posix()}:{name}"
+                for path in production_sources()
+                for name in verdict_spellers(path.read_text(encoding="utf-8"))
+            ),
+            ["lead_machine/sendability.py:sendable_flag"],
+        )
+
+    def test_the_scan_actually_catches_a_new_sendable_path(self) -> None:
+        # Guards the guard. A scanner that silently matches nothing would let
+        # every test above pass while the invariant rotted.
+        smuggled = (
+            "def ship(row):\n"
+            "    row['Sendable'] = 'Yes'\n"
+            "    row.update({'sendable': 'Yes' if ok else 'No'})\n"
+            "    row.setdefault('Sendable', 'Yes')\n"
+            "    return row\n"
+            "\n"
+            "def launder(row):\n"
+            "    sendable = 'Yes'\n"
+            "    row['Sendable'] = sendable\n"
+            "    return row\n"
+        )
+
+        self.assertEqual(
+            [site for site, _, _ in sendable_verdict_writes(smuggled, label="smuggled")],
+            ["smuggled:ship"] * 3,
+        )
+        # The two scanners overlap on a direct write and only `verdict_spellers`
+        # sees the laundered one, which is the point of running both.
+        self.assertEqual(verdict_spellers(smuggled), ["ship", "launder"])
+
+    def test_every_apply_sendability_caller_is_a_known_scoring_path(self) -> None:
+        # The choke point only chokes what flows through it. A new caller is a
+        # new way for a lead to become sendable and has to be named here, where
+        # the reviewer is looking at the invariant.
+        self.assertEqual(
+            apply_sendability_call_sites(),
+            {
+                "score_leads.py:score_record",
+                "lead_machine/manual_scores.py:merge_manual_score",
+                "refresh_packet_tiers.py:refresh_row",
+            },
+        )
+
+
+class AdmitRefusesAHardIcpSkipTest(unittest.TestCase):
+    def test_admit_refuses_however_clean_the_blockers_the_caller_hands_it(self) -> None:
+        # The check belongs to admit, not to the caller's blocker list. A caller
+        # that computed nothing wrong still cannot get an admission.
+        row = {
+            "Raw Evidence": json.dumps(
+                {"derived": {"hard_icp_skip": True, "hard_icp_reasons": ["too_few_reviews"]}}
+            )
+        }
+
+        admission = admit(row, [])
+
+        self.assertFalse(admission.admitted)
+        self.assertEqual(admission.sendable_flag, "No")
+        self.assertEqual(admission.blockers, (f"{HARD_ICP_SKIP_BLOCKER}: too_few_reviews",))
+
+    def test_admit_reads_the_verdict_wherever_the_row_still_carries_it(self) -> None:
+        derived = {"derived": {"hard_icp_skip": True, "hard_icp_reasons": ["dnc_suppressed"]}}
+        for label, row in (
+            ("raw evidence json", {"Raw Evidence": json.dumps(derived)}),
+            ("raw evidence dict", {"raw_evidence": derived}),
+            ("top level derived", dict(derived)),
+        ):
+            with self.subTest(carrier=label):
+                self.assertFalse(admit(row).admitted)
+
+    def test_an_unreadable_verdict_fails_closed(self) -> None:
+        # `make_llm_batch` raises on a malformed flag because stopping a batch is
+        # cheap. Raising here would take down a whole scoring run over one
+        # hand-edited row, and refusing to send is the same answer for less.
+        for value in ("string", [1, 2], 1, "false"):
+            with self.subTest(value=value):
+                self.assertFalse(admit({"derived": {"hard_icp_skip": value}}).admitted)
+
+        for value in (None, False, ""):
+            with self.subTest(value=value):
+                self.assertTrue(admit({"derived": {"hard_icp_skip": value}}).admitted)
+
+    def test_an_admission_with_no_blockers_is_the_only_yes(self) -> None:
+        self.assertEqual(Admission(()).sendable_flag, "Yes")
+        self.assertEqual(Admission(("anything",)).sendable_flag, "No")
+
+
+class NoScoringPathEmitsSendableYesOnASkippedLeadTest(unittest.TestCase):
+    """End-to-end proof through the real scorers, not just the gate in isolation."""
+
+    def _enriched(self, **derived: Any) -> dict:
+        enriched = {
+            "google": {
+                "business_name": "A+ Landscaping LLC",
+                "city": "Kirtland",
+                "phone": "(440) 637-5848",
+                "website_url": "https://example.com",
+                "google_maps_url": "https://maps.google.com/?cid=123",
+                "rating": "4.9",
+                "reviews": "18",
+                "place_id": "ChIJ123",
+            },
+            "buyer_intent": {
+                "money_signal": "yes",
+                "demand_signal": {
+                    "state": "yes",
+                    "source": "review_count",
+                    "velocity_band": "unknown",
+                    "demand_band": "ideal_growth",
+                    "evidence": ["Lifetime review count places this in the ideal_growth demand band."],
+                },
+                "crm_booking_stack": {"detected_tools": ["ServiceTitan"], "has_paid_crm": True},
+            },
+            "evidence": {
+                "site_status": "weak",
+                "screenshots": {"desktop": "desktop.png", "mobile": "mobile.png"},
+                "visible_pain_score": 35,
+                "visible_pain_reasons": ["No clear estimate CTA"],
+                "send_trigger": "No clear estimate CTA",
+                "evidence_items": [
+                    {"id": "E1", "field": "google_rating", "value": "4.9 stars / 18 reviews"},
+                    {"id": "E2", "field": "site_issue_flags", "value": "no_clear_cta_detected"},
+                    {"id": "E3", "field": "send_trigger", "value": "No clear estimate CTA"},
+                ],
+            },
+        }
+        if derived:
+            enriched["derived"] = derived
+        return enriched
+
+    def _manual_score(self) -> dict:
+        return {
+            "score_schema_version": 2,
+            "subscores": {
+                "icp_fit": 14,
+                "reputation_demand_proof": 12,
+                "web_conversion_pain": 18,
+                "mockup_leverage": 10,
+                "reachability": 7,
+                "offer_angle_clarity": 9,
+                "evidence_confidence": 5,
+            },
+            "confidence": "medium",
+            "hard_disqualifiers": [],
+            "best_angle": "Estimate Funnel",
+            "commercial_fit_state": "commercially-sendable",
+            "commercial_materiality": "Premium estimate requests can fail to reach a clear conversion path.",
+            "recurring_consequence": "The same path affects each new high-intent visitor.",
+            "root_cause_confidence": "Fresh rendered evidence shows the CTA-path weakness.",
+            "offer_component": "Get the Lead",
+            "packageable_solution": "Rebuild the estimate path and trust placement.",
+            "value_mechanism": "Reduce friction between existing demand and estimate requests.",
+            "beyond_free_fix": "The CTA, mobile path, trust proof, and routing require one coherent system.",
+            "self_fix_risk": "The existing multi-step path has persisted and needs coordinated implementation.",
+            "intentionality": "The verified customer path contradicts an intentional low-conversion design.",
+            "contact_eligibility": "contact-now",
+            "asset_state": "none",
+            "promise_state": "asset-free",
+            "asset_id": "",
+            "asset_verifier_verdict": "",
+            "recommended_action": "Build mockup then SMS owner",
+            "why_this_lead": ["Strong reviews", "Visible quote-path issue"],
+            "why_this_might_be_wrong": [],
+            "opener": "Your reviews are strong, but the quote path looks hard to find. Want me to send a cleaner version?",
+            "evidence_refs": ["E1", "E2"],
+            "safe_outreach_claims": [
+                {"claim": "Your quote path looks hard to find.", "evidence_refs": ["E2"]},
+                {"claim": "Your Google profile shows strong reviews.", "evidence_refs": ["E1"]},
+            ],
+            "unsafe_claims": ["Do not claim they are losing jobs."],
+            "airtable_fields": {},
+        }
+
+    def _scored(self, enriched: dict) -> dict:
+        return merge_manual_score(enriched, self._manual_score(), fallback_vertical="hardscaping")
+
+    def test_the_control_lead_really_is_sendable(self) -> None:
+        # Without this the tests below prove nothing: every one of them would
+        # also pass on a lead blocked for some unrelated reason.
+        self.assertEqual(self._scored(self._enriched())["Sendable"], "Yes")
+
+    def test_the_scorer_refuses_a_skipped_lead(self) -> None:
+        row = self._scored(
+            self._enriched(hard_icp_skip=True, hard_icp_reasons=["too_few_reviews"])
+        )
+
+        self.assertEqual(row["Sendable"], "No")
+        self.assertIn(HARD_ICP_SKIP_BLOCKER, row["Send Blockers"])
+
+    def test_a_skipped_lead_gets_no_packet_rather_than_a_manual_review_one(self) -> None:
+        # `hard_icp_skip` joins the evidence blockers for the same reason
+        # suppression does: a lead we are not prospecting should not come back
+        # through the manual-review door.
+        row = self._scored(
+            self._enriched(hard_icp_skip=True, hard_icp_reasons=["too_few_reviews"])
+        )
+
+        self.assertEqual(row["Minimum Evidence Passed"], "No")
+        self.assertEqual(row["Packet Tier"], "No Packet")
+        self.assertEqual(row["Packet Eligible"], "")
+
+    def test_regoverning_an_already_sendable_row_withdraws_it(self) -> None:
+        # The re-scoring paths matter as much as the first pass: a row can be
+        # sendable, get suppressed or fall under the floor, and be governed again.
+        sendable = self._scored(self._enriched())
+        self.assertEqual(sendable["Sendable"], "Yes")
+
+        raw = json.loads(sendable["Raw Evidence"])
+        raw["derived"] = {"hard_icp_skip": True, "hard_icp_reasons": ["dnc_suppressed"]}
+        sendable["Raw Evidence"] = json.dumps(raw)
+
+        self.assertEqual(apply_sendability(sendable)["Sendable"], "No")
+        self.assertEqual(refresh_row(sendable)["Sendable"], "No")
+
+    def test_the_review_ceiling_no_longer_withdraws_the_profile_that_booked(self) -> None:
+        # 2026-07-28's booked call was a 222-review business. Under the old
+        # ceiling that lead carried hard_icp_skip, so closing this gate while the
+        # ceiling still stood would have made the one profile that has ever
+        # converted unsendable — which is why the ceiling came out first.
+        #
+        # What still governs a 222-review lead is the demand band, not the ICP
+        # gate: `mature` demands a visible pain score of 40 rather than 16. That
+        # is the separate axis, and it is meant to keep biting.
+        enriched = self._enriched()
+        enriched["google"]["reviews"] = "222"
+
+        under_the_band = self._scored(enriched)
+        self.assertEqual(under_the_band["Sendable"], "No")
+        self.assertEqual(
+            under_the_band["Send Blockers"],
+            "Visible conversion pain too weak for business maturity",
+        )
+        self.assertNotIn(HARD_ICP_SKIP_BLOCKER, under_the_band["Send Blockers"])
+
+        enriched["evidence"]["visible_pain_score"] = 45
+        cleared = self._scored(enriched)
+
+        self.assertEqual(cleared["Review Demand Band"], "mature")
+        self.assertEqual(cleared["Sendable"], "Yes")
+        self.assertEqual(cleared["Send Blockers"], "")
+
+    def test_evaluate_sendability_reports_the_same_verdict_as_the_admission(self) -> None:
+        row = self._scored(
+            self._enriched(hard_icp_skip=True, hard_icp_reasons=["too_few_reviews"])
+        )
+        result = evaluate_sendability(row)
+
+        self.assertFalse(result["sendable"])
+        self.assertEqual(result["sendable_flag"], "No")
+
+
+class ReviewDemandBandsAreASeparateAxisTest(unittest.TestCase):
+    def test_the_demand_bands_did_not_move_when_the_icp_ceiling_was_removed(self) -> None:
+        # `buyer_signals` reads review count too, and detailing's numbers (126 /
+        # 401) are close enough to the deleted ICP ceiling of 130 to look like
+        # the same knob. They are not: these decide how much visible pain an
+        # established business must show, not whether it is in the ICP at all.
+        # Pinned so a future ceiling-shaped edit cannot drift them in passing.
+        self.assertEqual(
+            REVIEW_DEMAND_THRESHOLDS,
+            {
+                "detailing": {
+                    "early_proof_min": 5,
+                    "ideal_growth_min": 15,
+                    "established_min": 126,
+                    "mature_min": 401,
+                },
+                "default": {
+                    "early_proof_min": 5,
+                    "ideal_growth_min": 15,
+                    "established_min": 76,
+                    "mature_min": 201,
+                },
+            },
+        )
+
+
+class AStoredSendableYesCannotOutrankTheIcpGateTest(unittest.TestCase):
+    """The upload path, which is where the invariant was actually violable.
+
+    `upload_airtable.read_csv_records` filters `--only-sendable` with
+    `is_contact_ready`, not with anything that re-scores the lead. That reaches
+    `readiness_flags`, which used to return a stored `Sendable: Yes` verbatim —
+    so a row scored before it acquired a hard skip kept riding a stale cell all
+    the way into the Airtable send queue, whose readiness clause is
+    `Packet Tier = 'Sendable Packet'` (queue_state.py).
+
+    Tightening is still allowed to skip the gate: a human writing "No" never
+    needs permission.
+    """
+
+    def _row(self, *, sendable: str, skipped: bool) -> dict[str, Any]:
+        raw = {
+            "derived": {
+                "hard_icp_skip": skipped,
+                "hard_icp_reasons": ["too_few_reviews"] if skipped else [],
+            }
+        }
+        return {
+            "Business Name": "Lorain Garage Door Repair Co",
+            "Sendable": sendable,
+            "Packet Eligible": "Yes",
+            "Packet Tier": "Sendable Packet",
+            "Commercial Fit State": "commercially-sendable",
+            "Contact Eligibility": "contact-now",
+            "Raw Evidence": json.dumps(raw),
+        }
+
+    def test_a_stored_yes_is_withdrawn_when_the_lead_is_skipped(self) -> None:
+        self.assertEqual(readiness_flags(self._row(sendable="Yes", skipped=True))[0], "No")
+
+    def test_the_upload_filter_drops_the_skipped_lead(self) -> None:
+        # is_contact_ready IS the --only-sendable filter. Before this fix it
+        # returned True here and the lead was uploaded as a Sendable Packet.
+        self.assertFalse(is_contact_ready(self._row(sendable="Yes", skipped=True)))
+
+    def test_an_unskipped_lead_is_still_uploadable(self) -> None:
+        # Without this the test above would pass for any reason at all.
+        self.assertTrue(is_contact_ready(self._row(sendable="Yes", skipped=False)))
+
+    def test_a_skipped_lead_cannot_hold_the_sendable_packet_tier(self) -> None:
+        row = self._row(sendable="Yes", skipped=True)
+        tier, _ = evaluate_packet_tier(row, evaluate_sendability(row))
+
+        self.assertNotEqual(tier, "Sendable Packet")
+
+    def test_a_hand_edited_no_is_still_honoured(self) -> None:
+        # Tightening never goes through the gate; the pre-existing contract.
+        self.assertEqual(readiness_flags(self._row(sendable="No", skipped=False))[0], "No")
+
+
+if __name__ == "__main__":
+    unittest.main()

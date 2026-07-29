@@ -22,6 +22,7 @@ from lead_machine.scoring_profiles import (
 from lead_machine.verticals import (
     HARDSCAPE_FRANCHISE_DENYLIST,
     VERTICAL_PROFILES,
+    VerticalProfile,
     _infer_profile_key,
     _normalize_key,
     matches_term,
@@ -246,12 +247,16 @@ class EpoxyAndRoofingProfileTest(unittest.TestCase):
             with self.subTest(franchise=franchise):
                 self.assertIn(franchise, roofing)
 
-    def test_neither_new_profile_carries_a_review_ceiling(self) -> None:
-        # A ceiling silently skips the most established businesses in a metro,
-        # and both of these run live. Only detailing sets one.
-        for key in ("epoxy", "roofing"):
+    def test_no_profile_can_carry_a_review_ceiling(self) -> None:
+        # A ceiling silently skips the most established businesses in a metro.
+        # detailing set one at 130 and it cost real leads: the only booked call to
+        # date (2026-07-28) was a 222-review business. The ceiling is gone as a
+        # concept, not just as a number, so this pins the absence of the field
+        # rather than each profile's value — re-adding one has to fail here first.
+        self.assertNotIn("max_reviews", VerticalProfile.__dataclass_fields__)
+        for key, profile in VERTICAL_PROFILES.items():
             with self.subTest(vertical=key):
-                self.assertIsNone(VERTICAL_PROFILES[key].max_reviews)
+                self.assertFalse(hasattr(profile, "max_reviews"))
 
     def test_every_review_floor_matches_its_own_json_profile(self) -> None:
         # Two consumers, two files: generate_search_config writes
