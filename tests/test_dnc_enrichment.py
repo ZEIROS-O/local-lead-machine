@@ -27,6 +27,7 @@ from lead_machine.compliance import (
     load_configured_suppression_index,
     merge_suppression_disqualifiers,
     record_matches_suppression,
+    record_suppression_identifiers,
     suppression_disqualifiers,
 )
 from lead_machine.scoring_v3 import _hard_disqualifiers, score_v3
@@ -149,6 +150,117 @@ class SuppressionIndexTests(unittest.TestCase):
         self.assertIn("record_id:recabc", index)
         self.assertIn("phone:2165550100", index)
         self.assertTrue(is_suppressed({"record_id": "recABC"}, index))
+
+
+class SuppressionIdentityTests(unittest.TestCase):
+    """One identifier set, so send-time and score-time recognise the same lead.
+
+    Read these with the reachability split in mind: the record-id half of the
+    set only ever populates for a record that already exists in Airtable, while
+    the nested google/website half is what actually fires on the discovery path.
+    `test_a_pipeline_enriched_record_has_no_record_id_to_match_on` pins that
+    split, and every test here that supplies an id says where the id came from.
+    """
+
+    # Google's own documented example. Place IDs and Airtable record ids are
+    # different namespaces that collide on the key name `id`.
+    PLACE_ID = "ChIJN1t_tDeuEmsRUsoyG83frY4"
+
+    def test_a_places_payload_id_never_becomes_a_record_id_key(self) -> None:
+        """A Place ID in the record_id key space is wrong in both directions: it
+        can match a ledger row that meant a different record, and it shadows the
+        Airtable id the record should have been recognised by.
+
+        Both inputs are constructed, not captured: today enrichment matches
+        Places leads through `has_suppression_match` on contacts alone, so no
+        caller hands this function a bare `id`. That is exactly why the
+        narrowing needs a test — it is cheap to reintroduce and silent when
+        wrong.
+        """
+        payload = {
+            "id": self.PLACE_ID,
+            "displayName": {"text": "Patio Pros"},
+            "nationalPhoneNumber": SUPPRESSED_PHONE,
+        }
+        enriched = _enriched(id=self.PLACE_ID)
+        place_id_key = f"record_id:{self.PLACE_ID.casefold()}"
+
+        for record in (payload, enriched):
+            identifiers = record_suppression_identifiers(record)
+            self.assertEqual(
+                [key for key in identifiers if key.startswith("record_id:")], [], record
+            )
+            self.assertFalse(record_matches_suppression(record, {place_id_key}), record)
+
+    def test_an_airtable_envelope_id_is_still_a_record_id(self) -> None:
+        """mark_sent identifies the record it is about to send to by the `{"id",
+        "fields"}` envelope Airtable returns; narrowing `id` must not disarm it."""
+        envelope = {"id": "rec42", "fields": {"Status": "New"}}
+
+        self.assertIn("record_id:rec42", record_suppression_identifiers(envelope))
+        self.assertTrue(is_suppressed(envelope, {"record_id:rec42"}))
+
+    def test_an_airtable_sourced_record_is_matched_on_lead_id_and_nested_contacts(self) -> None:
+        """A record that arrives already carrying an Airtable id — a re-scored
+        export, not something enrich_leads produced — is matched on that id as
+        well as on its nested contacts. The lead_id here is supplied by the
+        test because only an Airtable-sourced record ever has one."""
+        record = _enriched(lead_id="recLedger01")
+        record["website"] = {**record["website"], "emails_found": ["bad@test.com"]}
+
+        identifiers = record_suppression_identifiers(record)
+
+        self.assertIn("record_id:recledger01", identifiers)
+        self.assertIn("email:bad@test.com", identifiers)
+        self.assertIn("phone:2165550100", identifiers)
+
+    def test_a_pipeline_enriched_record_has_no_record_id_to_match_on(self) -> None:
+        """What score-time matching can actually reach today, built by the real
+        constructor rather than by hand.
+
+        `enrich_row` writes google/website/screenshots/derived, where `google`
+        is the make_search_batch row — place_id, never an Airtable id. A newly
+        discovered lead has not been uploaded yet, so it genuinely has no record
+        id, while the ledger's lead_id always names a record already in the
+        base. Record-id matching is therefore only reachable for
+        Airtable-sourced records (mark_sent envelopes, hermes queue rows,
+        re-scored exports); on the discovery path the contact keys are the whole
+        gate. If ids ever start appearing here, the lead_id tests above stop
+        being hypothetical — and if the contact keys stop appearing, score-time
+        suppression has quietly gone dark.
+        """
+        row = {"business_name": "Test", "phone": SUPPRESSED_PHONE, "website_url": "https://x.example"}
+
+        with patch("enrich_leads.scrape_site") as scrape, patch("enrich_leads.build_buyer_intent"):
+            scrape.return_value = {"emails_found": ["bad@test.com"], "phones_found": []}
+            record = enrich_leads.enrich_row(row, Path("fake"), take_shots=False)
+
+        for block in (record, record["google"], record["website"]):
+            self.assertEqual(
+                sorted(key for key in block if key in {"id", "record_id", "lead_id"}),
+                [],
+                sorted(block),
+            )
+
+        identifiers = record_suppression_identifiers(record)
+
+        self.assertEqual([key for key in identifiers if key.startswith("record_id:")], [])
+        self.assertIn("phone:2165550100", identifiers)
+        self.assertIn("email:bad@test.com", identifiers)
+        self.assertTrue(record_matches_suppression(record, SUPPRESSED_INDEX))
+
+    def test_a_record_we_cannot_identify_is_refused_not_cleared(self) -> None:
+        """Fail closed. An empty identifier set is read downstream as "clear" —
+        hermes's morning queue keeps `not _is_suppressed(record, ...)` — so a
+        malformed record that returned no identifiers would be queued for send
+        instead of stopping the run."""
+        for malformed in ("recABC", ["recABC"], 42, None):
+            with self.assertRaises(ComplianceError, msg=malformed):
+                record_suppression_identifiers(malformed)
+            with self.assertRaises(ComplianceError, msg=malformed):
+                is_suppressed(malformed, {"record_id:recabc"})
+            with self.assertRaises(ComplianceError, msg=malformed):
+                record_matches_suppression(malformed, {"record_id:recabc"})
 
 
 class EnrichRowSuppressionTests(unittest.TestCase):
@@ -428,6 +540,82 @@ class EntryPointTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("[SKIP] Suppressed leads dropped before scoring: 1", stdout.getvalue())
         self.assertLessEqual(len(rows), 1)  # header only
+
+    def test_score_leads_drops_an_airtable_sourced_record_by_its_lead_id(self) -> None:
+        """Covers an input that arrives already carrying an Airtable id — NOT
+        the pipeline's own output.
+
+        enrich_leads writes google/website/screenshots/derived and no id
+        anywhere (see
+        SuppressionIdentityTests.test_a_pipeline_enriched_record_has_no_record_id_to_match_on),
+        so a freshly discovered lead has nothing for this branch to match and is
+        stopped on contacts instead. What this pins is the entry point for the
+        inputs that *do* carry an id: a re-scored Airtable export, where
+        operator-agent's ledger can log an opt_out with a lead_id and no phone
+        or email. Before scoring shared mark_sent's identifier set, such a row
+        bit at send time and nowhere earlier.
+
+        The lead_id below is therefore supplied by the test, on purpose.
+        """
+        record = _enriched(suppressed=False, lead_id="recLedger01")
+        # A clean phone, so the lead_id is the only thing that can match.
+        record["google"] = {**record["google"], "phone": "(216) 555-9999"}
+        self.assertFalse(is_suppressed_record(record))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "enriched.jsonl"
+            output = Path(tmp) / "scored.csv"
+            suppression = Path(tmp) / "suppress.jsonl"
+            source.write_text(json.dumps(record) + "\n", encoding="utf-8")
+            suppression.write_text(
+                json.dumps({"event": "opt_out", "lead_id": "recLedger01"}) + "\n", encoding="utf-8"
+            )
+            os.environ["SUPPRESSION_SOURCE"] = str(suppression)
+
+            argv = ["score_leads.py", "--input", str(source), "--output", str(output), "--vertical", "plumbing"]
+            with patch("sys.argv", argv):
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    code = score_leads.main()
+
+            rows = output.read_text(encoding="utf-8").strip().splitlines()
+
+        self.assertEqual(code, 0)
+        self.assertIn("[SKIP] Suppressed leads dropped before scoring: 1", stdout.getvalue())
+        self.assertLessEqual(len(rows), 1)  # header only
+
+    def test_score_leads_does_not_read_a_place_id_as_an_opted_out_record_id(self) -> None:
+        """The other half of sharing one identifier set: Google keys the Place ID
+        as `id`, so a ledger row holding that string must not drop a good lead.
+
+        The top-level `id` is injected here — enrich_leads never writes one —
+        precisely so the narrowing is proved for any record that ever does.
+        """
+        record = _enriched(suppressed=False, id=SuppressionIdentityTests.PLACE_ID)
+        record["google"] = {**record["google"], "phone": "(216) 555-9999"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "enriched.jsonl"
+            output = Path(tmp) / "scored.csv"
+            suppression = Path(tmp) / "suppress.jsonl"
+            source.write_text(json.dumps(record) + "\n", encoding="utf-8")
+            suppression.write_text(
+                json.dumps({"event": "opt_out", "record_id": SuppressionIdentityTests.PLACE_ID}) + "\n",
+                encoding="utf-8",
+            )
+            os.environ["SUPPRESSION_SOURCE"] = str(suppression)
+
+            argv = ["score_leads.py", "--input", str(source), "--output", str(output), "--vertical", "plumbing"]
+            with patch("sys.argv", argv):
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    code = score_leads.main()
+
+            rows = output.read_text(encoding="utf-8").strip().splitlines()
+
+        self.assertEqual(code, 0)
+        self.assertNotIn("Suppressed leads dropped before scoring", stdout.getvalue())
+        self.assertEqual(len(rows), 2)  # header plus the lead that was never opted out
 
     def test_a_scraped_email_in_the_index_also_suppresses_at_scoring_time(self) -> None:
         record = _enriched(suppressed=False)

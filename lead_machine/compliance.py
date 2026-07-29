@@ -53,23 +53,89 @@ def suppression_identifier(kind: str, value: Any) -> str:
     return f"{kind}:{cleaned}" if cleaned else ""
 
 
-def record_suppression_identifiers(record: dict[str, Any]) -> set[str]:
-    fields = record.get("fields") if isinstance(record.get("fields"), dict) else record
-    assert isinstance(fields, dict)
-    values = {
-        "record_id": (
-            record.get("record_id")
-            or record.get("id")
-            or record.get("lead_id")
-            or fields.get("record_id")
-            or fields.get("lead_id")
-        ),
-        "phone": fields.get("phone") or fields.get("Phone"),
-        "email": fields.get("email") or fields.get("Email"),
-    }
+def enriched_contact_identifiers(enriched: Mapping[str, Any] | None) -> tuple[list[str], list[str]]:
+    """Return (emails, phones) visible on an enriched record."""
+    if not isinstance(enriched, Mapping):
+        return [], []
+    google = enriched.get("google") if isinstance(enriched.get("google"), Mapping) else {}
+    website = enriched.get("website") if isinstance(enriched.get("website"), Mapping) else {}
+
+    emails = [value for value in (website.get("emails_found") or []) if value]
+    for key in ("email", "Email"):
+        if google.get(key):
+            emails.append(google[key])
+
+    phones = [value for value in (website.get("phones_found") or []) if value]
+    for key in ("phone", "Phone"):
+        if google.get(key):
+            phones.append(google[key])
+
+    return emails, phones
+
+
+def record_suppression_identifiers(record: Mapping[str, Any]) -> set[str]:
+    """Every suppression key a record can be matched on, whatever its shape.
+
+    One identifier set for the three shapes suppression has to survive — Airtable
+    envelopes ({"id", "fields"}), flat queue/pooled rows, and enriched pipeline
+    records with nested google/website blocks — so send time and score time
+    recognise a lead by exactly the same keys. Scoring used to build its own
+    emails-and-phones set, which left the two stages on different definitions of
+    "the same lead".
+
+    Read the record-id keys for what they are: they only populate for a record
+    that already exists in Airtable — a mark_sent envelope, a hermes queue row, a
+    re-scored export. A newly discovered lead has never been uploaded, so it has
+    no Airtable id yet and cannot be matched by one even in principle; the
+    ledger's lead_id always refers to a record already in the base. On the
+    discovery path it is the nested google/website contacts that carry the whole
+    gate — pinned by
+    tests/test_dnc_enrichment.py::SuppressionIdentityTests, which asserts that
+    shape has no record id to match on.
+    """
+    if not isinstance(record, Mapping):
+        # Fail closed. An empty identifier set reads downstream as "nothing
+        # matched", which is indistinguishable from "checked and clear": the
+        # hermes morning queue keeps `[r for r in records if not
+        # _is_suppressed(r, suppression)]`, so a malformed element would be
+        # queued for send rather than stopping the run. A record we cannot
+        # identify is a record we cannot clear.
+        raise ComplianceError(
+            f"suppression cannot identify a {type(record).__name__} record"
+        )
+    envelope = record.get("fields") if isinstance(record.get("fields"), Mapping) else None
+    fields = record if envelope is None else envelope
+    # An enriched record's google block is the row enrichment was handed, so an
+    # Airtable export re-run through enrich_leads carries its record id there.
+    google = record.get("google") if isinstance(record.get("google"), Mapping) else {}
+
+    record_ids = [
+        record.get("record_id"),
+        record.get("lead_id"),
+        fields.get("record_id"),
+        fields.get("lead_id"),
+        google.get("record_id"),
+        google.get("lead_id"),
+    ]
+    if envelope is not None:
+        # A bare `id` counts as a record id only inside the envelope Airtable
+        # actually returns. Google Places keys the *Place ID* as `id` ("ChIJ…")
+        # and Places payloads are what this pipeline is built out of, so
+        # honouring `id` on any flat dict would put a Place ID into the
+        # record_id key space — a false positive against a ledger row that
+        # happens to hold that string, and a false negative for the record it
+        # shadows. Nothing live needs it: query_ready_to_send names the key
+        # `record_id`, and mark_sent passes the Airtable envelope.
+        record_ids.append(record.get("id"))
+
+    emails, phones = enriched_contact_identifiers(record)
+    emails += [fields.get("email"), fields.get("Email")]
+    phones += [fields.get("phone"), fields.get("Phone")]
+
     return {
         identifier
-        for kind, value in values.items()
+        for kind, values in (("record_id", record_ids), ("email", emails), ("phone", phones))
+        for value in values
         if (identifier := suppression_identifier(kind, value))
     }
 
@@ -129,11 +195,13 @@ def load_suppression_index(value: Path | str) -> set[str]:
     return suppressed
 
 
-def matching_suppression_identifiers(record: dict[str, Any], suppression: Iterable[str]) -> set[str]:
+def matching_suppression_identifiers(
+    record: Mapping[str, Any], suppression: Iterable[str]
+) -> set[str]:
     return record_suppression_identifiers(record) & set(suppression)
 
 
-def is_suppressed(record: dict[str, Any], suppression: Iterable[str]) -> bool:
+def is_suppressed(record: Mapping[str, Any], suppression: Iterable[str]) -> bool:
     return bool(matching_suppression_identifiers(record, suppression))
 
 
@@ -221,28 +289,8 @@ def is_suppressed_record(enriched: Mapping[str, Any] | None) -> bool:
     return bool(suppression_disqualifiers(enriched))
 
 
-def enriched_contact_identifiers(enriched: Mapping[str, Any] | None) -> tuple[list[str], list[str]]:
-    """Return (emails, phones) visible on an enriched record."""
-    if not isinstance(enriched, Mapping):
-        return [], []
-    google = enriched.get("google") if isinstance(enriched.get("google"), Mapping) else {}
-    website = enriched.get("website") if isinstance(enriched.get("website"), Mapping) else {}
-
-    emails = [value for value in (website.get("emails_found") or []) if value]
-    for key in ("email", "Email"):
-        if google.get(key):
-            emails.append(google[key])
-
-    phones = [value for value in (website.get("phones_found") or []) if value]
-    for key in ("phone", "Phone"):
-        if google.get(key):
-            phones.append(google[key])
-
-    return emails, phones
-
-
 def record_matches_suppression(
-    enriched: Mapping[str, Any] | None, suppression_index: AbstractSet[str]
+    enriched: Mapping[str, Any], suppression_index: AbstractSet[str]
 ) -> bool:
     """Match an enriched record against a live suppression index.
 
@@ -251,13 +299,19 @@ def record_matches_suppression(
     enrichment almost by definition, so a record enriched before a business
     opted out carries a clean flag forever. Every stage that can still stop a
     lead has to re-check against the current index rather than trust it.
+
+    Runs through the shared identifier set rather than contacts alone so scoring
+    and mark_sent recognise a record by exactly the same keys: an opt-out logged
+    against a record_id or lead_id used to bite only at send time, which left the
+    business to be enriched, scored, packeted and pushed to Airtable first.
+
+    Inherits that set's fail-closed handling of a malformed record, unlike
+    `suppression_disqualifiers`, which only reads a stored verdict and can safely
+    shrug. Here a shrug would be a clearance.
     """
     if not suppression_index:
         return False
-    emails, phones = enriched_contact_identifiers(enriched)
-    return has_suppression_match(
-        emails=emails, phones=phones, suppression_index=suppression_index
-    )
+    return bool(matching_suppression_identifiers(enriched, suppression_index))
 
 
 def merge_suppression_disqualifiers(row: dict[str, Any], enriched: Mapping[str, Any] | None) -> dict[str, Any]:
