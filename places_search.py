@@ -29,6 +29,11 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import requests
 from dotenv import load_dotenv
 
+from lead_machine.compliance import (
+    ComplianceError,
+    has_suppression_match,
+    load_configured_suppression_index,
+)
 from lead_machine.review_velocity import ReviewSnapshotStore
 from lead_machine.scoring_profiles import infer_market, infer_vertical_key
 
@@ -426,6 +431,17 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    # After parse_args, so --help works, and reported as an [ERROR] rather than
+    # an unhandled traceback — same shape as make_search_batch.main and
+    # enrich_leads.main. Legacy or not, run_pipeline.py still runs this file as
+    # stage 1, so it is a live path to a paid Places call and the refusal has to
+    # land before the first one rather than downstream of it.
+    try:
+        suppression_index = load_configured_suppression_index()
+    except ComplianceError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+
     api_key = os.getenv("GOOGLE_PLACES_API_KEY", "").strip()
     if not api_key:
         print("[ERROR] Missing GOOGLE_PLACES_API_KEY in .env", file=sys.stderr)
@@ -485,10 +501,38 @@ def main() -> int:
 
             try:
                 details = place_details(api_key, place_id)
+                # Google bills on return, so the call counts even for a lead
+                # dropped below. MAX_DETAILS_CALLS_PER_RUN caps spend, not kept
+                # leads: skipping the increment for a call already paid for would
+                # let a run quietly bill past its own cap and make the
+                # "[DONE] Details calls" line understate the invoice.
                 details_calls += 1
                 lead = normalize_place(details, query)
-                if lead.place_id and lead.reviews:
-                    snapshot_record = {"google": asdict(lead)}
+            except Exception as exc:
+                print(f"[ERROR] Details failed for place_id={place_id}: {exc}", file=sys.stderr)
+                continue
+
+            if not lead.business_name:
+                continue
+
+            if has_suppression_match(phones=[lead.phone], suppression_index=suppression_index):
+                # Earliest point an opted-out business is recognisable here. The
+                # Text Search page cannot be matched against the index at all:
+                # TEXT_SEARCH_FIELD_MASK returns id, displayName,
+                # formattedAddress and types, and a Place ID is deliberately not
+                # a suppression identifier (see record_suppression_identifiers) —
+                # so Details is the first payload carrying a phone, and paying
+                # for it is unavoidable without raising the Text Search SKU on
+                # every place to save it on a handful. What is avoidable is
+                # everything after: this runs ahead of the review-velocity write
+                # so a business that asked us to stop leaves no row in run_state,
+                # and ahead of the raw CSV every later stage reads.
+                print(f"[SKIP] Suppressed: {lead.business_name}")
+                continue
+
+            if lead.place_id and lead.reviews:
+                snapshot_record = {"google": asdict(lead)}
+                try:
                     snapshot_store.record_snapshot(
                         place_key=lead.place_id,
                         review_count=int(float(lead.reviews)),
@@ -497,12 +541,15 @@ def main() -> int:
                         market=infer_market(snapshot_record),
                         source="google_places",
                     )
-            except Exception as exc:
-                print(f"[ERROR] Details failed for place_id={place_id}: {exc}", file=sys.stderr)
-                continue
-
-            if not lead.business_name:
-                continue
+                except Exception as exc:
+                    # Own handler now that this sits outside the Details try, so a
+                    # locked SQLite file is not reported as a Google failure.
+                    # Still drops the lead, as it did when it shared that block.
+                    print(
+                        f"[ERROR] Review snapshot failed for place_id={place_id}: {exc}",
+                        file=sys.stderr,
+                    )
+                    continue
 
             if lead.duplicate_key in leads_by_key:
                 kept = leads_by_key[lead.duplicate_key]
