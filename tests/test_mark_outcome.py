@@ -2,14 +2,25 @@
 
 Mirrors test_send_queue_scripts.py's mocked-requests pattern: no test
 touches the network or a real base.
+
+Also carries the repo-wide "no Airtable write may set typecast" invariant
+(TestNoAirtableWritePathTypecasts). It lives here because mark_outcome.py held
+the last typecast in the codebase, and the rule is not per-script: a typecast
+anywhere mints select choices in the same shared base.
 """
+import ast
 import io
 import json
 import os
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
+from urllib.parse import unquote
 
 import mark_outcome
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _response(status_code=200, payload=None, text=""):
@@ -86,9 +97,7 @@ class TestApplyMarkOutcome(unittest.TestCase):
         self.assertEqual(patch_fields, {"Status": "Follow-Up", "Next Follow-Up": "2026-07-31"})
         self.assertEqual(receipt["next_follow_up"], "2026-07-31")
 
-        activity_payload = session.post.call_args_list[0].kwargs["json"]
-        self.assertTrue(activity_payload["typecast"])
-        activity_fields = activity_payload["records"][0]["fields"]
+        activity_fields = session.post.call_args_list[0].kwargs["json"]["records"][0]["fields"]
         self.assertEqual(activity_fields["Activity Type"], "Reply")
         self.assertEqual(activity_fields["Outcome"], "Replied")
         self.assertEqual(activity_fields["Linked Prospect"], ["rec42"])
@@ -137,17 +146,124 @@ class TestApplyMarkOutcome(unittest.TestCase):
         with self.assertRaisesRegex(mark_outcome.MarkOutcomeError, "Next Follow-Up"):
             mark_outcome.apply_mark_outcome(event="replied", session=session, **self.ARGS)
 
-    def test_prospect_patch_and_deal_create_never_typecast(self):
-        # Only the Sales Activities create may mint a select choice; a bad
-        # Status or Deal Status has to 422 instead of drifting the schema.
-        session = self._session(patch_status="Closed", patch_follow_up=None)
-        mark_outcome.apply_mark_outcome(event="closed_won", session=session, **self.ARGS)
-        self.assertNotIn("typecast", session.patch.call_args.kwargs["json"])
-        self.assertNotIn("typecast", session.post.call_args_list[1].kwargs["json"])
+    def test_no_write_path_sets_typecast(self):
+        # Reads the bodies off the session rather than naming today's three
+        # writes, so a fourth one added later is covered without editing this.
+        for event in sorted(mark_outcome.OUTCOME_EVENTS):
+            with self.subTest(event=event):
+                closing = event in mark_outcome.CLOSING_EVENTS
+                session = self._session(
+                    patch_status=mark_outcome.TARGET_STATUS[event],
+                    patch_follow_up=None if closing else "2026-07-31",
+                )
+                mark_outcome.apply_mark_outcome(event=event, session=session, **self.ARGS)
+                bodies = [
+                    call.kwargs["json"]
+                    for call in [*session.patch.call_args_list, *session.post.call_args_list]
+                ]
+                # Guards against the assertion loop passing on an empty list if
+                # the write path ever stops going through the session.
+                self.assertGreaterEqual(len(bodies), 2)
+                for body in bodies:
+                    self.assertNotIn("typecast", body)
+
+    # Every single-select field the write paths put on the wire. Hand-kept: a new
+    # select field written by mark_outcome has to be added here, or the
+    # reconciliation below silently stops covering it.
+    SELECT_FIELDS_ON_THE_WIRE = {
+        "Prospects": ("Status",),
+        "Sales Activities": ("Activity Type", "Outcome"),
+        "Deals": ("Deal Status",),
+    }
+
+    @classmethod
+    def _select_writes_on_the_wire(cls, session):
+        """(table, field, choice) triples this session was actually asked to send."""
+        writes = set()
+        for call in [*session.patch.call_args_list, *session.post.call_args_list]:
+            # .../v0/{base}/{table}[/{record}] — the table is what says which
+            # field vocabulary a value had to come from.
+            table = unquote(call.args[0].split("/")[5])
+            body = call.kwargs["json"]
+            records = body["records"] if "records" in body else [body]
+            for record in records:
+                for field, value in record["fields"].items():
+                    if field in cls.SELECT_FIELDS_ON_THE_WIRE.get(table, ()):
+                        writes.add((table, field, value))
+        return writes
+
+    def test_declared_vocabulary_matches_what_the_write_paths_send(self):
+        # REQUIRED_SELECT_CHOICES is what the Airtable runbook step gets generated
+        # from, so it is spelled out in the module rather than derived from the
+        # maps — which means nothing but this test stops it drifting from reality.
+        # Reconciled against four real runs' request bodies, not against the maps.
+        observed = set()
+        for event in sorted(mark_outcome.OUTCOME_EVENTS):
+            with self.subTest(event=event):
+                closing = event in mark_outcome.CLOSING_EVENTS
+                session = self._session(
+                    patch_status=mark_outcome.TARGET_STATUS[event],
+                    patch_follow_up=None if closing else "2026-07-31",
+                )
+                mark_outcome.apply_mark_outcome(event=event, session=session, **self.ARGS)
+                on_the_wire = self._select_writes_on_the_wire(session)
+                self.assertTrue(on_the_wire)
+                # The preflight can only vet what it predicts, so its prediction
+                # for this event has to be exactly what the event then sent.
+                self.assertEqual(set(mark_outcome.pending_select_writes(event)), on_the_wire)
+                observed |= on_the_wire
+
+        declared = {
+            (table, field, value)
+            for table, fields in mark_outcome.REQUIRED_SELECT_CHOICES.items()
+            for field, values in fields.items()
+            for value in values
+        }
+        # Exact, not a subset: a fifth event that needs a new choice fails here
+        # instead of 422ing in production, and a choice left declared after the
+        # code stopped writing it fails too rather than lingering in the runbook.
+        self.assertEqual(observed, declared)
+
+    def test_preflight_names_the_undeclared_choice_and_the_runbook(self):
+        # The realistic mistake: an event mapping is renamed or added and the
+        # matching choice never gets created in the base. Without this the run
+        # dies on a bare Airtable 422 that reads like a transient API fault.
+        session = self._session(patch_status="Follow-Up")
+        with patch.dict(mark_outcome.ACTIVITY_TYPE, {"replied": "Reply Received"}):
+            with self.assertRaises(mark_outcome.MarkOutcomeError) as caught:
+                mark_outcome.apply_mark_outcome(event="replied", session=session, **self.ARGS)
+        message = str(caught.exception)
+        self.assertIn("'Reply Received'", message)
+        self.assertIn("Sales Activities.Activity Type", message)
+        self.assertIn(mark_outcome.RUNBOOK_DOC, message)
+        # Fires before the first request, so a rejected event cannot leave the
+        # prospect PATCHed to Follow-Up with no activity row explaining it.
+        session.get.assert_not_called()
+        session.patch.assert_not_called()
+        session.post.assert_not_called()
+
+    def test_preflight_blocks_a_new_event_whose_choices_are_undeclared(self):
+        # A fifth event wired into the three maps, with choices nobody created:
+        # "Follow-Up" is already declared, "Note" is not, and the first
+        # undeclared one is what has to be named.
+        with patch.dict(mark_outcome.TARGET_STATUS, {"ghosted": "Follow-Up"}), \
+             patch.dict(mark_outcome.ACTIVITY_TYPE, {"ghosted": "Note"}), \
+             patch.dict(mark_outcome.ACTIVITY_OUTCOME, {"ghosted": "No Reply"}):
+            with self.assertRaisesRegex(
+                mark_outcome.MarkOutcomeError, r"Sales Activities\.Activity Type choice 'Note'"
+            ):
+                mark_outcome.preflight_select_values("ghosted")
+
+    def test_preflight_passes_for_every_shipped_event(self):
+        # Guards the inverse failure: a typo in REQUIRED_SELECT_CHOICES that makes
+        # the preflight reject work the base is perfectly able to accept.
+        for event in sorted(mark_outcome.OUTCOME_EVENTS):
+            with self.subTest(event=event):
+                mark_outcome.preflight_select_values(event)
 
     def test_written_select_vocabulary_is_closed(self):
-        # typecast on the activity create means these strings become live
-        # Airtable choices. Changing one is a schema change, not a rename.
+        # Without typecast these strings must already exist as choices in the
+        # base or the write 422s. Changing one is a schema change, not a rename.
         self.assertEqual(set(mark_outcome.TARGET_STATUS.values()), {"Follow-Up", "Closed"})
         self.assertEqual(set(mark_outcome.ACTIVITY_TYPE.values()), {"Reply", "Call", "Close"})
         self.assertEqual(
@@ -197,6 +313,77 @@ class TestApplyMarkOutcome(unittest.TestCase):
         session.post.side_effect = [_response(422, text="INVALID_VALUE")]
         with self.assertRaisesRegex(mark_outcome.MarkOutcomeError, "POST activity failed"):
             mark_outcome.apply_mark_outcome(event="replied", session=session, **self.ARGS)
+
+
+class TestNoAirtableWritePathTypecasts(unittest.TestCase):
+    """Repo-wide source invariant, not a per-script assertion.
+
+    typecast is how Airtable was told to invent a select choice for any string
+    it received, which is what put a phone number into `Lead Priority` as a live
+    `(440) 537-2459` option. Catching that by asserting on three known request
+    bodies only holds until someone adds a fourth writer, so this scans the
+    source instead: no shipped module may hand Airtable a typecast flag at all.
+    """
+
+    # Tests are excluded because they legitimately name typecast to prove its
+    # absence; .venv and caches are third-party or generated.
+    SKIP_DIRS = frozenset({".venv", ".git", "__pycache__", "node_modules", "tests"})
+
+    def _repo_sources(self):
+        for dirpath, dirnames, filenames in os.walk(REPO_ROOT):
+            dirnames[:] = [d for d in dirnames if d not in self.SKIP_DIRS and not d.startswith(".")]
+            for name in sorted(filenames):
+                if name.endswith(".py"):
+                    yield Path(dirpath) / name
+
+    @staticmethod
+    def _typecast_lines(tree: ast.AST) -> list[int]:
+        # Three spellings reach Airtable: a "typecast" key in whatever dict ends
+        # up as the request body, a typecast= kwarg on a client helper, and the
+        # body being built first and keyed afterwards (`body["typecast"] = True`).
+        # The third is matched on the subscript itself rather than on the
+        # assignment, so the augmented and deleted forms are covered by the same
+        # rule; a *read* of body["typecast"] can only exist where the flag does.
+        lines = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Dict):
+                lines.extend(
+                    key.lineno
+                    for key in node.keys
+                    if isinstance(key, ast.Constant) and key.value == "typecast"
+                )
+            elif isinstance(node, ast.Call):
+                lines.extend(node.lineno for kw in node.keywords if kw.arg == "typecast")
+            elif isinstance(node, ast.Subscript):
+                if isinstance(node.slice, ast.Constant) and node.slice.value == "typecast":
+                    lines.append(node.lineno)
+        return sorted(lines)
+
+    def test_no_module_hands_airtable_a_typecast_flag(self):
+        scanned = 0
+        offenders = []
+        for path in self._repo_sources():
+            scanned += 1
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            offenders.extend(
+                f"{path.relative_to(REPO_ROOT)}:{line}" for line in self._typecast_lines(tree)
+            )
+        # A pruned walk that silently found nothing would pass vacuously.
+        self.assertGreater(scanned, 20)
+        self.assertEqual(offenders, [], f"typecast reintroduced at: {', '.join(offenders)}")
+
+    def test_scan_detects_a_typecast_write_path(self):
+        # Proves the invariant above can actually fail, since its passing state
+        # is an empty list either way.
+        planted = ast.parse('requests.patch(url, json={"fields": f, "typecast": True})')
+        self.assertEqual(self._typecast_lines(planted), [1])
+        kwarg_form = ast.parse("table.update(record_id, fields, typecast=True)")
+        self.assertEqual(self._typecast_lines(kwarg_form), [1])
+        # The literal-dict form is the one review catches anyway. Building the
+        # body and keying it afterwards is the reintroduction that reads as
+        # innocuous, so it is the one the scanner most has to see.
+        subscript_form = ast.parse('body = {"fields": f}\nbody["typecast"] = True\n')
+        self.assertEqual(self._typecast_lines(subscript_form), [2])
 
 
 class TestMain(unittest.TestCase):

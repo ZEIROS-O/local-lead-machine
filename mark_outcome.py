@@ -14,19 +14,36 @@ Writes:
   - a new row in Sales Activities, linked back to the prospect
   - on closed_won only: a new row in Deals, linked back to the prospect
 
-`typecast` is used on the Sales Activities create and *only* there. That table's
-Activity Type/Outcome vocabularies were built for meeting logistics
-(Completed/Scheduled/No Show) and cannot express a funnel outcome, and Airtable's
-Meta API refuses to add select choices to an existing field — typecast on write
-is the only mechanism that can. What keeps that from becoming open-ended drift is
-that the vocabulary is closed: `ACTIVITY_TYPE`/`ACTIVITY_OUTCOME` below are the
-complete set of values this script can ever emit, they are pinned by
-`tests/test_mark_outcome.py`, and they are declared in
-`docs/airtable_schema_required.md`.
+No write path here sets `typecast`, and none may. The Sales Activities create
+used to, because that table's Activity Type/Outcome vocabularies were built for
+meeting logistics (Completed/Scheduled/No Show) and Airtable's Meta API refuses
+to add select choices to an existing field — typecast on write was the only
+mechanism that could. The cost was a silent schema-drift channel: typecast makes
+Airtable invent a choice for *whatever* string it is handed, so one mis-mapped
+value minted a `Lead Priority` choice literally named `(440) 537-2459`.
 
-The Prospects PATCH and the Deals create write only values that already exist in
-the base, so neither uses typecast: an unknown Status or Deal Status is a bug and
-must 422 loudly rather than silently minting a fourteenth Status choice.
+Dropping typecast moves that obligation onto the base, and the base has not met
+it yet. **Precondition, unmet as of 2026-07-29:** every choice in
+`REQUIRED_SELECT_CHOICES` must already exist in the live base, and for
+Sales Activities none of them do — `Activity Type` offers Call/Email/Meeting/
+Follow Up/Demo/Note/Other (no Reply, no Close) and `Outcome` offers Completed/
+Scheduled/Rescheduled/Cancelled/No Show/Outcome Pending (none of the four written
+here). Until a human runs the Airtable runbook step that adds those choices by
+hand, **every** mark_outcome event 422s — this script cannot record a single
+outcome. That runbook step is a hard prerequisite, not a cleanup task. Restoring
+typecast is not the fix; it is the drift channel this removal closed.
+
+`REQUIRED_SELECT_CHOICES` states that prerequisite as data — the exact
+table/field/choice set the base must offer — so the runbook can be generated from
+this module instead of transcribed alongside it and left to drift.
+`preflight_select_values` checks the values a run is about to send against it
+before the first request, so a value the declaration has not caught up with fails
+by name instead of as an opaque Airtable 422.
+
+`TARGET_STATUS`/`ACTIVITY_TYPE`/`ACTIVITY_OUTCOME` below are still the complete
+set of values this script can ever emit, pinned by `tests/test_mark_outcome.py`
+against `REQUIRED_SELECT_CHOICES` so a fifth event cannot be added without
+declaring the choices it needs.
 """
 from __future__ import annotations
 
@@ -83,6 +100,30 @@ CLOSED_WON_DEAL_STATUS = "Deposit Pending"
 
 OUTCOME_EVENTS = frozenset(TARGET_STATUS)
 
+# Where the runbook's "create these choices" step is written down for a human.
+RUNBOOK_DOC = "docs/airtable_schema_required.md"
+
+# The select choices the base must already offer for a mark_outcome write to
+# succeed at all, keyed by the logical table and field that has to offer them.
+# Spelled out rather than derived from the maps above on purpose: this is a
+# statement about the *base*, so the runbook generator can import it verbatim
+# and the test below can catch the maps growing past what has been declared.
+# Keys are the default table names — the --*-table flags rename the table, not
+# the field vocabulary a renamed table still has to carry.
+REQUIRED_SELECT_CHOICES: dict[str, dict[str, frozenset[str]]] = {
+    "Prospects": {
+        "Status": frozenset({"Follow-Up", "Closed"}),
+    },
+    "Sales Activities": {
+        "Activity Type": frozenset({"Reply", "Call", "Close"}),
+        "Outcome": frozenset({"Replied", "Meeting Booked", "Won", "Lost"}),
+    },
+    "Deals": {
+        "Deal Status": frozenset({"Deposit Pending"}),
+    },
+}
+
+
 
 def airtable_record_url(base_id: str, table: str, record_id: str) -> str:
     return f"https://api.airtable.com/v0/{base_id}/{quote(table, safe='')}/{record_id}"
@@ -94,6 +135,43 @@ def airtable_table_url(base_id: str, table: str) -> str:
 
 class MarkOutcomeError(RuntimeError):
     pass
+
+
+def pending_select_writes(event: str) -> list[tuple[str, str, str]]:
+    """Every (table, field, choice) this event will hand Airtable, before sending.
+
+    Mirrors the write paths in `apply_mark_outcome` so the preflight and the test
+    that pins `REQUIRED_SELECT_CHOICES` both read the intent from one place.
+    """
+    writes = [
+        ("Prospects", "Status", TARGET_STATUS[event]),
+        ("Sales Activities", "Activity Type", ACTIVITY_TYPE[event]),
+        ("Sales Activities", "Outcome", ACTIVITY_OUTCOME[event]),
+    ]
+    if event == "closed_won":
+        writes.append(("Deals", "Deal Status", CLOSED_WON_DEAL_STATUS))
+    return writes
+
+
+def preflight_select_values(event: str) -> None:
+    """Refuse an undeclared select choice before the first request goes out.
+
+    Without typecast, Airtable answers an unknown choice with a bare 422
+    INVALID_MULTIPLE_CHOICE_OPTIONS, which reads as a transient API fault rather
+    than "the runbook step that creates these choices was never run". This is an
+    offline check against the declaration only — it never fetches the schema, so
+    it catches code that outran `REQUIRED_SELECT_CHOICES`; a base that is behind
+    the declaration still surfaces as the 422 the module docstring warns about.
+    """
+    for table, field, value in pending_select_writes(event):
+        if value not in REQUIRED_SELECT_CHOICES.get(table, {}).get(field, frozenset()):
+            raise MarkOutcomeError(
+                f"{table}.{field} choice {value!r} is not declared in "
+                f"REQUIRED_SELECT_CHOICES, so the Airtable runbook step that "
+                f"pre-creates these choices ({RUNBOOK_DOC}) does not cover it and "
+                f"Airtable will 422 on it. Declare the choice here and create it in "
+                f"the base before running this event."
+            )
 
 
 def _request_json(response: requests.Response, operation: str) -> dict:
@@ -126,6 +204,12 @@ def apply_mark_outcome(
 ) -> dict:
     if event not in OUTCOME_EVENTS:
         raise MarkOutcomeError(f"unknown event {event!r}; expected one of {sorted(OUTCOME_EVENTS)}")
+
+    # Runs before the GET so an undeclared choice costs no request and cannot
+    # leave a half-applied outcome: the Prospects PATCH lands before the Sales
+    # Activities create, so a 422 on the activity would otherwise strand the
+    # record at Follow-Up/Closed with nothing in the ledger explaining why.
+    preflight_select_values(event)
 
     try:
         occurred_on = dt.datetime.fromisoformat(occurred_at).date().isoformat()
@@ -186,9 +270,7 @@ def apply_mark_outcome(
                     "Linked Prospect": [record_id],
                 }
             }
-        ],
-        # See the module docstring: bounded, documented vocabulary only.
-        "typecast": True,
+        ]
     }
     activity_response = _request_json(
         session.post(activities_url, headers=headers, json=activity_payload, timeout=30),

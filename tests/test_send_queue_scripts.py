@@ -296,7 +296,7 @@ class TestMarkSent(unittest.TestCase):
                     patch_fields={**READY_FIELDS, "Status": "Sent", "Last Contacted": "2026-07-09", "Outreach Channel": "SMS"},
                 )
 
-    def test_patches_status_channel_and_date_with_typecast(self):
+    def test_patches_status_channel_and_date_without_typecast(self):
         with tempfile.TemporaryDirectory() as tmp:
             suppression = self._suppression(tmp)
             current = _response(200, {"id": "rec42", "fields": dict(READY_FIELDS)})
@@ -323,7 +323,9 @@ class TestMarkSent(unittest.TestCase):
 
         self.assertIn("/rec42", mock_patch.call_args[0][0])
         payload = mock_patch.call_args.kwargs["json"]
-        self.assertTrue(payload["typecast"])
+        # An Outreach Channel Airtable has never heard of must 422, not become
+        # the select field's newest choice.
+        self.assertNotIn("typecast", payload)
         self.assertEqual(
             payload["fields"],
             {

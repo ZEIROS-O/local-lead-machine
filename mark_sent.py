@@ -4,8 +4,13 @@
 Write-back half of the `send-queue` skill's Airtable loop. Only ever called
 after Lou has already sent the message himself and reports it via
 `/send-queue log` — this script logs status, it never sends anything.
-Uses Airtable's `typecast` so a not-yet-listed Outreach Channel value
-(e.g. "SMS") is added to the select field automatically instead of 422ing.
+
+The PATCH deliberately does not set Airtable's `typecast`. It used to, so a
+not-yet-listed Outreach Channel value (e.g. "SMS") would be added to the select
+field instead of 422ing — but typecast does that for *any* string, and that is
+how a mis-mapped value minted a `Lead Priority` choice literally named
+`(440) 537-2459` in the live base. Channel and Status choices are pre-created
+now, so an unknown one has to fail loudly rather than grow the schema.
 """
 from __future__ import annotations
 
@@ -141,7 +146,7 @@ def apply_mark_sent(
         session.patch(
             url,
             headers=headers,
-            json={"fields": requested_fields, "typecast": True},
+            json={"fields": requested_fields},
             timeout=30,
         ),
         "PATCH",
