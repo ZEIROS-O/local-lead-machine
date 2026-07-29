@@ -299,6 +299,15 @@ class EntryPointTests(unittest.TestCase):
         self.env = patch.dict(os.environ, {}, clear=True)
         self.env.start()
         self.addCleanup(self.env.stop)
+        # Clearing os.environ is not enough: every entry point calls
+        # load_dotenv() inside main(), which reads the developer's real .env
+        # back in and re-supplies SUPPRESSION_SOURCE. The fail-closed branch
+        # then never runs and these tests pass locally only when .env happens
+        # to be absent. Stub it the same way test_send_queue_scripts.py does.
+        for module in (make_search_batch, enrich_leads, score_leads):
+            patcher = patch.object(module, "load_dotenv", lambda: False)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def test_make_search_batch_passes_the_index_to_enrichment(self) -> None:
         """The regression this whole batch exists for: the production entry
