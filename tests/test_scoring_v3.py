@@ -486,6 +486,98 @@ class ScoringV3Test(unittest.TestCase):
         self.assertEqual(result.disposition, "reject")
         self.assertIn("outside_target_geography", result.hard_disqualifiers)
 
+    def test_outside_market_reject_reports_the_profile_error_alone(self) -> None:
+        """Blockers is operator-facing text, and this reject predates the
+        compliance fallback: it names itself in `reason_codes`, so a
+        `hard_disqualifier` prefix would add nothing and churn every
+        out-of-market record. Pinned exactly because it silently grew a second
+        element once already and no test caught it."""
+        record = _pilot_record()
+        record["market"] = "toledo"
+        with self.assertRaises(ScoringProfileError) as caught:
+            load_scoring_profile("detailing", "toledo")
+
+        result = score_v3(record, self._row())
+
+        self.assertEqual(result.hard_disqualifiers, ("outside_target_geography",))
+        self.assertEqual(result.reason_codes, ("outside_target_geography",))
+        self.assertEqual(result.blocking_gates, (str(caught.exception),))
+
+    def _unprofiled_record(self, *, suppressed: bool = False) -> dict:
+        """A lead in a cell with no exact scoring profile — hardscaping is in
+        the vertical catalogue but has no scoring_profiles/ cell, and is not a
+        supported cell, so it is inside geography and unscoreable."""
+        record = {
+            "vertical": "hardscaping",
+            "google": {
+                "business_name": "Lakeside Paver Works",
+                "category": "paver_contractor",
+                "city": "Cleveland",
+                "rating": "4.9",
+                "reviews": "120",
+            },
+        }
+        if suppressed:
+            record["derived"] = {"hard_icp_reasons": ["dnc_suppressed"]}
+        return record
+
+    def test_suppressed_lead_without_a_profile_is_rejected_not_queued_for_review(self) -> None:
+        """manual-review is a queue a human can still send from, so a suppressed
+        lead parked there stays contactable. The disqualifier outranks the rank
+        we could not compute."""
+        with self.assertRaises(ScoringProfileError) as caught:
+            load_scoring_profile("hardscaping", "cleveland")
+
+        result = score_v3(self._unprofiled_record(suppressed=True), self._row())
+
+        self.assertEqual(result.profile_id, "")
+        self.assertEqual(result.disposition, "reject")
+        self.assertEqual(result.hard_disqualifiers, ("dnc_suppressed",))
+        self.assertEqual(
+            result.reason_codes,
+            ("missing_exact_profile", "clear_profile_or_compliance_disqualifier"),
+        )
+        # The profile error alone would not tell an operator a compliance hit
+        # fired, so this case — and only this case — leads with the gate.
+        self.assertEqual(result.blocking_gates, ("hard_disqualifier", str(caught.exception)))
+
+    def test_clean_lead_without_a_profile_still_goes_to_manual_review(self) -> None:
+        """The reject follows the disqualifier only: an unscoreable but clean
+        lead is a human question, not a rejection."""
+        with self.assertRaises(ScoringProfileError) as caught:
+            load_scoring_profile("hardscaping", "cleveland")
+
+        result = score_v3(self._unprofiled_record(), self._row())
+
+        self.assertEqual(result.profile_id, "")
+        self.assertEqual(result.disposition, "manual-review")
+        self.assertEqual(result.hard_disqualifiers, ())
+        self.assertEqual(result.reason_codes, ("missing_exact_profile",))
+        self.assertEqual(result.blocking_gates, (str(caught.exception),))
+
+    def test_fallback_reuses_the_scored_paths_disqualifier_vocabulary(self) -> None:
+        """The fallback must not mint a second vocabulary for operators to
+        learn: both codes it emits are the ones the scored path already uses
+        when a hard disqualifier fires."""
+        scored = score_v3(
+            {
+                "vertical": "plumbing",
+                "google": {
+                    "business_name": "ARS / Rescue Rooter",
+                    "category": "plumber",
+                    "source_batch": "plumbing_cleveland_medium_001",
+                },
+            },
+            self._row(),
+        )
+        fallback = score_v3(self._unprofiled_record(suppressed=True), self._row())
+
+        self.assertEqual(scored.disposition, "reject")
+        self.assertIn("clear_profile_or_compliance_disqualifier", scored.reason_codes)
+        self.assertIn("hard_disqualifier", scored.blocking_gates)
+        self.assertIn("clear_profile_or_compliance_disqualifier", fallback.reason_codes)
+        self.assertIn("hard_disqualifier", fallback.blocking_gates)
+
     def test_fresh_external_observation_contributes_named_leak_and_offer(self) -> None:
         record = _pilot_record()
         record["signal_observations"] = [

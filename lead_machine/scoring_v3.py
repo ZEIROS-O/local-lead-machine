@@ -80,12 +80,24 @@ def score_v3(
         # A compliance disqualifier has to survive a missing profile. This
         # branch used to report no disqualifiers at all, so a suppressed lead in
         # a vertical/market with no scoring profile came back clean.
+        suppressed = tuple(suppression_disqualifiers(enriched))
         fallback_disqualifiers = tuple(
-            sorted(
-                ({"outside_target_geography"} if outside_target else set())
-                | set(suppression_disqualifiers(enriched))
-            )
+            sorted(({"outside_target_geography"} if outside_target else set()) | set(suppressed))
         )
+        # A hard disqualifier disqualifies whether or not a profile loaded. The
+        # missing profile only costs us a rank, and manual-review is a queue a
+        # human can still send from, so a suppressed lead parked there is the
+        # same leak this branch was added to close.
+        fallback_reasons = ["outside_target_geography" if outside_target else "missing_exact_profile"]
+        if suppressed:
+            fallback_reasons.append("clear_profile_or_compliance_disqualifier")
+        # Blockers is operator-facing text. The suppressed lead is newly rejected
+        # here and its only other signal is the generic
+        # `clear_profile_or_compliance_disqualifier` reason, so lead with the
+        # disqualifier. The outside-market reject predates this branch and already
+        # names itself in `reason_codes`, so it keeps the exact profile error it
+        # has always reported rather than churning for a redundant prefix.
+        fallback_blockers = ("hard_disqualifier", str(exc)) if suppressed else (str(exc),)
         return ScoreV3Result(
             policy_version=SCORING_POLICY_VERSION,
             profile_id="",
@@ -95,11 +107,11 @@ def score_v3(
             market=market,
             component_scores={},
             rank_score=None,
-            disposition="reject" if outside_target else "manual-review",
+            disposition="reject" if fallback_disqualifiers else "manual-review",
             offer_lane=_offer_lane(row, review_pain),
             named_leak=_named_leak(row, review_pain),
-            reason_codes=(("outside_target_geography",) if outside_target else ("missing_exact_profile",)),
-            blocking_gates=(str(exc),),
+            reason_codes=tuple(fallback_reasons),
+            blocking_gates=fallback_blockers,
             hard_disqualifiers=fallback_disqualifiers,
             reputation_risks=tuple(review_pain.get("reputation_risk_categories") or ()),
             review_velocity=review_velocity,
