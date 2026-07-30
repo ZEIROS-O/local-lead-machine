@@ -1,8 +1,21 @@
 # Agent orientation — local-lead-machine
 
 This repo finds local-service businesses with weak websites and scores them as outreach leads:
-`places_search.py` → `enrich_leads.py` → `make_llm_batch` → score (`score_leads.py`) →
-`sendability.py` gate → `make_packets.py` → Airtable. Core logic lives in `lead_machine/`.
+search → `enrich_leads.py` → `make_llm_batch` → score (`score_leads.py`) → `sendability.py` gate →
+`make_packets.py` → Airtable. Core logic lives in `lead_machine/`.
+
+**Two search front doors, and they are not interchangeable.** `make_search_batch.py --config
+<search config>` is the current one — it takes a JSON search config with geo slices, paginates,
+applies the ICP prefilter, dedupes against the batch and enriches in the same pass. It imports the
+Places API layer (`text_search_paged`, `place_details`, `normalize_place`) from `places_search.py`,
+so that module is live library code. `places_search.py`'s **CLI entry point** (`main()`) is a
+separate thing and is marked LEGACY in its own docstring: it reads a hand-maintained
+`data/searches.csv` that nothing produces, and it does not prefilter, dedupe or enrich.
+`run_pipeline.py` stage 1 still shells out to that legacy CLI — a known
+inconsistency, deliberately not fixed in `b601a92` because `make_search_batch` is not a drop-in
+(different flags, derives its own paths, enriches inline, so stage 2 would double-scrape). Treat
+`run_pipeline.py` as the older path and the search config as the current one. New search behaviour
+belongs in `make_search_batch.py`.
 
 ## The roadmap (one machine, four nested loops)
 
@@ -10,9 +23,10 @@ This repo is the first instance of an automated outreach loop: **Discovery & Sco
 **Asset Generation (B)** → **Sequencing & Reply-Routing (C)** → **Feedback (D)**. Build in dependency
 order; each loop is independently revertible.
 
-- **Phase A — Loop A (active, ~80% built):** find good leads + close the scoring loop.
-  Plan of record → **[`docs/phase-a-backlog.md`](docs/phase-a-backlog.md)**.
+- **Phase A — Loop A (G1–G4 shipped; hardening continues):** find good leads + close the scoring
+  loop. Design record → **[`docs/phase-a-backlog.md`](docs/phase-a-backlog.md)**.
 - **Phase B — Loops B/C (not built):** asset generation (the moat) + outreach sequencing.
+  Build order → **[`docs/phase-b-c-roadmap.md`](docs/phase-b-c-roadmap.md)**.
 - **Phase C — Loop D (partly instrumented):** scheduling + outcome feedback.
 - Strategic north-star (the *why*, end-state, EV, compliance, game-theory) →
   **[`docs/outreach-loop-strategy.md`](docs/outreach-loop-strategy.md)**.
@@ -29,16 +43,41 @@ order; each loop is independently revertible.
 
 ## Active work — read before touching scoring/enrichment/ICP/configs/pipeline
 
-**[`docs/phase-a-backlog.md`](docs/phase-a-backlog.md)** is the current plan of record. It is split
-into 4 sequenced groups (G1→G4) with tasks, "Done when", and verification. Work groups in order;
-respect the blocking links; keep each group a small, independently-revertible batch.
+**[`docs/phase-a-backlog.md`](docs/phase-a-backlog.md)** is the design record for Loop A. Its four
+groups (G1→G4) all shipped, so it is not a to-do list any more — but it is where the *reasoning*
+behind scoring, enrichment, ICP, configs and the pipeline lives, and its "Landed since" section
+carries the correctness rules added after G4. Read it before touching any of those. Keep each change
+a small, independently-revertible batch.
 
-Key in-flight facts (2026-07-26):
-- **Six live verticals across eleven metros**: hardscaping, car detailing, epoxy, plumbing, water
-  restoration, garage doors. Per-vertical terms live in `lead_machine/verticals.py` and per-metro
-  place names in `market_profiles/*.json` — add verticals and metros as **data, not code**. Nothing
-  in scoring should name Cleveland or a single trade; `resolve_profile` and `infer_market` exist
-  for that.
+Key in-flight facts (2026-07-29):
+- **Seven registered verticals across fifteen metros**: hardscaping, car detailing, epoxy, plumbing,
+  water restoration, garage doors, **roofing** (roofing and epoxy became real profiles in `c53b241`
+  instead of silently resolving to hardscaping). Per-vertical terms live in
+  `lead_machine/verticals.py` and per-metro place names in `market_profiles/*.json` — add verticals
+  and metros as **data, not code**, via the `add-vertical` / `add-metro` skills. Nothing in scoring
+  should name Cleveland or a single trade; `resolve_profile` and `infer_market` exist for that.
+- **Term matching is left-boundary aware, not bare substring** (`c53b241`). Plain `in` matching read
+  a term that was only the *tail* of a longer word as a hit, so registering `roofing` classified
+  every *waterproofing* business as roofing. The boundary is left-only on purpose — lists are
+  written singular and rely on `gutter` matching `gutters`. A collision-audit test fails if a new
+  term reintroduces the class.
+- **Review floor 8, no review ceiling** (`82a5716`). `max_reviews` is gone as a concept: the one
+  booked call to date (2026-07-28) was a 222-review garage-door business, which a ceiling would have
+  thrown away. Maturity is a *band* (`buyer_signals.REVIEW_DEMAND_THRESHOLDS`), not a gate. The
+  floor lives on two surfaces that must move together — `VerticalProfile.min_reviews` (score-time,
+  read by `icp.hard_icp_gate`) and `vertical_profiles/*.json` (search-time, read by
+  `generate_search_config.py`) — and a test fails if they disagree.
+- **`sendability.admit()` is the only place a lead may be declared sendable.** It re-reads the ICP
+  verdict from the row rather than trusting the caller's blocker list, because a stored
+  `Sendable: Yes` from an earlier scoring run used to ride into the send queue after the lead
+  acquired a skip. Any new sendable path goes through `admit`.
+- **No Airtable write may set `typecast`** (`91c7131`). It minted a select choice for any string
+  handed to it — that is how `Lead Priority` acquired an option named `(440) 537-2459`. A repo-wide
+  AST scan in `tests/test_mark_outcome.py` fails the suite if any shipped module reintroduces it, so
+  a new write path is covered without editing the test. The consequence is that **every select
+  choice must be pre-created in the base by hand**; `mark_outcome.py` is blocked on exactly that
+  today. Current state and the runbook list live in
+  [`docs/airtable_schema_required.md`](docs/airtable_schema_required.md).
 - **Scoring runs on the Anthropic Messages API** (`claude-sonnet-5`, `LLM_SCORING_MODEL` in `.env`,
   no SDK — uses `requests`). Spend caps price the resolved model from
   `score_leads.LLM_PRICING_USD_PER_MILLION_TOKENS`; an unpriced model fails the run rather than
@@ -63,22 +102,27 @@ every one of them logs something a human already did. **None of them send anythi
 - `mark_sent.py` — `Status=Sent`, `Last Contacted`, `Outreach Channel`, and arms `Next Follow-Up`
   one cadence step out.
 - `mark_outcome.py` — everything after that: `replied` / `meeting_booked` → `Follow-Up` (re-arms the
-  cadence), `closed_won` / `closed_lost` → `Closed` (clears it), plus a `Sales Activities` row and,
-  on a win, a `Deals` row.
+  cadence), `closed_won` → `Won`, `closed_lost` → `Lost` (both clear it), plus a
+  `Sales Activities` row and, on a win, a `Deals` row.
 
 The cadence itself lives in `lead_machine/follow_up.py` (`FOLLOW_UP_CADENCE_DAYS`, default 4) so the
 two writers cannot disagree about it. Table names and the exact select vocabularies these scripts
 write are in [`docs/airtable_schema_required.md`](docs/airtable_schema_required.md).
 
 ## Conventions
-- Config/secrets via `.env` (`python-dotenv`); env vars include `GOOGLE_PLACES_API_KEY`, `AIRTABLE_*`,
-  `ANTHROPIC_API_KEY`, `LLM_SCORING_MODEL`, `MAX_LLM_*` caps, `ENRICH_WORKERS`,
-  `REVIEW_SNAPSHOT_DB`, `AIRTABLE_RECEIPTS_PATH`.
+- Config/secrets via `.env` (`python-dotenv`); env vars include `GOOGLE_PLACES_API_KEY`,
+  `AIRTABLE_PAT` (with `AIRTABLE_API_KEY` as a fallback in some scripts), `AIRTABLE_BASE_ID`,
+  `AIRTABLE_PROSPECTS_TABLE`, `AIRTABLE_SALES_ACTIVITIES_TABLE` (default `Sales Activities`),
+  `AIRTABLE_DEALS_TABLE` (default `Deals`), `AIRTABLE_RECEIPTS_PATH`, `ANTHROPIC_API_KEY`,
+  `LLM_SCORING_MODEL`, the `MAX_LLM_*` caps, the Places caps (`MAX_SEARCH_CALLS_PER_RUN` 3,
+  `MAX_DETAILS_CALLS_PER_RUN` 50, `MAX_TOTAL_PLACES_PER_RUN` 50, `MAX_WEBSITES_PER_RUN` 40),
+  `ENRICH_WORKERS`, `BUYER_INTENT_ADS_CHECK` (off), `FOLLOW_UP_CADENCE_DAYS` (4), and
+  `REVIEW_SNAPSHOT_DB`.
   **Compliance requires `SUPPRESSION_SOURCE` (or `LPM_OUTCOMES_JSONL`) to be set** or search,
   enrichment and scoring all fail closed with `[ERROR]` and exit 1. `ALLOW_MISSING_SUPPRESSION_INDEX=1`
   bypasses it loudly; there is deliberately no silent empty-index fallback, because an empty index
   disables every opt-out.
-- HTTP via `requests` (see `places_search.py:170` `request_json`). No new heavy deps without reason.
+- HTTP via `requests` (see `places_search.request_json`). No new heavy deps without reason.
 - Tests are stdlib `unittest` in `tests/`. Run `.venv/bin/python -m unittest discover -s tests`
   (bare `python -m unittest` discovers 0 tests here, and the system interpreter has none of the
   deps — a dozen modules fail to import; esp. cover `tests.test_icp_lanes` +

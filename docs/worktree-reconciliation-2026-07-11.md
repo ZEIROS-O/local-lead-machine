@@ -57,10 +57,14 @@ unknown verticals).
   current Phase A behavior** (vertical-derived review bounds, centralized scoring rules, current
   Airtable payload/drop diagnostics, current prompt wording, and their tests). All Hermes-only
   command/state/executor/queue/doc/test code preserved.
-- Untracked `search_configs/epoxy_cleveland_medium_002.json`: **confirmed stale** — uses the
-  obsolete five-review floor (`min_reviews: 5`; current epoxy configs use 10) and predates
-  pagination; config numbering on the main line already advanced to 004/005. Discarded (copy in
-  backups).
+- Untracked `search_configs/epoxy_cleveland_medium_002.json`: **confirmed stale** — used a
+  five-review floor (`min_reviews: 5`) against the 10 that shipped epoxy configs carried at the
+  time, and predates pagination; config numbering on the main line already advanced to 004/005.
+  Discarded (copy in backups). **Superseded 2026-07-29 (`82a5716`):** the floor is now **8**, set on
+  both surfaces — `VerticalProfile.min_reviews` (score-time) and `vertical_profiles/epoxy.json`
+  (search-time) — with a test that fails if they disagree. The shipped
+  `search_configs/epoxy_cleveland_medium_00{1,4,5}.json` still carry the old `min_reviews: 10` and
+  predate that change; `generate_search_config.py` emits 8 for anything regenerated.
 
 ### manual-lead-inserter
 

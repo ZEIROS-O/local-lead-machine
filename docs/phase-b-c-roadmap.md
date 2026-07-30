@@ -3,12 +3,22 @@
 > **Status note (2026-07-11, reconciliation):** this doc was drafted when Phase A was declared
 > complete on 2026-06-20. Since then the Phase A line continued hardening through 2026-07-09
 > (scoring batches 1–8, ICP lane recalibration, Places pagination, manual-score merging; suite is
-> 256 tests). Live lanes are now **detailing / epoxy (Cleveland), garage doors (Columbus), water
-> restoration (Cleveland)** — not detailing-only as stated below. A manual morning send-queue layer
-> (`query_ready_to_send.py`, `mark_sent.py`, `morning_queue.json`, Hermes queue verbs) now exists;
-> it anticipates B4's approval-queue concept but **sends nothing** — Gate 0 is unchanged and still
-> governs. Treat Phase B/C content below as the build order; treat Phase A status claims as
-> superseded by [phase-a-backlog.md](phase-a-backlog.md) and the git log.
+> 256 tests). A manual morning send-queue layer (`query_ready_to_send.py`, `mark_sent.py`,
+> `morning_queue.json`, Hermes queue verbs) now exists; it anticipates B4's approval-queue concept
+> but **sends nothing** — Gate 0 is unchanged and still governs. Treat Phase B/C content below as
+> the build order; treat Phase A status claims as superseded by
+> [phase-a-backlog.md](phase-a-backlog.md) and the git log.
+>
+> **Status note (2026-07-29):** the lane list has moved again and the "detailing-only" framing below
+> is now two revisions stale. `lead_machine/verticals.py` registers **seven** verticals —
+> hardscaping, detailing, water restoration, garage doors, plumbing, epoxy, roofing — and
+> `search_configs/` covers **fifteen** Ohio metros. Suite is 779 tests at `82a5716`. Two rule
+> changes below the Phase B line are worth knowing before building any of it: **no Airtable write
+> may set `typecast`** (so every select choice must be pre-created by hand — `mark_outcome.py` is
+> currently blocked on six that do not exist), and **`sendability.admit()` is the only place a lead
+> may be declared sendable**. Both are detailed under "Landed since" in
+> [phase-a-backlog.md](phase-a-backlog.md). **Gate 0 still governs** — the first booked call landed
+> 2026-07-28, and Gate 0 opens on closes, not calls.
 
 ## Context
 
@@ -25,11 +35,18 @@ The gap: the pipeline produces A-grade sendable packets but **nothing sends them
 | Group | Item | Status |
 |---|---|---|
 | G1 | `llm_client.py` + `--mode api-llm` + caps | ✓ |
-| G2 | `verticals.py` (detailing + hardscaping profiles) + search configs | ✓ |
+| G2 | `verticals.py` (detailing + hardscaping profiles) + search configs | ✓ (seven profiles now) |
 | G3 | `buyer_signals.py` + `score_buyer_intent()` + sendability money gate | ✓ |
 | G4 | `run_pipeline.py` defaults api-llm, Airtable push, per-run summary | ✓ |
 
-Live niche: **car detailing** (Cleveland metro). `detailing_cleveland_medium_001.json` and `detailing_cleveland_full_001.json` are the active configs. Hardscaping is DQ'd per field validation (supply-constrained, 10/10 owners booked out — no conversion problem).
+Live niche **at the time this was written**: car detailing (Cleveland metro), configs
+`detailing_cleveland_medium_001.json` / `detailing_cleveland_full_001.json`. Hardscaping was DQ'd
+per field validation (supply-constrained, 10/10 owners booked out — no conversion problem).
+
+**Superseded 2026-07-29:** seven registered verticals across fifteen metros (see the 2026-07-29
+status note above). Garage doors is where the only booked call came from. Both hardscaping and
+detailing still have profiles and configs — a DQ'd niche keeps its profile so its regression tests
+keep guarding the shared code paths.
 
 ---
 
@@ -41,11 +58,14 @@ Live niche: **car detailing** (Cleveland metro). `detailing_cleveland_medium_001
 
 Command to generate leads:
 ```bash
-python run_pipeline.py \
+.venv/bin/python run_pipeline.py \
   --batch detailing_cleveland_medium_001 \
   --vertical detailing \
-  --skip-airtable  # or --live when ready
+  --skip-airtable          # drop this for a dry-run push; add --airtable-live to actually write
 ```
+There is no `--live` flag on `run_pipeline.py`. The Airtable stage is dry-run by default,
+`--skip-airtable` (alias `--no-airtable`) omits it entirely, and `--airtable-live` is the only way
+to write to the base.
 
 Packets land in `packets_detailing_cleveland_medium_001/`. Use them as the source for manual outreach asset building.
 
@@ -180,7 +200,7 @@ Start at `OUTREACH_AUTONOMY_LEVEL=1`. Graduate to 2 after 20+ approved touch-1s 
 
 ### C1 — Feedback Loop (~½ day, after first replies/closes)
 
-**What:** Extend existing `feedback.py` / `feedback_report.py` to consume outreach outcomes. Map `replied/call/deposit` outcomes from `state.db` back to score weights.
+**What:** Extend the existing `lead_machine/feedback.py` / `feedback_report.py` to consume outreach outcomes. Map `replied/call/deposit` outcomes from `state.db` back to score weights. (There is no top-level `feedback.py`.)
 
 **New file:** `outreach/outcomes.py` — reads `state.db`, joins to `output/scored_*.csv` by `lead_id`, groups by grade/angle, computes reply-rate per bucket, proposes adjustments to `SCORE_WEIGHTS` in `score_leads.py`.
 
