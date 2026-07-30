@@ -83,6 +83,70 @@ VISUAL_AUDIT_SCORE_FIELDS = [
     "trust_proof_visibility_score",
 ]
 
+# The visual scores reuse the ladder the crawl already publishes for
+# form_strength and cta_strength. The LLM packet is one JSON blob, so a second
+# private scale next to those keys would just be noise to decode.
+STRENGTH_RANK = {"None": 0, "Weak": 1, "Basic": 2, "Strong": 3}
+VISUAL_UNKNOWN = "Unknown"
+# "None" and "Unknown" are not the same claim. "None" means the page was read
+# and the thing is absent, which is a leak worth selling against. "Unknown"
+# means the evidence was never collected, which is worth nothing and must never
+# be dressed up as a finding.
+VISUAL_SCORE_SCALE = ("None", "Weak", "Basic", "Strong")
+# Overall look and premium feel are aesthetic calls. Markup can prove a page is
+# dated, thin, or unresponsive; nothing short of eyes on a screenshot can prove
+# it looks good, so these two are capped below Strong instead of manufacturing
+# praise the pipeline cannot back.
+VISUAL_AESTHETIC_CEILING = {
+    "visual_quality_score": "Basic",
+    "premium_perception_score": "Basic",
+}
+# Only these two site states are worth auditing. "social_only"/"jobber_only"
+# would grade Facebook's or Jobber's design rather than the prospect's, and
+# missing/broken/unknown means there was no page to read.
+AUDITABLE_SITE_STATES = {"okay", "weak"}
+# The crawl keeps visible text in DOM order, so the head of the homepage text
+# is the closest thing to an above-the-fold read available without a screenshot.
+HERO_TEXT_CHARS = 400
+
+GALLERY_TERMS = [
+    "gallery",
+    "portfolio",
+    "our work",
+    "our projects",
+    "recent projects",
+    "project photos",
+    "before and after",
+    "before & after",
+]
+
+REVIEW_PROOF_TERMS = [
+    "review",
+    "testimonial",
+    "5-star",
+    "5 star",
+    "five star",
+    "what our customers say",
+]
+
+# Canonical for both the crawl's CTA strength and the visual CTA score, so the
+# two cannot disagree about what counts as asking for the job.
+ESTIMATE_CTA_TERMS = [
+    "estimate",
+    "free estimate",
+    "request estimate",
+    "schedule estimate",
+    "schedule an estimate",
+    "quote",
+    "free quote",
+    "request a quote",
+    "get a quote",
+    "request service",
+    "schedule",
+    "appointment",
+    "consultation",
+]
+
 PAIN_FLAG_RULES = {
     "premium_perception_gap": (22, "Premium work is undersold by the owned website", ["premium_perception_gap"]),
     "premium_brand_mismatch": (22, "Premium branding is not matched by the website", ["premium_perception_gap"]),
@@ -232,6 +296,244 @@ def _status_from_site(site: Dict[str, Any]) -> str:
     return "unknown"
 
 
+def _hero_text(site: Dict[str, Any], structure: Dict[str, Any]) -> str:
+    homepage = site.get("homepage", {}) or {}
+    parts = [
+        _clean(homepage.get("title")),
+        _clean(homepage.get("meta")),
+        " ".join(_clean(text) for text in structure.get("h1_texts") or []),
+        _clean(homepage.get("text"))[:HERO_TEXT_CHARS],
+    ]
+    return " ".join(part for part in parts if part).lower()
+
+
+def _mentions(text: str, terms: List[str]) -> bool:
+    return any(term in text for term in terms)
+
+
+def _gallery_page_images(pages: Dict[str, Any]) -> int:
+    """Images on a crawled gallery/portfolio page, -1 when no such page exists."""
+    best = -1
+    for name, page in pages.items():
+        if not isinstance(page, dict):
+            continue
+        haystack = f"{name} {_clean(page.get('url'))}".lower()
+        if not _mentions(haystack, ["gallery", "portfolio", "project", "our-work", "/work"]):
+            continue
+        if page.get("ok") is False:
+            continue
+        best = max(best, int(page.get("image_count") or 0))
+    return best
+
+
+def _derive_visual_quality(structure: Dict[str, Any]) -> str:
+    if not structure:
+        return VISUAL_UNKNOWN
+    if structure.get("legacy_markup"):
+        return "Weak"
+    if not structure.get("responsive_viewport"):
+        # A homepage with no device-width viewport in 2026 is served to phones
+        # zoomed out. That is a dated site whether or not anyone looks at it.
+        return "Weak"
+    if int(structure.get("image_count") or 0) < 3 or int(structure.get("heading_count") or 0) < 3:
+        return "Weak"
+    return "Basic"
+
+
+def _derive_premium_perception(
+    *,
+    high_ticket: List[Any],
+    generic_copy: List[Any],
+    trust_terms: List[str],
+    gallery_images: int,
+) -> str:
+    if not high_ticket and generic_copy:
+        return "None"
+    if generic_copy or len(high_ticket) < 2:
+        return "Weak"
+    # Premium services named with nothing to back them is the premium-perception
+    # gap this pipeline sells against, so proof is what separates Weak from Basic.
+    if trust_terms or gallery_images >= 0:
+        return "Basic"
+    return "Weak"
+
+
+def _derive_mobile_visual(structure: Dict[str, Any], mobile_screenshot: str) -> str:
+    if not structure and not mobile_screenshot:
+        return VISUAL_UNKNOWN
+    if structure and not structure.get("has_viewport_meta"):
+        return "None"
+    if structure and not structure.get("responsive_viewport"):
+        return "Weak"
+    if not structure:
+        # A mobile render succeeded but the markup was never parsed, so all we
+        # can honestly say is that the page serves a 390px viewport.
+        return "Basic"
+    return "Strong" if mobile_screenshot else "Basic"
+
+
+def _derive_hero_clarity(hero: str, *, structure: Dict[str, Any], high_ticket: List[Any], service_area: List[str]) -> str:
+    if not hero:
+        return "None"
+    names_service = bool(high_ticket) and _mentions(hero, [str(term).lower() for term in high_ticket])
+    names_market = bool(service_area) and _mentions(hero, service_area)
+    has_headline = bool(structure.get("h1_texts")) if structure else False
+    if not names_service and not names_market:
+        return "Weak"
+    if names_service and names_market and has_headline:
+        return "Strong"
+    return "Basic"
+
+
+def _derive_cta_visibility(
+    *,
+    hero: str,
+    cta_terms: List[str],
+    phones: List[Any],
+    form_rank: int,
+    has_contact_page: bool,
+) -> str:
+    if not cta_terms and not phones and form_rank <= 0:
+        return "None"
+    estimate_cta = _mentions(" ".join(cta_terms), ESTIMATE_CTA_TERMS)
+    if not estimate_cta and not has_contact_page:
+        return "Weak"
+    if _mentions(hero, ESTIMATE_CTA_TERMS) and (phones or form_rank > 0):
+        return "Strong"
+    return "Basic"
+
+
+def _derive_gallery_visibility(*, gallery_images: int, homepage_images: int, text: str) -> str:
+    """Both counts are -1 when nothing was counted, which is not the same as zero."""
+    if gallery_images >= 8 or homepage_images >= 12:
+        return "Strong"
+    if gallery_images >= 0:
+        return "Basic"
+    if _mentions(text, GALLERY_TERMS) or homepage_images >= 3:
+        return "Weak"
+    if homepage_images < 0:
+        # No gallery page and no gallery wording, but the homepage images were
+        # never counted, so "no project photos anywhere" is not provable.
+        return VISUAL_UNKNOWN
+    return "None"
+
+
+def _derive_trust_proof_visibility(*, homepage_text: str, deep_text: str) -> str:
+    homepage_trust = [term for term in TRUST_TERMS if term in homepage_text]
+    deep_trust = [term for term in TRUST_TERMS if term in deep_text]
+    if not homepage_trust and not deep_trust:
+        return "None"
+    if not homepage_trust:
+        # Proof exists but a visitor has to leave the homepage to find it.
+        return "Weak"
+    if len(homepage_trust) >= 2 and _mentions(homepage_text, REVIEW_PROOF_TERMS):
+        return "Strong"
+    return "Basic"
+
+
+def derive_visual_audit_scores(site: Dict[str, Any]) -> Dict[str, str]:
+    """Score the seven visual-audit fields from evidence the crawl already holds.
+
+    These shipped as a hardcoded "Unknown" on every lead, so the review packet
+    carried seven dead keys straight into the prompt. Nothing here opens a
+    screenshot: the grounding is the markup and copy the enricher already
+    fetched, which the prompt already accepts as DOM evidence for visual
+    claims. Any field without that grounding stays Unknown, because a derived
+    score reads to the model as a fact and an Unknown does not.
+    """
+    scores = {field: VISUAL_UNKNOWN for field in VISUAL_AUDIT_SCORE_FIELDS}
+
+    homepage_candidate = site.get("homepage", {}) or {}
+    pages_candidate = site.get("pages", {}) or {}
+    has_parsed_page_evidence = bool(
+        site.get("page_structure")
+        or _clean(site.get("combined_text"))
+        or (
+            isinstance(homepage_candidate, dict)
+            and _clean(homepage_candidate.get("text"))
+        )
+        or any(
+            _clean(page.get("text")) or page.get("image_count") is not None
+            for page in pages_candidate.values()
+            if isinstance(page, dict)
+        )
+    )
+
+    if _status_from_site(site) in AUDITABLE_SITE_STATES and has_parsed_page_evidence:
+        homepage = site.get("homepage", {}) or {}
+        pages = site.get("pages", {}) or {}
+        structure = site.get("page_structure") or {}
+        homepage_text = _clean(homepage.get("text")).lower()
+        deep_text = " ".join(
+            _clean(page.get("text")) for page in pages.values() if isinstance(page, dict)
+        ).lower()
+        combined_text = _clean(site.get("combined_text")).lower() or f"{homepage_text} {deep_text}"
+        hero = _hero_text(site, structure)
+
+        high_ticket = list(site.get("high_ticket_terms") or [])
+        generic_copy = list(site.get("generic_copy_terms") or [])
+        cta_terms = [_clean(term).lower() for term in site.get("cta_terms") or []]
+        phones = list(site.get("phones_found") or [])
+        form_rank = STRENGTH_RANK.get(_clean(site.get("form_strength")), 0)
+        gallery_images = _gallery_page_images(pages)
+        homepage_images = int(structure.get("image_count") or 0) if structure else -1
+        trust_terms = [term for term in TRUST_TERMS if term in combined_text]
+        service_area = [term for term in SERVICE_AREA_TERMS if term in combined_text]
+        has_contact_page = any(
+            str(name).startswith(("contact", "estimate")) for name in pages
+        )
+
+        scores["visual_quality_score"] = _derive_visual_quality(structure)
+        scores["premium_perception_score"] = _derive_premium_perception(
+            high_ticket=high_ticket,
+            generic_copy=generic_copy,
+            trust_terms=trust_terms,
+            gallery_images=gallery_images,
+        )
+        scores["mobile_visual_score"] = _derive_mobile_visual(
+            structure, _clean(site.get("mobile_screenshot_path"))
+        )
+        scores["hero_clarity_score"] = _derive_hero_clarity(
+            hero, structure=structure, high_ticket=high_ticket, service_area=service_area
+        )
+        scores["cta_visibility_score"] = _derive_cta_visibility(
+            hero=hero,
+            cta_terms=cta_terms,
+            phones=phones,
+            form_rank=form_rank,
+            has_contact_page=has_contact_page,
+        )
+        scores["gallery_visibility_score"] = _derive_gallery_visibility(
+            gallery_images=gallery_images,
+            homepage_images=homepage_images,
+            text=combined_text,
+        )
+        scores["trust_proof_visibility_score"] = _derive_trust_proof_visibility(
+            homepage_text=homepage_text,
+            deep_text=deep_text,
+        )
+
+        for field, ceiling in VISUAL_AESTHETIC_CEILING.items():
+            if STRENGTH_RANK.get(scores[field], 0) > STRENGTH_RANK[ceiling]:
+                scores[field] = ceiling
+
+    # A value already on the record outranks anything derived here: it came
+    # from a human review or a future vision pass, both of which saw the page.
+    for field in VISUAL_AUDIT_SCORE_FIELDS:
+        existing = _clean(site.get(field))
+        if existing and existing != VISUAL_UNKNOWN:
+            scores[field] = existing
+
+    return scores
+
+
+def apply_visual_audit_scores(site: Dict[str, Any]) -> Dict[str, Any]:
+    """Write the derived visual scores onto a crawl result."""
+    updated = dict(site)
+    updated.update(derive_visual_audit_scores(site))
+    return updated
+
+
 def _derive_visible_pain_profile(
     *,
     site: Dict[str, Any],
@@ -357,10 +659,9 @@ def build_evidence_profile(enriched: Dict[str, Any]) -> Dict[str, Any]:
         visual_pain_reasons = [part.strip() for part in re.split(r"[;\n]+", visual_pain_reasons) if part.strip()]
     if not isinstance(visual_pain_reasons, list):
         visual_pain_reasons = []
-    visual_scores = {
-        field: _clean(site.get(field)) or "Unknown"
-        for field in VISUAL_AUDIT_SCORE_FIELDS
-    }
+    # Derived here as well as in the enricher so already-enriched JSONL, which
+    # carries the old all-Unknown block, still reaches the prompt scored.
+    visual_scores = derive_visual_audit_scores(site)
 
     homepage = site.get("homepage", {}) or {}
     pages = site.get("pages", {}) or {}

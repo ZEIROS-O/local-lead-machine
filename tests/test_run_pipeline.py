@@ -270,6 +270,284 @@ class RunPipelineTest(unittest.TestCase):
         self.assertIn("Stopped by cap: MAX_LLM_CALLS_PER_RUN", stdout.getvalue())
 
 
+class ReviewSignalStageTest(unittest.TestCase):
+    """`collect_review_signals.py` is paid, and it attaches at both ends of scoring.
+
+    `submit` selects with `select_deep_enrichment`, which ranks on Scoring V3
+    Disposition/Rank — columns that exist only in the scored CSV. `merge` writes
+    `review_items`/`review_collection` onto the enriched record, which is what
+    `scoring_v3` reads. So merge belongs before score_leads and submit after it,
+    and getting that backwards buys DataForSEO evidence no scored row ever sees.
+    These tests pin the ordering and the default-off-ness rather than the wording
+    of the commands.
+    """
+
+    def _write_enriched(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"google": {"business_name": "Lead A", "place_id": "place-1"}, "evidence": {}}) + "\n",
+            encoding="utf-8",
+        )
+
+    def _write_scored(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["Business Name", "Lead Priority", "Sendable", "Packet Eligible"])
+            writer.writeheader()
+            writer.writerow(
+                {"Business Name": "Lead A", "Lead Priority": "A", "Sendable": "Yes", "Packet Eligible": "Yes"}
+            )
+
+    def _write_receipt(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "submitted_count": 1,
+                    "estimated_usd": 0.20,
+                    "cost_usd": 0.17,
+                    "tasks": [{"id": "task-1"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def _run(
+        self,
+        root: Path,
+        extra: list[str],
+        *,
+        review_state: str = "complete",
+    ) -> tuple[int, list[list[str]], str]:
+        old_cwd = Path.cwd()
+        os.chdir(root)
+        commands: list[list[str]] = []
+
+        def fake_run(cmd: list[str]) -> None:
+            commands.append(cmd)
+            if cmd[1:3] == ["collect_review_signals.py", "collect"]:
+                output = Path(cmd[cmd.index("--output") + 1])
+                output.parent.mkdir(parents=True, exist_ok=True)
+                signal = {
+                    "task_id": "task-1",
+                    "state": review_state,
+                    "place_id": "place-1",
+                    "tag": "place-1",
+                    "items": [{"review_id": "review-1"}] if review_state == "complete" else [],
+                    "cost_usd": 0.17 if review_state == "complete" else 0.0,
+                    "source": "dataforseo_google_reviews_newest",
+                }
+                output.write_text(json.dumps(signal) + "\n", encoding="utf-8")
+                summary_output = Path(cmd[cmd.index("--summary-output") + 1])
+                summary_output.write_text(
+                    json.dumps(
+                        {
+                            "status": review_state,
+                            "total": 1,
+                            "complete": 1 if review_state == "complete" else 0,
+                            "pending": 0 if review_state == "complete" else 1,
+                            "cost_usd": signal["cost_usd"],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            if cmd[1:3] == ["collect_review_signals.py", "merge"]:
+                summary_output = Path(cmd[cmd.index("--summary-output") + 1])
+                summary_output.write_text(
+                    json.dumps(
+                        {
+                            "records": 1,
+                            "complete_signals": 1,
+                            "attached": 1,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            if "score_leads.py" in cmd:
+                self._write_scored(Path("output/scored_test.csv"))
+
+        try:
+            stdout = io.StringIO()
+            argv = [
+                "run_pipeline.py",
+                "--batch",
+                "test",
+                "--vertical",
+                "detailing",
+                "--skip-search",
+                "--skip-enrich",
+                "--skip-packets",
+                "--skip-airtable",
+                *extra,
+            ]
+            with patch("sys.argv", argv), patch("run_pipeline.run", side_effect=fake_run), redirect_stdout(stdout):
+                code = run_pipeline.main()
+        finally:
+            os.chdir(old_cwd)
+        return code, commands, stdout.getvalue()
+
+    @staticmethod
+    def _script_order(commands: list[list[str]]) -> list[str]:
+        order: list[str] = []
+        for cmd in commands:
+            script = next((part for part in cmd if part.endswith(".py")), "")
+            subcommand = (
+                cmd[2]
+                if script in {"collect_review_signals.py", "collect_external_signals.py"}
+                else ""
+            )
+            order.append(f"{script} {subcommand}".strip())
+        return order
+
+    def test_review_collection_costs_nothing_unless_it_is_asked_for(self) -> None:
+        """The whole reason these are opt-in instead of --skip-*: every batch
+        command already in use has to keep billing exactly what it bills today."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_enriched(root / "output/enriched_test.jsonl")
+            self._write_receipt(root / "output/review_tasks_test.json")
+            code, commands, _ = self._run(root, [])
+
+        self.assertEqual(code, 0)
+        self.assertNotIn("collect_review_signals.py", [part for cmd in commands for part in cmd])
+
+    def test_merge_lands_before_scoring_reads_the_enriched_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            enriched = root / "output/enriched_test.jsonl"
+            self._write_enriched(enriched)
+            self._write_receipt(root / "output/review_tasks_test.json")
+            code, commands, _ = self._run(root, ["--merge-review-signals"])
+
+        order = self._script_order(commands)
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            order[:3],
+            [
+                "collect_review_signals.py collect",
+                "collect_review_signals.py merge",
+                "score_leads.py",
+            ],
+        )
+        merge_cmd = next(cmd for cmd in commands if cmd[1:3] == ["collect_review_signals.py", "merge"])
+        score_cmd = next(cmd for cmd in commands if "score_leads.py" in cmd)
+        # The merge has to write back over the file scoring reads, or the evidence
+        # is stranded in a side artifact nothing opens.
+        self.assertEqual(merge_cmd[merge_cmd.index("--output") + 1], "output/enriched_test.jsonl")
+        self.assertEqual(score_cmd[score_cmd.index("--input") + 1], "output/enriched_test.jsonl")
+
+    def test_pending_review_collection_refuses_to_score_partial_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_enriched(root / "output/enriched_test.jsonl")
+            self._write_receipt(root / "output/review_tasks_test.json")
+            with self.assertRaises(SystemExit) as raised:
+                self._run(
+                    root,
+                    ["--merge-review-signals"],
+                    review_state="pending",
+                )
+            summary = json.loads(
+                (root / "output/run_summary_test.json").read_text(encoding="utf-8")
+            )
+
+        self.assertIn("review tasks are still pending", str(raised.exception).lower())
+        self.assertEqual(summary["review_signals"]["status"], "pending")
+        self.assertEqual(summary["review_signals"]["pending"], 1)
+        self.assertEqual(summary["review_signals"]["estimated_usd"], 0.20)
+
+    def test_submit_lands_after_scoring_and_reads_the_scored_csv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_enriched(root / "output/enriched_test.jsonl")
+            code, commands, _ = self._run(root, ["--submit-review-signals"])
+
+        order = self._script_order(commands)
+        self.assertEqual(code, 0)
+        self.assertEqual(order, ["score_leads.py", "collect_review_signals.py submit"])
+        submit_cmd = commands[-1]
+        self.assertEqual(submit_cmd[submit_cmd.index("--input") + 1], "output/scored_test.csv")
+        self.assertEqual(submit_cmd[submit_cmd.index("--output") + 1], "output/review_tasks_test.json")
+
+    def test_merge_refuses_rather_than_collecting_against_no_receipt(self) -> None:
+        """`collect` with no receipt is not a harmless no-op — it silently returns
+        an empty signal file, and the merge then reports success having attached
+        nothing, which reads as "the evidence just wasn't there"."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_enriched(root / "output/enriched_test.jsonl")
+            with self.assertRaises(SystemExit) as raised:
+                self._run(root, ["--merge-review-signals"])
+
+        self.assertIn("Review task receipt not found", str(raised.exception))
+
+    def test_submit_holds_while_manual_scores_are_still_outstanding(self) -> None:
+        """In manual-llm mode the scored CSV does not exist yet, so a submit here
+        would either crash or bill against a stale CSV from an earlier batch."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_enriched(root / "output/enriched_test.jsonl")
+            code, commands, stdout = self._run(
+                root, ["--mode", "manual-llm", "--submit-review-signals"]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertNotIn("submit", [part for cmd in commands for part in cmd])
+        self.assertIn("[SKIP] collect_review_signals.py submit", stdout)
+
+    def test_summary_records_which_halves_of_the_loop_ran(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_enriched(root / "output/enriched_test.jsonl")
+            self._write_receipt(root / "output/review_tasks_test.json")
+            old_cwd = Path.cwd()
+            try:
+                self._run(root, ["--merge-review-signals", "--submit-review-signals"])
+                os.chdir(root)
+                summary = json.loads(Path("output/run_summary_test.json").read_text(encoding="utf-8"))
+            finally:
+                os.chdir(old_cwd)
+
+        self.assertEqual(summary["review_signals"]["status"], "merged+submitted")
+        self.assertEqual(summary["review_signals"]["receipt"], "output/review_tasks_test.json")
+        self.assertEqual(summary["review_signals"]["signals"], "output/review_signals_test.jsonl")
+        self.assertEqual(summary["review_signals"]["complete"], 1)
+        self.assertEqual(summary["review_signals"]["pending"], 0)
+        self.assertEqual(summary["review_signals"]["cost_usd"], 0.17)
+        self.assertEqual(summary["review_signals"]["estimated_usd"], 0.20)
+
+    def test_external_signal_artifacts_merge_before_scoring(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_enriched(root / "output/enriched_test.jsonl")
+            signal = root / "signals/pagespeed.json"
+            signal.parent.mkdir(parents=True)
+            signal.write_text(
+                json.dumps(
+                    {
+                        "url": "https://lead.example",
+                        "observation": {
+                            "signal_id": "pagespeed:mobile:https://lead.example",
+                            "kind": "website_performance",
+                            "state": "present",
+                            "cost_usd": 0.03,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            code, commands, _ = self._run(
+                root,
+                ["--external-signal", "signals/pagespeed.json"],
+            )
+
+        order = self._script_order(commands)
+        self.assertEqual(code, 0)
+        self.assertEqual(order[:2], ["collect_external_signals.py merge", "score_leads.py"])
+        merge = commands[0]
+        self.assertEqual(merge[merge.index("--signal") + 1], "signals/pagespeed.json")
+
+
 class Stage1SuppressionGuardTest(unittest.TestCase):
     """Stage 1 is the pipeline's first spend, so it is where the refusal has to land.
 

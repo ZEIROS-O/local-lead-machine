@@ -41,7 +41,14 @@ from playwright.sync_api import sync_playwright
 
 from lead_machine.buyer_signals import build_buyer_intent
 from lead_machine.email_hygiene import clean_emails
-from lead_machine.evidence import build_evidence_profile
+from lead_machine.evidence import (  # re-exported: the crawl and the evidence profile grade on one scale
+    ESTIMATE_CTA_TERMS,
+    STRENGTH_RANK,
+    VISUAL_AUDIT_SCORE_FIELDS,
+    VISUAL_UNKNOWN,
+    apply_visual_audit_scores,
+    build_evidence_profile,
+)
 from lead_machine.icp import hard_icp_gate
 from lead_machine.schema import normalize_lead
 from lead_machine.scoring_profiles import infer_market, infer_vertical_key
@@ -108,22 +115,6 @@ CTA_TERMS = [
     "submit",
 ]
 
-ESTIMATE_CTA_TERMS = [
-    "estimate",
-    "free estimate",
-    "request estimate",
-    "schedule estimate",
-    "schedule an estimate",
-    "quote",
-    "free quote",
-    "request a quote",
-    "get a quote",
-    "request service",
-    "schedule",
-    "appointment",
-    "consultation",
-]
-
 CONTACT_ESTIMATE_PATHS = [
     "/contact",
     "/contact-us",
@@ -168,17 +159,15 @@ FORM_PROVIDER_TERMS = [
 ]
 
 CAPTCHA_TERMS = {"captcha", "recaptcha", "g-recaptcha"}
-FORM_STRENGTH_RANK = {"None": 0, "Weak": 1, "Basic": 2, "Strong": 3}
-VISUAL_UNKNOWN = "Unknown"
-VISUAL_AUDIT_SCORE_FIELDS = [
-    "visual_quality_score",
-    "premium_perception_score",
-    "mobile_visual_score",
-    "hero_clarity_score",
-    "cta_visibility_score",
-    "gallery_visibility_score",
-    "trust_proof_visibility_score",
-]
+# One ladder, defined once in lead_machine.evidence: the crawl writes these
+# strengths and the evidence profile grades the visual fields on the same rungs,
+# so a copy here is a drift waiting to happen.
+FORM_STRENGTH_RANK = STRENGTH_RANK
+
+# Markup that dates a page on its own. A visual score built on these has to
+# rest on signals no modern template emits by accident, because nothing here
+# ever looks at the rendered page.
+LEGACY_MARKUP_TAGS = ["font", "center", "marquee", "blink", "frameset", "frame"]
 
 HIGH_TICKET_TERMS = [
     "hardscape",
@@ -351,6 +340,43 @@ def extract_title_meta(html: str) -> Tuple[str, str]:
         meta = meta_tag["content"].strip()
 
     return clean_text(title, 300), clean_text(meta, 700)
+
+
+def extract_page_structure(html: str) -> Dict[str, Any]:
+    """Cheap DOM facts about a page that was already fetched.
+
+    The visual-audit scores need something observable to stand on, and this
+    pipeline never reads a screenshot back, so the markup is the evidence — the
+    review prompt already accepts DOM evidence for visual claims. Collected here
+    because scrape_site is the only place the raw HTML still exists; the crawl
+    result keeps text, not markup. An empty dict downstream means "never
+    parsed", which is why the failure paths leave it empty rather than zeroed.
+    """
+    if not html:
+        return {}
+
+    soup = BeautifulSoup(html, "lxml")
+
+    viewport = soup.find("meta", attrs={"name": re.compile("^viewport$", re.I)})
+    viewport_content = str(viewport.get("content") or "").lower() if viewport else ""
+
+    legacy = {tag.name for tag in soup.find_all(LEGACY_MARKUP_TAGS)}
+    if soup.find(attrs={"bgcolor": True}):
+        legacy.add("bgcolor")
+    # A table inside a table is layout markup, not tabular data.
+    if any(table.find("table") for table in soup.find_all("table")):
+        legacy.add("nested_table")
+
+    headings = [clean_text(tag.get_text(" ", strip=True), 200) for tag in soup.find_all("h1")]
+
+    return {
+        "h1_texts": [text for text in headings if text][:3],
+        "heading_count": len(soup.find_all(["h1", "h2", "h3"])),
+        "image_count": len(soup.find_all("img")) + len(soup.find_all("picture")),
+        "has_viewport_meta": bool(viewport),
+        "responsive_viewport": "device-width" in viewport_content,
+        "legacy_markup": sorted(legacy),
+    }
 
 
 def extract_links(base_url: str, html: str) -> Dict[str, List[str]]:
@@ -862,6 +888,9 @@ def empty_site_result(status: str, flags: List[str], url: str = "", error: str =
             "error": error,
         },
         "pages": {},
+        # Empty, not zeroed: nothing was parsed, so the visual scores must stay
+        # Unknown rather than read this as a page with no images and no headings.
+        "page_structure": {},
         "emails_found": [],
         "phones_found": [],
         "social_links": [],
@@ -1041,6 +1070,9 @@ def scrape_site(
             "estimate_form_detected": page_form_signals.get("estimate_form_detected", "No"),
             "form_strength": page_form_signals.get("form_strength", "None"),
             "form_detection_method": page_form_signals.get("form_detection_method", "none"),
+            # Counted here so gallery/portfolio pages can be graded later on how
+            # much work they actually show, not just on the page existing.
+            "image_count": len(page_soup.find_all("img")) + len(page_soup.find_all("picture")),
             "verification_snapshot": {
                 "page_role": default_page_name,
                 "requested_url": page_url,
@@ -1102,6 +1134,7 @@ def scrape_site(
             "text": clean_text(text, 9000),
         },
         "pages": pages,
+        "page_structure": extract_page_structure(html),
         "emails_found": emails,
         "phones_found": phones,
         "social_links": links["social_links"],
@@ -1141,7 +1174,10 @@ def scrape_site(
     result["enrichment_elapsed_seconds"] = round(elapsed, 1)
     if enrichment_timed_out:
         result = mark_per_lead_timeout(result, elapsed=elapsed)
-    return result
+    # Static-only grading, after the timeout flags land so it grades the crawl
+    # that actually happened. enrich_row re-derives once the browser pass has
+    # run, so a mobile render gets folded in when there is one.
+    return apply_visual_audit_scores(result)
 
 
 def detect_rendered_form(url: str, timeout_ms: int = 20000) -> Dict[str, Any]:
@@ -1412,6 +1448,11 @@ def enrich_row(
         else:
             screenshots = check_rendered_site(screenshot_url, timeout_ms=rendered_timeout_ms)
         site = apply_rendered_site_result(site, screenshots)
+
+    # Last word on the visual scores: the browser pass can turn a static
+    # failure into a loaded page, or add the 390px render the mobile score
+    # needs, and either flips what the evidence supports.
+    site = apply_visual_audit_scores(site)
 
     website_phones = site.get("phones_found", [])
 

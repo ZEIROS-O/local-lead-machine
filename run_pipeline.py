@@ -8,6 +8,11 @@ Runs:
 3. score_leads.py
 4. make_packets.py
 
+Optional, opt-in signal stages run before scoring:
+- collect_external_signals.py merges already-collected normalized observations.
+- collect_review_signals.py attaches DataForSEO newest-review evidence across
+  two runs — merge before scoring, submit after it.
+
 Example:
     python run_pipeline.py --batch hardscaping_round2 --vertical hardscaping
 
@@ -107,11 +112,30 @@ def build_summary(
     summary_path: Path,
     airtable_status: str,
     waiting_for_manual_scores: bool,
+    review_receipt: Path,
+    review_signals: Path,
+    review_collection_summary: Path,
+    review_merge_summary: Path,
+    review_signals_status: str,
+    external_signal_paths: list[Path],
 ) -> dict[str, Any]:
     scored_rows = read_csv_rows(scored)
     packet_index = packets / "packet_index.csv"
     llm_usage = read_json(llm_usage_path)
     caps = llm_usage.get("caps") if isinstance(llm_usage.get("caps"), dict) else {}
+    receipt = read_json(review_receipt)
+    collection = read_json(review_collection_summary)
+    review_merge = read_json(review_merge_summary)
+    receipt_tasks = receipt.get("tasks") if isinstance(receipt.get("tasks"), list) else []
+    submitted_count = int(receipt.get("submitted_count") or len(receipt_tasks))
+    estimated_cost = float(receipt.get("estimated_usd") or 0.0)
+    collection_cost = float(collection.get("cost_usd") or 0.0)
+    submission_cost = float(receipt.get("cost_usd") or 0.0)
+    external_cost = 0.0
+    for signal_path in external_signal_paths:
+        signal = read_json(signal_path)
+        observation = signal.get("observation") if isinstance(signal.get("observation"), dict) else {}
+        external_cost += float(observation.get("cost_usd") or 0.0)
 
     return {
         "batch": batch,
@@ -148,6 +172,29 @@ def build_summary(
         "airtable": {
             "status": airtable_status,
             "only_sendable": True,
+        },
+        "review_signals": {
+            "status": review_signals_status,
+            "receipt": str(review_receipt),
+            "signals": str(review_signals),
+            "collection_summary": str(review_collection_summary),
+            "merge_summary": str(review_merge_summary),
+            "submitted": submitted_count,
+            "complete": int(collection.get("complete") or 0),
+            "pending": int(collection.get("pending") or 0),
+            "attached": int(review_merge.get("attached") or 0),
+            "estimated_usd": round(estimated_cost, 6),
+            # Submit and collect report the same DataForSEO tasks at different
+            # points, so take the greater known total instead of double-counting.
+            "cost_usd": max(submission_cost, collection_cost),
+            "submission_cost_usd": submission_cost,
+            "collection_cost_usd": collection_cost,
+        },
+        "external_signals": {
+            "status": "merged" if external_signal_paths else "skipped",
+            "merged": len(external_signal_paths),
+            "cost_usd": round(external_cost, 6),
+            "artifacts": [str(path) for path in external_signal_paths],
         },
         "artifacts": {
             "raw": str(raw),
@@ -189,6 +236,8 @@ def print_summary(summary: dict[str, Any]) -> None:
         print(f"Packets:         {counts['packets']}")
         print(f"Packet index:    {artifacts['packet_index']}")
         print(f"Open packets:    cursor {artifacts['packets']}")
+    print(f"Review signals:  {summary['review_signals']['status']}")
+    print(f"External signals:{summary['external_signals']['status']}")
     print(f"Airtable rows:   {counts['airtable_rows']} ({summary['airtable']['status']})")
     print(f"LLM calls:       {llm['calls']['used']} / {llm['calls']['cap']}")
     print(f"LLM tokens:      {llm['tokens']['used']} / {llm['tokens']['cap']}")
@@ -209,6 +258,33 @@ def main() -> int:
     parser.add_argument("--skip-enrich", action="store_true", help="Skip enrichment/screenshots")
     parser.add_argument("--skip-score", action="store_true", help="Skip scoring")
     parser.add_argument("--skip-packets", action="store_true", help="Skip packet generation")
+
+    # Opt-in, not --skip-*, unlike every stage above. Those stages already run on
+    # every batch, so their skip flag can only ever remove spend. Review collection
+    # runs nowhere today and bills DataForSEO per task, so a default-on
+    # --skip-review-signals would add that spend to every batch command already in
+    # use without the command changing. Submit and merge are separate flags because
+    # DataForSEO's review endpoint is asynchronous and because the two halves attach
+    # at opposite ends of scoring.
+    parser.add_argument(
+        "--merge-review-signals",
+        action="store_true",
+        help="Before scoring, collect an earlier run's review tasks and merge them into the enriched JSONL",
+    )
+    parser.add_argument(
+        "--submit-review-signals",
+        action="store_true",
+        help="After scoring, submit bounded DataForSEO review tasks (paid) for the deep-enrichment selection",
+    )
+    parser.add_argument(
+        "--external-signal",
+        action="append",
+        default=[],
+        help=(
+            "Merge one normalized collect_external_signals.py artifact before "
+            "scoring; repeat for multiple observations"
+        ),
+    )
 
     parser.add_argument("--include-all-packets", action="store_true", help="Make packets for all scored rows")
     parser.add_argument("--priority", default="", help="Optional packet priority filter: A, B, C, Skip")
@@ -264,6 +340,41 @@ def main() -> int:
     scores_dir = Path(args.scores_dir) if args.scores_dir else queue_dir / "scores"
     llm_usage = Path(f"output/llm_usage_{batch}.json")
     summary_path = Path(f"output/run_summary_{batch}.json")
+    review_receipt = Path(f"output/review_tasks_{batch}.json")
+    review_signals = Path(f"output/review_signals_{batch}.jsonl")
+    review_collection_summary = Path(f"output/review_collection_{batch}.json")
+    review_merge_summary = Path(f"output/review_merge_{batch}.json")
+    external_signal_paths = [Path(value) for value in args.external_signal]
+
+    def persist_summary(
+        *,
+        airtable_status: str,
+        waiting_for_manual_scores: bool,
+        review_signals_status: str,
+    ) -> dict[str, Any]:
+        summary = build_summary(
+            batch=batch,
+            mode=mode,
+            raw=raw,
+            enriched=enriched,
+            scored=scored,
+            cards=cards,
+            packets=packets,
+            queue_dir=queue_dir,
+            scores_dir=scores_dir,
+            llm_usage_path=llm_usage,
+            summary_path=summary_path,
+            airtable_status=airtable_status,
+            waiting_for_manual_scores=waiting_for_manual_scores,
+            review_receipt=review_receipt,
+            review_signals=review_signals,
+            review_collection_summary=review_collection_summary,
+            review_merge_summary=review_merge_summary,
+            review_signals_status=review_signals_status,
+            external_signal_paths=external_signal_paths,
+        )
+        write_summary(summary_path, summary)
+        return summary
 
     print("\nLead pipeline")
     print("-------------")
@@ -321,6 +432,91 @@ def main() -> int:
         run(cmd)
     else:
         print("\n[SKIP] enrich_leads.py")
+
+    review_signals_status = "skipped"
+
+    for signal_path in external_signal_paths:
+        if not enriched.exists():
+            raise SystemExit(f"\n[ERROR] Enriched file not found: {enriched}")
+        if not signal_path.exists():
+            raise SystemExit(f"\n[ERROR] External signal artifact not found: {signal_path}")
+        run([
+            sys.executable,
+            "collect_external_signals.py",
+            "merge",
+            "--input",
+            str(enriched),
+            "--signal",
+            str(signal_path),
+            "--output",
+            str(enriched),
+        ])
+    if not external_signal_paths:
+        print("\n[SKIP] collect_external_signals.py merge")
+
+    # Ahead of scoring on purpose. scoring_v3 reads review_items/review_collection
+    # off the enriched record, so evidence merged after score_leads has run is paid
+    # for and then read by nothing until some later run happens to re-score.
+    if args.merge_review_signals:
+        if not enriched.exists():
+            raise SystemExit(f"\n[ERROR] Enriched file not found: {enriched}")
+        if not review_receipt.exists():
+            raise SystemExit(f"\n[ERROR] Review task receipt not found: {review_receipt}")
+
+        run([
+            sys.executable,
+            "collect_review_signals.py",
+            "collect",
+            "--receipt",
+            str(review_receipt),
+            "--output",
+            str(review_signals),
+            "--summary-output",
+            str(review_collection_summary),
+        ])
+
+        if not review_collection_summary.exists():
+            raise SystemExit(
+                "\n[ERROR] Review collection did not write its required summary: "
+                f"{review_collection_summary}"
+            )
+        collection = read_json(review_collection_summary)
+        if collection.get("status") not in {"complete", "empty", "partial", "pending"}:
+            raise SystemExit(
+                "\n[ERROR] Review collection summary is malformed: "
+                f"{review_collection_summary}"
+            )
+        pending = int(collection.get("pending") or 0)
+        if pending:
+            review_signals_status = str(collection.get("status") or "pending")
+            persist_summary(
+                airtable_status="skipped",
+                waiting_for_manual_scores=False,
+                review_signals_status=review_signals_status,
+            )
+            raise SystemExit(
+                f"\n[WAITING] {pending} review tasks are still pending; "
+                "scoring was not run against partial review evidence."
+            )
+
+        # Merged back over the same enriched file so scoring needs no new input
+        # path. Keying is by place_id, so re-running a merge is idempotent.
+        run([
+            sys.executable,
+            "collect_review_signals.py",
+            "merge",
+            "--input",
+            str(enriched),
+            "--signals",
+            str(review_signals),
+            "--output",
+            str(enriched),
+            "--summary-output",
+            str(review_merge_summary),
+        ])
+        review_signals_status = "merged"
+    else:
+        print("\n[SKIP] collect_review_signals.py merge")
 
     score_was_run = False
     waiting_for_manual_scores = False
@@ -386,6 +582,28 @@ def main() -> int:
     else:
         print("\n[SKIP] score_leads.py")
 
+    # Behind scoring on purpose. select_deep_enrichment ranks on Scoring V3
+    # Disposition/Rank, which exist only once score_leads has written the CSV; run
+    # earlier it would bill 25 DataForSEO tasks against an unranked selection. The
+    # tasks opened here are picked up by a later run with --merge-review-signals.
+    if args.submit_review_signals:
+        if waiting_for_manual_scores or not scored.exists():
+            print("\n[SKIP] collect_review_signals.py submit")
+            print("[WAITING] Scored CSV not created yet.")
+        else:
+            run([
+                sys.executable,
+                "collect_review_signals.py",
+                "submit",
+                "--input",
+                str(scored),
+                "--output",
+                str(review_receipt),
+            ])
+            review_signals_status = "merged+submitted" if review_signals_status == "merged" else "submitted"
+    else:
+        print("\n[SKIP] collect_review_signals.py submit")
+
     packets_allowed = score_was_run or (args.skip_score and scored.exists()) or (mode != "manual-llm" and scored.exists())
 
     if not args.skip_packets and packets_allowed:
@@ -448,22 +666,11 @@ def main() -> int:
     print("PIPELINE COMPLETE")
     print("=" * 100)
 
-    summary = build_summary(
-        batch=batch,
-        mode=mode,
-        raw=raw,
-        enriched=enriched,
-        scored=scored,
-        cards=cards,
-        packets=packets,
-        queue_dir=queue_dir,
-        scores_dir=scores_dir,
-        llm_usage_path=llm_usage,
-        summary_path=summary_path,
+    summary = persist_summary(
         airtable_status=airtable_status,
         waiting_for_manual_scores=waiting_for_manual_scores,
+        review_signals_status=review_signals_status,
     )
-    write_summary(summary_path, summary)
     print_summary(summary)
 
     return 0
