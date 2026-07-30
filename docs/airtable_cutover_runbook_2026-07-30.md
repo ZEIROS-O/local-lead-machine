@@ -157,7 +157,7 @@ places on three filesystems — `run_state/…` (gitignored, holds lead data),
 `/mnt/c/Users/lucas/lpm-airtable-backups/2026-07-30-ready`, which survives a WSL
 distro reset. All three hashes match.*
 
-### 2. Expand the schema before any deletion — **partly done**
+### 2. Expand the schema before any deletion — **done**
 
 Create these two Prospects fields — **done**:
 
@@ -166,7 +166,7 @@ Create these two Prospects fields — **done**:
 | ICP Lane | Single select | `no_site_launch`, `social_jobber_escape`, `owned_weak_site_rebuild`, `premium_perception_gap`, `portfolio_presentation_gap`, `estimate_funnel`, `optimization_only`, `skip` | `fld0DevPnL52YCy4p` |
 | Opportunity Score | Number | Integer precision, 0–100 | `fldH6acA46yqTyEHb` |
 
-Add, but do not yet remove, these select choices — **blocked, hand step**:
+Added these select choices by hand — **done**:
 
 | Table.field | Add | Live field ID |
 |---|---|---|
@@ -243,9 +243,9 @@ them with no recovery path. No code writes `Notes`, so any prior content was
 typed by hand. Low probability, zero recoverability — recorded rather than
 discovered later.
 
-### 4. Remove unused select choices — **blocked, hand step**
+### 4. Remove unused select choices — **done**
 
-Only after confirming zero records at execution time, remove:
+Removed after confirming zero records at execution time:
 
 - Lead Priority: `D`, `New`, `(440) 537-2459`
 - AI Confidence: `No-Site Launch`
@@ -253,14 +253,13 @@ Only after confirming zero records at execution time, remove:
 - Site Status: `Audit site / booking flow`
 - Offer Fit: `Not Fit`, `Mediocre`
 
-All nine choices had zero records in the 2026-07-30 read-only check. Re-confirm
-each is still at zero immediately before removing it.
+All nine choices had zero records in the 2026-07-30 read-only check and were
+confirmed at zero immediately before removal.
 
-Add `Status: Closed` to this list once `Won` and `Lost` exist and step 3's
-re-count is still 0. It is the tenth choice to remove and the only one whose
-removal is sequenced behind another step.
+`Status: Closed` was the tenth removed choice. `Won` and `Lost` existed first,
+and step 3's execution-time re-count remained 0.
 
-### 5. Delete the 23 retired Prospects fields — **blocked, hand step**
+### 5. Delete the 23 retired Prospects fields — **done**
 
 Delete only after the deployed code-side allowlist no longer writes them and the
 second preparation report says `safe_to_delete=true`:
@@ -304,7 +303,7 @@ This is also what clears the stale-data problem the code swap created:
 their last-written values to reps, and `upload_airtable.py` no longer writes
 them, so they can never refresh.
 
-### 6. Build the rep-facing views — **blocked, hand step**
+### 6. Build the rep-facing views — **done**
 
 Keep one hidden `System` view containing all fields for diagnostics. Delete
 `Grid 11` and consolidate the legacy numbered/temporary views into exactly four
@@ -339,9 +338,8 @@ in the other two views:
 Keep Packet Tier, Commercial Fit State, Contact Eligibility, evidence internals,
 and path/debug fields available in System but hidden from rep-facing views.
 
-Current views, unchanged: `System`, `00 - Sales Assignment`, `10 - New Calls`,
-`20 - Follow-Ups`, `30 - Active Pipeline`, `40 - Hot Opportunities`,
-`50 - Closed Outcomes`, `60 - Data Repair`, `Grid 11`. No script reads a view,
+Current views: `System`, `🔥 Call Queue`, `📅 Follow-Ups Due`, `📊 Pipeline`, and
+`🧪 Manual Review`. All eight legacy views were deleted. No script reads a view,
 so this step is rep ergonomics rather than a correctness gate.
 
 ### 7. Add rep-readable field descriptions — **done**

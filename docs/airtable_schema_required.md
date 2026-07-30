@@ -37,7 +37,7 @@ Also observed 2026-07-29: the base has five tables (`Prospects`, `Sales Activiti
 | Rating | Number | ? | Decimal; set field to 2 decimal places |
 | Specific Observation | Long text | ? |  |
 | Packet Tier | Single select | ? | Options: Sendable Packet, Manual Review Packet, Watchlist, No Packet |
-| Lead Priority | Single select | yes (2026-07-29) | Code writes **A, B, C, Skip** only (`score_leads.PRIORITY_RANK`; `classify_priority` can return `Skip`, and an upload without `--only-sendable` carries it through). Live also carries `D` and `New`, which no code path here writes, plus a junk choice literally named **`(440) 537-2459`** — a phone number minted by the `typecast` flag that has since been removed. **Runbook: delete `(440) 537-2459`** and decide whether `D`/`New` are intentional |
+| Lead Priority | Single select | yes (2026-07-30) | Code writes **A, B, C, Skip** only (`score_leads.PRIORITY_RANK`; `classify_priority` can return `Skip`, and an upload without `--only-sendable` carries it through). Live choices are the same clean four: `A`, `B`, `C`, `Skip`. The junk `(440) 537-2459` choice and unused `D`/`New` choices were deleted during the cutover. |
 | Offer Fit | Single select | ? | Options: No-Site Launch, Website Rebuild, Estimate Funnel, Automation / Follow-Up |
 | Site Status | Single select | ? | Options: Missing, Broken, No Website, Loaded, Redirect Issue, Social Only, Unknown |
 | Visible Pain Score | Number | ? | Integer 0–100 (sendability thresholds fire at 10/16/30/35/40) |
@@ -59,7 +59,7 @@ Also observed 2026-07-29: the base has five tables (`Prospects`, `Sales Activiti
 | Send Blockers | Long text | ? |  |
 | Skip Reason | Single line text | ? |  |
 | Place Key | Single line text | ? | Used as upsert key; must be unique per business |
-| Status | Single select | yes (2026-07-30) | Canonical code vocabulary: New, Mockup Needed, Manual Review, Not Fit, Sent, Follow-Up, Won, Lost. **The live base still has `Closed` and neither `Won` nor `Lost`** — the API cannot add them, so it is hand step H1 in the runbook. 0 rows use `Closed`, so removing it afterwards costs nothing. `Not Fit` is applied by hand, never by code |
+| Status | Single select | yes (2026-07-30) | Canonical code vocabulary and live choices: New, Mockup Needed, Manual Review, Not Fit, Sent, Follow-Up, Won, Lost. `Won` and `Lost` were added by hand during the cutover and `Closed` was removed; 0 rows used `Closed` at execution time. `Not Fit` is applied by hand, never by code |
 | Outreach Channel | Single select | yes (2026-07-29) | Live choices match exactly: Email, Phone, Instagram DM, SMS. This is why `mark_sent.py` is safe without `typecast` and `mark_outcome.py` is not — see below |
 | Consent Posture | Single line text | ? | Required and documented before any SMS draft can pass |
 | Last Contacted | Date | ? |  |
@@ -206,8 +206,8 @@ the point of removing `typecast`. All of it landed in the cutover. Full record:
    grade.
 5. ~~Decide on `Prospects.Lead Priority` choices `D` and `New`.~~ **Done — both deleted.** Neither
    appears anywhere in this repo. `A`, `B`, `C`, `Skip` remain; **`Skip` is written by the scorer on
-   every disqualified lead and must never be removed**, despite sitting next to the junk. Note
-   `upload_airtable.py:69` describes this field as "Options: A, B, C (grade)", which omits `Skip`.
+   every disqualified lead and must never be removed**, despite having sat next to the junk.
+   `upload_airtable.py:72` now correctly describes this field as "Options: A, B, C, Skip (grade)".
 6. ~~Record whether the Meta API can add a choice to an existing single-select.~~ **Done
    2026-07-30: it cannot.** The result and the exact calls are in the Sales Activities section
    above. Adding choices by hand in the UI is the only path, not merely the assumed one.
