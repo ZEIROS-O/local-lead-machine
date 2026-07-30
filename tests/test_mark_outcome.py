@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch
 from urllib.parse import unquote
 
 import mark_outcome
+from lead_machine import queue_state
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -78,7 +79,7 @@ class TestApplyMarkOutcome(unittest.TestCase):
                 session = self._session(current_status=allowed, patch_status="Follow-Up")
                 receipt = mark_outcome.apply_mark_outcome(event="replied", session=session, **self.ARGS)
                 self.assertEqual(receipt["result"], "applied")
-        for refused in ("New", "Mockup Needed", "Manual Review", "Closed", ""):
+        for refused in ("New", "Mockup Needed", "Manual Review", "Won", "Lost", ""):
             with self.subTest(status=refused):
                 session = self._session(current_status=refused)
                 with self.assertRaisesRegex(mark_outcome.MarkOutcomeError, "not eligible"):
@@ -111,19 +112,35 @@ class TestApplyMarkOutcome(unittest.TestCase):
         self.assertEqual(activity_fields["Activity Type"], "Call")
         self.assertEqual(activity_fields["Outcome"], "Meeting Booked")
 
-    def test_closed_lost_patches_closed_and_creates_no_deal(self):
-        session = self._session(patch_status="Closed", patch_follow_up=None)
+    def test_closed_lost_patches_lost_and_creates_no_deal(self):
+        session = self._session(patch_status="Lost", patch_follow_up=None)
         receipt = mark_outcome.apply_mark_outcome(event="closed_lost", session=session, **self.ARGS)
-        self.assertEqual(receipt["status"], "Closed")
+        self.assertEqual(receipt["status"], "Lost")
         self.assertNotIn("deal_record_id", receipt)
         self.assertEqual(session.post.call_count, 1)
         activity_fields = session.post.call_args_list[0].kwargs["json"]["records"][0]["fields"]
         self.assertEqual(activity_fields["Outcome"], "Lost")
 
+    def test_the_two_closing_events_land_on_distinguishable_statuses(self):
+        # The whole reason for the split. A shared `Closed` made a win and a
+        # dead lead the same cell, so nothing downstream — a rollup, a view, a
+        # conversion rate — could ever tell them apart after the fact.
+        applied = {}
+        for event in sorted(mark_outcome.CLOSING_EVENTS):
+            with self.subTest(event=event):
+                target = mark_outcome.TARGET_STATUS[event]
+                session = self._session(patch_status=target, patch_follow_up=None)
+                receipt = mark_outcome.apply_mark_outcome(event=event, session=session, **self.ARGS)
+                self.assertEqual(session.patch.call_args.kwargs["json"]["fields"]["Status"], target)
+                applied[event] = receipt["status"]
+        self.assertEqual(applied, {"closed_won": "Won", "closed_lost": "Lost"})
+
     def test_closing_clears_next_follow_up_and_open_events_rearm_it(self):
         for event in ("closed_won", "closed_lost"):
             with self.subTest(event=event):
-                session = self._session(patch_status="Closed", patch_follow_up=None)
+                session = self._session(
+                    patch_status=mark_outcome.TARGET_STATUS[event], patch_follow_up=None
+                )
                 receipt = mark_outcome.apply_mark_outcome(event=event, session=session, **self.ARGS)
                 self.assertIsNone(session.patch.call_args.kwargs["json"]["fields"]["Next Follow-Up"])
                 self.assertIsNone(receipt["next_follow_up"])
@@ -264,7 +281,7 @@ class TestApplyMarkOutcome(unittest.TestCase):
     def test_written_select_vocabulary_is_closed(self):
         # Without typecast these strings must already exist as choices in the
         # base or the write 422s. Changing one is a schema change, not a rename.
-        self.assertEqual(set(mark_outcome.TARGET_STATUS.values()), {"Follow-Up", "Closed"})
+        self.assertEqual(set(mark_outcome.TARGET_STATUS.values()), {"Follow-Up", "Won", "Lost"})
         self.assertEqual(set(mark_outcome.ACTIVITY_TYPE.values()), {"Reply", "Call", "Close"})
         self.assertEqual(
             set(mark_outcome.ACTIVITY_OUTCOME.values()),
@@ -272,8 +289,24 @@ class TestApplyMarkOutcome(unittest.TestCase):
         )
         self.assertEqual(mark_outcome.CLOSED_WON_DEAL_STATUS, "Deposit Pending")
 
+    def test_every_status_written_or_accepted_exists_in_the_canonical_vocabulary(self):
+        # REQUIRED_SELECT_CHOICES is deliberately spelled out rather than derived,
+        # so this is the only thing tying it to queue_state's Status vocabulary.
+        # Half-splitting the two is worse than either whole one: mark_outcome
+        # would write a status the send queue's gate has never heard of.
+        vocabulary = set(queue_state.PROSPECT_STATUS_CHOICES)
+        self.assertLessEqual(
+            mark_outcome.REQUIRED_SELECT_CHOICES["Prospects"]["Status"], vocabulary
+        )
+        self.assertLessEqual(set(mark_outcome.TARGET_STATUS.values()), vocabulary)
+        # The source gate matches on a casefolded status, so a rename in the
+        # vocabulary would make it accept nothing without raising anything.
+        self.assertLessEqual(
+            mark_outcome.OUTCOME_SOURCE_STATUSES, {value.casefold() for value in vocabulary}
+        )
+
     def test_closed_won_creates_deal_with_optional_fields(self):
-        session = self._session(patch_status="Closed", patch_follow_up=None)
+        session = self._session(patch_status="Won", patch_follow_up=None)
         receipt = mark_outcome.apply_mark_outcome(
             event="closed_won",
             deal_package="Growth",
@@ -293,7 +326,7 @@ class TestApplyMarkOutcome(unittest.TestCase):
         self.assertEqual(deal_fields["Retainer Price"], 500.0)
 
     def test_closed_won_omits_optional_deal_fields_but_never_the_primary(self):
-        session = self._session(patch_status="Closed", patch_follow_up=None)
+        session = self._session(patch_status="Won", patch_follow_up=None)
         mark_outcome.apply_mark_outcome(event="closed_won", session=session, **self.ARGS)
         deal_fields = session.post.call_args_list[1].kwargs["json"]["records"][0]["fields"]
         # Package is the Deals primary field — an empty one renders as a blank
@@ -313,6 +346,49 @@ class TestApplyMarkOutcome(unittest.TestCase):
         session.post.side_effect = [_response(422, text="INVALID_VALUE")]
         with self.assertRaisesRegex(mark_outcome.MarkOutcomeError, "POST activity failed"):
             mark_outcome.apply_mark_outcome(event="replied", session=session, **self.ARGS)
+
+    def test_unknown_choice_422_names_the_choice_and_the_runbook(self):
+        # The live failure mode for the whole window between this code shipping
+        # and the Airtable runbook running: Won does not exist in the base yet.
+        # Airtable's reply names neither the field nor the value, so untreated it
+        # reads as a transient API fault worth retrying — forever.
+        session = self._session(patch_status="Won", patch_follow_up=None)
+        session.patch.return_value = _response(
+            422, text='{"error":{"type":"INVALID_MULTIPLE_CHOICE_OPTIONS"}}'
+        )
+        with self.assertRaises(mark_outcome.MarkOutcomeError) as caught:
+            mark_outcome.apply_mark_outcome(event="closed_won", session=session, **self.ARGS)
+        message = str(caught.exception)
+        self.assertIn("PATCH prospect failed 422", message)
+        self.assertIn("Prospects.Status='Won'", message)
+        self.assertIn(mark_outcome.RUNBOOK_DOC, message)
+        # Only the failed request's own choices, not every choice the event needs:
+        # the Deals write never happened and naming it sends the operator to the
+        # wrong runbook line.
+        self.assertNotIn("Deal Status", message)
+
+    def test_unknown_choice_diagnosis_is_scoped_to_the_failing_table(self):
+        session = self._session(patch_status="Follow-Up")
+        session.post.side_effect = [
+            _response(422, text='{"error":{"type":"INVALID_MULTIPLE_CHOICE_OPTIONS"}}')
+        ]
+        with self.assertRaises(mark_outcome.MarkOutcomeError) as caught:
+            mark_outcome.apply_mark_outcome(event="replied", session=session, **self.ARGS)
+        message = str(caught.exception)
+        self.assertIn("Sales Activities.Activity Type='Reply'", message)
+        self.assertIn("Sales Activities.Outcome='Replied'", message)
+        self.assertNotIn("Prospects.Status", message)
+
+    def test_other_failures_are_not_diagnosed_as_a_missing_choice(self):
+        # A wrong diagnosis is worse than none: it would send the operator to
+        # edit the base over a token or rate-limit problem.
+        for status_code, text in ((401, "AUTHENTICATION_REQUIRED"), (429, "RATE_LIMIT")):
+            with self.subTest(status_code=status_code):
+                session = self._session(patch_status="Won", patch_follow_up=None)
+                session.patch.return_value = _response(status_code, text=text)
+                with self.assertRaises(mark_outcome.MarkOutcomeError) as caught:
+                    mark_outcome.apply_mark_outcome(event="closed_won", session=session, **self.ARGS)
+                self.assertNotIn(mark_outcome.RUNBOOK_DOC, str(caught.exception))
 
 
 class TestNoAirtableWritePathTypecasts(unittest.TestCase):

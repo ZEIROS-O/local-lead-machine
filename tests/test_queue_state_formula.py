@@ -72,6 +72,60 @@ class TestQueueStateFormula(unittest.TestCase):
             ),
         )
 
+    def test_prospect_status_vocabulary_is_the_post_split_eight(self):
+        # Exact tuple, not a subset: without typecast every one of these has to
+        # exist as a choice in the base, so adding or renaming one is a schema
+        # change that needs the Airtable runbook, not an edit.
+        self.assertEqual(
+            getattr(queue_state, "PROSPECT_STATUS_CHOICES", None),
+            (
+                "New",
+                "Mockup Needed",
+                "Manual Review",
+                "Not Fit",
+                "Sent",
+                "Follow-Up",
+                "Won",
+                "Lost",
+            ),
+        )
+        # The split is the point: `Closed` could not say which of the two
+        # happened, so re-introducing it silently destroys conversion data again.
+        self.assertNotIn("Closed", queue_state.PROSPECT_STATUS_CHOICES)
+
+    def test_queue_gate_is_a_live_subset_of_the_status_vocabulary(self):
+        # The hazard the Won/Lost split exposed: the gate names Status values as
+        # bare strings, so a vocabulary edit that renames or drops one leaves the
+        # gate referencing a choice no record can ever hold — an empty morning
+        # queue that reports no error, because "nobody is ready to dial" is a
+        # legitimate answer. Fail here instead.
+        orphans = [
+            value
+            for value in queue_state.QUEUE_STATUS_CLAUSE.allowed
+            if value not in queue_state.PROSPECT_STATUS_CHOICES
+        ]
+        self.assertEqual(orphans, [])
+
+    def test_queue_gate_is_unchanged_by_the_won_lost_split(self):
+        # Evidence that splitting Closed did not move "Ready to Dial": the two
+        # queued statuses are untouched, and neither new value joins them —
+        # a closed lead, won or lost, is never dialled again.
+        self.assertEqual(queue_state.QUEUE_STATUS_CLAUSE.allowed, ("New", "Mockup Needed"))
+        for closed in ("Won", "Lost"):
+            with self.subTest(status=closed):
+                self.assertNotIn(closed, queue_state.QUEUE_STATUS_CLAUSE.allowed)
+                self.assertEqual(
+                    queue_state.queue_state_for_row(
+                        {
+                            "Packet Tier": "Sendable Packet",
+                            "Commercial Fit State": "commercially-sendable",
+                            "Contact Eligibility": "contact-now",
+                            "Status": closed,
+                        }
+                    ),
+                    "Blocked: Status must be New or Mockup Needed",
+                )
+
     def test_queue_status_clause_is_canonical(self):
         clause = getattr(queue_state, "QUEUE_STATUS_CLAUSE", None)
         if clause is None:

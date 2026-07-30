@@ -17,6 +17,7 @@ from airtable_schema_cutover import (
     backup_records,
     cutover_from_snapshot,
     fetch_records,
+    load_cutover_config,
     load_fields_config,
     main,
     parse_args,
@@ -67,8 +68,6 @@ class AirtableSchemaCutoverTest(unittest.TestCase):
             {
                 "Legacy Send Trigger": "Send Trigger",
                 "Legacy Last Contacted": "Last Contacted",
-                "Legacy Recommended Action": "Recommended Action",
-                "Legacy Form Strength": "Form Strength",
                 "Legacy Skip Reason": "Skip Reason",
             },
         )
@@ -78,7 +77,12 @@ class AirtableSchemaCutoverTest(unittest.TestCase):
         # pair mapping would point at a column that no longer exists.
         self.assertEqual(
             LEGACY_ORPHAN_FIELDS,
-            ("Legacy Current Website Quality", "Legacy CTA Strength"),
+            (
+                "Legacy Current Website Quality",
+                "Legacy CTA Strength",
+                "Legacy Recommended Action",
+                "Legacy Form Strength",
+            ),
         )
         self.assertTrue(set(LEGACY_ORPHAN_FIELDS).isdisjoint(LEGACY_FIELD_PAIRS))
         self.assertEqual(
@@ -93,15 +97,15 @@ class AirtableSchemaCutoverTest(unittest.TestCase):
                     "Place Key": "p1",
                     "Legacy Send Trigger": "old",
                     "Send Trigger": "",
-                    "Legacy Form Strength": "weak",
-                    "Form Strength": "strong",
+                    "Legacy Skip Reason": "old reason",
+                    "Skip Reason": "new reason",
                 },
             }
         ]
         report = prepare_cutover(schema_with_all_pairs(), records)
         self.assertFalse(report["safe_to_delete"])
         self.assertEqual(report["legacy_only"]["Legacy Send Trigger"], ["rec1"])
-        self.assertEqual(report["conflicts"]["Legacy Form Strength"], ["rec1"])
+        self.assertEqual(report["conflicts"]["Legacy Skip Reason"], ["rec1"])
 
     def test_last_contacted_iso_timestamp_equals_same_date(self) -> None:
         records = [
@@ -237,8 +241,38 @@ class FieldOverrideTest(unittest.TestCase):
                 "Sales — Opener Arm",
                 "Sales — Consent to Text",
                 "Sales — Notes",
+                "Sales — Assigned Rep",
+                "Sales — Batch",
+                "Sales — Booked Out?",
+                "Sales — Ask Arm",
             ),
         )
+
+    def test_shipped_config_records_the_consent_migration_before_the_delete(self) -> None:
+        """`Sales — Consent to Text` is a checkbox holding live consent.
+
+        The tool cannot see the difference between a dead column and one whose
+        value has to survive somewhere else first, so the obligation is written
+        down next to the delete list instead of only in a runbook step that a
+        second operator would never read.
+        """
+        config = json.loads(SHIPPED_CONFIG.read_text(encoding="utf-8"))
+        migrations = config["migrate_before_delete"]
+        consent = migrations["Sales — Consent to Text"]
+        self.assertEqual(consent["into"], "Consent Posture")
+        self.assertTrue(consent["why"].strip())
+        self.assertNotIn("tooling_gap", consent)
+
+    def test_every_declared_migration_is_deleted_and_lands_somewhere_surviving(self) -> None:
+        config = json.loads(SHIPPED_CONFIG.read_text(encoding="utf-8"))
+        deleted = set(load_fields_config(SHIPPED_CONFIG))
+        for source, migration in config["migrate_before_delete"].items():
+            with self.subTest(field=source):
+                # Declaring a migration for a field nobody deletes is noise; a
+                # target that is itself on the delete list is a data loss the
+                # checklist would read as safe.
+                self.assertIn(source, deleted)
+                self.assertNotIn(migration["into"], deleted)
 
     def test_load_fields_config_rejects_bad_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -269,8 +303,70 @@ class FieldOverrideTest(unittest.TestCase):
         )
         args = parse_args(["prepare", "--fields-config", str(SHIPPED_CONFIG)])
         self.assertEqual(
-            resolve_cutover(args), FieldCutover({}, load_fields_config(SHIPPED_CONFIG))
+            resolve_cutover(args), load_cutover_config(SHIPPED_CONFIG)
         )
+
+    def test_shipped_config_promotes_consent_to_a_blocking_migration(self) -> None:
+        cutover = load_cutover_config(SHIPPED_CONFIG)
+        self.assertEqual(
+            cutover.migrations,
+            {"Sales — Consent to Text": "Consent Posture"},
+        )
+        self.assertNotIn("Sales — Consent to Text", cutover.plain)
+        self.assertIn("Sales — Consent to Text", cutover.delete_fields)
+        self.assertIn("Consent Posture", cutover.backup_fields)
+
+    def test_prepare_refuses_checked_consent_without_canonical_posture(self) -> None:
+        cutover = FieldCutover(
+            plain=("Sales — Notes",),
+            migrations={"Sales — Consent to Text": "Consent Posture"},
+        )
+        schema = {
+            "fields": [
+                {"id": "f1", "name": "Place Key"},
+                {"id": "f2", "name": "Sales — Consent to Text"},
+                {"id": "f3", "name": "Consent Posture"},
+                {"id": "f4", "name": "Sales — Notes"},
+            ]
+        }
+        blocked = prepare_cutover(
+            schema,
+            [
+                {
+                    "id": "rec-consent",
+                    "fields": {
+                        "Sales — Consent to Text": True,
+                        "Consent Posture": "",
+                    },
+                }
+            ],
+            cutover,
+        )
+        self.assertFalse(blocked["safe_to_delete"])
+        self.assertEqual(
+            blocked["unmigrated"]["Sales — Consent to Text"],
+            ["rec-consent"],
+        )
+
+        safe = prepare_cutover(
+            schema,
+            [
+                {
+                    "id": "rec-consent",
+                    "fields": {
+                        "Sales — Consent to Text": True,
+                        "Consent Posture": "express verbal consent recorded 2026-07-01",
+                    },
+                },
+                {
+                    "id": "rec-no-consent",
+                    "fields": {"Sales — Consent to Text": False},
+                },
+            ],
+            cutover,
+        )
+        self.assertTrue(safe["safe_to_delete"])
+        self.assertEqual(safe["unmigrated"], {})
 
     def test_field_override_args_are_mutually_exclusive(self) -> None:
         with contextlib.redirect_stderr(io.StringIO()):
@@ -322,8 +418,21 @@ class FieldOverrideTest(unittest.TestCase):
 
     def test_cutover_from_snapshot_round_trips_and_validates(self) -> None:
         self.assertIs(cutover_from_snapshot({}), DEFAULT_CUTOVER)
-        stored = {"cutover": {"pairs": {"Legacy A": "A"}, "plain": ["B"]}}
-        self.assertEqual(cutover_from_snapshot(stored), FieldCutover({"Legacy A": "A"}, ("B",)))
+        stored = {
+            "cutover": {
+                "pairs": {"Legacy A": "A"},
+                "migrations": {"Consent A": "Consent Posture"},
+                "plain": ["B"],
+            }
+        }
+        self.assertEqual(
+            cutover_from_snapshot(stored),
+            FieldCutover(
+                {"Legacy A": "A"},
+                ("B",),
+                {"Consent A": "Consent Posture"},
+            ),
+        )
         for bad in (
             {"cutover": "B"},
             {"cutover": {"pairs": {}, "plain": []}},
@@ -387,7 +496,12 @@ class FieldOverrideTest(unittest.TestCase):
             )
             snapshot = json.loads((Path(tmp) / "pre_cutover.json").read_text(encoding="utf-8"))
             self.assertEqual(
-                snapshot["cutover"], {"pairs": {}, "plain": ["Form Strength", "Asset ID"]}
+                snapshot["cutover"],
+                {
+                    "pairs": {},
+                    "migrations": {},
+                    "plain": ["Form Strength", "Asset ID"],
+                },
             )
             backup = json.loads((Path(tmp) / "backup.json").read_text(encoding="utf-8"))
             self.assertEqual(backup["records"][0]["Form Strength"], "weak")

@@ -41,6 +41,35 @@ READINESS_CLAUSES = (
         "Contact Eligibility must be contact-now",
     ),
 )
+# The whole `Prospects.Status` vocabulary, declared here because this module
+# already owns the only clause that reads Status and is imported by the send
+# path. Everything else that names a Status is a narrower view of this tuple —
+# the queue gate below, `compliance.MARK_SENT_ALLOWED_SOURCE_STATUSES`,
+# `mark_outcome.REQUIRED_SELECT_CHOICES` — and none of those views can notice
+# the field changing underneath them on their own.
+#
+# `Closed` was split into `Won`/`Lost` (2026-07-29). One closed state cannot say
+# which, so a won deal and a dead lead landed in the same cell and no conversion
+# rate was recoverable from the base. The base still offers `Closed` and neither
+# new choice: code leads, the Airtable runbook follows, and a write of `Won`
+# 422s until a human has created it. That ordering is deliberate — removing the
+# choice before the code stopped writing it would 422 every upload instead.
+PROSPECT_STATUS_CHOICES = (
+    "New",
+    "Mockup Needed",
+    "Manual Review",
+    "Not Fit",
+    "Sent",
+    "Follow-Up",
+    "Won",
+    "Lost",
+)
+
+# An allowlist, never a "not in {Sent, Closed}" denylist: a denylist silently
+# widens the morning queue the moment a status is added, and the Won/Lost split
+# is exactly such an addition. Pinned against PROSPECT_STATUS_CHOICES by
+# tests/test_queue_state_formula.py so a vocabulary edit that renames or drops a
+# queued status fails there rather than quietly emptying "Ready to Dial".
 QUEUE_STATUS_CLAUSE = QueueStatusClause(
     "Status",
     ("New", "Mockup Needed"),

@@ -735,7 +735,7 @@ class SearchWorkflowTest(unittest.TestCase):
         fields = build_airtable_payload(card)["fields"]
 
         self.assertEqual(fields["Business Name"], "A+ Landscaping")
-        self.assertEqual(fields["Recommended Action"], "Build mockup")
+        self.assertNotIn("Recommended Action", fields)
         self.assertEqual(fields["Site Status"], "Broken")
         self.assertEqual(fields["Evidence Refs"], '["ev-google"]')
         self.assertEqual(fields["Safe Outreach Claims"], "claim")

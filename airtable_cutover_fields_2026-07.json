@@ -1,5 +1,11 @@
 {
   "description": "Fields removed from the Prospects table in the 2026-07 CRM rebuild. Snapshot with: .venv/bin/python airtable_schema_cutover.py prepare --fields-config airtable_cutover_fields_2026-07.json",
+  "migrate_before_delete": {
+    "Sales — Consent to Text": {
+      "into": "Consent Posture",
+      "why": "A checkbox holding live consent, not a dead column. Consent Posture is what every SMS draft is gated on, so deleting this before the ticked rows are written into Consent Posture destroys the only evidence that those leads agreed to be texted."
+    }
+  },
   "fields": [
     "Commercial Materiality",
     "Recurring Consequence",
@@ -19,6 +25,10 @@
     "Sales — Last Activity",
     "Sales — Opener Arm",
     "Sales — Consent to Text",
-    "Sales — Notes"
+    "Sales — Notes",
+    "Sales — Assigned Rep",
+    "Sales — Batch",
+    "Sales — Booked Out?",
+    "Sales — Ask Arm"
   ]
 }

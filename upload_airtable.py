@@ -30,6 +30,8 @@ from lead_machine.airtable_sync import (
     normalize_airtable_value,
     plan_airtable_sync,
 )
+from lead_machine.icp_lanes import classify_icp_lane
+from lead_machine.queue_state import PROSPECT_STATUS_CHOICES
 from lead_machine.schema import GENERIC_DOMAINS, normalize_domain, normalize_phone
 from lead_machine.sendability import (
     PACKET_TIER_MANUAL,
@@ -67,37 +69,26 @@ _FIELD_SCHEMA: List[tuple[str, str, str]] = [
     ("Lead Priority",          "Single select",      "Options: A, B, C (grade)"),
     ("Offer Fit",              "Single select",      "Options: No-Site Launch, Website Rebuild, Estimate Funnel, Automation / Follow-Up"),
     ("Site Status",            "Single select",      "Options: Missing, Broken, No Website, Loaded, Redirect Issue, Social Only, Unknown"),
-    ("Form Strength",          "Single line text",   ""),
     ("Visible Pain Score",     "Number",             "Integer 0–100"),
     ("Visible Pain Reasons",   "Long text",          ""),
     ("Send Trigger",           "Single line text",   ""),
     ("Buyer Intent Signals",   "Long text",          "Comma-separated signals detected by LLM"),
     ("Commercial Fit State",   "Single select",      "Options: commercially-sendable, minor-fix/nurture, needs-broader-system-evidence, intentional-or-ambiguous, not-an-LPM-fit, unverified"),
-    ("Commercial Materiality", "Long text",          "Evidence-backed commercial consequence"),
-    ("Recurring Consequence",  "Long text",          "Why the issue repeats or creates downstream loss"),
-    ("Root Cause Confidence",  "Long text",          "Bounded connection between evidence and mechanism"),
     ("LPM Offer Component",    "Single line text",   "One authoritative offer component"),
-    ("Packageable Solution",   "Long text",          "Bounded deliverable LPM can build"),
-    ("Value Mechanism",        "Long text",          "Credible gain or avoided-loss mechanism"),
-    ("Beyond Free Fix",        "Long text",          "Why this is broader than one free edit"),
-    ("Self Fix Risk",          "Long text",          "Likelihood and scope of self-resolution"),
-    ("Intentionality",         "Long text",          "Why the condition is not intentional or ambiguous"),
     ("Contact Eligibility",    "Single select",      "Options: contact-now, contact-after-asset, hold-commercial-case"),
     ("Asset State",            "Single select",      "Options: none, planned, verified-existing"),
     ("Promise State",          "Single select",      "Options: asset-free, future-build, existing-verified-asset"),
-    ("Asset ID",               "Single line text",   "Verified asset identifier when present"),
-    ("Asset Verifier Verdict", "Single select",      "Options: PASS, FAIL, BLOCK"),
     ("Evidence Refs",          "Long text",          "Structured evidence identifiers"),
     ("Safe Outreach Claims",   "Long text",          "Claims bound to evidence identifiers"),
-    ("Evidence Snapshot",      "Long text",          "Structured bounded evidence used by the morning verifier"),
     ("AI Confidence",          "Single select",      "Options: low, medium, high"),
     ("Score Total",            "Number",             "Integer"),
+    ("ICP Lane",               "Single select",      "Options: no_site_launch, social_jobber_escape, owned_weak_site_rebuild, premium_perception_gap, portfolio_presentation_gap, estimate_funnel, optimization_only, skip"),
+    ("Opportunity Score",      "Number",             "Integer 0–100; the icp_lanes score behind ICP Lane"),
     ("Opener",                 "Long text",          ""),
-    ("Recommended Action",     "Single line text",   ""),
     ("Send Blockers",          "Long text",          ""),
     ("Skip Reason",            "Single line text",   ""),
     ("Place Key",              "Single line text",   "Used as upsert key; must be unique per business"),
-    ("Status",                 "Single select",      "Options: New, Mockup Needed, Manual Review, Not Fit, Sent, Follow-Up, Closed"),
+    ("Status",                 "Single select",      "Options: " + ", ".join(PROSPECT_STATUS_CHOICES)),
     ("Outreach Channel",       "Single select",      "Options: Email, Phone, Instagram DM, SMS"),
     ("Consent Posture",        "Single line text",   "Required and documented before any SMS draft can pass"),
     ("Last Contacted",         "Date",               ""),
@@ -202,34 +193,23 @@ CSV_AIRTABLE_FIELDS = [
     "Lead Priority",
     "Offer Fit",
     "Site Status",
-    "Form Strength",
     "Visible Pain Score",
     "Visible Pain Reasons",
     "Send Trigger",
     "Buyer Intent Signals",
     "Commercial Fit State",
-    "Commercial Materiality",
-    "Recurring Consequence",
-    "Root Cause Confidence",
     "LPM Offer Component",
-    "Packageable Solution",
-    "Value Mechanism",
-    "Beyond Free Fix",
-    "Self Fix Risk",
-    "Intentionality",
     "Contact Eligibility",
     "Asset State",
     "Promise State",
-    "Asset ID",
-    "Asset Verifier Verdict",
     "Evidence Refs",
     "Safe Outreach Claims",
-    "Evidence Snapshot",
     "AI Confidence",
     "Skip Reason",
     "Score Total",
+    "ICP Lane",
+    "Opportunity Score",
     "Opener",
-    "Recommended Action",
     "Send Blockers",
     "Place Key",
     "Mockup URL",
@@ -242,6 +222,48 @@ CSV_AIRTABLE_FIELDS = [
 OPERATIONAL_FIELDS = ["Status", "Outreach Channel"]
 OPTIONAL_FIELDS = ["Packet Path"]
 DEFAULT_PACKET_DIR = Path("packets_manual_existing_manual")
+
+ICP_LANE_FIELD = "ICP Lane"
+OPPORTUNITY_SCORE_FIELD = "Opportunity Score"
+
+
+def raw_evidence_record(row: Dict[str, Any]) -> Dict[str, Any]:
+    """The enriched record a scored row carries, or an empty dict.
+
+    Both scorers dump the whole enriched record into `Raw Evidence` before
+    writing the CSV, which is the only place the upload path can still reach the
+    structured evidence a flat row has already collapsed.
+    """
+    raw = row.get("Raw Evidence") or row.get("raw_evidence")
+    if isinstance(raw, dict):
+        return raw
+    text = str(raw or "").strip()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def icp_lane_fields(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Lane and opportunity score for a scored row, derived not copied.
+
+    No scorer writes these as CSV columns; `classify_icp_lane` is the one
+    authority for both, so this re-derives them from the record the same way
+    `is_sendable_record` re-derives the ICP verdict instead of trusting a stored
+    value. A row whose record cannot be recovered gets neither field: an absent
+    cell reads as "never classified", whereas classifying an empty dict would
+    mint a confident `skip` for a lead nothing ever looked at.
+    """
+    record = raw_evidence_record(row)
+    if not record:
+        return {}
+    result = classify_icp_lane(record)
+    # int, not str: no write path here sets typecast, so a stringified number
+    # into an Airtable Number field is a 422 rather than a coercion.
+    return {ICP_LANE_FIELD: result.lane, OPPORTUNITY_SCORE_FIELD: int(result.score)}
 
 
 def read_cards(path: Path) -> List[Dict[str, Any]]:
@@ -419,6 +441,10 @@ def csv_row_to_record(row: Dict[str, str], packet_dir: Path) -> Dict[str, Any]:
         value = coerce_airtable_value(field, row.get(field, ""))
         if value != "":
             fields[field] = value
+
+    # After the column loop, so a derived lane wins over a stale one a CSV may
+    # already carry rather than the other way round.
+    fields.update(icp_lane_fields(row))
 
     for field in OPERATIONAL_FIELDS:
         value = clean_cell(row.get(field, ""))

@@ -204,9 +204,9 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertNotIn("Best Service Angle", fields)
         self.assertNotIn("Next Action", fields)
         self.assertEqual(fields["Packet Tier"], "Sendable Packet")
-        # Form Strength is the one form signal that still syncs; the rest of
-        # the scraper detail stays in the scored CSV and the packet.
-        self.assertEqual(fields["Form Strength"], "None")
+        # Form detail stays in the scored CSV and packet; the CRM keeps only
+        # the surviving visible-pain summary fields.
+        self.assertNotIn("Form Strength", fields)
         for demoted in (
             "Contact Form Detected",
             "Estimate Form Detected",

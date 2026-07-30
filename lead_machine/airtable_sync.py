@@ -4,6 +4,7 @@ import math
 import re
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
+from .icp_lanes import LANES
 from .schema import GENERIC_DOMAINS, normalize_domain, normalize_phone
 from .verticals import VERTICAL_PROFILES, clean_vertical_label
 
@@ -31,41 +32,30 @@ AIRTABLE_ALLOWED_FIELDS = [
     "Lead Priority",
     "Offer Fit",
     "Site Status",
-    "Form Strength",
     "Visible Pain Score",
     "Visible Pain Reasons",
     "Send Trigger",
     "Buyer Intent Signals",
     "Commercial Fit State",
-    "Commercial Materiality",
-    "Recurring Consequence",
-    "Root Cause Confidence",
     "LPM Offer Component",
-    "Packageable Solution",
-    "Value Mechanism",
-    "Beyond Free Fix",
-    "Self Fix Risk",
-    "Intentionality",
     "Contact Eligibility",
     "Asset State",
     "Promise State",
-    "Asset ID",
-    "Asset Verifier Verdict",
     "Evidence Refs",
     "Safe Outreach Claims",
-    "Evidence Snapshot",
     "AI Confidence",
     "Skip Reason",
     "Place Key",
     "Score Total",
+    "ICP Lane",
+    "Opportunity Score",
     "Packet Tier",
     "Opener",
-    "Recommended Action",
     "Send Blockers",
     "Packet Path",
 ]
 
-INTEGER_FIELDS = {"Reviews", "Score Total", "Visible Pain Score"}
+INTEGER_FIELDS = {"Reviews", "Score Total", "Visible Pain Score", "Opportunity Score"}
 FLOAT_FIELDS = {"Rating"}
 AI_CONFIDENCE_FIELD = "AI Confidence"
 AI_CONFIDENCE_LABELS = {"low", "medium", "high"}
@@ -132,8 +122,13 @@ SERVICE_ANGLE_LABELS = {
     "advanced optimization": "Automation / Follow-Up",
     "tracking / missed call": "Automation / Follow-Up",
 }
+ICP_LANE_FIELD = "ICP Lane"
+ICP_LANE_LABELS = set(LANES)
 TYPED_AIRTABLE_FIELDS = (
-    INTEGER_FIELDS | FLOAT_FIELDS | {AI_CONFIDENCE_FIELD, VERTICAL_FIELD, SITE_STATUS_FIELD} | SERVICE_ANGLE_FIELDS
+    INTEGER_FIELDS
+    | FLOAT_FIELDS
+    | {AI_CONFIDENCE_FIELD, VERTICAL_FIELD, SITE_STATUS_FIELD, ICP_LANE_FIELD}
+    | SERVICE_ANGLE_FIELDS
 )
 
 
@@ -223,6 +218,10 @@ def normalize_airtable_value(field: str, value: Any) -> Any:
     if field in SERVICE_ANGLE_FIELDS:
         return SERVICE_ANGLE_LABELS.get(_clean_label(value))
 
+    if field == ICP_LANE_FIELD:
+        label = str(value or "").strip().casefold().replace(" ", "_")
+        return label if label in ICP_LANE_LABELS else None
+
     if field in INTEGER_FIELDS:
         number = _parse_finite_float(value)
         if number is None:
@@ -248,7 +247,6 @@ def build_airtable_payload_with_drops(card: Dict[str, Any]) -> tuple[Dict[str, A
     fields["Lead Priority"] = card.get("grade", fields.get("Lead Priority", ""))
     fields["AI Confidence"] = _first_non_blank(card.get("confidence"), fields.get("AI Confidence", ""))
     fields["Offer Fit"] = card.get("best_angle", fields.get("Offer Fit", ""))
-    fields["Recommended Action"] = card.get("recommended_action", fields.get("Recommended Action", ""))
     fields["Opener"] = card.get("opener", fields.get("Opener", ""))
     allowed = set(AIRTABLE_ALLOWED_FIELDS)
     payload_fields: Dict[str, Any] = {}

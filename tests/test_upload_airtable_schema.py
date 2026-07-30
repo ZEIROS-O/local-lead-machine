@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import sys
 import tempfile
 import unittest
@@ -8,7 +9,17 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import upload_airtable as ua
-from lead_machine.airtable_sync import AIRTABLE_ALLOWED_FIELDS, normalize_airtable_value
+from airtable_schema_cutover import load_fields_config
+from lead_machine.airtable_sync import (
+    AIRTABLE_ALLOWED_FIELDS,
+    build_airtable_payload,
+    normalize_airtable_value,
+)
+from lead_machine.icp_lanes import LANES
+from lead_machine.queue_state import PROSPECT_STATUS_CHOICES
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+CUTOVER_CONFIG = REPO_ROOT / "airtable_cutover_fields_2026-07.json"
 
 
 # Every label choose_offer_fit() can return (score_leads.py:784-869). A typed
@@ -62,10 +73,31 @@ LEGACY_FIELDS = {
 CANONICAL_FIELDS = {
     "Send Trigger",
     "Last Contacted",
-    "Recommended Action",
-    "Form Strength",
     "Skip Reason",
 }
+# The 13 columns the writer used to fill that the 2026-07 CRM rebuild deletes.
+# Airtable answers a write to a deleted field with a 422 for the whole record,
+# so the code has to stop writing them before the base loses them — never the
+# other way round.
+CUTOVER_2026_07_WRITTEN_FIELDS = {
+    "Form Strength",
+    "Commercial Materiality",
+    "Recurring Consequence",
+    "Root Cause Confidence",
+    "Packageable Solution",
+    "Value Mechanism",
+    "Beyond Free Fix",
+    "Self Fix Risk",
+    "Intentionality",
+    "Asset ID",
+    "Asset Verifier Verdict",
+    "Evidence Snapshot",
+    "Recommended Action",
+}
+# Columns the rebuild adds. Both are derived from icp_lanes at upload time.
+NEW_CRM_FIELDS = ("ICP Lane", "Opportunity Score")
+# Explicitly deferred until a producer and taxonomy are approved.
+DEFERRED_CRM_FIELDS = {"Selected Opportunity"}
 # Canonical halves of a Legacy* pair that have since been demoted off the
 # Airtable surface entirely. Their Legacy* counterparts are tracked as
 # airtable_schema_cutover.LEGACY_ORPHAN_FIELDS — deleted outright, not migrated.
@@ -82,6 +114,7 @@ class SchemaReportContentTest(unittest.TestCase):
             self.assertTrue(CANONICAL_FIELDS.issubset(active_fields))
             self.assertTrue(LEGACY_FIELDS.isdisjoint(active_fields))
             self.assertTrue(DEMOTED_CANONICAL_FIELDS.isdisjoint(active_fields))
+            self.assertTrue(DEFERRED_CRM_FIELDS.isdisjoint(active_fields))
 
     def test_schema_report_includes_buyer_intent_signals(self):
         report = ua.build_schema_report()
@@ -115,16 +148,163 @@ class SchemaReportContentTest(unittest.TestCase):
             "Website URL", "Google Maps URL", "Reviews", "Rating",
             "Specific Observation",
             "Packet Tier", "Lead Priority", "Offer Fit",
-            "Site Status", "Form Strength",
+            "Site Status",
             "Visible Pain Score", "Visible Pain Reasons", "Send Trigger",
             "Buyer Intent Signals", "AI Confidence", "Score Total",
-            "Opener", "Recommended Action",
+            "ICP Lane", "Opportunity Score",
+            "Opener",
             "Send Blockers", "Skip Reason", "Place Key", "Status",
             "Outreach Channel", "Last Contacted", "Next Follow-Up",
             "Mockup URL", "Video URL", "Packet Path",
         }
         report_fields = {row["field"] for row in ua.build_schema_report()}
         self.assertTrue(expected.issubset(report_fields), f"Missing from report: {expected - report_fields}")
+
+    def test_status_schema_report_uses_the_canonical_vocabulary(self):
+        status = next(row for row in ua.build_schema_report() if row["field"] == "Status")
+        self.assertEqual(
+            status["notes"],
+            "Options: " + ", ".join(PROSPECT_STATUS_CHOICES),
+        )
+
+
+class CutoverFieldSwapTest(unittest.TestCase):
+    """The write path and the deletion checklist must not overlap.
+
+    A field in both is the 422 the whole cutover exists to avoid: the runbook
+    deletes the column, the next upload still sends it, and Airtable rejects the
+    entire record rather than the one key.
+    """
+
+    def test_code_writes_nothing_the_shipped_cutover_config_deletes(self):
+        doomed = set(load_fields_config(CUTOVER_CONFIG))
+        schema_fields = {field for field, _, _ in ua._FIELD_SCHEMA}
+        for written in (
+            schema_fields,
+            set(ua.CSV_AIRTABLE_FIELDS),
+            set(AIRTABLE_ALLOWED_FIELDS),
+        ):
+            self.assertEqual(doomed & written, set())
+
+    def test_shipped_cutover_config_still_covers_every_field_the_writer_dropped(self):
+        # The other direction: a field pulled out of the writer with nothing
+        # deleting it in Airtable leaves a stale column nobody maintains.
+        self.assertTrue(
+            CUTOVER_2026_07_WRITTEN_FIELDS.issubset(set(load_fields_config(CUTOVER_CONFIG)))
+        )
+
+    def test_new_crm_fields_are_in_both_the_write_path_and_the_schema_report(self):
+        schema_fields = {field for field, _, _ in ua._FIELD_SCHEMA}
+        for field in NEW_CRM_FIELDS:
+            with self.subTest(field=field):
+                self.assertIn(field, ua.CSV_AIRTABLE_FIELDS)
+                self.assertIn(field, schema_fields)
+
+
+def scored_row(**overrides) -> dict:
+    """A minimal scored CSV row, including the Raw Evidence record."""
+    record = {
+        "google": {
+            "business_name": "A+ Patio Pros",
+            "website_url": "",
+            "phone": "(440) 555-0100",
+            "rating": "4.9",
+            "reviews": "19",
+            "category": "landscaper",
+            "source_query": "hardscaping Cleveland OH",
+            "vertical": "hardscaping",
+            "place_id": "ChIJLANE",
+        },
+        "website": {
+            "site_status": "missing",
+            "combined_text": "hardscape patio retaining wall estimate",
+            "high_ticket_terms": ["hardscape", "patio"],
+        },
+        "evidence": {
+            "site_status": "missing",
+            "rendered_site_status": "Unknown",
+            "raw_flags": [],
+            "visible_pain_categories": ["no_site_or_social_only_pain"],
+            "visible_pain_score": 40,
+            "visible_pain_reasons": ["No owned website found"],
+            "send_trigger": "No owned website found",
+            "form_strength": "None",
+            "phone_visible": True,
+        },
+    }
+    row = {
+        "Business Name": "A+ Patio Pros",
+        "City": "Cleveland",
+        "Phone": "(440) 555-0100",
+        "Place Key": "ChIJLANE",
+        "Lead Priority": "A",
+        "Packet Tier": "Sendable Packet",
+        "Raw Evidence": json.dumps(record),
+    }
+    row.update(overrides)
+    return row
+
+
+class WritePathFieldSwapTest(unittest.TestCase):
+    def _fields(self, row: dict) -> dict:
+        return ua.csv_row_to_record(row, Path("packets_does_not_exist"))["airtable_fields"]
+
+    def _final_fields(self, row: dict) -> dict:
+        card = ua.csv_row_to_record(row, Path("packets_does_not_exist"))
+        return build_airtable_payload(card)["fields"]
+
+    def test_icp_lane_and_opportunity_score_are_filled_from_the_record(self):
+        # The point of the two new columns: a real producer, not a blank column.
+        fields = self._fields(scored_row())
+        self.assertIn(fields["ICP Lane"], LANES)
+        self.assertEqual(fields["ICP Lane"], "no_site_launch")
+        self.assertGreater(fields["Opportunity Score"], 0)
+
+    def test_opportunity_score_is_written_as_a_number(self):
+        # No write path sets typecast, so a stringified number into an Airtable
+        # Number field is a 422, not a coercion.
+        fields = self._fields(scored_row())
+        self.assertIsInstance(fields["Opportunity Score"], int)
+        self.assertNotIsInstance(fields["Opportunity Score"], bool)
+
+    def test_new_crm_fields_survive_the_shared_final_payload_builder(self):
+        fields = self._final_fields(scored_row())
+        self.assertEqual(fields["ICP Lane"], "no_site_launch")
+        self.assertIsInstance(fields["Opportunity Score"], int)
+        self.assertGreater(fields["Opportunity Score"], 0)
+
+    def test_a_derived_lane_overrides_a_stale_column_on_the_row(self):
+        fields = self._fields(scored_row(**{"ICP Lane": "estimate_funnel"}))
+        self.assertEqual(fields["ICP Lane"], "no_site_launch")
+
+    def test_no_lane_is_invented_when_the_record_cannot_be_recovered(self):
+        for label, raw in (("absent", None), ("blank", ""), ("unparseable", "{nope")):
+            with self.subTest(raw_evidence=label):
+                row = scored_row()
+                if raw is None:
+                    del row["Raw Evidence"]
+                else:
+                    row["Raw Evidence"] = raw
+                fields = self._fields(row)
+                self.assertNotIn("ICP Lane", fields)
+                self.assertNotIn("Opportunity Score", fields)
+
+    def test_a_row_still_carrying_the_dropped_columns_uploads_without_them(self):
+        # Scored CSVs written before this cut still have all 13 columns, and
+        # they keep flowing through the pipeline for months.
+        stale = {field: f"legacy {field}" for field in CUTOVER_2026_07_WRITTEN_FIELDS}
+        with_stale = self._fields(scored_row(**stale))
+        without_stale = self._fields(scored_row())
+        self.assertEqual(CUTOVER_2026_07_WRITTEN_FIELDS & set(with_stale), set())
+        # Dropping them changes nothing else about the record.
+        self.assertEqual(with_stale, without_stale)
+
+    def test_a_field_absent_from_the_row_is_absent_from_the_payload(self):
+        # Absent, not blank: a blank would overwrite a value already in Airtable
+        # on the PATCH half of the upsert.
+        fields = self._fields(scored_row())
+        self.assertNotIn("Consent Posture", fields)
+        self.assertNotIn("Mockup URL", fields)
 
 
 class LegacyOrphanRegistrationTest(unittest.TestCase):

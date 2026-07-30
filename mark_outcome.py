@@ -8,7 +8,7 @@ for those four events — it never sends anything, only logs what a human
 already observed, mirroring mark_sent.py's guarded-PATCH conventions.
 
 Writes:
-  - Prospects.Status -> Follow-Up (replied / meeting_booked) or Closed (closed_won / closed_lost)
+  - Prospects.Status -> Follow-Up (replied / meeting_booked), Won (closed_won), Lost (closed_lost)
   - Prospects.Next Follow-Up -> re-armed one cadence step out while the lead is
     still open, and cleared on a close so a closed lead leaves the follow-up queue
   - a new row in Sales Activities, linked back to the prospect
@@ -28,17 +28,23 @@ it yet. **Precondition, unmet as of 2026-07-29:** every choice in
 Sales Activities none of them do — `Activity Type` offers Call/Email/Meeting/
 Follow Up/Demo/Note/Other (no Reply, no Close) and `Outcome` offers Completed/
 Scheduled/Rescheduled/Cancelled/No Show/Outcome Pending (none of the four written
-here). Until a human runs the Airtable runbook step that adds those choices by
-hand, **every** mark_outcome event 422s — this script cannot record a single
-outcome. That runbook step is a hard prerequisite, not a cleanup task. Restoring
-typecast is not the fix; it is the drift channel this removal closed.
+here). `Prospects.Status` now joins that list: this module writes `Won`/`Lost`
+where it used to write a single `Closed`, because one closed state cannot say
+which of the two happened, and the base still offers only `Closed`. Until a
+human runs the Airtable runbook step that adds those choices by hand, **every**
+mark_outcome event 422s — this script cannot record a single outcome. That
+runbook step is a hard prerequisite, not a cleanup task. Restoring typecast is
+not the fix; it is the drift channel this removal closed.
 
 `REQUIRED_SELECT_CHOICES` states that prerequisite as data — the exact
 table/field/choice set the base must offer — so the runbook can be generated from
 this module instead of transcribed alongside it and left to drift.
 `preflight_select_values` checks the values a run is about to send against it
 before the first request, so a value the declaration has not caught up with fails
-by name instead of as an opaque Airtable 422.
+by name instead of as an opaque Airtable 422. It cannot see the other direction —
+a choice correctly declared here that the base has simply never been given — so
+the 422 that case does produce is annotated with the choices the failed write
+needed and a pointer to the runbook, rather than left as a raw API error.
 
 `TARGET_STATUS`/`ACTIVITY_TYPE`/`ACTIVITY_OUTCOME` below are still the complete
 set of values this script can ever emit, pinned by `tests/test_mark_outcome.py`
@@ -68,11 +74,15 @@ except ModuleNotFoundError:
 
 OUTCOME_SOURCE_STATUSES = frozenset({"sent", "follow-up"})
 
+# Won and Lost, not a shared Closed: the two closing events are the only place
+# the pipeline ever learns whether the work converted, and collapsing them threw
+# that away at the exact moment it was observed. Both values are part of
+# queue_state.PROSPECT_STATUS_CHOICES, which is the canonical vocabulary.
 TARGET_STATUS = {
     "replied": "Follow-Up",
     "meeting_booked": "Follow-Up",
-    "closed_won": "Closed",
-    "closed_lost": "Closed",
+    "closed_won": "Won",
+    "closed_lost": "Lost",
 }
 
 ACTIVITY_TYPE = {
@@ -103,6 +113,11 @@ OUTCOME_EVENTS = frozenset(TARGET_STATUS)
 # Where the runbook's "create these choices" step is written down for a human.
 RUNBOOK_DOC = "docs/airtable_schema_required.md"
 
+# The error code Airtable returns for a select value that is not one of the
+# field's choices. It is the expected failure for the whole window between this
+# code shipping and the runbook running, so it must not read as an API fault.
+UNKNOWN_CHOICE_ERROR_CODE = "INVALID_MULTIPLE_CHOICE_OPTIONS"
+
 # The select choices the base must already offer for a mark_outcome write to
 # succeed at all, keyed by the logical table and field that has to offer them.
 # Spelled out rather than derived from the maps above on purpose: this is a
@@ -112,7 +127,7 @@ RUNBOOK_DOC = "docs/airtable_schema_required.md"
 # the field vocabulary a renamed table still has to carry.
 REQUIRED_SELECT_CHOICES: dict[str, dict[str, frozenset[str]]] = {
     "Prospects": {
-        "Status": frozenset({"Follow-Up", "Closed"}),
+        "Status": frozenset({"Follow-Up", "Won", "Lost"}),
     },
     "Sales Activities": {
         "Activity Type": frozenset({"Reply", "Call", "Close"}),
@@ -153,6 +168,11 @@ def pending_select_writes(event: str) -> list[tuple[str, str, str]]:
     return writes
 
 
+def select_writes_for_table(event: str, table: str) -> list[tuple[str, str, str]]:
+    """The subset of `pending_select_writes` a single request is responsible for."""
+    return [write for write in pending_select_writes(event) if write[0] == table]
+
+
 def preflight_select_values(event: str) -> None:
     """Refuse an undeclared select choice before the first request goes out.
 
@@ -174,9 +194,30 @@ def preflight_select_values(event: str) -> None:
             )
 
 
-def _request_json(response: requests.Response, operation: str) -> dict:
+def _request_json(
+    response: requests.Response,
+    operation: str,
+    *,
+    select_writes: list[tuple[str, str, str]] | None = None,
+) -> dict:
     if response.status_code >= 400:
-        raise MarkOutcomeError(f"Airtable {operation} failed {response.status_code}: {response.text[:1000]}")
+        detail = ""
+        # The preflight only proves the code agrees with its own declaration.
+        # The base being behind that declaration — the state this repo is in
+        # until the runbook runs — can only surface here, and Airtable says so
+        # with an error code and no field name. Name the choices this request
+        # required so the operator knows which runbook line was skipped instead
+        # of reading it as a transient failure and retrying forever.
+        if select_writes and UNKNOWN_CHOICE_ERROR_CODE in response.text:
+            required = ", ".join(f"{table}.{field}={value!r}" for table, field, value in select_writes)
+            detail = (
+                f" — Airtable rejected a select choice this write requires ({required}). "
+                f"These are declared in REQUIRED_SELECT_CHOICES but must also exist in the "
+                f"base; run the choice-creation step in {RUNBOOK_DOC} before retrying."
+            )
+        raise MarkOutcomeError(
+            f"Airtable {operation} failed {response.status_code}: {response.text[:1000]}{detail}"
+        )
     try:
         payload = response.json()
     except (ValueError, json.JSONDecodeError) as exc:
@@ -208,7 +249,7 @@ def apply_mark_outcome(
     # Runs before the GET so an undeclared choice costs no request and cannot
     # leave a half-applied outcome: the Prospects PATCH lands before the Sales
     # Activities create, so a 422 on the activity would otherwise strand the
-    # record at Follow-Up/Closed with nothing in the ledger explaining why.
+    # record at Follow-Up/Won/Lost with nothing in the ledger explaining why.
     preflight_select_values(event)
 
     try:
@@ -248,6 +289,7 @@ def apply_mark_outcome(
             timeout=30,
         ),
         "PATCH prospect",
+        select_writes=select_writes_for_table(event, "Prospects"),
     )
     patched_fields = patch_response.get("fields")
     if not isinstance(patched_fields, dict) or str(patched_fields.get("Status") or "").strip() != target_status:
@@ -275,6 +317,7 @@ def apply_mark_outcome(
     activity_response = _request_json(
         session.post(activities_url, headers=headers, json=activity_payload, timeout=30),
         "POST activity",
+        select_writes=select_writes_for_table(event, "Sales Activities"),
     )
     activity_records = activity_response.get("records")
     if not isinstance(activity_records, list) or not activity_records:
@@ -312,6 +355,7 @@ def apply_mark_outcome(
                 timeout=30,
             ),
             "POST deal",
+            select_writes=select_writes_for_table(event, "Deals"),
         )
         deal_records = deal_response.get("records")
         if not isinstance(deal_records, list) or not deal_records:

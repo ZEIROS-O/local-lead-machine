@@ -12,6 +12,7 @@ from unittest.mock import patch
 import manual_lead_insert
 import upload_airtable
 from lead_machine import manual_lead_insert as mli
+from lead_machine.queue_state import PROSPECT_STATUS_CHOICES
 
 
 RAW_LEAD = """Business: ABC Concrete Coatings
@@ -113,6 +114,32 @@ class ManualLeadInsertTest(unittest.TestCase):
         self.assertEqual(fields["Packet Eligible"], "Yes")
         self.assertEqual(fields["Lead Priority"], "C")
         self.assertEqual(fields["AI Confidence"], "low")
+
+    def test_manual_status_validation_uses_the_canonical_vocabulary(self) -> None:
+        self.assertEqual(
+            mli.CONTROLLED_SELECT_LABELS["Status"],
+            set(PROSPECT_STATUS_CHOICES),
+        )
+
+    def test_manual_card_never_emits_fields_scheduled_for_cutover_deletion(self) -> None:
+        card = mli.build_manual_lead_card(RAW_LEAD, vertical="epoxy")
+        payload = mli.plan_manual_airtable_sync(card)[0]["payload"]["fields"]
+        doomed = {
+            "Form Strength",
+            "Commercial Materiality",
+            "Recurring Consequence",
+            "Root Cause Confidence",
+            "Packageable Solution",
+            "Value Mechanism",
+            "Beyond Free Fix",
+            "Self Fix Risk",
+            "Intentionality",
+            "Asset ID",
+            "Asset Verifier Verdict",
+            "Evidence Snapshot",
+            "Recommended Action",
+        }
+        self.assertEqual(doomed & set(payload), set())
 
     def test_weak_website_quality_is_not_synced(self) -> None:
         # Current Website Quality was removed from the Airtable surface (PR #9):
@@ -315,7 +342,7 @@ Website: https://second.example
 
     def test_preflight_rejects_unsupported_single_select_value(self) -> None:
         card = mli.build_manual_lead_card(RAW_LEAD, vertical="epoxy")
-        card["airtable_fields"]["Status"] = "New"
+        card["airtable_fields"]["Status"] = "Closed"
 
         errors = mli.validate_manual_lead_preflight(RAW_LEAD, card)
 

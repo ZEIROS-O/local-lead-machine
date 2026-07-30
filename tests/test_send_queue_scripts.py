@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 
 import mark_sent
 import query_ready_to_send as qrs
+from lead_machine import compliance
 from lead_machine import queue_state
 from lead_machine import sendability
 
@@ -216,6 +217,20 @@ class TestMarkSent(unittest.TestCase):
         )
         return receipt, session
 
+    def test_mark_sent_source_gate_tracks_the_queue_gate_and_the_vocabulary(self):
+        # Three declarations describe the same Status field: the queue gate, this
+        # casefolded copy in compliance, and mark_outcome's write list. The
+        # Won/Lost split showed they can move independently — so a status that
+        # query_ready_to_send hands Lou has to be one mark_sent will still accept,
+        # or the morning queue offers a record the write-back then refuses.
+        self.assertEqual(
+            compliance.MARK_SENT_ALLOWED_SOURCE_STATUSES,
+            {value.casefold() for value in queue_state.QUEUE_STATUS_CLAUSE.allowed},
+        )
+        for value in queue_state.QUEUE_STATUS_CLAUSE.allowed:
+            with self.subTest(status=value):
+                self.assertIn(value, queue_state.PROSPECT_STATUS_CHOICES)
+
     def test_direct_sms_requires_current_consent_and_readiness(self):
         with tempfile.TemporaryDirectory() as tmp:
             suppression = self._suppression(tmp)
@@ -233,7 +248,7 @@ class TestMarkSent(unittest.TestCase):
                 receipt, session = self._apply(suppression, {**READY_FIELDS, "Status": allowed}, channel="Email")
                 self.assertEqual(receipt["result"], "applied")
                 session.patch.assert_called_once()
-            for refused in ("", "Manual Review", "Follow-Up", "Contacted", "Closed", "Unknown"):
+            for refused in ("", "Manual Review", "Follow-Up", "Contacted", "Won", "Lost", "Unknown"):
                 with self.subTest(status=refused):
                     session = MagicMock()
                     session.get.return_value = _response(

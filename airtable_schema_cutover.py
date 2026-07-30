@@ -29,8 +29,6 @@ from dotenv import load_dotenv
 LEGACY_FIELD_PAIRS = {
     "Legacy Send Trigger": "Send Trigger",
     "Legacy Last Contacted": "Last Contacted",
-    "Legacy Recommended Action": "Recommended Action",
-    "Legacy Form Strength": "Form Strength",
     "Legacy Skip Reason": "Skip Reason",
 }
 
@@ -44,6 +42,8 @@ LEGACY_FIELD_PAIRS = {
 LEGACY_ORPHAN_FIELDS = (
     "Legacy Current Website Quality",
     "Legacy CTA Strength",
+    "Legacy Recommended Action",
+    "Legacy Form Strength",
 )
 
 
@@ -51,23 +51,25 @@ LEGACY_ORPHAN_FIELDS = (
 class FieldCutover:
     """The set of fields one cutover deletes.
 
-    ``pairs`` maps a legacy column to the canonical column its values must
-    already live in; deletion is refused until the two reconcile. ``plain``
-    fields have no canonical half: they are backed up and deleted outright,
-    and their populated-row counts are reported so the operator sees how
-    much data the deletion drops.
+    ``pairs`` maps a legacy column to the canonical column whose value must
+    match exactly. ``migrations`` maps a source field to a canonical field
+    that must be populated whenever the source carries a truthy value; this
+    covers representation changes such as checkbox -> consent evidence text.
+    ``plain`` fields have no canonical half: they are backed up and deleted
+    outright, and their populated-row counts are reported.
     """
 
     pairs: dict[str, str] = dataclass_field(default_factory=dict)
     plain: tuple[str, ...] = ()
+    migrations: dict[str, str] = dataclass_field(default_factory=dict)
 
     @property
     def delete_fields(self) -> list[str]:
-        return [*self.pairs, *self.plain]
+        return list(dict.fromkeys([*self.pairs, *self.migrations, *self.plain]))
 
     @property
     def canonical_fields(self) -> list[str]:
-        return list(self.pairs.values())
+        return list(dict.fromkeys([*self.pairs.values(), *self.migrations.values()]))
 
     @property
     def backup_fields(self) -> list[str]:
@@ -97,6 +99,16 @@ def comparable(field: str, value: Any) -> str:
     return text[:10] if field == "Legacy Last Contacted" and len(text) >= 10 else text
 
 
+def migration_value_requires_target(value: Any) -> bool:
+    """Whether a migration source carries state that must survive deletion."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    normalized = " ".join(str(value or "").strip().casefold().split())
+    return normalized not in {"", "0", "false", "no", "unchecked"}
+
+
 def prepare_cutover(
     schema: dict[str, Any],
     records: list[dict[str, Any]],
@@ -107,6 +119,7 @@ def prepare_cutover(
     missing_canonical = sorted(set(cutover.canonical_fields) - names)
     legacy_only = {field: [] for field in cutover.pairs}
     conflicts = {field: [] for field in cutover.pairs}
+    unmigrated = {field: [] for field in cutover.migrations}
     orphan_populated = {field: 0 for field in cutover.plain}
     for record in records:
         fields = record.get("fields") or {}
@@ -120,22 +133,35 @@ def prepare_cutover(
                 legacy_only[legacy].append(record_id)
             elif old and new and old != new:
                 conflicts[legacy].append(record_id)
+        for source, target in cutover.migrations.items():
+            if migration_value_requires_target(fields.get(source)) and not comparable(
+                target, fields.get(target)
+            ):
+                unmigrated[source].append(record_id)
         for orphan in cutover.plain:
             if comparable(orphan, fields.get(orphan)):
                 orphan_populated[orphan] += 1
     populated_legacy_only = {key: value for key, value in legacy_only.items() if value}
     populated_conflicts = {key: value for key, value in conflicts.items() if value}
+    populated_unmigrated = {key: value for key, value in unmigrated.items() if value}
     return {
         "record_count": len(records),
         "missing_legacy_fields": missing_legacy,
         "missing_canonical_fields": missing_canonical,
         "legacy_only": populated_legacy_only,
+        "unmigrated": populated_unmigrated,
         # Orphans have no canonical column left, so their values cannot be
         # reconciled — only backed up. Reported, never blocking.
         "orphan_populated_counts": {k: v for k, v in orphan_populated.items() if v},
         "conflicts": populated_conflicts,
         "safe_to_delete": not any(
-            (missing_legacy, missing_canonical, populated_legacy_only, populated_conflicts)
+            (
+                missing_legacy,
+                missing_canonical,
+                populated_legacy_only,
+                populated_conflicts,
+                populated_unmigrated,
+            )
         ),
     }
 
@@ -269,8 +295,7 @@ def parse_field_list(value: str) -> tuple[str, ...]:
     return fields
 
 
-def load_fields_config(path: Path) -> tuple[str, ...]:
-    """Load a JSON fields config: an object with a non-empty ``fields`` list."""
+def _load_fields_config_value(path: Path) -> dict[str, Any]:
     try:
         raw = path.read_text(encoding="utf-8")
     except OSError as exc:
@@ -288,7 +313,49 @@ def load_fields_config(path: Path) -> tuple[str, ...]:
         raise ValueError(
             f'fields config {path} "fields" must name at least one non-empty string'
         )
-    return tuple(dict.fromkeys(item.strip() for item in fields))
+    return value
+
+
+def load_fields_config(path: Path) -> tuple[str, ...]:
+    """Load the complete ordered delete list from a JSON fields config."""
+    value = _load_fields_config_value(path)
+    return tuple(dict.fromkeys(item.strip() for item in value["fields"]))
+
+
+def load_cutover_config(path: Path) -> FieldCutover:
+    """Load deletion fields plus any migration-before-delete obligations."""
+    value = _load_fields_config_value(path)
+    fields = tuple(dict.fromkeys(item.strip() for item in value["fields"]))
+    raw_migrations = value.get("migrate_before_delete", {})
+    if not isinstance(raw_migrations, dict):
+        raise ValueError(
+            f'fields config {path} "migrate_before_delete" must be an object'
+        )
+    migrations: dict[str, str] = {}
+    for source, spec in raw_migrations.items():
+        if (
+            not isinstance(source, str)
+            or not source.strip()
+            or not isinstance(spec, dict)
+            or not isinstance(spec.get("into"), str)
+            or not spec["into"].strip()
+        ):
+            raise ValueError(
+                f'fields config {path} has a malformed "migrate_before_delete" entry'
+            )
+        source = source.strip()
+        target = spec["into"].strip()
+        if source not in fields:
+            raise ValueError(
+                f'fields config {path} migration source {source!r} is not in "fields"'
+            )
+        if target in fields:
+            raise ValueError(
+                f"fields config {path} migration target {target!r} is also deleted"
+            )
+        migrations[source] = target
+    plain = tuple(field for field in fields if field not in migrations)
+    return FieldCutover(plain=plain, migrations=migrations)
 
 
 def resolve_cutover(args: argparse.Namespace) -> FieldCutover:
@@ -296,7 +363,7 @@ def resolve_cutover(args: argparse.Namespace) -> FieldCutover:
     if getattr(args, "fields", None) is not None:
         return FieldCutover(plain=parse_field_list(args.fields))
     if getattr(args, "fields_config", None):
-        return FieldCutover(plain=load_fields_config(args.fields_config))
+        return load_cutover_config(args.fields_config)
     return DEFAULT_CUTOVER
 
 
@@ -308,6 +375,7 @@ def cutover_from_snapshot(snapshot: dict[str, Any]) -> FieldCutover:
     if not isinstance(stored, dict):
         raise ValueError("snapshot cutover section must be an object")
     pairs = stored.get("pairs")
+    migrations = stored.get("migrations", {})
     plain = stored.get("plain")
     if (
         not isinstance(pairs, dict)
@@ -317,10 +385,15 @@ def cutover_from_snapshot(snapshot: dict[str, Any]) -> FieldCutover:
         )
         or not isinstance(plain, list)
         or not all(isinstance(item, str) and item.strip() for item in plain)
-        or not (pairs or plain)
+        or not isinstance(migrations, dict)
+        or not all(
+            isinstance(k, str) and k.strip() and isinstance(v, str) and v.strip()
+            for k, v in migrations.items()
+        )
+        or not (pairs or migrations or plain)
     ):
         raise ValueError("snapshot cutover section is malformed")
-    return FieldCutover(dict(pairs), tuple(plain))
+    return FieldCutover(dict(pairs), tuple(plain), dict(migrations))
 
 
 def _credentials(args: argparse.Namespace) -> tuple[str, str, str]:
@@ -370,7 +443,11 @@ def run_prepare(args: argparse.Namespace) -> int:
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "base_id": base_id,
         "table": {"id": schema.get("id", ""), "name": schema.get("name", "")},
-        "cutover": {"pairs": dict(cutover.pairs), "plain": list(cutover.plain)},
+        "cutover": {
+            "pairs": dict(cutover.pairs),
+            "migrations": dict(cutover.migrations),
+            "plain": list(cutover.plain),
+        },
         "record_count": len(records),
         "fields": [
             {"id": field.get("id", ""), "name": field.get("name", "")}

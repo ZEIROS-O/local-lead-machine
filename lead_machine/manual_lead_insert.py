@@ -34,6 +34,7 @@ from .airtable_sync import (
     plan_airtable_sync,
 )
 from .email_hygiene import clean_airtable_email
+from .queue_state import PROSPECT_STATUS_CHOICES
 from .schema import normalize_phone
 from .sendability import MANUAL_CARD_UNVERIFIED_BLOCKER, admit
 from .verticals import clean_vertical_label
@@ -57,7 +58,6 @@ MANUAL_FIELDS = [
     "Packet Tier",
     "Lead Priority",
     "Offer Fit",
-    "Form Strength",
     "Visible Pain Score",
     "Visible Pain Reasons",
     "Send Trigger",
@@ -65,7 +65,6 @@ MANUAL_FIELDS = [
     "AI Confidence",
     "Score Total",
     "Opener",
-    "Recommended Action",
     "Send Blockers",
     "Status",
     "Outreach Channel",
@@ -94,7 +93,7 @@ CONTROLLED_SELECT_LABELS = {
     "Sendable": {"Yes", "No"},
     "Packet Tier": {"Sendable Packet", "Manual Review Packet", "Watchlist", "No Packet"},
     "Lead Priority": {"A", "B", "C"},
-    "Status": {"Mockup Needed", "Manual Review", "Sent", "Follow-Up", "Closed"},
+    "Status": set(PROSPECT_STATUS_CHOICES),
     "Outreach Channel": {"Email", "Phone", "Instagram DM", "SMS"},
 }
 # Vertical is validated through the shared registry (VERTICAL_LABELS), not a
@@ -415,10 +414,9 @@ def _infer_site_fields(text: str) -> Dict[str, str]:
         else:
             fields["Site Status"] = "Missing"
     if "no estimate form" in lowered:
-        # Contact/Estimate Form Detected and CTA Strength were removed from the
-        # Airtable surface (PR #9): Form Strength is the one form signal that
-        # still syncs, and it already carries this fact.
-        fields["Form Strength"] = "None"
+        # Keep the actionable evidence in the surviving CRM fields. The raw
+        # form diagnostic remains in local artifacts rather than a retired
+        # Airtable column.
         fields["Visible Pain Reasons"] = "No estimate form detected"
         fields["Send Trigger"] = "No estimate form detected"
     if any(term in lowered for term in ("ceramic", "paint correction", "ppf", "epoxy", "coating", "garage floor")):
@@ -610,7 +608,6 @@ def build_manual_lead_card(
         "Packet Tier": "Sendable Packet" if admission.admitted else "Manual Review Packet",
         "Lead Priority": "C",
         "AI Confidence": "medium" if llm_fields else "low",
-        "Recommended Action": "Manual review before sending",
     }
     fields = _merge_fields(defaults, [regex_fields, llm_fields])
     if not clean_cell(fields.get("Outreach Channel")):
