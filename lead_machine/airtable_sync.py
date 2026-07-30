@@ -59,6 +59,7 @@ INTEGER_FIELDS = {"Reviews", "Score Total", "Visible Pain Score", "Opportunity S
 FLOAT_FIELDS = {"Rating"}
 AI_CONFIDENCE_FIELD = "AI Confidence"
 AI_CONFIDENCE_LABELS = {"low", "medium", "high"}
+OUTREACH_CHANNEL_CHOICES = frozenset({"Email", "Phone", "Instagram DM", "SMS"})
 VERTICAL_FIELD = "Vertical"
 IDENTITY_VERTICAL_SELECT_ALIASES = {
     "epoxy": ("epoxy", "epoxy flooring", "garage floor coating"),

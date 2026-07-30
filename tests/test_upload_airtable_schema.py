@@ -164,7 +164,7 @@ class SchemaReportContentTest(unittest.TestCase):
         status = next(row for row in ua.build_schema_report() if row["field"] == "Status")
         self.assertEqual(
             status["notes"],
-            "Options: " + ", ".join(PROSPECT_STATUS_CHOICES),
+            "Options: " + ", ".join(sorted(PROSPECT_STATUS_CHOICES)),
         )
 
 

@@ -23,25 +23,38 @@ except ModuleNotFoundError:
 
 from lead_machine.email_hygiene import clean_airtable_email
 from lead_machine.airtable_sync import (
+    AI_CONFIDENCE_LABELS,
+    OUTREACH_CHANNEL_CHOICES,
+    SERVICE_ANGLE_LABELS,
+    SITE_STATUS_LABELS,
     TYPED_AIRTABLE_FIELDS,
+    VERTICAL_LABELS,
     build_airtable_payload,
     normalize_business_name,
     normalize_city,
     normalize_airtable_value,
     plan_airtable_sync,
 )
-from lead_machine.icp_lanes import classify_icp_lane
+from lead_machine.icp_lanes import LANES, classify_icp_lane
 from lead_machine.queue_state import PROSPECT_STATUS_CHOICES
+from lead_machine.score_schema import (
+    ASSET_STATES,
+    COMMERCIAL_FIT_STATES,
+    CONTACT_ELIGIBILITY_STATES,
+    PROMISE_STATES,
+)
 from lead_machine.schema import GENERIC_DOMAINS, normalize_domain, normalize_phone
 from lead_machine.sendability import (
     PACKET_TIER_MANUAL,
     PACKET_TIER_NONE,
     PACKET_TIER_SENDABLE,
+    PACKET_TIER_WATCHLIST,
     SCORER_WITHHELD_BLOCKER,
     admit,
     hard_icp_skip_blockers,
     is_contact_ready,
 )
+from score_leads import LEAD_PRIORITY_CHOICES
 
 
 # Alias the canonical tiers rather than restating the literals: sendability
@@ -51,11 +64,39 @@ _TIER_SENDABLE = PACKET_TIER_SENDABLE
 _TIER_MANUAL = PACKET_TIER_MANUAL
 _TIER_NONE = PACKET_TIER_NONE
 
+WRITE_PATH_SELECT_CHOICES: dict[str, frozenset[str]] = {
+    "Vertical": frozenset(VERTICAL_LABELS.values()),
+    "Packet Tier": frozenset(
+        {
+            PACKET_TIER_SENDABLE,
+            PACKET_TIER_MANUAL,
+            PACKET_TIER_WATCHLIST,
+            PACKET_TIER_NONE,
+        }
+    ),
+    "Lead Priority": LEAD_PRIORITY_CHOICES,
+    "Offer Fit": frozenset(SERVICE_ANGLE_LABELS.values()),
+    "Site Status": frozenset(SITE_STATUS_LABELS.values()),
+    "Commercial Fit State": frozenset(COMMERCIAL_FIT_STATES),
+    "Contact Eligibility": frozenset(CONTACT_ELIGIBILITY_STATES),
+    "Asset State": frozenset(ASSET_STATES),
+    "Promise State": frozenset(PROMISE_STATES),
+    "AI Confidence": frozenset(AI_CONFIDENCE_LABELS),
+    "ICP Lane": frozenset(LANES),
+    "Status": frozenset(PROSPECT_STATUS_CHOICES),
+    "Outreach Channel": OUTREACH_CHANNEL_CHOICES,
+}
+
+
+def _select_options_note(field: str) -> str:
+    return "Options: " + ", ".join(sorted(WRITE_PATH_SELECT_CHOICES[field]))
+
+
 # (field, airtable_type, notes)
 _FIELD_SCHEMA: List[tuple[str, str, str]] = [
     ("Business Name",          "Single line text",   ""),
     ("Owner Name",             "Single line text",   ""),
-    ("Vertical",               "Single select",      "Options: detailing, epoxy, garage_doors, hardscaping, landscaping, pressure_washing, roofing, water_restoration"),
+    ("Vertical",               "Single select",      _select_options_note("Vertical")),
     ("City",                   "Single line text",   ""),
     ("Metro Context",          "Single line text",   "Authoritative Operator metro-context slug"),
     ("Phone",                  "Phone number",       ""),
@@ -65,34 +106,34 @@ _FIELD_SCHEMA: List[tuple[str, str, str]] = [
     ("Reviews",                "Number",             "Integer; set field to 'Integer' precision"),
     ("Rating",                 "Number",             "Decimal; set field to 2 decimal places"),
     ("Specific Observation",   "Long text",          ""),
-    ("Packet Tier",            "Single select",      "Options: Sendable Packet, Manual Review Packet, Watchlist, No Packet"),
+    ("Packet Tier",            "Single select",      _select_options_note("Packet Tier")),
     # Skip is a real grade the scorer writes on every disqualified lead, not a
     # placeholder. It was missing from this line while the live base also carried
     # junk choices next to it, which is exactly the reading that gets it deleted.
-    ("Lead Priority",          "Single select",      "Options: A, B, C, Skip (grade)"),
-    ("Offer Fit",              "Single select",      "Options: No-Site Launch, Website Rebuild, Estimate Funnel, Automation / Follow-Up"),
-    ("Site Status",            "Single select",      "Options: Missing, Broken, No Website, Loaded, Redirect Issue, Social Only, Unknown"),
+    ("Lead Priority",          "Single select",      _select_options_note("Lead Priority")),
+    ("Offer Fit",              "Single select",      _select_options_note("Offer Fit")),
+    ("Site Status",            "Single select",      _select_options_note("Site Status")),
     ("Visible Pain Score",     "Number",             "Integer 0–100"),
     ("Visible Pain Reasons",   "Long text",          ""),
     ("Send Trigger",           "Single line text",   ""),
     ("Buyer Intent Signals",   "Long text",          "Comma-separated signals detected by LLM"),
-    ("Commercial Fit State",   "Single select",      "Options: commercially-sendable, minor-fix/nurture, needs-broader-system-evidence, intentional-or-ambiguous, not-an-LPM-fit, unverified"),
+    ("Commercial Fit State",   "Single select",      _select_options_note("Commercial Fit State")),
     ("LPM Offer Component",    "Single line text",   "One authoritative offer component"),
-    ("Contact Eligibility",    "Single select",      "Options: contact-now, contact-after-asset, hold-commercial-case"),
-    ("Asset State",            "Single select",      "Options: none, planned, verified-existing"),
-    ("Promise State",          "Single select",      "Options: asset-free, future-build, existing-verified-asset"),
+    ("Contact Eligibility",    "Single select",      _select_options_note("Contact Eligibility")),
+    ("Asset State",            "Single select",      _select_options_note("Asset State")),
+    ("Promise State",          "Single select",      _select_options_note("Promise State")),
     ("Evidence Refs",          "Long text",          "Structured evidence identifiers"),
     ("Safe Outreach Claims",   "Long text",          "Claims bound to evidence identifiers"),
-    ("AI Confidence",          "Single select",      "Options: low, medium, high"),
+    ("AI Confidence",          "Single select",      _select_options_note("AI Confidence")),
     ("Score Total",            "Number",             "Integer"),
-    ("ICP Lane",               "Single select",      "Options: no_site_launch, social_jobber_escape, owned_weak_site_rebuild, premium_perception_gap, portfolio_presentation_gap, estimate_funnel, optimization_only, skip"),
+    ("ICP Lane",               "Single select",      _select_options_note("ICP Lane")),
     ("Opportunity Score",      "Number",             "Integer 0–100; the icp_lanes score behind ICP Lane"),
     ("Opener",                 "Long text",          ""),
     ("Send Blockers",          "Long text",          ""),
     ("Skip Reason",            "Single line text",   ""),
     ("Place Key",              "Single line text",   "Used as upsert key; must be unique per business"),
-    ("Status",                 "Single select",      "Options: " + ", ".join(PROSPECT_STATUS_CHOICES)),
-    ("Outreach Channel",       "Single select",      "Options: Email, Phone, Instagram DM, SMS"),
+    ("Status",                 "Single select",      _select_options_note("Status")),
+    ("Outreach Channel",       "Single select",      _select_options_note("Outreach Channel")),
     ("Consent Posture",        "Single line text",   "Required and documented before any SMS draft can pass"),
     ("Last Contacted",         "Date",               ""),
     ("Next Follow-Up",         "Date",               ""),

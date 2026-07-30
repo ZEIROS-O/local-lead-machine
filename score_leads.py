@@ -1085,6 +1085,12 @@ def classify_priority(
     return priority, ceiling, fit_flags
 
 
+# The AirTable Prospects write path needs the complete grade vocabulary, not
+# just the currently common A/B/C values: hard disqualifiers and low scores
+# are deliberately emitted as Skip.
+LEAD_PRIORITY_CHOICES = frozenset(PRIORITY_RANK)
+
+
 ICP_CEILING_SHADOW_FIELDS = ("ICP Ceiling", "ICP Ceiling Flags", "Grade Disagreement")
 
 

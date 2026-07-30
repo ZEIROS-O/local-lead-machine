@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import airtable_required_choices as checker
+import upload_airtable
 from airtable_required_choices import (
     FieldStatus,
     audit_choices,
@@ -51,27 +52,37 @@ def live_tables(
     deal_status: list[dict] | None = None,
 ) -> list[dict]:
     """The base as the Meta API returns it, defaulting to the 2026-07-30 state."""
+    prospect_fields = [
+        select_field(
+            "fldStatus",
+            "Status",
+            status
+            if status is not None
+            else [
+                choice("sel1", "New"),
+                choice("sel2", "Mockup Needed"),
+                choice("sel3", "Manual Review"),
+                choice("sel4", "Not Fit"),
+                choice("sel5", "Sent"),
+                choice("sel6", "Follow-Up"),
+                choice("sel7", "Closed"),
+            ],
+        )
+    ]
+    prospect_fields.extend(
+        select_field(
+            f"fldProspect{index}",
+            field_name,
+            [choice(f"selProspect{index}_{choice_index}", name) for choice_index, name in enumerate(sorted(choices))],
+        )
+        for index, (field_name, choices) in enumerate(upload_airtable.WRITE_PATH_SELECT_CHOICES.items())
+        if field_name != "Status"
+    )
     return [
         {
             "id": "tblProspects",
             "name": "Prospects",
-            "fields": [
-                select_field(
-                    "fldStatus",
-                    "Status",
-                    status
-                    if status is not None
-                    else [
-                        choice("sel1", "New"),
-                        choice("sel2", "Mockup Needed"),
-                        choice("sel3", "Manual Review"),
-                        choice("sel4", "Not Fit"),
-                        choice("sel5", "Sent"),
-                        choice("sel6", "Follow-Up"),
-                        choice("sel7", "Closed"),
-                    ],
-                )
-            ],
+            "fields": prospect_fields,
         },
         {
             "id": "tblActivities",
@@ -174,6 +185,39 @@ class RequiredVocabularyIsDerivedTest(unittest.TestCase):
             checker, "PROSPECT_STATUS_CHOICES", (*PROSPECT_STATUS_CHOICES, "Archived")
         ):
             self.assertIn("Archived", required_choices()["Prospects"]["Status"])
+
+
+class ProspectWritePathVocabularyTest(unittest.TestCase):
+    """Every select the upload path can write has one owned vocabulary."""
+
+    def test_every_prospect_single_select_has_a_required_vocabulary(self):
+        schema_selects = {
+            field
+            for field, airtable_type, _notes in upload_airtable._FIELD_SCHEMA
+            if airtable_type == "Single select"
+        }
+        self.assertEqual(schema_selects, set(upload_airtable.WRITE_PATH_SELECT_CHOICES))
+
+    def test_select_schema_notes_are_derived_from_owned_vocabularies(self):
+        schema_notes = {
+            field: notes
+            for field, airtable_type, notes in upload_airtable._FIELD_SCHEMA
+            if airtable_type == "Single select"
+        }
+        expected = {
+            field: "Options: " + ", ".join(sorted(choices))
+            for field, choices in upload_airtable.WRITE_PATH_SELECT_CHOICES.items()
+        }
+        self.assertEqual(schema_notes, expected)
+
+    def test_required_choices_unions_the_complete_prospect_write_path(self):
+        required = required_choices()["Prospects"]
+        for field, choices in upload_airtable.WRITE_PATH_SELECT_CHOICES.items():
+            self.assertTrue(
+                choices <= required[field],
+                f"Prospects.{field} lost upload-path choices",
+            )
+        self.assertIn("skip", required["ICP Lane"])
 
 
 class AuditChoicesTest(unittest.TestCase):

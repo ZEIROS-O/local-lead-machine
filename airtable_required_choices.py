@@ -62,6 +62,7 @@ from dotenv import load_dotenv
 
 from lead_machine.queue_state import PROSPECT_STATUS_CHOICES
 from mark_outcome import REQUIRED_SELECT_CHOICES
+from upload_airtable import WRITE_PATH_SELECT_CHOICES
 
 META_TABLES_URL = "https://api.airtable.com/v0/meta/bases/{base_id}/tables"
 
@@ -108,6 +109,8 @@ def required_choices() -> dict[str, dict[str, frozenset[str]]]:
     prospects["Status"] = frozenset(prospects.get("Status", frozenset())) | frozenset(
         PROSPECT_STATUS_CHOICES
     )
+    for field, choices in WRITE_PATH_SELECT_CHOICES.items():
+        prospects[field] = frozenset(prospects.get(field, frozenset())) | choices
     return required
 
 
