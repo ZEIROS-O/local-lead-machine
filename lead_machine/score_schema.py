@@ -29,17 +29,17 @@ COMMERCIAL_FIELD_TITLES = {
     "intentionality": "Intentionality",
 }
 
-COMMERCIAL_FIT_STATES = {
+COMMERCIAL_FIT_STATES = frozenset({
     "commercially-sendable",
     "minor-fix/nurture",
     "needs-broader-system-evidence",
     "intentional-or-ambiguous",
     "not-an-LPM-fit",
     "unverified",
-}
-CONTACT_ELIGIBILITY_STATES = {"contact-now", "contact-after-asset", "hold-commercial-case"}
-ASSET_STATES = {"none", "planned", "verified-existing"}
-PROMISE_STATES = {"asset-free", "future-build", "existing-verified-asset"}
+})
+CONTACT_ELIGIBILITY_STATES = frozenset({"contact-now", "contact-after-asset", "hold-commercial-case"})
+ASSET_STATES = frozenset({"none", "planned", "verified-existing"})
+PROMISE_STATES = frozenset({"asset-free", "future-build", "existing-verified-asset"})
 
 V2_SCORE_FIELDS = {
     "score_schema_version",

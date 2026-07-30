@@ -241,6 +241,23 @@ class TestMarkSent(unittest.TestCase):
             with self.assertRaisesRegex(mark_sent.MarkSentError, "Sendable"):
                 self._apply(suppression, {**READY_FIELDS, "Packet Tier": "Watchlist"}, channel="Email")
 
+    def test_unknown_outreach_channel_is_refused_before_any_airtable_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = MagicMock()
+            with self.assertRaisesRegex(mark_sent.MarkSentError, "Outreach Channel"):
+                mark_sent.apply_mark_sent(
+                    record_id="rec42",
+                    channel="TikTok DM",
+                    last_contacted="2026-07-10",
+                    base_id="app123",
+                    table="Prospects",
+                    token="tok",
+                    suppression_source=self._suppression(tmp),
+                    session=session,
+                )
+            session.get.assert_not_called()
+            session.patch.assert_not_called()
+
     def test_only_new_and_mockup_needed_may_transition_to_sent(self):
         with tempfile.TemporaryDirectory() as tmp:
             suppression = self._suppression(tmp)

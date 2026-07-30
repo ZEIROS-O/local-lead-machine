@@ -58,8 +58,8 @@ AIRTABLE_ALLOWED_FIELDS = [
 INTEGER_FIELDS = {"Reviews", "Score Total", "Visible Pain Score", "Opportunity Score"}
 FLOAT_FIELDS = {"Rating"}
 AI_CONFIDENCE_FIELD = "AI Confidence"
-AI_CONFIDENCE_LABELS = {"low", "medium", "high"}
-OUTREACH_CHANNEL_CHOICES = frozenset({"Email", "Phone", "Instagram DM", "SMS"})
+AI_CONFIDENCE_CHOICES = frozenset({"low", "medium", "high"})
+AI_CONFIDENCE_LABELS = AI_CONFIDENCE_CHOICES
 VERTICAL_FIELD = "Vertical"
 IDENTITY_VERTICAL_SELECT_ALIASES = {
     "epoxy": ("epoxy", "epoxy flooring", "garage floor coating"),
@@ -90,6 +90,7 @@ SITE_STATUS_LABELS = {
     "weak": "Loaded",
     "okay": "Loaded",
 }
+SITE_STATUS_CHOICES = frozenset(SITE_STATUS_LABELS.values())
 OFFER_FIT_FIELD = "Offer Fit"
 # Offer Fit is the only service-angle column that syncs. "Best Service Angle"
 # used to sit beside it here; it was a prose blurb no select option could ever
@@ -123,8 +124,10 @@ SERVICE_ANGLE_LABELS = {
     "advanced optimization": "Automation / Follow-Up",
     "tracking / missed call": "Automation / Follow-Up",
 }
+OFFER_FIT_CHOICES = frozenset(SERVICE_ANGLE_LABELS.values())
 ICP_LANE_FIELD = "ICP Lane"
-ICP_LANE_LABELS = set(LANES)
+ICP_LANE_CHOICES = frozenset(LANES)
+ICP_LANE_LABELS = ICP_LANE_CHOICES
 TYPED_AIRTABLE_FIELDS = (
     INTEGER_FIELDS
     | FLOAT_FIELDS
@@ -175,6 +178,7 @@ def _vertical_label_lookup() -> Dict[str, str]:
 
 
 VERTICAL_LABELS = _vertical_label_lookup()
+VERTICAL_CHOICES = frozenset(VERTICAL_LABELS.values())
 
 
 def resolve_vertical_label(value: str) -> str:

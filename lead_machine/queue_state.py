@@ -64,6 +64,7 @@ PROSPECT_STATUS_CHOICES = (
     "Won",
     "Lost",
 )
+PROSPECT_STATUS_CHOICE_SET = frozenset(PROSPECT_STATUS_CHOICES)
 
 # An allowlist, never a "not in {Sent, Closed}" denylist: a denylist silently
 # widens the morning queue the moment a status is added, and the Won/Lost split

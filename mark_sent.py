@@ -49,6 +49,9 @@ class MarkSentError(RuntimeError):
     pass
 
 
+OUTREACH_CHANNEL_CHOICES = frozenset({"Email", "Phone", "Instagram DM", "SMS"})
+
+
 def _request_json(response: requests.Response, operation: str) -> dict:
     if response.status_code >= 400:
         raise MarkSentError(f"Airtable {operation} failed {response.status_code}: {response.text[:1000]}")
@@ -84,6 +87,12 @@ def apply_mark_sent(
     suppression_source: str,
     session: object = requests,
 ) -> dict:
+    channel = str(channel or "").strip()
+    if channel and channel not in OUTREACH_CHANNEL_CHOICES:
+        choices = ", ".join(sorted(OUTREACH_CHANNEL_CHOICES))
+        raise MarkSentError(
+            f"Outreach Channel {channel!r} is not supported; expected one of: {choices}"
+        )
     try:
         suppression = load_suppression_index(suppression_source)
     except ComplianceError as exc:

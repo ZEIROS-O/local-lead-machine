@@ -9,6 +9,8 @@ from unittest.mock import patch
 
 import airtable_required_choices as checker
 import upload_airtable
+import mark_sent
+import score_leads
 from airtable_required_choices import (
     FieldStatus,
     audit_choices,
@@ -20,6 +22,7 @@ from airtable_required_choices import (
     resolve_table_names,
 )
 from lead_machine.queue_state import PROSPECT_STATUS_CHOICES
+from lead_machine import airtable_sync, queue_state, score_schema, sendability
 from mark_outcome import REQUIRED_SELECT_CHOICES
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -218,6 +221,34 @@ class ProspectWritePathVocabularyTest(unittest.TestCase):
                 f"Prospects.{field} lost upload-path choices",
             )
         self.assertIn("skip", required["ICP Lane"])
+
+    def test_writer_owned_sets_drive_the_map_notes_and_required_union(self):
+        owned = {
+            "Vertical": airtable_sync.VERTICAL_CHOICES,
+            "Packet Tier": sendability.PACKET_TIER_CHOICES,
+            "Lead Priority": score_leads.LEAD_PRIORITY_CHOICES,
+            "Offer Fit": airtable_sync.OFFER_FIT_CHOICES,
+            "Site Status": airtable_sync.SITE_STATUS_CHOICES,
+            "Commercial Fit State": score_schema.COMMERCIAL_FIT_STATES,
+            "Contact Eligibility": score_schema.CONTACT_ELIGIBILITY_STATES,
+            "Asset State": score_schema.ASSET_STATES,
+            "Promise State": score_schema.PROMISE_STATES,
+            "AI Confidence": airtable_sync.AI_CONFIDENCE_CHOICES,
+            "ICP Lane": airtable_sync.ICP_LANE_CHOICES,
+            "Status": queue_state.PROSPECT_STATUS_CHOICE_SET,
+            "Outreach Channel": mark_sent.OUTREACH_CHANNEL_CHOICES,
+        }
+        notes = {
+            field: note
+            for field, airtable_type, note in upload_airtable._FIELD_SCHEMA
+            if airtable_type == "Single select"
+        }
+        required = required_choices()["Prospects"]
+        for field, choices in owned.items():
+            with self.subTest(field=field):
+                self.assertIs(upload_airtable.WRITE_PATH_SELECT_CHOICES[field], choices)
+                self.assertEqual(notes[field], "Options: " + ", ".join(sorted(choices)))
+                self.assertTrue(choices <= required[field])
 
 
 class AuditChoicesTest(unittest.TestCase):

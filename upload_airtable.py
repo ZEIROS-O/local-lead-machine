@@ -23,20 +23,20 @@ except ModuleNotFoundError:
 
 from lead_machine.email_hygiene import clean_airtable_email
 from lead_machine.airtable_sync import (
-    AI_CONFIDENCE_LABELS,
-    OUTREACH_CHANNEL_CHOICES,
-    SERVICE_ANGLE_LABELS,
-    SITE_STATUS_LABELS,
+    AI_CONFIDENCE_CHOICES,
+    ICP_LANE_CHOICES,
+    OFFER_FIT_CHOICES,
+    SITE_STATUS_CHOICES,
     TYPED_AIRTABLE_FIELDS,
-    VERTICAL_LABELS,
+    VERTICAL_CHOICES,
     build_airtable_payload,
     normalize_business_name,
     normalize_city,
     normalize_airtable_value,
     plan_airtable_sync,
 )
-from lead_machine.icp_lanes import LANES, classify_icp_lane
-from lead_machine.queue_state import PROSPECT_STATUS_CHOICES
+from lead_machine.icp_lanes import classify_icp_lane
+from lead_machine.queue_state import PROSPECT_STATUS_CHOICE_SET
 from lead_machine.score_schema import (
     ASSET_STATES,
     COMMERCIAL_FIT_STATES,
@@ -48,12 +48,13 @@ from lead_machine.sendability import (
     PACKET_TIER_MANUAL,
     PACKET_TIER_NONE,
     PACKET_TIER_SENDABLE,
-    PACKET_TIER_WATCHLIST,
+    PACKET_TIER_CHOICES,
     SCORER_WITHHELD_BLOCKER,
     admit,
     hard_icp_skip_blockers,
     is_contact_ready,
 )
+from mark_sent import OUTREACH_CHANNEL_CHOICES
 from score_leads import LEAD_PRIORITY_CHOICES
 
 
@@ -65,25 +66,18 @@ _TIER_MANUAL = PACKET_TIER_MANUAL
 _TIER_NONE = PACKET_TIER_NONE
 
 WRITE_PATH_SELECT_CHOICES: dict[str, frozenset[str]] = {
-    "Vertical": frozenset(VERTICAL_LABELS.values()),
-    "Packet Tier": frozenset(
-        {
-            PACKET_TIER_SENDABLE,
-            PACKET_TIER_MANUAL,
-            PACKET_TIER_WATCHLIST,
-            PACKET_TIER_NONE,
-        }
-    ),
+    "Vertical": VERTICAL_CHOICES,
+    "Packet Tier": PACKET_TIER_CHOICES,
     "Lead Priority": LEAD_PRIORITY_CHOICES,
-    "Offer Fit": frozenset(SERVICE_ANGLE_LABELS.values()),
-    "Site Status": frozenset(SITE_STATUS_LABELS.values()),
-    "Commercial Fit State": frozenset(COMMERCIAL_FIT_STATES),
-    "Contact Eligibility": frozenset(CONTACT_ELIGIBILITY_STATES),
-    "Asset State": frozenset(ASSET_STATES),
-    "Promise State": frozenset(PROMISE_STATES),
-    "AI Confidence": frozenset(AI_CONFIDENCE_LABELS),
-    "ICP Lane": frozenset(LANES),
-    "Status": frozenset(PROSPECT_STATUS_CHOICES),
+    "Offer Fit": OFFER_FIT_CHOICES,
+    "Site Status": SITE_STATUS_CHOICES,
+    "Commercial Fit State": COMMERCIAL_FIT_STATES,
+    "Contact Eligibility": CONTACT_ELIGIBILITY_STATES,
+    "Asset State": ASSET_STATES,
+    "Promise State": PROMISE_STATES,
+    "AI Confidence": AI_CONFIDENCE_CHOICES,
+    "ICP Lane": ICP_LANE_CHOICES,
+    "Status": PROSPECT_STATUS_CHOICE_SET,
     "Outreach Channel": OUTREACH_CHANNEL_CHOICES,
 }
 
