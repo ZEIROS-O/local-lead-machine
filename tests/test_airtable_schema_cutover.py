@@ -9,12 +9,14 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from airtable_schema_cutover import (
+    COMPUTED_FIELD_TYPES,
     DEFAULT_CUTOVER,
     LEGACY_FIELD_PAIRS,
     LEGACY_ORPHAN_FIELDS,
     FieldCutover,
     all_legacy_fields,
     backup_records,
+    computed_field_names,
     cutover_from_snapshot,
     fetch_records,
     load_cutover_config,
@@ -393,6 +395,68 @@ class FieldOverrideTest(unittest.TestCase):
         )
         self.assertEqual(report["legacy_only"], {})
         self.assertEqual(report["conflicts"], {})
+
+    def test_a_computed_field_is_never_counted_as_data_the_deletion_drops(self) -> None:
+        # `Sales — Last Activity` is a lastModifiedTime: it reads as populated on
+        # every record and always will, but there is no stored cell to back up.
+        # Counting it as data loss overstates the cost of the one checklist that
+        # gates an irreversible deletion.
+        cutover = FieldCutover(plain=("Sales — Last Activity", "Form Strength"))
+        schema = {
+            "fields": [
+                {"id": "f1", "name": "Place Key", "type": "singleLineText"},
+                {
+                    "id": "f2",
+                    "name": "Sales — Last Activity",
+                    "type": "lastModifiedTime",
+                },
+                {"id": "f3", "name": "Form Strength", "type": "singleLineText"},
+            ]
+        }
+        records = [
+            {
+                "id": f"rec{index}",
+                "fields": {
+                    "Sales — Last Activity": "2026-07-27T04:46:23.000Z",
+                    "Form Strength": "weak",
+                },
+            }
+            for index in range(3)
+        ]
+        report = prepare_cutover(schema, records, cutover)
+        self.assertEqual(report["orphan_populated_counts"], {"Form Strength": 3})
+        self.assertEqual(report["computed_orphan_fields"], ["Sales — Last Activity"])
+        self.assertTrue(report["safe_to_delete"])
+
+    def test_every_computed_type_is_split_out_of_the_data_loss_counts(self) -> None:
+        computed = sorted(COMPUTED_FIELD_TYPES)
+        cutover = FieldCutover(plain=tuple(f"Derived {kind}" for kind in computed))
+        schema = {
+            "fields": [
+                {"id": "f0", "name": "Place Key", "type": "singleLineText"},
+                *[
+                    {"id": f"f{index + 1}", "name": f"Derived {kind}", "type": kind}
+                    for index, kind in enumerate(computed)
+                ],
+            ]
+        }
+        records = [
+            {"id": "rec1", "fields": {f"Derived {kind}": "x" for kind in computed}}
+        ]
+        report = prepare_cutover(schema, records, cutover)
+        self.assertEqual(report["orphan_populated_counts"], {})
+        self.assertEqual(
+            report["computed_orphan_fields"], [f"Derived {kind}" for kind in computed]
+        )
+
+    def test_computed_field_names_reads_the_type_not_the_name(self) -> None:
+        schema = {
+            "fields": [
+                {"id": "f1", "name": "Looks Computed", "type": "singleLineText"},
+                {"id": "f2", "name": "Plain Name", "type": "formula"},
+            ]
+        }
+        self.assertEqual(computed_field_names(schema), {"Plain Name"})
 
     def test_prepare_refuses_an_overridden_field_missing_from_the_schema(self) -> None:
         # Typo protection: silently backing up nothing would lose the values.

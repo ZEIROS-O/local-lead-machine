@@ -83,6 +83,43 @@ def all_legacy_fields() -> list[str]:
     return DEFAULT_CUTOVER.delete_fields
 
 
+# Field types Airtable derives rather than stores. They read as populated on
+# every record and always will, so counting them alongside real orphans told the
+# operator that deleting `Sales — Last Activity` would drop 145 records' worth of
+# data. It drops nothing: there is no cell to back up, only a rule. Overstating
+# loss in the one checklist that gates an irreversible deletion trains the reader
+# to discount it, which is worse than saying nothing.
+COMPUTED_FIELD_TYPES = frozenset(
+    {
+        "autoNumber",
+        "button",
+        "count",
+        "createdBy",
+        "createdTime",
+        "formula",
+        "lastModifiedBy",
+        "lastModifiedTime",
+        "lookup",
+        "multipleLookupValues",
+        "rollup",
+    }
+)
+
+
+def computed_field_names(schema: dict[str, Any]) -> set[str]:
+    """Names of fields whose values Airtable derives, so deleting loses no data."""
+    fields = schema.get("fields")
+    if not isinstance(fields, list):
+        raise ValueError("table schema must contain a fields list")
+    return {
+        str(field.get("name") or "")
+        for field in fields
+        if isinstance(field, dict)
+        and field.get("name")
+        and field.get("type") in COMPUTED_FIELD_TYPES
+    }
+
+
 def schema_field_names(schema: dict[str, Any]) -> set[str]:
     fields = schema.get("fields")
     if not isinstance(fields, list):
@@ -144,6 +181,7 @@ def prepare_cutover(
     populated_legacy_only = {key: value for key, value in legacy_only.items() if value}
     populated_conflicts = {key: value for key, value in conflicts.items() if value}
     populated_unmigrated = {key: value for key, value in unmigrated.items() if value}
+    computed = computed_field_names(schema)
     return {
         "record_count": len(records),
         "missing_legacy_fields": missing_legacy,
@@ -151,8 +189,15 @@ def prepare_cutover(
         "legacy_only": populated_legacy_only,
         "unmigrated": populated_unmigrated,
         # Orphans have no canonical column left, so their values cannot be
-        # reconciled — only backed up. Reported, never blocking.
-        "orphan_populated_counts": {k: v for k, v in orphan_populated.items() if v},
+        # reconciled — only backed up. Reported, never blocking. Computed fields
+        # are split out rather than counted here: they carry no stored value, so
+        # listing them as data loss overstates what the deletion costs.
+        "orphan_populated_counts": {
+            k: v for k, v in orphan_populated.items() if v and k not in computed
+        },
+        "computed_orphan_fields": sorted(
+            k for k in orphan_populated if k in computed
+        ),
         "conflicts": populated_conflicts,
         "safe_to_delete": not any(
             (
@@ -480,6 +525,17 @@ def run_prepare(args: argparse.Namespace) -> int:
                     f"- `{name}` holds data on {count} of {len(records)} records"
                     for name, count in sorted(orphan_counts.items())
                 ],
+                "",
+            ]
+        computed_orphans = report.get("computed_orphan_fields") or []
+        if computed_orphans:
+            checklist += [
+                "## Computed — nothing to back up",
+                "",
+                "Airtable derives these rather than storing them. They read as populated",
+                "on every record, but deleting them loses no data.",
+                "",
+                *[f"- `{name}`" for name in computed_orphans],
                 "",
             ]
         checklist += [
