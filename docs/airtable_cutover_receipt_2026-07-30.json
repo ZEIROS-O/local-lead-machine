@@ -8,7 +8,7 @@
     "docs/airtable_cutover_runbook_2026-07-30.md for the ordered steps."
   ],
   "date": "2026-07-30",
-  "status": "executed_in_part",
+  "status": "complete",
   "base_id": "appLbCDdUDSZf7qaK",
   "prospects_table_id": "tblUwMo16aVtOnCEE",
   "sales_activities_table_id": "tbl7HIh5a4FrgQWNZ",
@@ -45,13 +45,63 @@
     "remaining_tasks_rows": 0,
     "typecast_used": false
   },
-  "blocked_live_changes": [
-    "Add choices to existing single-select fields (8 across 3 fields)",
-    "Remove the 9 junk select choices, and Status=Closed",
-    "Delete the 23 retired Prospects fields",
-    "Delete the now-empty Tasks table",
-    "Create, reconfigure, or delete ordinary Airtable grid and kanban views"
-  ],
+  "completed_by_hand_2026-07-30": {
+    "_comment": [
+      "Done by Lou in the Airtable UI. Every item here was blocked because no",
+      "API call can perform it — not because it was skipped. See",
+      "api_capability_probe_2026-07-30 for why."
+    ],
+    "select_choices_added": {
+      "Prospects.Status": ["Won", "Lost"],
+      "Sales Activities.Activity Type": ["Reply", "Close"],
+      "Sales Activities.Outcome": ["Replied", "Meeting Booked", "Won", "Lost"]
+    },
+    "select_choices_removed": {
+      "Prospects.Status": ["Closed"],
+      "Prospects.Lead Priority": ["D", "New", "(440) 537-2459"],
+      "Prospects.AI Confidence": ["No-Site Launch"],
+      "Prospects.Lead Source": ["50", "Medium"],
+      "Prospects.Site Status": ["Audit site / booking flow"],
+      "Prospects.Offer Fit": ["Not Fit", "Mediocre"]
+    },
+    "lead_priority_skip_preserved": true,
+    "retired_fields_deleted": 23,
+    "tasks_table_deleted": "tblPI4P4kLzMTGiZ9",
+    "stray_tasks_link_field_deleted": "Airtable degraded the Prospects Tasks link field to singleLineText when the table was deleted; removed as well",
+    "prospects_field_count_after": 48,
+    "views": {
+      "🔥 Call Queue": "viwTIS6NX47jK412Z",
+      "📅 Follow-Ups Due": "viwT8IoxEWyCOMA5M",
+      "📊 Pipeline": "viwb3nZQ3lW0aIQBD",
+      "🧪 Manual Review": "viw41G0duU8rwglL0",
+      "System": "viwA867ZYuPN03FTy"
+    },
+    "legacy_views_deleted": [
+      "Grid 11",
+      "00 - Sales Assignment",
+      "10 - New Calls",
+      "20 - Follow-Ups",
+      "30 - Active Pipeline",
+      "40 - Hot Opportunities",
+      "50 - Closed Outcomes",
+      "60 - Data Repair"
+    ]
+  },
+  "final_verification_2026-07-30": {
+    "airtable_required_choices_check": "exit 0",
+    "airtable_schema_cutover_verify": "exit 0, errors []",
+    "record_count": 145,
+    "record_count_unchanged": true,
+    "upload_airtable_dry_run": "exit 0; ICP Lane and Opportunity Score present; no retired field in any payload",
+    "call_queue_records": 12,
+    "call_queue_matches_query_ready_to_send": "identical record set, not merely the same count",
+    "call_queue_readiness_clause_violations": 0,
+    "manual_review_records": 39,
+    "manual_review_matches_packet_tier_filter": true,
+    "follow_ups_due_records": 0,
+    "pipeline_records": 145,
+    "not_verified": "Per-view hidden/shown field configuration. The REST API returns all populated fields regardless of a view's visibility settings, so field visibility cannot be asserted from outside the UI."
+  },
   "api_capability_probe_2026-07-30": {
     "_comment": [
       "An earlier version of docs/airtable_schema_required.md asserted that the",
@@ -74,12 +124,13 @@
   },
   "verification_commands": {
     "required_select_choices": ".venv/bin/python airtable_required_choices.py check",
-    "required_select_choices_expected": "exit 2 until the 8 choices are created by hand",
+    "required_select_choices_expected": "exit 0 — the base offers every choice the code writes",
     "field_deletion": ".venv/bin/python airtable_schema_cutover.py verify run_state/airtable_schema_cutover/2026-07-30-ready/pre_cutover.json",
-    "field_deletion_expected": "exit 2 until the 23 fields are deleted by hand"
+    "field_deletion_expected": "exit 0 — the 23 retired fields are gone and the record count is unchanged",
+    "_comment": "Both are ongoing drift checks, not one-shot gates. Re-run either after any base edit; a non-zero exit means the base has fallen behind the code again."
   },
   "known_risks": [
     "backup.json does not contain Notes. The 16 records whose misplaced Sales — Batch call notes were migrated now hold exactly the migration string in Notes. If any of them carried prior hand-typed notes, those are unrecoverable. No code path writes Notes, so prior content would have been typed by hand.",
-    "The 13 fields dropped from upload_airtable.py's write path still exist in the base and still show their last-written values (Recommended Action on 129 of 145 records, Form Strength on 123). They can never refresh again. Deleting them is what clears this."
+    "RESOLVED by the field deletion: the 13 fields dropped from upload_airtable.py's write path no longer exist, so no stale value can be read as current."
   ]
 }

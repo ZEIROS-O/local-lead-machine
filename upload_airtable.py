@@ -66,7 +66,10 @@ _FIELD_SCHEMA: List[tuple[str, str, str]] = [
     ("Rating",                 "Number",             "Decimal; set field to 2 decimal places"),
     ("Specific Observation",   "Long text",          ""),
     ("Packet Tier",            "Single select",      "Options: Sendable Packet, Manual Review Packet, Watchlist, No Packet"),
-    ("Lead Priority",          "Single select",      "Options: A, B, C (grade)"),
+    # Skip is a real grade the scorer writes on every disqualified lead, not a
+    # placeholder. It was missing from this line while the live base also carried
+    # junk choices next to it, which is exactly the reading that gets it deleted.
+    ("Lead Priority",          "Single select",      "Options: A, B, C, Skip (grade)"),
     ("Offer Fit",              "Single select",      "Options: No-Site Launch, Website Rebuild, Estimate Funnel, Automation / Follow-Up"),
     ("Site Status",            "Single select",      "Options: Missing, Broken, No Website, Loaded, Redirect Issue, Social Only, Unknown"),
     ("Visible Pain Score",     "Number",             "Integer 0–100"),

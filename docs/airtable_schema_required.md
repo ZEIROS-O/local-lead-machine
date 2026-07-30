@@ -80,16 +80,19 @@ call-sheet state. Do not wire a script to both.
 Written only by `mark_outcome.py`, after Lou reports something that already happened. Nothing in
 the automated pipeline creates rows here.
 
-> **Blocked as of 2026-07-30.** `mark_outcome.py` cannot write a single row until eight select
-> choices are created by hand — six in `Sales Activities`, plus `Won` and `Lost` on
-> `Prospects.Status`. The exact list, and why it is a hand step rather than something the code can do
-> for itself, is immediately below. `mark_outcome.RUNBOOK_DOC` points a failing operator at this
-> file, so this is the page that has to be right.
+> **Unblocked 2026-07-30.** `mark_outcome.py` was unable to write a single row from `91c7131`
+> (typecast removal) until the eight missing select choices were created by hand — six in
+> `Sales Activities`, plus `Won` and `Lost` on `Prospects.Status`. All eight now exist and the
+> module is operational.
 >
-> Run `.venv/bin/python airtable_required_choices.py check` for the live version of that list. It
-> derives the requirement from `mark_outcome.REQUIRED_SELECT_CHOICES` and
-> `queue_state.PROSPECT_STATUS_CHOICES`, prints the UI steps, and exits 2 until the base is complete
-> — so it cannot go stale the way this page can.
+> **If a write starts 422-ing, run this first:**
+> `.venv/bin/python airtable_required_choices.py check` — it derives the requirement from
+> `mark_outcome.REQUIRED_SELECT_CHOICES` and `queue_state.PROSPECT_STATUS_CHOICES`, so it cannot go
+> stale the way this page can. Exit 0 means the base is complete; exit 2 prints exactly which choice
+> is missing and the UI steps to add it. Adding a value to either declaration without adding it to
+> the base puts the module straight back into the blocked state, and this check is what catches that.
+> `mark_outcome.RUNBOOK_DOC` points a failing operator at this file, so this is the page that has to
+> be right.
 
 ### `Sales Activities` (`AIRTABLE_SALES_ACTIVITIES_TABLE`, default `Sales Activities`)
 
@@ -105,9 +108,7 @@ in-CRM record of what happened on a lead after `Status=Sent`.
 | Details | Long text | `--notes` |
 | Linked Prospect | Link → Prospects | Join back to the lead |
 
-#### These six choices must be PRE-CREATED by hand. They do not exist yet.
-
-(Plus `Won` and `Lost` on `Prospects.Status` — same reason, same hand step.)
+#### Every choice here must be PRE-CREATED by hand. All eight now exist.
 
 The field's stock choices describe meeting logistics and cannot express a funnel outcome. They used
 to be minted on first write by Airtable's `typecast` flag; **`typecast` was removed from every write
@@ -116,16 +117,18 @@ path** in this repo (`91c7131`) and cannot come back — `tests/test_mark_outcom
 if any of them sets it. It was removed because it minted a choice for *whatever* string it was
 handed, which is how `Prospects.Lead Priority` acquired an option named `(440) 537-2459`.
 
-Removing it moved the obligation onto the base, and **the base has not met it as of 2026-07-29**:
+Removing it moved the obligation onto the base. The base did not meet it for a day and a half —
+`mark_outcome` 422'd on every event with `INVALID_MULTIPLE_CHOICE_OPTIONS` and recorded nothing —
+until the eight were added by hand on 2026-07-30:
 
-| Field | Live choices (observed 2026-07-29) | Missing — must be created |
-|-------|------------------------------------|---------------------------|
-| Activity Type | Call, Email, Meeting, Follow Up, Demo, Note, Other | **Reply**, **Close** |
-| Outcome | Completed, Scheduled, Rescheduled, Cancelled, No Show, Outcome Pending | **all four**: Replied, Meeting Booked, Won, Lost |
+| Field | Added by hand 2026-07-30 | Live vocabulary now |
+|-------|--------------------------|---------------------|
+| `Sales Activities.Activity Type` | **Reply**, **Close** | Call, Email, Meeting, Follow Up, Demo, Note, Other, Reply, Close |
+| `Sales Activities.Outcome` | **Replied**, **Meeting Booked**, **Won**, **Lost** | Completed, Scheduled, Rescheduled, Cancelled, No Show, Outcome Pending, Replied, Meeting Booked, Won, Lost |
+| `Prospects.Status` | **Won**, **Lost** (and `Closed` removed) | New, Mockup Needed, Manual Review, Not Fit, Sent, Follow-Up, Won, Lost |
 
-Until a human creates those six, **every** `mark_outcome` event 422s with
-`INVALID_MULTIPLE_CHOICE_OPTIONS` and not one outcome can be recorded. This is a hard prerequisite,
-not cleanup. Restoring `typecast` is not the fix; it is the drift channel the removal closed.
+The same obligation applies to any value added later: it is a hard prerequisite, not cleanup, and
+restoring `typecast` is not the fix — it is the drift channel the removal closed.
 
 #### Why the code cannot do it: the recorded result (2026-07-30)
 
@@ -189,29 +192,31 @@ somewhere to land.
 2026-07-30 it holds **0 rows** — the single blank row was deleted during the cutover — and the table
 itself is waiting on hand step H3 because the API has no delete-table endpoint.
 
-## Open schema debt (what the Airtable runbook has to do)
+## Schema debt — cleared 2026-07-30
 
-Everything here is a **base** change. The code side is already done and the repo is deliberately
-unable to make these changes for itself — that is the point of removing `typecast`.
+Everything here was a **base** change the repo is deliberately unable to make for itself; that is
+the point of removing `typecast`. All of it landed in the cutover. Full record:
+**[`airtable_cutover_runbook_2026-07-30.md`](airtable_cutover_runbook_2026-07-30.md)**.
 
-The ordered version of this list, with click-by-click steps and the gate command after each, is
-**[`airtable_cutover_runbook_2026-07-30.md`](airtable_cutover_runbook_2026-07-30.md) → Remaining
-hand steps**. Kept here as the schema-shaped view of the same debt.
-
-1. **Create `Sales Activities.Activity Type` choices `Reply` and `Close`.** Blocking; without them
-   `mark_outcome` records nothing. *(Runbook H1)*
-2. **Create `Sales Activities.Outcome` choices `Replied`, `Meeting Booked`, `Won`, `Lost`.** Same.
-   *(Runbook H1)*
-3. **Create `Prospects.Status` choices `Won` and `Lost`.** Classify every existing `Closed` row
-   into one of them before deleting `Closed`; do not guess when the outcome is unknown. As of
-   2026-07-30 **0 rows** use `Closed`, so there is nothing to classify — re-count before removing
-   it. *(Runbook H1, then H2)*
-4. **Delete `Prospects.Lead Priority` choice `(440) 537-2459`.** Typecast residue, not a grade.
-   *(Runbook H2)*
-5. **Decide on `Prospects.Lead Priority` choices `D` and `New`.** Present in the base, written by
-   nothing in this repo. Both are on 0 records; the runbook removes them. *(Runbook H2)*
+1. ~~Create `Sales Activities.Activity Type` choices `Reply` and `Close`.~~ **Done.**
+2. ~~Create `Sales Activities.Outcome` choices `Replied`, `Meeting Booked`, `Won`, `Lost`.~~ **Done.**
+3. ~~Create `Prospects.Status` choices `Won` and `Lost`, then remove `Closed`.~~ **Done.** 0 rows
+   used `Closed` at execution time, so nothing needed classifying.
+4. ~~Delete `Prospects.Lead Priority` choice `(440) 537-2459`.~~ **Done** — typecast residue, not a
+   grade.
+5. ~~Decide on `Prospects.Lead Priority` choices `D` and `New`.~~ **Done — both deleted.** Neither
+   appears anywhere in this repo. `A`, `B`, `C`, `Skip` remain; **`Skip` is written by the scorer on
+   every disqualified lead and must never be removed**, despite sitting next to the junk. Note
+   `upload_airtable.py:69` describes this field as "Options: A, B, C (grade)", which omits `Skip`.
 6. ~~Record whether the Meta API can add a choice to an existing single-select.~~ **Done
    2026-07-30: it cannot.** The result and the exact calls are in the Sales Activities section
-   above. Adding choices by hand in the UI is now the only path, not merely the assumed one.
-7. **Fill the `Exists` column for the remaining Prospects fields** while you are in the base, and
-   date the pass. `?` means unchecked, not absent.
+   above. Adding choices by hand in the UI is the only path, not merely the assumed one.
+7. **Fill the `Exists` column for the remaining Prospects fields** — the one item still open. `?`
+   means unchecked, not absent. Date the pass when you do it.
+
+### Standing obligation
+
+The debt is cleared, not abolished. Any select value added to
+`mark_outcome.REQUIRED_SELECT_CHOICES` or `queue_state.PROSPECT_STATUS_CHOICES` must be created in
+the base by hand before that code path can run. `airtable_required_choices.py check` is what catches
+it — exit 2 names the missing choice and prints the UI steps.

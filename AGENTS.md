@@ -77,11 +77,12 @@ Key in-flight facts (2026-07-29):
   a new write path is covered without editing the test. The consequence is that **every select
   choice must be pre-created in the base by hand** — verified 2026-07-30, the Airtable API cannot
   add a choice to an existing select at all (`PATCH .../fields/{id}` takes `description` but 422s on
-  `options.choices`). `mark_outcome.py` is blocked on exactly that today, missing 8 choices.
-  Run `airtable_required_choices.py check` for the live list; it derives the requirement from
-  `mark_outcome.REQUIRED_SELECT_CHOICES` and `queue_state.PROSPECT_STATUS_CHOICES`, prints the UI
-  steps, and exits 2 until the base is complete. Background in
-  [`docs/airtable_schema_required.md`](docs/airtable_schema_required.md); ordered steps in
+  `options.choices`, five body shapes tried). So **adding a value to
+  `mark_outcome.REQUIRED_SELECT_CHOICES` or `queue_state.PROSPECT_STATUS_CHOICES` is half a change**:
+  the base has to be edited by hand too, or that write path 422s. `airtable_required_choices.py
+  check` catches it — exit 2 names the missing choice and prints the UI steps. The base was brought
+  level on 2026-07-30 and the check exits 0. Background in
+  [`docs/airtable_schema_required.md`](docs/airtable_schema_required.md); full record in
   [`docs/airtable_cutover_runbook_2026-07-30.md`](docs/airtable_cutover_runbook_2026-07-30.md).
 - **Scoring runs on the Anthropic Messages API** (`claude-sonnet-5`, `LLM_SCORING_MODEL` in `.env`,
   no SDK — uses `requests`). Spend caps price the resolved model from
@@ -114,8 +115,8 @@ The cadence itself lives in `lead_machine/follow_up.py` (`FOLLOW_UP_CADENCE_DAYS
 two writers cannot disagree about it. Table names and the exact select vocabularies these scripts
 write are in [`docs/airtable_schema_required.md`](docs/airtable_schema_required.md).
 
-Two read-only tools guard the base against the code drifting ahead of it. Both exit 2 today, which
-is the correct answer while the 2026-07-30 cutover's hand steps are outstanding:
+Two read-only tools guard the base against the code drifting ahead of it. Both exit 0 as of
+2026-07-30; a non-zero exit means the base has fallen behind and a write path is about to 422:
 
 - `airtable_required_choices.py check` — does the base offer every select choice the code writes?
 - `airtable_schema_cutover.py verify <snapshot>` — are the retired fields gone and the record count
