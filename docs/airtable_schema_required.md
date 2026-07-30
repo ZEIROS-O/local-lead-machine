@@ -53,13 +53,13 @@ Also observed 2026-07-29: the base has five tables (`Prospects`, `Sales Activiti
 | Safe Outreach Claims | Long text | ? | Claims bound to evidence identifiers |
 | AI Confidence | Single select | ? | Options: low, medium, high |
 | Score Total | Number | ? | Integer |
-| ICP Lane | Single select | no (2026-07-30) | Create during the approved cutover. Options: no_site_launch, social_jobber_escape, owned_weak_site_rebuild, premium_perception_gap, portfolio_presentation_gap, estimate_funnel, optimization_only, skip |
-| Opportunity Score | Number | no (2026-07-30) | Create during the approved cutover; integer 0–100 from `icp_lanes` |
+| ICP Lane | Single select | yes (2026-07-30) | Created during the cutover as `fld0DevPnL52YCy4p`. All eight choices confirmed live: no_site_launch, social_jobber_escape, owned_weak_site_rebuild, premium_perception_gap, portfolio_presentation_gap, estimate_funnel, optimization_only, skip |
+| Opportunity Score | Number | yes (2026-07-30) | Created during the cutover as `fldH6acA46yqTyEHb`, precision 0; integer 0–100 from `icp_lanes` |
 | Opener | Long text | ? |  |
 | Send Blockers | Long text | ? |  |
 | Skip Reason | Single line text | ? |  |
 | Place Key | Single line text | ? | Used as upsert key; must be unique per business |
-| Status | Single select | yes (2026-07-30) | Canonical code vocabulary: New, Mockup Needed, Manual Review, Not Fit, Sent, Follow-Up, Won, Lost. The live base still has `Closed` instead of `Won`/`Lost`; the runbook must add both, classify any existing Closed rows, then remove Closed. `Not Fit` is applied by hand, never by code |
+| Status | Single select | yes (2026-07-30) | Canonical code vocabulary: New, Mockup Needed, Manual Review, Not Fit, Sent, Follow-Up, Won, Lost. **The live base still has `Closed` and neither `Won` nor `Lost`** — the API cannot add them, so it is hand step H1 in the runbook. 0 rows use `Closed`, so removing it afterwards costs nothing. `Not Fit` is applied by hand, never by code |
 | Outreach Channel | Single select | yes (2026-07-29) | Live choices match exactly: Email, Phone, Instagram DM, SMS. This is why `mark_sent.py` is safe without `typecast` and `mark_outcome.py` is not — see below |
 | Consent Posture | Single line text | ? | Required and documented before any SMS draft can pass |
 | Last Contacted | Date | ? |  |
@@ -80,10 +80,16 @@ call-sheet state. Do not wire a script to both.
 Written only by `mark_outcome.py`, after Lou reports something that already happened. Nothing in
 the automated pipeline creates rows here.
 
-> **Blocked as of 2026-07-29.** `mark_outcome.py` cannot write a single row until six select choices
-> are created by hand in `Sales Activities`. The exact list, and why it is a hand step rather than
-> something the code can do for itself, is immediately below. `mark_outcome.RUNBOOK_DOC` points a
-> failing operator at this file, so this is the page that has to be right.
+> **Blocked as of 2026-07-30.** `mark_outcome.py` cannot write a single row until eight select
+> choices are created by hand — six in `Sales Activities`, plus `Won` and `Lost` on
+> `Prospects.Status`. The exact list, and why it is a hand step rather than something the code can do
+> for itself, is immediately below. `mark_outcome.RUNBOOK_DOC` points a failing operator at this
+> file, so this is the page that has to be right.
+>
+> Run `.venv/bin/python airtable_required_choices.py check` for the live version of that list. It
+> derives the requirement from `mark_outcome.REQUIRED_SELECT_CHOICES` and
+> `queue_state.PROSPECT_STATUS_CHOICES`, prints the UI steps, and exits 2 until the base is complete
+> — so it cannot go stale the way this page can.
 
 ### `Sales Activities` (`AIRTABLE_SALES_ACTIVITIES_TABLE`, default `Sales Activities`)
 
@@ -100,6 +106,8 @@ in-CRM record of what happened on a lead after `Status=Sent`.
 | Linked Prospect | Link → Prospects | Join back to the lead |
 
 #### These six choices must be PRE-CREATED by hand. They do not exist yet.
+
+(Plus `Won` and `Lost` on `Prospects.Status` — same reason, same hand step.)
 
 The field's stock choices describe meeting logistics and cannot express a funnel outcome. They used
 to be minted on first write by Airtable's `typecast` flag; **`typecast` was removed from every write
@@ -119,11 +127,35 @@ Until a human creates those six, **every** `mark_outcome` event 422s with
 `INVALID_MULTIPLE_CHOICE_OPTIONS` and not one outcome can be recorded. This is a hard prerequisite,
 not cleanup. Restoring `typecast` is not the fix; it is the drift channel the removal closed.
 
-Whether the Meta API can add a choice to an existing single-select is **unverified** — an earlier
-version of this file asserted it refuses, on no recorded evidence. The PAT is `permissionLevel:
-create`, and Airtable does document *adding* (never removing) choices on an existing select, so the
-refusal claim is probably wrong. **Verify it during the runbook**, in the base's own UI or via the
-Meta API, before assuming either way. Do not re-assert either claim here without a recorded result.
+#### Why the code cannot do it: the recorded result (2026-07-30)
+
+This was carried as "unverified" for two days. It is now tested. Probed against
+`Prospects.Status` (`fldmLhCfLofxspxNS`) with the repo's own PAT, which has schema-write access —
+it created `ICP Lane` and `Opportunity Score` the same day:
+
+| Call | Result |
+|---|---|
+| `PATCH /v0/meta/bases/{baseId}/tables/{tableId}/fields/{fieldId}` with `{"description": …}` | **200**, and 200 again restoring the original value |
+| The same endpoint with `options.choices` | **422 `INVALID_REQUEST_UNKNOWN`** |
+
+The 422 reproduced across five structurally different bodies: existing choices echoed verbatim
+(`id` + `name` + `color`); without colours; as `id` only; new choices with and without colours; and
+with an explicit `"type": "singleSelect"`. Identical generic validation failure every time, while a
+`description` PATCH on the very same field succeeded. So it is not the token, not the endpoint, and
+not the body shape — **Airtable's Update Field API does not modify an existing single select's
+choices.**
+
+`POST .../fields` *can* create a new field with choices; that asymmetry is why `ICP Lane` shipped
+with all eight lanes and `Status` could not gain two. There is no delete endpoint for fields,
+tables or views either. The base was left unchanged by the probe.
+
+Re-run those two calls before believing otherwise. One version of this file asserted the refusal on
+no recorded evidence; the next called it unverified but leaned the other way, also on none. Both
+guesses cost a cutover pass. Do not re-assert either direction without a result you actually ran.
+
+The two alternatives are both worse than a hand step: restoring `typecast` is the drift channel
+that removal closed, and creating a replacement field to migrate 145 records onto would be a
+destructive rename dance on the CRM's most-read column with no way to delete the original.
 
 `mark_outcome.REQUIRED_SELECT_CHOICES` is the machine-readable form of this table — the exact
 `{table: {field: choices}}` set the base must offer — so a runbook can be generated from the module
@@ -153,21 +185,33 @@ retainer state, linked to both the Prospect and the Deal. **No code writes eithe
 onboarding is a human step by design (see AGENTS.md Gate 0), and the schema exists so that step has
 somewhere to land.
 
+`Tasks` is being retired: its work folds into `Prospects.Next Follow-Up` and `Prospects.Notes`. As of
+2026-07-30 it holds **0 rows** — the single blank row was deleted during the cutover — and the table
+itself is waiting on hand step H3 because the API has no delete-table endpoint.
+
 ## Open schema debt (what the Airtable runbook has to do)
 
 Everything here is a **base** change. The code side is already done and the repo is deliberately
 unable to make these changes for itself — that is the point of removing `typecast`.
 
+The ordered version of this list, with click-by-click steps and the gate command after each, is
+**[`airtable_cutover_runbook_2026-07-30.md`](airtable_cutover_runbook_2026-07-30.md) → Remaining
+hand steps**. Kept here as the schema-shaped view of the same debt.
+
 1. **Create `Sales Activities.Activity Type` choices `Reply` and `Close`.** Blocking; without them
-   `mark_outcome` records nothing.
+   `mark_outcome` records nothing. *(Runbook H1)*
 2. **Create `Sales Activities.Outcome` choices `Replied`, `Meeting Booked`, `Won`, `Lost`.** Same.
+   *(Runbook H1)*
 3. **Create `Prospects.Status` choices `Won` and `Lost`.** Classify every existing `Closed` row
-   into one of them before deleting `Closed`; do not guess when the outcome is unknown.
+   into one of them before deleting `Closed`; do not guess when the outcome is unknown. As of
+   2026-07-30 **0 rows** use `Closed`, so there is nothing to classify — re-count before removing
+   it. *(Runbook H1, then H2)*
 4. **Delete `Prospects.Lead Priority` choice `(440) 537-2459`.** Typecast residue, not a grade.
+   *(Runbook H2)*
 5. **Decide on `Prospects.Lead Priority` choices `D` and `New`.** Present in the base, written by
-   nothing in this repo.
-6. **Record whether the Meta API can add a choice to an existing single-select**, and write the
-   answer back into the Sales Activities section above, replacing the "unverified" note. Adding
-   choices by hand in the UI is always available and is the assumed path.
+   nothing in this repo. Both are on 0 records; the runbook removes them. *(Runbook H2)*
+6. ~~Record whether the Meta API can add a choice to an existing single-select.~~ **Done
+   2026-07-30: it cannot.** The result and the exact calls are in the Sales Activities section
+   above. Adding choices by hand in the UI is now the only path, not merely the assumed one.
 7. **Fill the `Exists` column for the remaining Prospects fields** while you are in the base, and
    date the pass. `?` means unchecked, not absent.

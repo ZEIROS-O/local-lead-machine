@@ -75,9 +75,14 @@ Key in-flight facts (2026-07-29):
   handed to it — that is how `Lead Priority` acquired an option named `(440) 537-2459`. A repo-wide
   AST scan in `tests/test_mark_outcome.py` fails the suite if any shipped module reintroduces it, so
   a new write path is covered without editing the test. The consequence is that **every select
-  choice must be pre-created in the base by hand**; `mark_outcome.py` is blocked on exactly that
-  today. Current state and the runbook list live in
-  [`docs/airtable_schema_required.md`](docs/airtable_schema_required.md).
+  choice must be pre-created in the base by hand** — verified 2026-07-30, the Airtable API cannot
+  add a choice to an existing select at all (`PATCH .../fields/{id}` takes `description` but 422s on
+  `options.choices`). `mark_outcome.py` is blocked on exactly that today, missing 8 choices.
+  Run `airtable_required_choices.py check` for the live list; it derives the requirement from
+  `mark_outcome.REQUIRED_SELECT_CHOICES` and `queue_state.PROSPECT_STATUS_CHOICES`, prints the UI
+  steps, and exits 2 until the base is complete. Background in
+  [`docs/airtable_schema_required.md`](docs/airtable_schema_required.md); ordered steps in
+  [`docs/airtable_cutover_runbook_2026-07-30.md`](docs/airtable_cutover_runbook_2026-07-30.md).
 - **Scoring runs on the Anthropic Messages API** (`claude-sonnet-5`, `LLM_SCORING_MODEL` in `.env`,
   no SDK — uses `requests`). Spend caps price the resolved model from
   `score_leads.LLM_PRICING_USD_PER_MILLION_TOKENS`; an unpriced model fails the run rather than
@@ -108,6 +113,13 @@ every one of them logs something a human already did. **None of them send anythi
 The cadence itself lives in `lead_machine/follow_up.py` (`FOLLOW_UP_CADENCE_DAYS`, default 4) so the
 two writers cannot disagree about it. Table names and the exact select vocabularies these scripts
 write are in [`docs/airtable_schema_required.md`](docs/airtable_schema_required.md).
+
+Two read-only tools guard the base against the code drifting ahead of it. Both exit 2 today, which
+is the correct answer while the 2026-07-30 cutover's hand steps are outstanding:
+
+- `airtable_required_choices.py check` — does the base offer every select choice the code writes?
+- `airtable_schema_cutover.py verify <snapshot>` — are the retired fields gone and the record count
+  unchanged? `prepare` writes the snapshot, backup and deletion checklist first; it is GET-only.
 
 ## Conventions
 - Config/secrets via `.env` (`python-dotenv`); env vars include `GOOGLE_PLACES_API_KEY`,

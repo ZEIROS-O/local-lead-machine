@@ -1,0 +1,85 @@
+{
+  "_comment": [
+    "Tracked record of what the 2026-07-30 Airtable cutover actually did to the",
+    "live base. The tool writes its receipt into run_state/, which is gitignored",
+    "because backup.json beside it holds real lead notes and phone numbers. This",
+    "copy carries counts, IDs and hashes only — no lead data — so the repo's",
+    "account of the base survives a machine loss. See",
+    "docs/airtable_cutover_runbook_2026-07-30.md for the ordered steps."
+  ],
+  "date": "2026-07-30",
+  "status": "executed_in_part",
+  "base_id": "appLbCDdUDSZf7qaK",
+  "prospects_table_id": "tblUwMo16aVtOnCEE",
+  "sales_activities_table_id": "tbl7HIh5a4FrgQWNZ",
+  "deployed_commit": "6390d64f44db5ec0c56701542e04902ea76dca10",
+  "repository_verification": {
+    "full_suite": "837 tests passed",
+    "origin_main_matches_head": true
+  },
+  "snapshots": {
+    "record_count": 145,
+    "pre_cutover_safe_to_delete": true,
+    "ready_safe_to_delete": true,
+    "ready_backup_sha256": "e5e96babbffe07e089b289ee6537c692dd202ba2851fe97ef96ec8693c9fbd39",
+    "locations": [
+      "run_state/airtable_schema_cutover/2026-07-30-ready",
+      "/home/lucascoh/airtable-cutover-backups/2026-07-30-ready",
+      "/mnt/c/Users/lucas/lpm-airtable-backups/2026-07-30-ready"
+    ],
+    "backup_covers": "the 23 retired fields plus Place Key and Consent Posture",
+    "backup_does_not_cover": "Notes — see known_risks below"
+  },
+  "completed_live_changes": {
+    "created_fields": {
+      "ICP Lane": "fld0DevPnL52YCy4p",
+      "Opportunity Score": "fldH6acA46yqTyEHb"
+    },
+    "rep_field_descriptions_applied": 15,
+    "misplaced_sales_batch_notes_migrated_to_notes": 16,
+    "migration_was_non_destructive": true,
+    "tasks_exported": true,
+    "blank_tasks_row_deleted": "reclWKZoAUvr1fP8h",
+    "status_closed_count": 0,
+    "checked_consent_count": 0,
+    "remaining_tasks_rows": 0,
+    "typecast_used": false
+  },
+  "blocked_live_changes": [
+    "Add choices to existing single-select fields (8 across 3 fields)",
+    "Remove the 9 junk select choices, and Status=Closed",
+    "Delete the 23 retired Prospects fields",
+    "Delete the now-empty Tasks table",
+    "Create, reconfigure, or delete ordinary Airtable grid and kanban views"
+  ],
+  "api_capability_probe_2026-07-30": {
+    "_comment": [
+      "An earlier version of docs/airtable_schema_required.md asserted that the",
+      "Meta API refuses to add choices to an existing select, on no recorded",
+      "evidence; a later version marked the claim unverified. This is the",
+      "recorded result. Re-run the two calls below before believing otherwise."
+    ],
+    "field_tested": "Prospects.Status (fldmLhCfLofxspxNS)",
+    "patch_field_description": "200 — endpoint, PAT scope and field are all fine; restored to the original value, also 200",
+    "patch_field_options_choices": "422 INVALID_REQUEST_UNKNOWN",
+    "body_shapes_tried": [
+      "existing choices echoed verbatim (id + name + color), new choices name-only",
+      "existing choices without color",
+      "existing choices as id only",
+      "new choices with explicit colors",
+      "body with an explicit \"type\": \"singleSelect\""
+    ],
+    "conclusion": "Airtable's Update Field API does not modify an existing single-select's choices. POST .../fields can create a new field with choices (that is how ICP Lane was created the same day); update cannot, and there is no delete endpoint at all. Creating the missing choices is a hand step.",
+    "base_left_unchanged": true
+  },
+  "verification_commands": {
+    "required_select_choices": ".venv/bin/python airtable_required_choices.py check",
+    "required_select_choices_expected": "exit 2 until the 8 choices are created by hand",
+    "field_deletion": ".venv/bin/python airtable_schema_cutover.py verify run_state/airtable_schema_cutover/2026-07-30-ready/pre_cutover.json",
+    "field_deletion_expected": "exit 2 until the 23 fields are deleted by hand"
+  },
+  "known_risks": [
+    "backup.json does not contain Notes. The 16 records whose misplaced Sales — Batch call notes were migrated now hold exactly the migration string in Notes. If any of them carried prior hand-typed notes, those are unrecoverable. No code path writes Notes, so prior content would have been typed by hand.",
+    "The 13 fields dropped from upload_airtable.py's write path still exist in the base and still show their last-written values (Recommended Action on 129 of 145 records, Form Strength on 123). They can never refresh again. Deleting them is what clears this."
+  ]
+}

@@ -1,23 +1,61 @@
-# Proposed Airtable Cutover Runbook — 2026-07-30
+# Airtable Cutover Runbook — 2026-07-30
 
-Status: **review only; no Airtable mutation has been performed**
+Status: **executed in part on 2026-07-30.** Steps 0, 1, 3, 7 and 8 are done;
+steps 2, 4, 5, 6 and 9 are blocked on hand work in the Airtable UI. Machine
+record: [`airtable_cutover_receipt_2026-07-30.json`](airtable_cutover_receipt_2026-07-30.json).
 
 Base: `appLbCDdUDSZf7qaK` (`Local Lead Machine CRM`)
 
-This is the phase-6 handoff. It deliberately stops before execution. Lou must
-approve this document, and the code changes must be reviewed, committed, pushed,
-and deployed before a separate run changes the live base.
+This began as the phase-6 handoff and stopped before execution for review. Lou
+approved it, the code shipped as `6390d64`, and the execution pass ran the same
+day — as far as the Airtable API allows. Everything still open is open because
+**no API call can perform it**, not because it was skipped.
+
+## What actually happened
+
+| Step | State | Note |
+|---|---|---|
+| 0. Deploy code and freeze writes | **done** | `6390d64`, `origin/main` matches, 837 tests green. No cron or timer is armed, so nothing writes unattended. |
+| 1. Pre-mutation snapshot | **done** | 145 records, `safe_to_delete=true`, backup `e5e96bab…` held in three locations on three filesystems. |
+| 2. Expand the schema | **partly done** | `ICP Lane` and `Opportunity Score` created with the exact types below. The 8 select-choice additions are **blocked** — see *Why the rest is hand work*. |
+| 3. Reconcile values | **done** | 0 `Status=Closed`, 0 checked consent, 16 misplaced `Sales — Batch` call notes copied into `Notes` non-destructively (the source cells still hold them). |
+| 4. Remove unused select choices | **blocked** | The API cannot remove a choice. |
+| 5. Delete the 23 retired fields | **blocked** | The API has no delete-field endpoint. `airtable_schema_cutover.py verify` correctly exits 2. |
+| 6. Build the rep-facing views | **blocked** | The API cannot create or configure ordinary grid/kanban views. |
+| 7. Field descriptions | **done** | 15 applied. |
+| 8. Fold and remove Tasks | **partly done** | Table exported, blank row deleted, 0 rows remain. Deleting the table itself is **blocked**. |
+| 9. Verify before unfreezing | **blocked** | Cannot pass until 2, 4, 5 and 6 are done. Both gate commands are wired and currently exit 2, which is the correct answer. |
+
+### Why the rest is hand work
+
+Not a tooling gap. Probed directly on 2026-07-30 against `Prospects.Status`
+with a PAT that has schema-write access:
+
+- `PATCH /v0/meta/bases/{baseId}/tables/{tableId}/fields/{fieldId}` with
+  `{"description": …}` → **200**, and again to restore it → 200. Endpoint,
+  token and field are all fine.
+- The same endpoint with `options.choices` → **422 INVALID_REQUEST_UNKNOWN**, in
+  five structurally different body shapes.
+
+So Airtable's Update Field API does not modify an existing single select's
+choices. `POST .../fields` *can* create a field with choices — that is how
+`ICP Lane` was created — but update cannot, and there is no delete endpoint for
+fields, tables or views. The base was left unchanged by the probe.
+
+Restoring `typecast` is not the fallback; it is the drift channel that removal
+closed, and it is what minted `Lead Priority: (440) 537-2459`.
 
 ## Live read-only checkpoint
 
-Observed through the Airtable integration on 2026-07-30:
+Observed through the Airtable integration on 2026-07-30, **before** the
+execution pass:
 
 - Prospects: **145 records**. Treat this as an observation, not the future
   cutover invariant; the deletion-time snapshot supplies the authoritative count.
 - Sales Activities: 1 record; Deals: 1; Tasks: 1 blank record; Clients: 2.
-- `ICP Lane` and `Opportunity Score` do not exist. `Selected Opportunity` also
-  does not exist and is deliberately deferred because no producer or approved
-  taxonomy exists.
+- `ICP Lane` and `Opportunity Score` did not exist; both were created during the
+  execution pass. `Selected Opportunity` still does not exist and is
+  deliberately deferred because no producer or approved taxonomy exists.
 - `Status` still has seven choices: New, Mockup Needed, Manual Review, Not Fit,
   Sent, Follow-Up, Closed. It has no Won or Lost choice.
 - **0** Prospects currently use `Status=Closed`.
@@ -36,23 +74,27 @@ execution pass.
 
 ## Approval decisions
 
-Lou should explicitly approve or amend these before execution:
+Approved 2026-07-30. Kept here because they are the reasoning behind the hand
+steps still outstanding.
 
-- [ ] **Four rep-facing views:** Call Queue, Follow-Ups Due, Pipeline, and Manual
+- [x] **Four rep-facing views:** Call Queue, Follow-Ups Due, Pipeline, and Manual
   Review. Blocked/data-repair diagnostics move into the hidden System view.
+  *Still to build — the API cannot create views.*
 - [x] **Selected Opportunity:** defer it. No code producer or approved
   opportunity taxonomy exists, so an empty schema-only field would add clutter
-  without creating an operational capability.
-- [ ] **Assigned Rep:** follow the locked decision and delete `Sales — Assigned
+  without creating an operational capability. *Held: not created, not written.*
+- [x] **Assigned Rep:** follow the locked decision and delete `Sales — Assigned
   Rep` after exporting its 25 populated values. If future multi-rep assignment is
   wanted now, stop and revise the locked two-field expansion before deleting it.
-- [ ] **Tasks:** delete the table after exporting and confirming its only current
+  *Exported into `backup.json`; deletion outstanding.*
+- [x] **Tasks:** delete the table after exporting and confirming its only current
   row is blank. If any real task exists at execution time, migrate its due date
   to `Prospects.Next Follow-Up` and its notes to `Prospects.Notes` first.
+  *Row was blank and is deleted; 0 rows remain. Table deletion outstanding.*
 
 ## Execution order
 
-### 0. Deploy code and freeze writes
+### 0. Deploy code and freeze writes — **done**
 
 1. Review this worktree and the 836-test result.
 2. Commit/push/deploy the code-side field swap. Do not run the Airtable cutover
@@ -64,7 +106,10 @@ Lou should explicitly approve or amend these before execution:
 Hard stop: the current local branch is ahead of the remote and the worktree is
 dirty. This step is not satisfied merely because the code exists locally.
 
-### 1. Capture the pre-mutation snapshot
+*Satisfied by `6390d64`: `origin/main` matches HEAD, tree clean, 837 tests green,
+and no cron or systemd timer is armed.*
+
+### 1. Capture the pre-mutation snapshot — **done**
 
 Run the GET-only preparation command:
 
@@ -72,7 +117,7 @@ Run the GET-only preparation command:
 .venv/bin/python airtable_schema_cutover.py \
   prepare \
   --fields-config airtable_cutover_fields_2026-07.json \
-  --output-dir run_state/airtable_schema_cutover/2026-07-cutover-pre
+  --output-dir run_state/airtable_schema_cutover/2026-07-30-ready
 ```
 
 Required outputs:
@@ -86,25 +131,36 @@ Copy the output directory to a second durable location before mutation. A
 non-zero exit or `safe_to_delete=false` blocks deletion. It may be resolved only
 by the explicit migrations below, followed by a new preparation snapshot.
 
-### 2. Expand the schema before any deletion
+*Done: 145 records, `safe_to_delete=true`, backup `e5e96bab…`. Held in three
+places on three filesystems — `run_state/…` (gitignored, holds lead data),
+`~/airtable-cutover-backups/2026-07-30-ready`, and
+`/mnt/c/Users/lucas/lpm-airtable-backups/2026-07-30-ready`, which survives a WSL
+distro reset. All three hashes match.*
 
-Create these two Prospects fields:
+### 2. Expand the schema before any deletion — **partly done**
 
-| Field | Type | Configuration |
+Create these two Prospects fields — **done**:
+
+| Field | Type | Configuration | Live field ID |
+|---|---|---|---|
+| ICP Lane | Single select | `no_site_launch`, `social_jobber_escape`, `owned_weak_site_rebuild`, `premium_perception_gap`, `portfolio_presentation_gap`, `estimate_funnel`, `optimization_only`, `skip` | `fld0DevPnL52YCy4p` |
+| Opportunity Score | Number | Integer precision, 0–100 | `fldH6acA46yqTyEHb` |
+
+Add, but do not yet remove, these select choices — **blocked, hand step**:
+
+| Table.field | Add | Live field ID |
 |---|---|---|
-| ICP Lane | Single select | `no_site_launch`, `social_jobber_escape`, `owned_weak_site_rebuild`, `premium_perception_gap`, `portfolio_presentation_gap`, `estimate_funnel`, `optimization_only`, `skip` |
-| Opportunity Score | Number | Integer precision, 0–100 |
-
-Add, but do not yet remove, these select choices:
-
-| Table.field | Add |
-|---|---|
-| Prospects.Status | Won, Lost |
-| Sales Activities.Activity Type | Reply, Close |
-| Sales Activities.Outcome | Replied, Meeting Booked, Won, Lost |
+| Prospects.Status | Won, Lost | `fldmLhCfLofxspxNS` |
+| Sales Activities.Activity Type | Reply, Close | `fldhm4mx3KfCBmVTh` |
+| Sales Activities.Outcome | Replied, Meeting Booked, Won, Lost | `fldl79M2U2xVZcbBe` |
 
 Do not add typecast to any write. Do not change `Deals.Deal Status`; Deposit
 Pending already exists.
+
+`airtable_required_choices.py check` derives this list from
+`mark_outcome.REQUIRED_SELECT_CHOICES` and `queue_state.PROSPECT_STATUS_CHOICES`,
+prints the UI steps, and exits 2 until every value exists. Use it rather than
+this table — the table can drift, the check cannot.
 
 ### 3. Reconcile values before narrowing choices
 
@@ -141,8 +197,11 @@ posture.
 .venv/bin/python airtable_schema_cutover.py \
   prepare \
   --fields-config airtable_cutover_fields_2026-07.json \
-  --output-dir run_state/airtable_schema_cutover/2026-07-cutover-ready
+  --output-dir run_state/airtable_schema_cutover/2026-07-30-ready
 ```
+
+*Done: 0 rows checked, so nothing needed migrating. `unmigrated` is empty and
+`safe_to_delete` is true.*
 
 #### Misplaced Sales data
 
@@ -151,7 +210,20 @@ Review every populated `Sales — *` value in the backup. Some observed
 operationally valuable notes into the surviving `Notes` field before deletion.
 The backup is not a substitute for data that should remain usable in the CRM.
 
-### 4. Remove unused select choices
+*Done: 16 of the 35 populated `Sales — Batch` cells held call notes rather than
+the `Michael-WaterRestoration-2026-07-28` batch identifier. Each was copied into
+`Notes` prefixed `Migrated from Sales — Batch during 2026-07-30 Airtable
+cutover:`, and the source cell was left intact — so this step is re-runnable and
+the deletion in step 5 is what finally drops the source.*
+
+**Caveat worth knowing before deleting:** `backup.json` covers the 23 retired
+fields plus `Place Key` and `Consent Posture`. It does **not** cover `Notes`. If
+any of those 16 records carried prior hand-typed notes, the migration overwrote
+them with no recovery path. No code writes `Notes`, so any prior content was
+typed by hand. Low probability, zero recoverability — recorded rather than
+discovered later.
+
+### 4. Remove unused select choices — **blocked, hand step**
 
 Only after confirming zero records at execution time, remove:
 
@@ -161,9 +233,14 @@ Only after confirming zero records at execution time, remove:
 - Site Status: `Audit site / booking flow`
 - Offer Fit: `Not Fit`, `Mediocre`
 
-All nine choices had zero records in the 2026-07-30 read-only check.
+All nine choices had zero records in the 2026-07-30 read-only check. Re-confirm
+each is still at zero immediately before removing it.
 
-### 5. Delete the 23 retired Prospects fields
+Add `Status: Closed` to this list once `Won` and `Lost` exist and step 3's
+re-count is still 0. It is the tenth choice to remove and the only one whose
+removal is sequenced behind another step.
+
+### 5. Delete the 23 retired Prospects fields — **blocked, hand step**
 
 Delete only after the deployed code-side allowlist no longer writes them and the
 second preparation report says `safe_to_delete=true`:
@@ -196,7 +273,18 @@ Do not delete `Evidence Refs`, `Safe Outreach Claims`, `Asset State`, `Promise
 State`, `AI Confidence`, `Owner Name`, `Mockup URL`, or `Video URL`. Those
 survive deliberately even when sparsely populated.
 
-### 6. Build the rep-facing views
+`delete_checklist.md` in the ready snapshot carries the same list with each
+field's populated-row count, so the cost of each deletion is visible at the
+moment of deleting it. `Sales — Last Activity` is listed separately there as
+computed: it reads as populated on all 145 records but stores nothing, so
+deleting it loses no data.
+
+This is also what clears the stale-data problem the code swap created:
+`Recommended Action` (129 of 145) and `Form Strength` (123 of 145) still show
+their last-written values to reps, and `upload_airtable.py` no longer writes
+them, so they can never refresh.
+
+### 6. Build the rep-facing views — **blocked, hand step**
 
 Keep one hidden `System` view containing all fields for diagnostics. Delete
 `Grid 11` and consolidate the legacy numbered/temporary views into exactly four
@@ -231,9 +319,14 @@ in the other two views:
 Keep Packet Tier, Commercial Fit State, Contact Eligibility, evidence internals,
 and path/debug fields available in System but hidden from rep-facing views.
 
-### 7. Add rep-readable field descriptions
+Current views, unchanged: `System`, `00 - Sales Assignment`, `10 - New Calls`,
+`20 - Follow-Ups`, `30 - Active Pipeline`, `40 - Hot Opportunities`,
+`50 - Closed Outcomes`, `60 - Data Repair`, `Grid 11`. No script reads a view,
+so this step is rep ergonomics rather than a correctness gate.
 
-At minimum, apply these descriptions to every displayed field:
+### 7. Add rep-readable field descriptions — **done**
+
+All 15 applied 2026-07-30 and confirmed live.
 
 | Field | Description |
 |---|---|
@@ -253,7 +346,7 @@ At minimum, apply these descriptions to every displayed field:
 | Outreach Channel | Channel actually used for the most recent outreach. |
 | Next Follow-Up | Next date the prospect should re-enter the follow-up queue. |
 
-### 8. Fold and remove Tasks
+### 8. Fold and remove Tasks — **partly done**
 
 Export the Tasks table. It currently contains one blank row.
 
@@ -264,14 +357,23 @@ Export the Tasks table. It currently contains one blank row.
 
 Do not delete Sales Activities, Deals, or Clients.
 
-### 9. Verify before unfreezing writes
+*Done: exported, the row was blank, `reclWKZoAUvr1fP8h` deleted, 0 rows remain
+(`tblPI4P4kLzMTGiZ9`). Prospects still carries `Next Follow-Up` and `Notes`.
+Deleting the table itself is a hand step — the API has no delete-table endpoint.*
 
-Run:
+### 9. Verify before unfreezing writes — **blocked until 2, 4, 5 and 6 are done**
+
+Run both gates. Each exits 2 today, which is the correct answer while the hand
+steps are outstanding:
 
 ```bash
+# Does the base offer every select choice the code writes?
+.venv/bin/python airtable_required_choices.py check
+
+# Are the 23 retired fields gone, and is the record count unchanged?
 .venv/bin/python airtable_schema_cutover.py \
   verify \
-  run_state/airtable_schema_cutover/2026-07-cutover-ready/pre_cutover.json
+  run_state/airtable_schema_cutover/2026-07-30-ready/pre_cutover.json
 ```
 
 Then verify read-only:
@@ -288,9 +390,73 @@ Then verify read-only:
 - `query_ready_to_send.py` count matches the Call Queue count.
 - `upload_airtable.py --dry-run` succeeds on a representative scored CSV.
 - A read-only schema check contains every value in
-  `mark_outcome.REQUIRED_SELECT_CHOICES`.
+  `mark_outcome.REQUIRED_SELECT_CHOICES` — that is
+  `airtable_required_choices.py check`, exiting 0.
 
 Only after every check passes should live Airtable writes be unfrozen.
+
+---
+
+## Remaining hand steps
+
+Everything below needs the Airtable UI. No API call can do any of it — see
+*Why the rest is hand work* above. Work top to bottom; the order matters in one
+place only, marked below.
+
+### H1 — Add 8 select choices (unblocks `mark_outcome.py`)
+
+This is the one with an operational cost today: until it is done,
+`mark_outcome.py` cannot record a single funnel event. It fails honestly rather
+than silently, but the capability is offline.
+
+Run `.venv/bin/python airtable_required_choices.py check` — it prints the exact
+field, a link to each table, and the exact spellings. As of 2026-07-30:
+
+- [ ] **Prospects → Status** — add `Won`, `Lost`
+- [ ] **Sales Activities → Activity Type** — add `Reply`, `Close`
+- [ ] **Sales Activities → Outcome** — add `Replied`, `Meeting Booked`, `Won`, `Lost`
+
+Spelling must match exactly, including the hyphen in `Follow-Up` style values.
+A choice named `won` or `Won ` is a different choice and still 422s.
+
+- [ ] Re-run `airtable_required_choices.py check` — **must exit 0**
+
+### H2 — Remove 10 select choices
+
+**Sequenced after H1:** `Closed` can only go once `Won`/`Lost` exist. Re-confirm
+each choice is on 0 records immediately before removing it.
+
+- [ ] Lead Priority: `D`, `New`, `(440) 537-2459`
+- [ ] AI Confidence: `No-Site Launch`
+- [ ] Lead Source: `50`, `Medium`
+- [ ] Site Status: `Audit site / booking flow`
+- [ ] Offer Fit: `Not Fit`, `Mediocre`
+- [ ] Status: `Closed` *(after H1, and only while the count is still 0)*
+
+### H3 — Delete 23 fields and the Tasks table
+
+Read `run_state/airtable_schema_cutover/2026-07-30-ready/delete_checklist.md`
+first: it lists each field with its populated-row count, and separates
+`Sales — Last Activity` as computed with nothing to back up.
+
+- [ ] Delete the 23 fields listed in step 5
+- [ ] Delete the `Tasks` table (`tblPI4P4kLzMTGiZ9`, 0 rows)
+- [ ] Keep `Sales Activities`, `Deals`, `Clients`
+- [ ] Run `airtable_schema_cutover.py verify …/2026-07-30-ready/pre_cutover.json`
+      — **must exit 0**, and the record count must still be 145
+
+### H4 — Build the 4 rep-facing views
+
+- [ ] Create the four views exactly as specified in step 6
+- [ ] Delete `Grid 11`
+- [ ] Keep `System` hidden with every field visible for diagnostics
+- [ ] Confirm `query_ready_to_send.py`'s count matches the Call Queue count
+
+### H5 — Unfreeze
+
+- [ ] Work through step 9's read-only checklist
+- [ ] Update `docs/airtable_cutover_receipt_2026-07-30.json` with what H1–H4 did
+- [ ] Resume live writes
 
 ## Rollback boundary
 

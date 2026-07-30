@@ -399,21 +399,28 @@ def write_csv(path: Path, leads: Iterable[Lead]) -> None:
 
 
 def main() -> int:
-    """LEGACY entry point. Not part of the current pipeline.
+    """LEGACY entry point — still live, still called, do not extend.
 
-    Reads `data/searches.csv`, a hand-maintained query list that nothing in the
-    current flow produces. The pipeline runs `make_search_batch.py`, which takes
-    a JSON search config with geo slices, applies the ICP prefilter and enriches
-    in the same pass. This is kept because it is still the simplest way to run a
-    one-off ad-hoc query list, but it does not prefilter, dedupe against a batch,
-    or enrich — do not extend it. New search behaviour belongs in
-    `make_search_batch.py`.
+    `run_pipeline.py` runs this as stage 1, so it is a real paid path, not dead
+    code. It is legacy in what it does rather than whether it runs: it reads
+    `data/searches.csv`, a hand-maintained query list nothing in the current flow
+    produces, and it does not prefilter, dedupe against a batch, or enrich.
+    `make_search_batch.py` does all three from a JSON search config with geo
+    slices, and is where new search behaviour belongs.
+
+    An earlier version of this docstring said "not part of the current pipeline"
+    while `run_pipeline.py` was calling it, which is how a reader concludes the
+    suppression guard below does not matter. It does — see the comment on it.
     """
     load_dotenv()
 
+    # Fires on every run_pipeline.py run, because run_pipeline still calls this
+    # as stage 1. Worded as a "prefer" rather than a "wrong": an operator seeing
+    # a [LEGACY] line during an ordinary batch should not go hunting for a fault.
     print(
-        "[LEGACY] places_search.py is not the pipeline entry point; "
-        "use make_search_batch.py --config <search config>.",
+        "[LEGACY] places_search.py runs an ad-hoc CSV query list without "
+        "prefilter, dedupe or enrichment; prefer "
+        "make_search_batch.py --config <search config>.",
         file=sys.stderr,
     )
 
