@@ -66,6 +66,22 @@ PROSPECT_STATUS_CHOICES = (
 )
 PROSPECT_STATUS_CHOICE_SET = frozenset(PROSPECT_STATUS_CHOICES)
 
+# The accept-rate KPI — AGENTS.md: "below ~50% the loop is losing" — asks one
+# question of Status: did a human accept what the machine proposed? That is a
+# reading of this vocabulary, so it is declared beside it rather than in the eval
+# that consumes it; a gate carrying its own copy would keep answering for a
+# Status set that had moved underneath it.
+#
+# Accepted means "taken into outreach", not "won". A lead that was sent and lost
+# was still accepted — the machine's job is to propose leads worth contacting,
+# and conversion is a separate question with a separate metric.
+ACCEPTED_STATUSES = frozenset({"Sent", "Follow-Up", "Won", "Lost"})
+REJECTED_STATUSES = frozenset({"Not Fit"})
+UNDECIDED_STATUSES = frozenset({"New", "Mockup Needed", "Manual Review"})
+# Pinned as a partition by tests/test_queue_state_formula.py: a new Status must
+# be classified as accept, reject or undecided, because the alternative is a KPI
+# that silently stops counting the cases it cannot place.
+
 # An allowlist, never a "not in {Sent, Closed}" denylist: a denylist silently
 # widens the morning queue the moment a status is added, and the Won/Lost split
 # is exactly such an addition. Pinned against PROSPECT_STATUS_CHOICES by

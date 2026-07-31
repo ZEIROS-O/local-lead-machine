@@ -106,6 +106,33 @@ class TestQueueStateFormula(unittest.TestCase):
         ]
         self.assertEqual(orphans, [])
 
+    def test_accept_reject_undecided_partition_covers_every_status(self):
+        # The accept-rate KPI divides by (accepted + rejected). A Status that
+        # belongs to no bucket does not raise — it silently leaves the
+        # denominator, and the rate drifts up as the unclassified value spreads.
+        # Force the classification at declaration time instead.
+        buckets = {
+            "accepted": queue_state.ACCEPTED_STATUSES,
+            "rejected": queue_state.REJECTED_STATUSES,
+            "undecided": queue_state.UNDECIDED_STATUSES,
+        }
+        self.assertEqual(
+            set().union(*buckets.values()),
+            queue_state.PROSPECT_STATUS_CHOICE_SET,
+        )
+        names = sorted(buckets)
+        for index, first in enumerate(names):
+            for second in names[index + 1 :]:
+                with self.subTest(pair=(first, second)):
+                    self.assertEqual(buckets[first] & buckets[second], frozenset())
+
+    def test_undecided_statuses_contain_the_whole_dial_queue(self):
+        # A queued lead has not been judged yet. If one ever counted as accepted,
+        # the KPI would report the machine's own proposals back as approvals.
+        for status in queue_state.QUEUE_STATUS_CLAUSE.allowed:
+            with self.subTest(status=status):
+                self.assertIn(status, queue_state.UNDECIDED_STATUSES)
+
     def test_queue_gate_is_unchanged_by_the_won_lost_split(self):
         # Evidence that splitting Closed did not move "Ready to Dial": the two
         # queued statuses are untouched, and neither new value joins them —

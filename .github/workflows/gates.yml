@@ -127,3 +127,20 @@ jobs:
           .venv/bin/python evals/gate_liveness.py --output-dir "$LPM_SCORED_OUTPUT_DIR"
           trap - ERR
           printf '%s\n' '- PASS: gate liveness' >> "$GITHUB_STEP_SUMMARY"
+
+      # This one writes its own summary line: "too few decisions to judge" is a
+      # third outcome, and a step that printed PASS for it would report a KPI
+      # with no data behind it as green.
+      - name: Report the accept-rate KPI
+        env:
+          AIRTABLE_PAT: ${{ secrets.AIRTABLE_PAT }}
+          AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
+        run: |
+          set -euo pipefail
+          report_failure() {
+            status=$?
+            exit "$status"
+          }
+          trap report_failure ERR
+          .venv/bin/python evals/accept_rate.py --summary-file "$GITHUB_STEP_SUMMARY"
+          trap - ERR

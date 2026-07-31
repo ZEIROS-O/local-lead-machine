@@ -21,21 +21,32 @@ CORPUS_ENV = {"LPM_SCORED_OUTPUT_DIR": "${{ vars.LPM_SCORED_OUTPUT_DIR }}"}
 # see. Pinned as one list so adding a gate to the workflow without declaring it
 # here — or declaring one and never wiring it — fails rather than passing
 # quietly, which is the failure mode the whole schedule exists to end.
+#
+# `self_reports` marks a gate that writes its own job-summary line instead of
+# taking the step's PASS/FAIL wrapper, because it has an outcome that is neither.
 EXPECTED_GATES = (
-    (".venv/bin/python airtable_required_choices.py check", SECRET_ENV),
-    (".venv/bin/python upload_airtable.py --schema-report", SECRET_ENV),
+    (".venv/bin/python airtable_required_choices.py check", SECRET_ENV, False),
+    (".venv/bin/python upload_airtable.py --schema-report", SECRET_ENV, False),
     (
         '.venv/bin/python evals/completeness.py --output-dir "$LPM_SCORED_OUTPUT_DIR"',
         {**SECRET_ENV, **CORPUS_ENV},
+        False,
     ),
     (
         '.venv/bin/python evals/reproducibility.py --output-dir "$LPM_SCORED_OUTPUT_DIR"',
         {**SECRET_ENV, **CORPUS_ENV},
+        False,
     ),
     # Corpus only: a gate that never reads the base is never handed the PAT.
     (
         '.venv/bin/python evals/gate_liveness.py --output-dir "$LPM_SCORED_OUTPUT_DIR"',
         CORPUS_ENV,
+        False,
+    ),
+    (
+        '.venv/bin/python evals/accept_rate.py --summary-file "$GITHUB_STEP_SUMMARY"',
+        SECRET_ENV,
+        True,
     ),
 )
 
@@ -165,7 +176,9 @@ class WorkflowContractTests(unittest.TestCase):
             if ".venv/bin/python " in step.get("run", "")
         ]
         self.assertEqual(len(gate_steps), len(EXPECTED_GATES))
-        for step, (_command, expected_env) in zip(gate_steps, EXPECTED_GATES):
+        for step, (_command, expected_env, _self_reports) in zip(
+            gate_steps, EXPECTED_GATES
+        ):
             self.assertEqual(step.get("env"), expected_env)
         for step in job["steps"]:
             if step not in gate_steps and step["name"] != "Preflight scored corpus":
@@ -176,7 +189,9 @@ class WorkflowContractTests(unittest.TestCase):
             for line in step.get("run", "").splitlines()
             if line.strip().startswith(".venv/bin/python ")
         ]
-        self.assertEqual(commands, [command for command, _env in EXPECTED_GATES])
+        self.assertEqual(
+            commands, [command for command, _env, _self_reports in EXPECTED_GATES]
+        )
         self.assertNotRegex(source, r"\.venv/bin/python[^\n]*secrets\.")
 
     def test_gate_summaries_preserve_command_failures(self) -> None:
@@ -188,14 +203,20 @@ class WorkflowContractTests(unittest.TestCase):
         ]
 
         self.assertEqual(len(gate_steps), len(EXPECTED_GATES))
-        for step in gate_steps:
+        for step, (_command, _env, self_reports) in zip(gate_steps, EXPECTED_GATES):
             run = step["run"]
             self.assertIn("trap report_failure ERR", run)
             self.assertIn('exit "$status"', run)
             self.assertIn('"$GITHUB_STEP_SUMMARY"', run)
-            self.assertIn("PASS:", run)
-            self.assertIn("FAIL:", run)
             self.assertNotIn("continue-on-error", step)
+            if self_reports:
+                # Its own outcome word reaches the summary, so the step must not
+                # also stamp one — that is how a "no verdict" reads as PASS.
+                self.assertNotIn("PASS:", run)
+                self.assertIn('--summary-file "$GITHUB_STEP_SUMMARY"', run)
+            else:
+                self.assertIn("PASS:", run)
+                self.assertIn("FAIL:", run)
 
 
 if __name__ == "__main__":
