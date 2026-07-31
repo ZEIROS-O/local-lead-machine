@@ -134,7 +134,7 @@ class QueueTopupTest(unittest.TestCase):
             self.assertTrue(kwargs["auto"])
             self.assertTrue(kwargs["yes_score"])
             self.assertTrue(kwargs["yes_live"])
-            self.assertFalse(kwargs["include_manual"])
+            self.assertNotIn("include_manual", kwargs)
             self.assertTrue(kwargs["execute"])
             outcome = json.loads(hq.topup_file_path(root, hq._today()).read_text(encoding="utf-8"))
             self.assertEqual(outcome["outcome"], "completed")

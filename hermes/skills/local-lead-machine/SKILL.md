@@ -61,10 +61,9 @@ Pass user tokens unchanged. A leading slash is fine; the module strips it.
 - `/score <batch> --limit N --timeout MINUTES` runs paid scoring only.
 - `/score-rest <batch>` chunks remaining paid scoring.
 - `/packets <batch>` deterministically refreshes tiers and builds packets.
-- `/sync-dry <batch> [--include-manual]` runs Airtable dry-run only and records
-  the input hash.
-- `/sync-live <batch> [--include-manual]` is the only live Airtable command and
-  refuses unless the latest dry-run is clean and hash-matched.
+- `/sync-dry <batch>` dry-runs all scored rows and records the input hash.
+- `/sync-live <batch>` is the only live Airtable command and mirrors all scored
+  rows only after the latest dry-run is clean and hash-matched.
 - `/status <batch>` reads local files only.
 - `/confirm <batch>` refuses and tells the user to use staged commands.
 

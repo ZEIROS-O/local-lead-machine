@@ -30,8 +30,8 @@ Without `--execute`, mutating commands preview the command they would run.
 | `/score <batch> --limit N --timeout MINUTES [...]` | Paid API-LLM scoring only, with resume and budget env caps. | Anthropic only |
 | `/score-rest <batch> [...]` | Scores remaining rows in chunks and stops on no progress or budget exhaustion. | Anthropic only |
 | `/packets <batch>` | Refreshes `output/scored_<batch>_api_tiered.csv` from canonical `_api.csv`, then builds `packets_<batch>`. | none |
-| `/sync-dry <batch> [--include-manual]` | Airtable dry-run only; records POST/PATCH/SKIP counts and input hash. | Airtable read only when credentials are present |
-| `/sync-live <batch> [--include-manual]` | Live Airtable sync only after a fresh clean matching dry-run hash. | Airtable write |
+| `/sync-dry <batch>` | Airtable dry-run for all scored rows; records POST/PATCH/SKIP counts and input hash. | Airtable read only when credentials are present |
+| `/sync-live <batch>` | Live Airtable sync for all scored rows only after a fresh clean matching dry-run hash. | Airtable write |
 | `/status <batch>` | Local status only. | none |
 
 Defaults:
@@ -51,8 +51,8 @@ Defaults:
   `MAX_LLM_TOKENS_PER_RUN`.
 - `/packets` always uses `output/scored_<batch>_api.csv` as the source and
   regenerates `output/scored_<batch>_api_tiered.csv`.
-- `/sync-live` refuses unless `/sync-dry` recorded a clean hash for the same
-  include-manual mode and the packet/scored inputs have not changed.
+- `/sync-live` refuses unless `/sync-dry` recorded a clean total-upload hash
+  and the packet/scored inputs have not changed.
 - No command except `/sync-live` builds `upload_airtable.py --live`.
 
 ## Run State
@@ -65,7 +65,7 @@ Hermes writes local metadata to `run_state/<batch>.json`:
 - packet build timestamp
 - Airtable dry-run/live timestamps
 - dry-run/live POST/PATCH/SKIP counts
-- dry-run warnings and include-manual mode
+- dry-run warnings and the fixed `all_scored_rows` upload scope
 - input hash for live sync verification
 - next recommended command
 

@@ -473,7 +473,6 @@ def cmd_queue_topup(
     run_kwargs: dict[str, Any] = dict(
         auto=True,
         score_budget=resolved_budget,
-        include_manual=False,
         yes_score=True,
         yes_live=True,
         execute=True,

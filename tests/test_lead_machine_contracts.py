@@ -854,6 +854,33 @@ class LeadMachineContractsTest(unittest.TestCase):
             {"Sendable Co", "Manual Co", "Watchlist Co", "No Packet Co"},
         )
 
+    def test_airtable_plan_tightens_stale_sendable_tier_after_hard_icp_skip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "scored.csv"
+            stale = self._airtable_csv_row(
+                **{
+                    "Raw Evidence": json.dumps(
+                        {
+                            "derived": {
+                                "hard_icp_skip": True,
+                                "hard_icp_reasons": ["too_few_reviews"],
+                            }
+                        }
+                    ),
+                    "Sendable": "Yes",
+                    "Packet Eligible": "Yes",
+                    "Packet Tier": "Sendable Packet",
+                }
+            )
+            self._write_airtable_csv(csv_path, [stale])
+
+            records = upload_airtable.read_csv_records(csv_path, packet_dir=Path(tmp))
+            planned = plan_airtable_sync(records, existing_records_by_key={})
+
+        fields = planned[0]["payload"]["fields"]
+        self.assertEqual(fields["Packet Tier"], "No Packet")
+        self.assertNotEqual(fields["Packet Tier"], "Sendable Packet")
+
     def test_airtable_retired_subset_flags_fail_in_parser_before_network(self) -> None:
         for retired_flag in ("--only-sendable", "--include-manual-review"):
             with self.subTest(flag=retired_flag):

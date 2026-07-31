@@ -10,6 +10,7 @@ from lead_machine.hermes_batch import BatchPaths
 
 
 SCHEMA_VERSION = 1
+TOTAL_UPLOAD_SCOPE = "all_scored_rows"
 
 
 def utc_now() -> str:
@@ -31,7 +32,7 @@ def _rel(path: Path, root: Path) -> str:
         return str(path)
 
 
-def sync_manifest(paths: BatchPaths, *, include_manual: bool) -> dict[str, Any]:
+def sync_manifest(paths: BatchPaths) -> dict[str, Any]:
     files = []
     for path in (paths.tiered_csv, paths.packet_index):
         if not path.exists():
@@ -45,13 +46,13 @@ def sync_manifest(paths: BatchPaths, *, include_manual: bool) -> dict[str, Any]:
         )
     return {
         "batch": paths.batch,
-        "include_manual": bool(include_manual),
+        "upload_scope": TOTAL_UPLOAD_SCOPE,
         "files": files,
     }
 
 
-def current_sync_hash(paths: BatchPaths, *, include_manual: bool) -> str:
-    manifest = sync_manifest(paths, include_manual=include_manual)
+def current_sync_hash(paths: BatchPaths) -> str:
+    manifest = sync_manifest(paths)
     payload = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
@@ -79,7 +80,9 @@ def default_state(paths: BatchPaths) -> dict[str, Any]:
         "dry_run_skip_count": 0,
         "dry_run_warnings": [],
         "dry_run_fallback_match_count": 0,
-        "dry_run_include_manual": False,
+        # Empty fails closed for run-state files written before total upload.
+        # record_dry_run sets the fixed scope after a fresh total dry-run.
+        "dry_run_upload_scope": "",
         "last_live_sync_timestamp": "",
         "live_sync_input_hash": "",
         "live_post_count": 0,

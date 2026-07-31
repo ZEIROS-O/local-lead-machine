@@ -80,6 +80,7 @@ class HelpAndDispatchTest(unittest.TestCase):
         for verb in ("/run", "/score-dry", "/score", "/score-rest", "/packets", "/sync-dry", "/sync-live", "/status"):
             self.assertIn(verb, msg)
         self.assertIn("/confirm - deprecated", msg)
+        self.assertNotIn("--include-manual", msg)
         self.assertLess(len(msg), hc.TELEGRAM_BUDGET)
 
     def test_leading_slash_tolerated(self) -> None:
@@ -92,18 +93,39 @@ class HelpAndDispatchTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             hc.build_parser().parse_args(["score", "detailing_cleveland_medium_001", "--timeout", "20"])
 
+    def test_retired_include_manual_flag_is_rejected_by_every_old_surface(self) -> None:
+        commands = (
+            ["run", "epoxy", "cleveland", "medium", "--auto", "--include-manual"],
+            ["sync-dry", "epoxy_cleveland_medium_001", "--include-manual"],
+            ["sync-live", "epoxy_cleveland_medium_001", "--include-manual"],
+        )
+        for argv in commands:
+            with self.subTest(argv=argv), self.assertRaises(SystemExit):
+                hc.build_parser().parse_args(argv)
+
+    def test_hermes_skill_and_docs_describe_only_total_upload(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        for relative in (
+            "hermes/skills/local-lead-machine/SKILL.md",
+            "docs/hermes-commands.md",
+        ):
+            with self.subTest(path=relative):
+                text = (root / relative).read_text(encoding="utf-8")
+                self.assertNotIn("--include-manual", text)
+                self.assertIn("all scored", text.lower())
+
 
 class TelegramRouterTest(unittest.TestCase):
     def test_run_slash_run_routes_to_hermes_autopilot_execute(self) -> None:
         routed = hc.route_telegram_message(
-            "run /run epoxy cleveland medium --auto --score-budget 5 --include-manual"
+            "run /run epoxy cleveland medium --auto --score-budget 5"
         )
 
         self.assertIsNotNone(routed)
         assert routed is not None
         self.assertEqual(
             routed.argv,
-            ["run", "epoxy", "cleveland", "medium", "--auto", "--score-budget", "5", "--include-manual", "--execute"],
+            ["run", "epoxy", "cleveland", "medium", "--auto", "--score-budget", "5", "--execute"],
         )
         self.assertEqual(routed.cwd, Path("~/local-lead-machine-hermes").expanduser())
         self.assertEqual(routed.env["LOCAL_LEAD_MACHINE_ROOT"], str(Path("~/local-lead-machine").expanduser()))
@@ -124,7 +146,6 @@ class TelegramRouterTest(unittest.TestCase):
                 "--auto",
                 "--score-budget",
                 "5",
-                "--include-manual",
                 "--execute",
             ],
         )
@@ -163,7 +184,7 @@ class TelegramRouterTest(unittest.TestCase):
 
     def test_router_preview_does_not_execute(self) -> None:
         routed = hc.route_telegram_message(
-            "run /run epoxy cleveland medium --auto --score-budget 5 --include-manual"
+            "run /run epoxy cleveland medium --auto --score-budget 5"
         )
         assert routed is not None
 

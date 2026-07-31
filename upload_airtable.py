@@ -494,6 +494,13 @@ def csv_row_to_record(row: Dict[str, str], packet_dir: Path) -> Dict[str, Any]:
     # CSV. This also keeps scored CSVs written before Packet Tier existed working.
     source = {**row, **fields}
     row_is_sendable = is_sendable_record(source)
+    if clean_cell(fields.get("Packet Tier")) == _TIER_SENDABLE and not row_is_sendable:
+        # An explicit tier is still only a snapshot. Total mirroring means a
+        # stale Sendable Packet would otherwise survive after the canonical
+        # admission/contact gate withdrew the lead and re-enter the rep queue.
+        # Tighten fail-closed, and do not mark this as a default: an existing
+        # Airtable row must be PATCHed away from the stale sendable tier.
+        fields["Packet Tier"] = _TIER_NONE
     if row_is_sendable:
         if not clean_cell(fields.get("Status")):
             fields["Status"] = "Mockup Needed"

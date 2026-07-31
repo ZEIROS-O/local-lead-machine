@@ -13,7 +13,7 @@ from unittest.mock import patch
 from lead_machine import hermes_commands as hc
 from lead_machine.hermes_batch import BatchPaths, resolve_batch_paths
 from lead_machine.hermes_executor import StreamResult
-from lead_machine.hermes_state import current_sync_hash
+from lead_machine.hermes_state import current_sync_hash, load_run_state, sync_manifest, update_run_state
 
 
 def make_repo_root(root: Path) -> None:
@@ -255,7 +255,7 @@ class HermesBatchStateTest(unittest.TestCase):
             paths.packets_dir.mkdir()
             paths.packet_index.write_text("Business Name,Packet Tier\nA,Sendable Packet\n", encoding="utf-8")
             self._write_csv(paths.tiered_csv, [{"Business Name": "A", "Packet Tier": "Sendable Packet"}])
-            hc.record_dry_run(paths, include_manual=False, post=1, patch=0, skip=0, warnings=[])
+            hc.record_dry_run(paths, post=1, patch=0, skip=0, warnings=[])
             self.assertTrue((root / "run_state" / "detailing_cleveland_medium_001.json").exists())
 
     def test_sync_live_refuses_without_fresh_dry_run(self) -> None:
@@ -275,7 +275,7 @@ class HermesBatchStateTest(unittest.TestCase):
             paths.packets_dir.mkdir(parents=True)
             paths.packet_index.write_text("Business Name,Packet Tier\nA,Sendable Packet\n", encoding="utf-8")
             self._write_csv(paths.tiered_csv, [{"Business Name": "A", "Packet Tier": "Sendable Packet"}])
-            hc.record_dry_run(paths, include_manual=False, post=1, patch=0, skip=0, warnings=[], root=root)
+            hc.record_dry_run(paths, post=1, patch=0, skip=0, warnings=[], root=root)
             paths.packet_index.write_text("Business Name,Packet Tier\nB,Sendable Packet\n", encoding="utf-8")
             with self.assertRaises(hc.CommandError):
                 hc.cmd_sync_live(paths.batch, root=root)
@@ -287,7 +287,7 @@ class HermesBatchStateTest(unittest.TestCase):
             paths.packets_dir.mkdir(parents=True)
             paths.packet_index.write_text("Business Name,Packet Tier\nA,Sendable Packet\n", encoding="utf-8")
             self._write_csv(paths.tiered_csv, [{"Business Name": "A", "Packet Tier": "Sendable Packet"}])
-            hc.record_dry_run(paths, include_manual=False, post=1, patch=0, skip=0, warnings=[], root=root)
+            hc.record_dry_run(paths, post=1, patch=0, skip=0, warnings=[], root=root)
             stale = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
             data = json.loads(paths.state_json.read_text(encoding="utf-8"))
             data["last_airtable_dry_run_timestamp"] = stale
@@ -295,19 +295,20 @@ class HermesBatchStateTest(unittest.TestCase):
             with self.assertRaises(hc.CommandError):
                 hc.cmd_sync_live(paths.batch, root=root)
 
-    def test_sync_live_refuses_warnings_and_include_manual_mismatch(self) -> None:
+    def test_sync_live_refuses_warnings_and_pre_total_upload_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             paths = BatchPaths.for_batch("detailing_cleveland_medium_001", root=root)
             paths.packets_dir.mkdir(parents=True)
             paths.packet_index.write_text("Business Name,Packet Tier\nA,Sendable Packet\n", encoding="utf-8")
             self._write_csv(paths.tiered_csv, [{"Business Name": "A", "Packet Tier": "Sendable Packet"}])
-            hc.record_dry_run(paths, include_manual=False, post=1, patch=0, skip=0, warnings=["ambiguous"], root=root)
+            hc.record_dry_run(paths, post=1, patch=0, skip=0, warnings=["ambiguous"], root=root)
             with self.assertRaises(hc.CommandError):
                 hc.cmd_sync_live(paths.batch, root=root)
-            hc.record_dry_run(paths, include_manual=False, post=1, patch=0, skip=0, warnings=[], root=root)
+            hc.record_dry_run(paths, post=1, patch=0, skip=0, warnings=[], root=root)
+            update_run_state(paths, dry_run_upload_scope="")
             with self.assertRaises(hc.CommandError):
-                hc.cmd_sync_live(paths.batch, include_manual=True, root=root)
+                hc.cmd_sync_live(paths.batch, root=root)
 
     def test_status_summarizes_fixture_files_and_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -328,7 +329,7 @@ class HermesBatchStateTest(unittest.TestCase):
                 "Business Name,Packet Tier\nA,Sendable Packet\nB,Manual Review Packet\n",
                 encoding="utf-8",
             )
-            hc.record_dry_run(paths, include_manual=True, post=1, patch=1, skip=0, warnings=[], root=root)
+            hc.record_dry_run(paths, post=1, patch=1, skip=0, warnings=[], root=root)
             msg = hc.cmd_status(paths.batch, root=root).message
             self.assertIn("enriched 2", msg)
             self.assertIn("scored 2", msg)
@@ -345,10 +346,35 @@ class HermesBatchStateTest(unittest.TestCase):
             paths.packets_dir.mkdir(parents=True)
             paths.packet_index.write_text("Business Name,Packet Tier\nA,Sendable Packet\n", encoding="utf-8")
             self._write_csv(paths.tiered_csv, [{"Business Name": "A", "Packet Tier": "Sendable Packet"}])
-            first = current_sync_hash(paths, include_manual=False)
+            first = current_sync_hash(paths)
             paths.packet_index.write_text("Business Name,Packet Tier\nB,Sendable Packet\n", encoding="utf-8")
-            second = current_sync_hash(paths, include_manual=False)
+            second = current_sync_hash(paths)
             self.assertNotEqual(first, second)
+
+    def test_sync_manifest_and_approval_name_total_upload_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = BatchPaths.for_batch("detailing_cleveland_medium_001", root=root)
+            paths.packets_dir.mkdir(parents=True)
+            paths.packet_index.write_text("Business Name,Packet Tier\nA,Sendable Packet\n", encoding="utf-8")
+            self._write_csv(paths.tiered_csv, [{"Business Name": "A", "Packet Tier": "Sendable Packet"}])
+
+            manifest = sync_manifest(paths)
+            approval = hc.create_pending_approval(
+                paths,
+                stage="live",
+                original_command="/sync-dry detailing_cleveland_medium_001",
+                next_command="/sync-live detailing_cleveland_medium_001",
+                score_budget=0.0,
+                dry_run_hash=current_sync_hash(paths),
+            )
+            saved_approval = load_run_state(paths)["pending_approval"]
+
+        self.assertEqual(manifest["upload_scope"], "all_scored_rows")
+        self.assertNotIn("include_manual", manifest)
+        self.assertEqual(approval["upload_scope"], "all_scored_rows")
+        self.assertNotIn("include_manual", approval)
+        self.assertEqual(saved_approval["upload_scope"], "all_scored_rows")
 
 
 class HermesExecutorTest(unittest.TestCase):

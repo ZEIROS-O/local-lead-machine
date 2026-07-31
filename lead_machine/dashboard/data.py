@@ -19,7 +19,7 @@ from lead_machine.dashboard.legacy import (
     load_legacy_batches,
 )
 from lead_machine.hermes_batch import BatchPaths, BatchResolutionError, resolve_batch_paths
-from lead_machine.hermes_state import current_sync_hash, default_state
+from lead_machine.hermes_state import TOTAL_UPLOAD_SCOPE, current_sync_hash, default_state
 from lead_machine.score_schema import validate_current_scored_row
 from lead_machine.sendability import (
     PACKET_TIER_MANUAL,
@@ -739,7 +739,7 @@ class DashboardRepository:
             reason = str(usage.get("stop_reason") or "configured LLM cap")
             issues.append(_issue("llm_cap_stop", "attention", f"Scoring stopped at {reason}."))
 
-        dry_include_manual = _typed_bool(state, "dry_run_include_manual", issues, scope="run_state")
+        dry_upload_scope = str(state.get("dry_run_upload_scope") or "")
         dry_skip_count = _typed_int(state, "dry_run_skip_count", issues, scope="run_state")
         live_skip_count = _typed_int(state, "live_skip_count", issues, scope="run_state")
         dry_post_count = _typed_int(state, "dry_run_post_count", issues, scope="run_state")
@@ -751,7 +751,7 @@ class DashboardRepository:
         current_hash = ""
         if paths.tiered_csv.exists() and paths.packet_index.exists():
             try:
-                current_hash = current_sync_hash(paths, include_manual=dry_include_manual)
+                current_hash = current_sync_hash(paths)
             except (FileNotFoundError, OSError):
                 current_hash = ""
         dry_hash = str(state.get("dry_run_input_hash") or "")
@@ -763,6 +763,7 @@ class DashboardRepository:
             and dry_hash == current_hash
             and dry_skip_count == 0
             and not warnings
+            and dry_upload_scope == TOTAL_UPLOAD_SCOPE
         )
         live_current = bool(
             dry_clean

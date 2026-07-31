@@ -25,7 +25,13 @@ from typing import Any, Optional
 from generate_search_config import MARKET_PROFILES_DIR, VALID_SIZES, VERTICAL_PROFILES_DIR
 from lead_machine.hermes_batch import BatchPaths, BatchResolutionError, nearby_batches, resolve_batch_paths
 from lead_machine.hermes_executor import StreamResult, render_command, run_streaming
-from lead_machine.hermes_state import current_sync_hash, load_run_state, update_run_state, utc_now
+from lead_machine.hermes_state import (
+    TOTAL_UPLOAD_SCOPE,
+    current_sync_hash,
+    load_run_state,
+    update_run_state,
+    utc_now,
+)
 from lead_machine.sendability import (
     PACKET_TIER_MANUAL,
     PACKET_TIER_NONE,
@@ -361,7 +367,6 @@ def create_pending_approval(
     stage: str,
     original_command: str,
     next_command: str,
-    include_manual: bool,
     score_budget: float,
     projected_score_cost: float | None = None,
     dry_run_hash: str = "",
@@ -376,7 +381,7 @@ def create_pending_approval(
         "next_command": next_command,
         "created_at": utc_now(),
         "expires_at": _approval_expiry(),
-        "include_manual": bool(include_manual),
+        "upload_scope": TOTAL_UPLOAD_SCOPE,
         "score_budget": float(score_budget),
         "projected_score_cost": projected_score_cost,
         "dry_run_hash": dry_run_hash,
@@ -444,7 +449,6 @@ def _original_auto_command(
     size: str,
     *,
     budget: float,
-    include_manual: bool,
     fresh: bool = False,
     use_existing: bool = False,
     batch: str = "",
@@ -456,33 +460,28 @@ def _original_auto_command(
     if use_existing:
         cmd += " --use-existing"
     cmd += f" --score-budget {_fmt_usd(budget)}"
-    if include_manual:
-        cmd += " --include-manual"
     return cmd
 
 
-def _fresh_auto_command(vertical: str, market: str, size: str, *, budget: float, include_manual: bool) -> str:
+def _fresh_auto_command(vertical: str, market: str, size: str, *, budget: float) -> str:
     return _original_auto_command(
         vertical,
         market,
         size,
         budget=budget,
-        include_manual=include_manual,
         fresh=True,
     )
 
 
-def _score_resume_command(batch: str, *, budget: float, include_manual: bool) -> str:
-    cmd = f"/score-rest {batch} --budget {_fmt_usd(budget)} --chunk-size {DEFAULT_AUTO_CHUNK_SIZE}"
-    if include_manual:
-        cmd += f" && /packets {batch} && /sync-dry {batch} --include-manual"
-    else:
-        cmd += f" && /packets {batch} && /sync-dry {batch}"
-    return cmd
+def _score_resume_command(batch: str, *, budget: float) -> str:
+    return (
+        f"/score-rest {batch} --budget {_fmt_usd(budget)} --chunk-size {DEFAULT_AUTO_CHUNK_SIZE}"
+        f" && /packets {batch} && /sync-dry {batch}"
+    )
 
 
-def _live_resume_command(batch: str, *, include_manual: bool) -> str:
-    return f"/sync-live {batch}" + (" --include-manual" if include_manual else "")
+def _live_resume_command(batch: str) -> str:
+    return f"/sync-live {batch}"
 
 
 def parse_airtable_plan(lines: list[str]) -> tuple[int, int, int, list[str], list[str]]:
@@ -512,7 +511,6 @@ def parse_airtable_plan(lines: list[str]) -> tuple[int, int, int, list[str], lis
 def record_dry_run(
     paths: BatchPaths,
     *,
-    include_manual: bool,
     post: int,
     patch: int,
     skip: int,
@@ -523,14 +521,14 @@ def record_dry_run(
     update_run_state(
         paths,
         last_airtable_dry_run_timestamp=utc_now(),
-        dry_run_input_hash=current_sync_hash(paths, include_manual=include_manual),
+        dry_run_input_hash=current_sync_hash(paths),
         dry_run_post_count=post,
         dry_run_patch_count=patch,
         dry_run_skip_count=skip,
         dry_run_warnings=warnings,
         dry_run_fallback_match_count=fallback_matches,
-        dry_run_include_manual=include_manual,
-        next_recommended_action=f"/sync-live {paths.batch}" + (" --include-manual" if include_manual else ""),
+        dry_run_upload_scope=TOTAL_UPLOAD_SCOPE,
+        next_recommended_action=f"/sync-live {paths.batch}",
     )
 
 
@@ -577,6 +575,7 @@ def _sync_dry_is_clean(state: dict[str, Any]) -> bool:
         int(state.get("dry_run_skip_count") or 0) == 0
         and not state.get("dry_run_warnings")
         and bool(state.get("dry_run_input_hash"))
+        and state.get("dry_run_upload_scope") == TOTAL_UPLOAD_SCOPE
     )
 
 
@@ -585,7 +584,6 @@ def _approval_prompt_score(
     *,
     budget: float,
     selected: int,
-    include_manual: bool,
     original_command: str,
     chat_id: str = "",
     user_id: str = "",
@@ -609,8 +607,7 @@ def _approval_prompt_score(
         paths,
         stage="score",
         original_command=original_command,
-        next_command=_score_resume_command(paths.batch, budget=budget, include_manual=include_manual),
-        include_manual=include_manual,
+        next_command=_score_resume_command(paths.batch, budget=budget),
         score_budget=budget,
         projected_score_cost=projected,
         chat_id=chat_id,
@@ -689,7 +686,6 @@ def _continue_existing_batch(
     existing: ExistingBatch,
     *,
     budget: float,
-    include_manual: bool,
     yes_score: bool,
     yes_live: bool,
     yes_all: bool,
@@ -723,7 +719,6 @@ def _continue_existing_batch(
         paths,
         budget=budget,
         selected=DEFAULT_AUTO_CHUNK_SIZE,
-        include_manual=include_manual,
         original_command=original_command,
         chat_id=chat_id,
         user_id=user_id,
@@ -736,7 +731,6 @@ def _continue_existing_batch(
     return _continue_after_scoring(
         paths,
         budget=budget,
-        include_manual=include_manual,
         yes_live=bool(yes_live or yes_all),
         root=root,
         python_path=python_path,
@@ -750,7 +744,6 @@ def _continue_after_scoring(
     paths: BatchPaths,
     *,
     budget: float,
-    include_manual: bool,
     yes_live: bool,
     root: Path,
     python_path: Path | str | None,
@@ -777,24 +770,24 @@ def _continue_after_scoring(
             update_run_state(
                 paths,
                 last_error=f"Anthropic credit/billing error: {text}",
-                next_recommended_action=_score_resume_command(paths.batch, budget=budget, include_manual=include_manual),
+                next_recommended_action=_score_resume_command(paths.batch, budget=budget),
             )
             return CommandResult(
                 "Anthropic credit/billing error. Autopilot stopped. "
-                f"Top up credits, then resume with: {_score_resume_command(paths.batch, budget=budget, include_manual=include_manual)}"
+                f"Top up credits, then resume with: {_score_resume_command(paths.batch, budget=budget)}"
             )
-        update_run_state(paths, last_error=text, next_recommended_action=_score_resume_command(paths.batch, budget=budget, include_manual=include_manual))
+        update_run_state(paths, last_error=text, next_recommended_action=_score_resume_command(paths.batch, budget=budget))
         raise
 
     if len(_read_csv_rows(paths.scored_csv)) <= 0:
-        update_run_state(paths, next_recommended_action=_score_resume_command(paths.batch, budget=budget, include_manual=include_manual))
+        update_run_state(paths, next_recommended_action=_score_resume_command(paths.batch, budget=budget))
         return CommandResult(
             f"{score_result.message}\nAutopilot stopped: no scored rows available for packets. "
-            f"Resume with: {_score_resume_command(paths.batch, budget=budget, include_manual=include_manual)}"
+            f"Resume with: {_score_resume_command(paths.batch, budget=budget)}"
         )
 
     packets_result = cmd_packets(paths.batch, execute=True, root=root, python_path=python_path)
-    dry_result = cmd_sync_dry(paths.batch, include_manual=include_manual, execute=True, root=root, python_path=python_path)
+    dry_result = cmd_sync_dry(paths.batch, execute=True, root=root, python_path=python_path)
     state = load_run_state(paths)
     post = int(state.get("dry_run_post_count") or 0)
     patch = int(state.get("dry_run_patch_count") or 0)
@@ -803,7 +796,7 @@ def _continue_after_scoring(
     fallback_matches = int(state.get("dry_run_fallback_match_count") or 0)
     if not _sync_dry_is_clean(state):
         clear_pending_approval(paths)
-        update_run_state(paths, next_recommended_action=f"/sync-dry {paths.batch}" + (" --include-manual" if include_manual else ""))
+        update_run_state(paths, next_recommended_action=f"/sync-dry {paths.batch}")
         return CommandResult(
             f"Scoring complete. Packets built. {dry_result.message}\n"
             f"Live sync refused: dry-run is not clean. POST {post} / PATCH {patch} / SKIP {skip} / "
@@ -812,7 +805,7 @@ def _continue_after_scoring(
 
     dry_hash = str(state.get("dry_run_input_hash") or "")
     if yes_live:
-        live_result = cmd_sync_live(paths.batch, include_manual=include_manual, execute=True, root=root, python_path=python_path)
+        live_result = cmd_sync_live(paths.batch, execute=True, root=root, python_path=python_path)
         clear_pending_approval(paths)
         return CommandResult(f"Live sync complete. {live_result.message}\n{_summary(paths, live_status='completed')}")
 
@@ -820,8 +813,7 @@ def _continue_after_scoring(
         paths,
         stage="live",
         original_command=original_command,
-        next_command=_live_resume_command(paths.batch, include_manual=include_manual),
-        include_manual=include_manual,
+        next_command=_live_resume_command(paths.batch),
         score_budget=budget,
         dry_run_hash=dry_hash,
         chat_id=chat_id,
@@ -830,7 +822,7 @@ def _continue_after_scoring(
     return CommandResult(
         f"Scoring complete. Packets built. Airtable dry-run complete for {paths.batch}. "
         f"POST {post} / PATCH {patch} / SKIP {skip} / warnings {len(warnings)}. "
-        f"Include manual review: {'yes' if include_manual else 'no'}. Live sync now? Reply yes/no."
+        "Upload scope: all scored rows. Live sync now? Reply yes/no."
     )
 
 
@@ -841,14 +833,15 @@ def _continue_live_approval(
     root: Path,
     python_path: Path | str | None,
 ) -> CommandResult:
-    include_manual = bool(approval.get("include_manual"))
+    if approval.get("upload_scope") != TOTAL_UPLOAD_SCOPE:
+        raise CommandError("Refusing live approval: approval predates total-upload scope. Re-run /sync-dry.")
     expected_hash = str(approval.get("dry_run_hash") or "")
     state = load_run_state(paths)
     if state.get("dry_run_input_hash") != expected_hash:
         raise CommandError("Refusing live approval: dry-run hash no longer matches.")
-    if current_sync_hash(paths, include_manual=include_manual) != expected_hash:
+    if current_sync_hash(paths) != expected_hash:
         raise CommandError("Refusing live approval: dry-run hash no longer matches.")
-    live_result = cmd_sync_live(paths.batch, include_manual=include_manual, execute=True, root=root, python_path=python_path)
+    live_result = cmd_sync_live(paths.batch, execute=True, root=root, python_path=python_path)
     clear_pending_approval(paths)
     return CommandResult(f"Live sync complete. {live_result.message}\n{_summary(paths, live_status='completed')}")
 
@@ -879,7 +872,6 @@ def cmd_approval_reply(
         return _continue_after_scoring(
             paths,
             budget=float(approval.get("score_budget") or DEFAULT_BUDGET),
-            include_manual=bool(approval.get("include_manual")),
             yes_live=False,
             root=root_path,
             python_path=python_path,
@@ -892,7 +884,6 @@ def cmd_approval_reply(
         return _continue_existing_batch(
             existing,
             budget=float(approval.get("score_budget") or DEFAULT_BUDGET),
-            include_manual=bool(approval.get("include_manual")),
             yes_score=False,
             yes_live=False,
             yes_all=False,
@@ -918,7 +909,6 @@ def cmd_run(
     use_existing: bool = False,
     batch: str = "",
     score_budget: float = DEFAULT_BUDGET,
-    include_manual: bool = False,
     yes_score: bool = False,
     yes_live: bool = False,
     yes_all: bool = False,
@@ -939,7 +929,6 @@ def cmd_run(
             market,
             size,
             budget=score_budget,
-            include_manual=include_manual,
             fresh=fresh,
             use_existing=use_existing,
             batch=batch,
@@ -951,7 +940,6 @@ def cmd_run(
             return _continue_existing_batch(
                 existing,
                 budget=score_budget,
-                include_manual=include_manual,
                 yes_score=yes_score,
                 yes_live=yes_live,
                 yes_all=yes_all,
@@ -971,7 +959,6 @@ def cmd_run(
                 market,
                 size,
                 budget=score_budget,
-                include_manual=include_manual,
             )
             prompt = (
                 f"{_format_existing_batch(existing)}. Continue this batch instead of starting a fresh search? "
@@ -984,7 +971,6 @@ def cmd_run(
                 stage="existing_batch",
                 original_command=original,
                 next_command=fresh_command,
-                include_manual=include_manual,
                 score_budget=score_budget,
                 chat_id=chat_id,
                 user_id=user_id,
@@ -995,7 +981,6 @@ def cmd_run(
             return _continue_existing_batch(
                 existing,
                 budget=score_budget,
-                include_manual=include_manual,
                 yes_score=yes_score,
                 yes_live=yes_live,
                 yes_all=yes_all,
@@ -1029,7 +1014,6 @@ def cmd_run(
                 market,
                 size,
                 budget=score_budget,
-                include_manual=include_manual,
             ),
         )
         match = re.search(r"Batch:\s*(\S+)", run_result.message)
@@ -1053,7 +1037,6 @@ def cmd_run(
             paths,
             budget=score_budget,
             selected=selected,
-            include_manual=include_manual,
             original_command=original,
             chat_id=chat_id,
             user_id=user_id,
@@ -1065,7 +1048,6 @@ def cmd_run(
         return _continue_after_scoring(
             paths,
             budget=score_budget,
-            include_manual=include_manual,
             yes_live=bool(yes_live or yes_all),
             root=root_path,
             python_path=python_path,
@@ -1261,7 +1243,6 @@ def cmd_packets(
 def cmd_sync_dry(
     batch: str,
     *,
-    include_manual: bool = False,
     execute: bool = False,
     root: Path | str = Path("."),
     python_path: Path | str | None = None,
@@ -1270,7 +1251,7 @@ def cmd_sync_dry(
     paths = _resolve(batch, root=root_path)
     if not paths.packet_index.exists():
         raise CommandError(f"Packet index missing: {paths.packet_index}")
-    current_sync_hash(paths, include_manual=include_manual)
+    current_sync_hash(paths)
     cmd = build_sync_command(paths, live=False, python_path=python_path)
     if not execute:
         return CommandResult(_preview("/sync-dry", cmd, root=root_path))
@@ -1279,7 +1260,6 @@ def cmd_sync_dry(
     post, patch, skip, warnings, matches = parse_airtable_plan(result.tail_lines)
     record_dry_run(
         paths,
-        include_manual=include_manual,
         post=post,
         patch=patch,
         skip=skip,
@@ -1289,14 +1269,13 @@ def cmd_sync_dry(
     )
     return CommandResult(
         f"dry-run POST {post} PATCH {patch} SKIP {skip}; warnings {len(warnings)}; fallback matches {len(matches)}. "
-        f"Next: /sync-live {batch}{' --include-manual' if include_manual else ''}"
+        f"Next: /sync-live {batch}"
     )
 
 
 def cmd_sync_live(
     batch: str,
     *,
-    include_manual: bool = False,
     execute: bool = False,
     root: Path | str = Path("."),
     python_path: Path | str | None = None,
@@ -1318,11 +1297,11 @@ def cmd_sync_live(
     age_seconds = (datetime.now(timezone.utc) - dry_run_at.astimezone(timezone.utc)).total_seconds()
     if age_seconds > DRY_RUN_MAX_AGE_MINUTES * 60:
         raise CommandError(f"Refusing live sync: last dry-run is older than {DRY_RUN_MAX_AGE_MINUTES} minutes.")
-    if bool(state.get("dry_run_include_manual")) != bool(include_manual):
-        raise CommandError("Refusing live sync: --include-manual mode differs from last dry-run.")
+    if state.get("dry_run_upload_scope") != TOTAL_UPLOAD_SCOPE:
+        raise CommandError("Refusing live sync: last dry-run predates total-upload scope. Run /sync-dry again.")
     if state.get("dry_run_warnings"):
         raise CommandError("Refusing live sync: last dry-run had warnings.")
-    current_hash = current_sync_hash(paths, include_manual=include_manual)
+    current_hash = current_sync_hash(paths)
     if state.get("dry_run_input_hash") != current_hash:
         raise CommandError("Refusing live sync: packet/scored input changed since last dry-run.")
     cmd = build_sync_command(paths, live=True, python_path=python_path)
@@ -1474,14 +1453,14 @@ def cmd_help() -> CommandResult:
         _truncate(
             "Lead-machine commands:\n"
             "/run <vertical> <market> <size> - search/enrich only\n"
-            "/run <vertical> <market> <size> --auto [--use-existing|--fresh] [--score-budget USD] [--include-manual] - guided autopilot\n"
+            "/run <vertical> <market> <size> --auto [--use-existing|--fresh] [--score-budget USD] - guided autopilot\n"
             "/run <batch> --auto - continue a specific existing batch\n"
             "/score-dry <batch> [--limit N] [--budget USD] - cost estimate only\n"
             "/score <batch> --limit N [--timeout MINUTES] - paid scoring only\n"
             "/score-rest <batch> - chunk remaining scoring\n"
             "/packets <batch> - refresh tiers and build packets\n"
-            "/sync-dry <batch> [--include-manual] - Airtable dry-run\n"
-            "/sync-live <batch> [--include-manual] - live only after clean dry-run\n"
+            "/sync-dry <batch> - Airtable dry-run for all scored rows\n"
+            "/sync-live <batch> - live all-scored upload only after clean dry-run\n"
             "/status <batch> - local status\n"
             "/confirm - deprecated/refusal-only\n"
             "Morning queue:\n"
@@ -1510,7 +1489,6 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--use-existing", action="store_true")
         p.add_argument("--batch", default="")
         p.add_argument("--score-budget", type=float, default=DEFAULT_BUDGET)
-        p.add_argument("--include-manual", action="store_true")
         p.add_argument("--yes-score", action="store_true")
         p.add_argument("--yes-live", action="store_true")
         p.add_argument("--yes-all", action="store_true")
@@ -1550,8 +1528,6 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("batch")
         if name in {"packets", "sync-dry", "sync-live", "status", "confirm"}:
             p.add_argument("--execute", action="store_true")
-        if name in {"sync-dry", "sync-live"}:
-            p.add_argument("--include-manual", action="store_true")
 
     p = sub.add_parser("create-vertical", parents=[runtime])
     p.add_argument("slug")
@@ -1651,7 +1627,6 @@ def dispatch(args: argparse.Namespace) -> CommandResult:
             use_existing=args.use_existing,
             batch=batch,
             score_budget=args.score_budget,
-            include_manual=args.include_manual,
             yes_score=args.yes_score,
             yes_live=args.yes_live,
             yes_all=args.yes_all,
@@ -1702,7 +1677,6 @@ def dispatch(args: argparse.Namespace) -> CommandResult:
     if args.verb == "sync-dry":
         return cmd_sync_dry(
             args.batch,
-            include_manual=args.include_manual,
             execute=args.execute,
             root=repo_root,
             python_path=python_path,
@@ -1710,7 +1684,6 @@ def dispatch(args: argparse.Namespace) -> CommandResult:
     if args.verb == "sync-live":
         return cmd_sync_live(
             args.batch,
-            include_manual=args.include_manual,
             execute=args.execute,
             root=repo_root,
             python_path=python_path,

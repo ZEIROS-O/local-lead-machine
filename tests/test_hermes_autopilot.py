@@ -84,7 +84,7 @@ def run_cli(root: Path, argv: list[str]) -> tuple[int, str]:
 
 
 class HermesAutopilotTest(unittest.TestCase):
-    def _seed_scoring_approval(self, root: Path, *, include_manual: bool = False) -> BatchPaths:
+    def _seed_scoring_approval(self, root: Path) -> BatchPaths:
         paths = BatchPaths.for_batch("epoxy_cleveland_medium_001", root=root)
         paths.enriched.parent.mkdir(parents=True, exist_ok=True)
         paths.enriched.write_text("{}\n{}\n", encoding="utf-8")
@@ -93,13 +93,12 @@ class HermesAutopilotTest(unittest.TestCase):
             stage="score",
             original_command="/run epoxy cleveland medium --auto --score-budget 5",
             next_command="/score-rest epoxy_cleveland_medium_001 --budget 5.00",
-            include_manual=include_manual,
             score_budget=5.0,
             projected_score_cost=0.87,
         )
         return paths
 
-    def _seed_live_approval(self, root: Path, *, include_manual: bool = False) -> BatchPaths:
+    def _seed_live_approval(self, root: Path) -> BatchPaths:
         paths = BatchPaths.for_batch("epoxy_cleveland_medium_001", root=root)
         paths.enriched.parent.mkdir(parents=True, exist_ok=True)
         paths.enriched.write_text("{}\n{}\n", encoding="utf-8")
@@ -122,13 +121,12 @@ class HermesAutopilotTest(unittest.TestCase):
             "Business Name,Packet Tier\nA,Sendable Packet\nB,Manual Review Packet\n",
             encoding="utf-8",
         )
-        hc.record_dry_run(paths, include_manual=include_manual, post=1, patch=1, skip=0, warnings=[], root=root)
+        hc.record_dry_run(paths, post=1, patch=1, skip=0, warnings=[], root=root)
         hc.create_pending_approval(
             paths,
             stage="live",
             original_command="/run epoxy cleveland medium --auto --score-budget 5",
             next_command="/sync-live epoxy_cleveland_medium_001",
-            include_manual=include_manual,
             score_budget=5.0,
             dry_run_hash=load_run_state(paths)["dry_run_input_hash"],
         )
@@ -141,11 +139,11 @@ class HermesAutopilotTest(unittest.TestCase):
             with patch.object(hc, "run_streaming") as run:
                 rc, out = run_cli(
                     root,
-                    ["run", "epoxy", "cleveland", "medium", "--auto", "--score-budget", "5", "--include-manual"],
+                    ["run", "epoxy", "cleveland", "medium", "--auto", "--score-budget", "5"],
                 )
         self.assertEqual(rc, 0)
         self.assertIn("preview /run --auto", out)
-        self.assertIn("/run epoxy cleveland medium --auto --score-budget 5.00 --include-manual --execute", out)
+        self.assertIn("/run epoxy cleveland medium --auto --score-budget 5.00 --execute", out)
         run.assert_not_called()
 
     def test_telegram_run_slash_auto_path_is_normalized(self) -> None:
@@ -154,7 +152,7 @@ class HermesAutopilotTest(unittest.TestCase):
             make_repo_root(root)
             rc, out = run_cli(
                 root,
-                ["run", "/run", "epoxy", "cleveland", "medium", "--auto", "--score-budget", "5", "--include-manual"],
+                ["run", "/run", "epoxy", "cleveland", "medium", "--auto", "--score-budget", "5"],
             )
         self.assertEqual(rc, 0)
         self.assertIn("preview /run --auto", out)
@@ -176,7 +174,6 @@ class HermesAutopilotTest(unittest.TestCase):
                         "--auto",
                         "--score-budget",
                         "5",
-                        "--include-manual",
                         "--execute",
                     ],
                 )
@@ -214,7 +211,6 @@ class HermesAutopilotTest(unittest.TestCase):
                         "--use-existing",
                         "--score-budget",
                         "5",
-                        "--include-manual",
                         "--execute",
                     ],
                 )
@@ -246,7 +242,6 @@ class HermesAutopilotTest(unittest.TestCase):
                         "--auto",
                         "--score-budget",
                         "5",
-                        "--include-manual",
                         "--execute",
                     ],
                 )
@@ -334,7 +329,6 @@ class HermesAutopilotTest(unittest.TestCase):
                     "--auto",
                     "--score-budget",
                     "5",
-                    "--include-manual",
                     "--execute",
                 ],
             )
@@ -371,7 +365,6 @@ class HermesAutopilotTest(unittest.TestCase):
                     "--auto",
                     "--score-budget",
                     "5",
-                    "--include-manual",
                     "--execute",
                 ],
             )
@@ -379,14 +372,14 @@ class HermesAutopilotTest(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         self.assertIn("Autopilot stopped.", out)
-        self.assertIn("/run epoxy cleveland medium --auto --fresh --score-budget 5.00 --include-manual", out)
+        self.assertIn("/run epoxy cleveland medium --auto --fresh --score-budget 5.00", out)
         self.assertIsNone(load_run_state(paths).get("pending_approval"))
 
     def test_yes_to_score_runs_score_rest_packets_sync_dry_and_pending_live(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             make_repo_root(root)
-            paths = self._seed_scoring_approval(root, include_manual=True)
+            paths = self._seed_scoring_approval(root)
 
             def fake_run(cmd: list[str], **_: object) -> StreamResult:
                 if "score_leads.py" in cmd and "--confirm-llm-spend" in cmd:
@@ -431,10 +424,11 @@ class HermesAutopilotTest(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertEqual(run.call_count, 4)
             self.assertIn("Airtable dry-run complete for epoxy_cleveland_medium_001", out)
+            self.assertIn("Upload scope: all scored rows.", out)
             self.assertIn("Live sync now? Reply yes/no.", out)
             state = load_run_state(paths)
             self.assertEqual(state["pending_approval"]["stage"], "live")
-            self.assertTrue(state["pending_approval"]["include_manual"])
+            self.assertEqual(state["pending_approval"]["upload_scope"], "all_scored_rows")
 
     def test_no_cancels_pending_approval_and_prints_resume_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -545,7 +539,6 @@ class HermesAutopilotTest(unittest.TestCase):
                 stage="score",
                 original_command="/run epoxy cleveland medium --auto",
                 next_command="/score-rest epoxy_cleveland_medium_001",
-                include_manual=False,
                 score_budget=5.0,
             )
 
@@ -566,11 +559,11 @@ class HermesAutopilotTest(unittest.TestCase):
             self.assertIn("Live sync refused", out)
             self.assertIsNone(load_run_state(paths).get("pending_approval"))
 
-    def test_yes_to_live_runs_sync_live_only_when_hash_matches_and_preserves_manual(self) -> None:
+    def test_yes_to_live_runs_sync_live_only_when_hash_matches_and_preserves_total_scope(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             make_repo_root(root)
-            paths = self._seed_live_approval(root, include_manual=True)
+            paths = self._seed_live_approval(root)
 
             with patch.object(
                 hc,
@@ -584,7 +577,7 @@ class HermesAutopilotTest(unittest.TestCase):
             self.assertNotIn("--include-manual-review", run.call_args.args[0])
             self.assertNotIn("--only-sendable", run.call_args.args[0])
 
-            paths = self._seed_live_approval(root, include_manual=True)
+            paths = self._seed_live_approval(root)
             paths.packet_index.write_text("Business Name,Packet Tier\nchanged,Sendable Packet\n", encoding="utf-8")
             with patch.object(hc, "run_streaming") as run2:
                 rc, out = run_cli(root, ["yes"])

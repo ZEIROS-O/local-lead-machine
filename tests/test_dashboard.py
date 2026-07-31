@@ -306,7 +306,7 @@ class DashboardRepositoryTest(unittest.TestCase):
                 {"Place Key": "place-1", "Business Name": "Lead 1", "City": "Cleveland", "Packet Tier": PACKET_TIER_MANUAL},
             ],
         )
-        sync_hash = current_sync_hash(self.paths, include_manual=True)
+        sync_hash = current_sync_hash(self.paths)
         now = datetime.now(timezone.utc).isoformat()
         self.paths.state_json.write_text(
             json.dumps(
@@ -319,7 +319,7 @@ class DashboardRepositoryTest(unittest.TestCase):
                     "manual_review_count": 1,
                     "last_airtable_dry_run_timestamp": now,
                     "dry_run_input_hash": sync_hash,
-                    "dry_run_include_manual": True,
+                    "dry_run_upload_scope": "all_scored_rows",
                     "dry_run_post_count": 1,
                     "dry_run_patch_count": 1,
                     "dry_run_skip_count": 0,
