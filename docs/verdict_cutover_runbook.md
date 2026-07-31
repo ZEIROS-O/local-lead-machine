@@ -157,21 +157,45 @@ inside the same admission; `tests/test_verdict.py` and
 `tests/test_queue_state_formula.py` pin that implication. The shorter filter
 selects the same leads, and step 2 confirmed that against live data.
 
-The four rep views, and the one that matters:
+**Only two of the four views change.** Checked against their definitions in the
+[2026-07-30 runbook](airtable_cutover_runbook_2026-07-30.md#6-build-the-rep-facing-views--done):
+`📅 Follow-Ups Due` filters on `Next Follow-Up` + `Status`, and `📊 Pipeline` is
+a kanban grouped by `Status`. Neither mentions a readiness column, so neither
+needs touching.
 
-| View | ID | Change |
-|---|---|---|
-| 🔥 Call Queue | `viwTIS6NX47jK412Z` | rebuild on the formula above |
-| 📅 Follow-Ups Due | `viwT8IoxEWyCOMA5M` | repoint off `Packet Tier` onto `Verdict` |
-| 📊 Pipeline | `viwb3nZQ3lW0aIQBD` | repoint off `Packet Tier` onto `Verdict` |
-| 🧪 Manual Review | `viw41G0duU8rwglL0` | `{Verdict}='review'` |
+**🔥 Call Queue** (`viwTIS6NX47jK412Z`) — four conditions become two:
 
-- [ ] 🔥 Call Queue rebuilt on the formula above
-- [ ] The other three rep views repointed off `Packet Tier` onto `Verdict`
+| Was | Now |
+|---|---|
+| `Packet Tier` is `Sendable Packet` | **`Verdict` is `send`** |
+| `Commercial Fit State` is `commercially-sendable` | *delete this condition* |
+| `Contact Eligibility` is `contact-now` | *delete this condition* |
+| `Status` is any of `New`, `Mockup Needed` | unchanged |
+
+Sort (`Lead Priority` asc → `Opportunity Score` desc → `Score Total` desc) and
+grouping (`Vertical`) are unchanged.
+
+**🧪 Manual Review** (`viw41G0duU8rwglL0`) — one condition:
+
+| Was | Now |
+|---|---|
+| `Packet Tier` is `Manual Review Packet` | **`Verdict` is `review`** |
+
+Sort (`Opportunity Score` desc → `Score Total` desc) unchanged.
+
+Hidden fields need no action: the seven deleted columns simply stop existing in
+step 4, and they are already hidden from every rep-facing view.
+
+- [ ] 🔥 Call Queue: swap the tier condition for `Verdict = send`, delete the
+      two now-redundant ones
+- [ ] 🧪 Manual Review: swap the tier condition for `Verdict = review`
 - [ ] **Call Queue returns the identical set `query_ready_to_send.py` returns** —
       the same records, not merely the same count. This was the 2026-07-30
       acceptance test and it is the one that matters. The 12 to expect today:
       9 garage-door and 3 plumbing leads, all `Status = New`.
+- [ ] Manual Review should show **85** rows (`Verdict = review`), up from the 39
+      the tier filter showed — the collapse folded `Watchlist`-era leads and the
+      stale `Sendable Packet` rows into `review`, which is where they belong.
 
 ## Step 4 — Delete the seven superseded columns (hand step)
 
