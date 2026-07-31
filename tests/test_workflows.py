@@ -11,6 +11,29 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
 
+SECRET_ENV = {
+    "AIRTABLE_PAT": "${{ secrets.AIRTABLE_PAT }}",
+    "AIRTABLE_BASE_ID": "${{ secrets.AIRTABLE_BASE_ID }}",
+}
+CORPUS_ENV = {"LPM_SCORED_OUTPUT_DIR": "${{ vars.LPM_SCORED_OUTPUT_DIR }}"}
+
+# The gates that must run daily, in order, each with the env it is allowed to
+# see. Pinned as one list so adding a gate to the workflow without declaring it
+# here — or declaring one and never wiring it — fails rather than passing
+# quietly, which is the failure mode the whole schedule exists to end.
+EXPECTED_GATES = (
+    (".venv/bin/python airtable_required_choices.py check", SECRET_ENV),
+    (".venv/bin/python upload_airtable.py --schema-report", SECRET_ENV),
+    (
+        '.venv/bin/python evals/completeness.py --output-dir "$LPM_SCORED_OUTPUT_DIR"',
+        {**SECRET_ENV, **CORPUS_ENV},
+    ),
+    (
+        '.venv/bin/python evals/reproducibility.py --output-dir "$LPM_SCORED_OUTPUT_DIR"',
+        {**SECRET_ENV, **CORPUS_ENV},
+    ),
+)
+
 
 class WorkflowContractTests(unittest.TestCase):
     def load_workflow(self, name: str) -> tuple[dict[str, Any], str]:
@@ -131,25 +154,14 @@ class WorkflowContractTests(unittest.TestCase):
         job = self.only_job(workflow)
 
         self.assertNotIn("env", job)
-        expected_secret_env = {
-            "AIRTABLE_PAT": "${{ secrets.AIRTABLE_PAT }}",
-            "AIRTABLE_BASE_ID": "${{ secrets.AIRTABLE_BASE_ID }}",
-        }
         gate_steps = [
             step
             for step in job["steps"]
             if ".venv/bin/python " in step.get("run", "")
         ]
-        self.assertEqual(len(gate_steps), 3)
-        self.assertEqual(gate_steps[0].get("env"), expected_secret_env)
-        self.assertEqual(gate_steps[1].get("env"), expected_secret_env)
-        self.assertEqual(
-            gate_steps[2].get("env"),
-            {
-                **expected_secret_env,
-                "LPM_SCORED_OUTPUT_DIR": "${{ vars.LPM_SCORED_OUTPUT_DIR }}",
-            },
-        )
+        self.assertEqual(len(gate_steps), len(EXPECTED_GATES))
+        for step, (_command, expected_env) in zip(gate_steps, EXPECTED_GATES):
+            self.assertEqual(step.get("env"), expected_env)
         for step in job["steps"]:
             if step not in gate_steps and step["name"] != "Preflight scored corpus":
                 self.assertNotIn("env", step)
@@ -159,14 +171,7 @@ class WorkflowContractTests(unittest.TestCase):
             for line in step.get("run", "").splitlines()
             if line.strip().startswith(".venv/bin/python ")
         ]
-        self.assertEqual(
-            commands,
-            [
-                ".venv/bin/python airtable_required_choices.py check",
-                ".venv/bin/python upload_airtable.py --schema-report",
-                '.venv/bin/python evals/completeness.py --output-dir "$LPM_SCORED_OUTPUT_DIR"',
-            ],
-        )
+        self.assertEqual(commands, [command for command, _env in EXPECTED_GATES])
         self.assertNotRegex(source, r"\.venv/bin/python[^\n]*secrets\.")
 
     def test_gate_summaries_preserve_command_failures(self) -> None:
@@ -177,7 +182,7 @@ class WorkflowContractTests(unittest.TestCase):
             if ".venv/bin/python " in step.get("run", "")
         ]
 
-        self.assertEqual(len(gate_steps), 3)
+        self.assertEqual(len(gate_steps), len(EXPECTED_GATES))
         for step in gate_steps:
             run = step["run"]
             self.assertIn("trap report_failure ERR", run)

@@ -93,3 +93,20 @@ jobs:
           .venv/bin/python evals/completeness.py --output-dir "$LPM_SCORED_OUTPUT_DIR"
           trap - ERR
           printf '%s\n' '- PASS: scored corpus completeness' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check verdict reproducibility
+        env:
+          AIRTABLE_PAT: ${{ secrets.AIRTABLE_PAT }}
+          AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
+          LPM_SCORED_OUTPUT_DIR: ${{ vars.LPM_SCORED_OUTPUT_DIR }}
+        run: |
+          set -euo pipefail
+          report_failure() {
+            status=$?
+            printf '%s\n' '- FAIL: verdict reproducibility' >> "$GITHUB_STEP_SUMMARY"
+            exit "$status"
+          }
+          trap report_failure ERR
+          .venv/bin/python evals/reproducibility.py --output-dir "$LPM_SCORED_OUTPUT_DIR"
+          trap - ERR
+          printf '%s\n' '- PASS: verdict reproducibility' >> "$GITHUB_STEP_SUMMARY"
