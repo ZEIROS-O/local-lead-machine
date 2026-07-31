@@ -13,9 +13,6 @@ permissions:
 jobs:
   airtable-gates:
     runs-on: ubuntu-latest
-    env:
-      AIRTABLE_PAT: ${{ secrets.AIRTABLE_PAT }}
-      AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -31,6 +28,9 @@ jobs:
           .venv/bin/pip install requests python-dotenv
 
       - name: Check required Airtable choices
+        env:
+          AIRTABLE_PAT: ${{ secrets.AIRTABLE_PAT }}
+          AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
         run: |
           set -euo pipefail
           report_failure() {
@@ -44,6 +44,9 @@ jobs:
           printf '%s\n' '- PASS: required Airtable choices' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Check Airtable schema
+        env:
+          AIRTABLE_PAT: ${{ secrets.AIRTABLE_PAT }}
+          AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
         run: |
           set -euo pipefail
           report_failure() {

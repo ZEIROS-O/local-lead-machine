@@ -28,13 +28,26 @@ class WorkflowContractTests(unittest.TestCase):
             raise AssertionError(f"expected one job, found {list(jobs)}")
         return next(iter(jobs.values()))
 
+    def assert_daily_schedule(self, workflow: dict[str, Any]) -> None:
+        schedules = workflow["on"]["schedule"]
+        self.assertEqual(len(schedules), 1)
+        self.assertEqual(set(schedules[0]), {"cron"})
+        fields = schedules[0]["cron"].split()
+        self.assertEqual(len(fields), 5)
+        minute, hour, day_of_month, month, day_of_week = fields
+        self.assertTrue(minute.isdigit())
+        self.assertTrue(hour.isdigit())
+        self.assertIn(int(minute), range(60))
+        self.assertIn(int(hour), range(24))
+        self.assertEqual([day_of_month, month, day_of_week], ["*", "*", "*"])
+
     def test_tests_workflow_has_push_pull_request_and_daily_triggers(self) -> None:
         workflow, _ = self.load_workflow("tests.yml")
 
         triggers = workflow["on"]
         self.assertIn("push", triggers)
         self.assertIn("pull_request", triggers)
-        self.assertRegex(triggers["schedule"][0]["cron"], r"\S")
+        self.assert_daily_schedule(workflow)
 
     def test_tests_workflow_runs_the_suite_without_application_secrets(self) -> None:
         workflow, source = self.load_workflow("tests.yml")
@@ -79,7 +92,7 @@ class WorkflowContractTests(unittest.TestCase):
         steps = job["steps"]
 
         self.assertIn("schedule", workflow["on"])
-        self.assertRegex(workflow["on"]["schedule"][0]["cron"], r"\S")
+        self.assert_daily_schedule(workflow)
         self.assertIn("workflow_dispatch", workflow["on"])
         self.assertEqual(workflow["permissions"], {"contents": "read"})
         self.assertEqual(job["runs-on"], "ubuntu-latest")
@@ -91,13 +104,22 @@ class WorkflowContractTests(unittest.TestCase):
         workflow, source = self.load_workflow("gates.yml")
         job = self.only_job(workflow)
 
-        self.assertEqual(
-            job["env"],
-            {
-                "AIRTABLE_PAT": "${{ secrets.AIRTABLE_PAT }}",
-                "AIRTABLE_BASE_ID": "${{ secrets.AIRTABLE_BASE_ID }}",
-            },
-        )
+        self.assertNotIn("env", job)
+        expected_secret_env = {
+            "AIRTABLE_PAT": "${{ secrets.AIRTABLE_PAT }}",
+            "AIRTABLE_BASE_ID": "${{ secrets.AIRTABLE_BASE_ID }}",
+        }
+        gate_steps = [
+            step
+            for step in job["steps"]
+            if ".venv/bin/python " in step.get("run", "")
+        ]
+        self.assertEqual(len(gate_steps), 2)
+        for step in gate_steps:
+            self.assertEqual(step.get("env"), expected_secret_env)
+        for step in job["steps"]:
+            if step not in gate_steps:
+                self.assertNotIn("env", step)
         commands = [
             line.strip()
             for step in job["steps"]
