@@ -58,3 +58,19 @@ jobs:
           .venv/bin/python upload_airtable.py --schema-report
           trap - ERR
           printf '%s\n' '- PASS: Airtable schema report' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check scored corpus completeness
+        env:
+          AIRTABLE_PAT: ${{ secrets.AIRTABLE_PAT }}
+          AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
+        run: |
+          set -euo pipefail
+          report_failure() {
+            status=$?
+            printf '%s\n' '- FAIL: scored corpus completeness' >> "$GITHUB_STEP_SUMMARY"
+            exit "$status"
+          }
+          trap report_failure ERR
+          .venv/bin/python evals/completeness.py
+          trap - ERR
+          printf '%s\n' '- PASS: scored corpus completeness' >> "$GITHUB_STEP_SUMMARY"

@@ -114,7 +114,7 @@ class WorkflowContractTests(unittest.TestCase):
             for step in job["steps"]
             if ".venv/bin/python " in step.get("run", "")
         ]
-        self.assertEqual(len(gate_steps), 2)
+        self.assertEqual(len(gate_steps), 3)
         for step in gate_steps:
             self.assertEqual(step.get("env"), expected_secret_env)
         for step in job["steps"]:
@@ -131,6 +131,7 @@ class WorkflowContractTests(unittest.TestCase):
             [
                 ".venv/bin/python airtable_required_choices.py check",
                 ".venv/bin/python upload_airtable.py --schema-report",
+                ".venv/bin/python evals/completeness.py",
             ],
         )
         self.assertNotRegex(source, r"\.venv/bin/python[^\n]*secrets\.")
@@ -143,7 +144,7 @@ class WorkflowContractTests(unittest.TestCase):
             if ".venv/bin/python " in step.get("run", "")
         ]
 
-        self.assertEqual(len(gate_steps), 2)
+        self.assertEqual(len(gate_steps), 3)
         for step in gate_steps:
             run = step["run"]
             self.assertIn("trap report_failure ERR", run)
