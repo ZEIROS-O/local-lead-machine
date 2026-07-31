@@ -1,0 +1,57 @@
+name: Airtable gates
+
+on:
+  schedule:
+    - cron: "37 11 * * *"
+  workflow_dispatch:
+
+# One-time repository setup: add AIRTABLE_PAT and AIRTABLE_BASE_ID as
+# Actions secrets under Settings > Secrets and variables > Actions.
+permissions:
+  contents: read
+
+jobs:
+  airtable-gates:
+    runs-on: ubuntu-latest
+    env:
+      AIRTABLE_PAT: ${{ secrets.AIRTABLE_PAT }}
+      AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install gate dependencies
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install requests python-dotenv
+
+      - name: Check required Airtable choices
+        run: |
+          set -euo pipefail
+          report_failure() {
+            status=$?
+            printf '%s\n' '- FAIL: required Airtable choices' >> "$GITHUB_STEP_SUMMARY"
+            exit "$status"
+          }
+          trap report_failure ERR
+          .venv/bin/python airtable_required_choices.py check
+          trap - ERR
+          printf '%s\n' '- PASS: required Airtable choices' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check Airtable schema
+        run: |
+          set -euo pipefail
+          report_failure() {
+            status=$?
+            printf '%s\n' '- FAIL: Airtable schema report' >> "$GITHUB_STEP_SUMMARY"
+            exit "$status"
+          }
+          trap report_failure ERR
+          .venv/bin/python upload_airtable.py --schema-report
+          trap - ERR
+          printf '%s\n' '- PASS: Airtable schema report' >> "$GITHUB_STEP_SUMMARY"
