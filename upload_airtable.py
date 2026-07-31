@@ -498,16 +498,12 @@ def csv_row_to_record(row: Dict[str, str], packet_dir: Path) -> Dict[str, Any]:
         # An explicit tier is still only a snapshot. Total mirroring means a
         # stale Sendable Packet would otherwise survive after the canonical
         # admission/contact gate withdrew the lead and re-enter the rep queue.
-        # Tighten fail-closed, and do not mark this as a default: an existing
-        # Airtable row must be PATCHed away from the stale sendable tier.
-        fields["Packet Tier"] = _TIER_NONE
-    if row_is_sendable:
-        if not clean_cell(fields.get("Status")):
-            fields["Status"] = "Mockup Needed"
-            defaulted_fields.append("Status")
-    elif clean_cell(row.get("Packet Tier", "")) == _TIER_MANUAL:
-        fields["Status"] = "Manual Review"
-        defaulted_fields.append("Status")
+        # Tighten to the canonical non-send tier, and do not mark this as a
+        # default: an existing Airtable row must be PATCHed away from the stale
+        # sendable tier.
+        fields["Packet Tier"] = (
+            _TIER_MANUAL if truthy_yes(source.get("Packet Eligible")) else _TIER_NONE
+        )
 
     # Packet Tier is the only readiness column Airtable keeps, so a CSV without
     # one would upload a record the send-queue filter can never match. Derive it
@@ -528,6 +524,14 @@ def csv_row_to_record(row: Dict[str, str], packet_dir: Path) -> Dict[str, Any]:
             derived_tier = _TIER_NONE
         fields["Packet Tier"] = derived_tier
         defaulted_fields.append("Packet Tier")
+
+    if row_is_sendable:
+        if not clean_cell(fields.get("Status")):
+            fields["Status"] = "Mockup Needed"
+            defaulted_fields.append("Status")
+    elif clean_cell(fields.get("Packet Tier")) == _TIER_MANUAL:
+        fields["Status"] = "Manual Review"
+        defaulted_fields.append("Status")
 
     # Filter platform/system emails before Airtable payload creation.
     if "Email" in fields:
