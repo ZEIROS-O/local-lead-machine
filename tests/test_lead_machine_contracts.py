@@ -519,6 +519,70 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(patched[0]["method"], "PATCH")
         self.assertNotIn("Packet Tier", patched[0]["payload"]["fields"])
 
+    def test_airtable_derived_verdict_travels_with_the_derived_tier(self) -> None:
+        """A Verdict minted from a defaulted tier is just as much a guess.
+
+        `Verdict` is computed from `Packet Tier`, so when the tier had to be
+        derived from the booleans the verdict inherits that uncertainty. If only
+        the tier is held back from the PATCH, the base keeps its real tier and
+        gets the guessed verdict beside it — the two disagree, and because the
+        Call Queue now filters on `Verdict` alone, a live lead silently leaves
+        the dial list.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            card = upload_airtable.csv_row_to_record(
+                {
+                    "Business Name": "Legacy CSV Landscaping",
+                    "Place Key": "ChIJ-legacy-csv",
+                    "Sendable": "No",
+                    "Packet Eligible": "No",
+                },
+                Path(tmp),
+            )
+
+        self.assertEqual(card["airtable_fields"]["Packet Tier"], "No Packet")
+        self.assertEqual(card["airtable_fields"]["Verdict"], "reject")
+        self.assertIn("Verdict", card["defaulted_airtable_fields"])
+
+        patched = plan_airtable_sync(
+            [card], existing_records_by_key={"place:ChIJ-legacy-csv": "recExisting"}
+        )
+        self.assertEqual(patched[0]["method"], "PATCH")
+        self.assertNotIn("Packet Tier", patched[0]["payload"]["fields"])
+        self.assertNotIn("Verdict", patched[0]["payload"]["fields"])
+
+    def test_airtable_patch_clears_verdict_reasons_when_the_verdict_is_send(self) -> None:
+        """An empty reason list is an answer, not a missing value.
+
+        Airtable leaves unmentioned fields alone on PATCH, so dropping the empty
+        string would leave reject-era prose sitting next to `Verdict = send`.
+        `Verdict Reasons` is machine-owned, so it is written on every row the
+        verdict is written on.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            card = upload_airtable.csv_row_to_record(
+                {
+                    "Business Name": "Fresh Sendable Detailing",
+                    "Place Key": "ChIJ-fresh-send",
+                    "Packet Tier": "Sendable Packet",
+                    "Sendable": "Yes",
+                    "Packet Eligible": "Yes",
+                    "Commercial Fit State": "commercially-sendable",
+                    "Contact Eligibility": "contact-now",
+                    "Verdict Reasons": "",
+                    "Send Blockers": "",
+                },
+                Path(tmp),
+            )
+
+        patched = plan_airtable_sync(
+            [card], existing_records_by_key={"place:ChIJ-fresh-send": "recExisting"}
+        )
+        fields = patched[0]["payload"]["fields"]
+        self.assertEqual(patched[0]["method"], "PATCH")
+        self.assertEqual(fields["Verdict"], "send")
+        self.assertEqual(fields["Verdict Reasons"], "")
+
     def test_airtable_csv_dry_run_preserves_explicit_sendable_operational_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             csv_path = Path(tmp) / "scored.csv"

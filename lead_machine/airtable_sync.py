@@ -136,6 +136,13 @@ TYPED_AIRTABLE_FIELDS = (
     | {AI_CONFIDENCE_FIELD, VERTICAL_FIELD, SITE_STATUS_FIELD, ICP_LANE_FIELD}
     | SERVICE_ANGLE_FIELDS
 )
+# Empty is a real answer on these, not a missing value, so they are written even
+# when blank. Airtable leaves an unmentioned field untouched on PATCH: dropping
+# a blank "Verdict Reasons" would leave the reasons from an earlier reject
+# sitting beside a fresh `Verdict = send`, which is exactly the machine-owned
+# drift the verdict collapse exists to end. Keep this set to machine-owned
+# fields — a blank on a human-owned column means "the CSV did not carry it".
+CLEARABLE_AIRTABLE_FIELDS = frozenset({"Verdict Reasons"})
 
 
 def _parse_finite_float(value: Any) -> Optional[float]:
@@ -262,7 +269,7 @@ def build_airtable_payload_with_drops(card: Dict[str, Any]) -> tuple[Dict[str, A
         if key not in allowed:
             continue
         normalized_value = normalize_airtable_value(key, value)
-        if normalized_value in ("", None, [], {}):
+        if normalized_value in ("", None, [], {}) and key not in CLEARABLE_AIRTABLE_FIELDS:
             if key in TYPED_AIRTABLE_FIELDS and value not in ("", None, [], {}):
                 dropped_fields.append({"field": key, "value": value})
             continue

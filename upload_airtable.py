@@ -535,6 +535,9 @@ def csv_row_to_record(row: Dict[str, str], packet_dir: Path) -> Dict[str, Any]:
             derived_tier = _TIER_NONE
         fields["Packet Tier"] = derived_tier
         defaulted_fields.append("Packet Tier")
+        tier_was_defaulted = True
+    else:
+        tier_was_defaulted = False
 
     # Derived from the final tier rather than copied from the CSV column, and
     # placed after every rule that can still move the tier — the stale-sendable
@@ -545,8 +548,12 @@ def csv_row_to_record(row: Dict[str, str], packet_dir: Path) -> Dict[str, Any]:
     fields[VERDICT_REASONS_FIELD] = clean_cell(
         row.get(VERDICT_REASONS_FIELD) or row.get("Send Blockers")
     )
-    if not fields[VERDICT_REASONS_FIELD]:
-        del fields[VERDICT_REASONS_FIELD]
+    if tier_was_defaulted:
+        # Computed from a guessed tier, so it is a guess too. Holding the tier
+        # back from the PATCH while letting its verdict through would hand the
+        # base a disagreeing pair — and the Call Queue reads the verdict alone,
+        # so the guess is what decides whether the lead stays dialable.
+        defaulted_fields.extend([VERDICT_FIELD, VERDICT_REASONS_FIELD])
 
     if row_is_sendable:
         if not clean_cell(fields.get("Status")):
