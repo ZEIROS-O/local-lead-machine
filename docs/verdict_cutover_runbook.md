@@ -1,6 +1,6 @@
 # Verdict Cutover Runbook
 
-Status: **NOT STARTED — the code is written, the base is untouched.**
+Status: **STEP 1 DONE — the two fields exist; the branch is clear to merge.**
 
 Base: `appLbCDdUDSZf7qaK` (`Local Lead Machine CRM`)
 
@@ -43,36 +43,39 @@ before and after. If that diff is ever non-empty, the collapse changed a
 decision and must not ship.
 
 - [x] `snapshot_drift = 0`
-- [x] 953 tests green
+- [x] 955 tests green
 - [x] `upload_airtable.py --schema-report` lists `Verdict` with 4 choices
 
-## Step 1 — Create the two fields (hand step, BEFORE merging)
+## Step 1 — Create the two fields (BEFORE merging) — done 2026-07-31
 
-Create in `Prospects`:
+Created in `Prospects`:
 
-| Field | Type | Choices |
-|---|---|---|
-| `Verdict` | Single select | `send`, `review`, `watch`, `reject` |
-| `Verdict Reasons` | Long text | — |
+| Field | Type | Field ID | Choices |
+|---|---|---|---|
+| `Verdict` | Single select | `fldKQrryUKS29zMH9` | `send`, `review`, `watch`, `reject` |
+| `Verdict Reasons` | Long text | `fldq0ua0VeSoIOFb0` | — |
 
-The choices are exactly what `upload_airtable.py --schema-report` prints; the
-required-choices gate refuses until all four exist. Its current message is the
-one to clear:
+The choices are exactly what `upload_airtable.py --schema-report` prints. The
+message this step existed to clear:
 
 ```
 [airtable-required-choices] REFUSED: expected one field named/id 'Verdict'
 in table 'Prospects', found 0
 ```
 
-Note the plan's open question about the Create Field API: the **Update** Field
-API cannot modify an existing single-select's choices
-(`airtable_required_choices.py:20-37`), but creation *with* choices is a
-different endpoint. If creating by API, confirm all four choices land before
-relying on it; by hand is fine and is what 2026-07-30 did.
+The plan's open question about the Create Field API is now answered: **creating
+a single select with its choices works.** All four landed in one call, which the
+**Update** Field API could not have done afterwards
+(`airtable_required_choices.py:20-37`). Verified by reading back
+`live_choice_count: 4` rather than by trusting the create response.
 
-- [ ] `Verdict` created with all four choices
-- [ ] `Verdict Reasons` created
-- [ ] `.venv/bin/python airtable_required_choices.py check` exits **0**
+Choice order is decision order, not alphabetical — the gate checks presence, not
+sequence, so the rep-facing dropdown reads `send → review → watch → reject`.
+
+- [x] `Verdict` created with all four choices
+- [x] `Verdict Reasons` created
+- [x] `.venv/bin/python airtable_required_choices.py check` exits **0** — all 17
+      select fields OK, `missing: []`
 
 ## Step 2 — Merge and backfill
 
