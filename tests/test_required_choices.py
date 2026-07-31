@@ -22,7 +22,7 @@ from airtable_required_choices import (
     resolve_table_names,
 )
 from lead_machine.queue_state import PROSPECT_STATUS_CHOICES
-from lead_machine import airtable_sync, queue_state, score_schema, sendability
+from lead_machine import airtable_sync, queue_state, score_schema, sendability, verdict
 from mark_outcome import REQUIRED_SELECT_CHOICES
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -223,16 +223,16 @@ class ProspectWritePathVocabularyTest(unittest.TestCase):
         self.assertIn("skip", required["ICP Lane"])
 
     def test_writer_owned_sets_drive_the_map_notes_and_required_union(self):
+        # `Packet Tier` and the four readiness selects are absent by design:
+        # step 4 of the verdict cutover deletes those columns, and this gate
+        # refuses on a field the base lacks — so listing one the write path no
+        # longer sends would fail the gate over a column nobody writes.
         owned = {
             "Vertical": airtable_sync.VERTICAL_CHOICES,
-            "Packet Tier": sendability.PACKET_TIER_CHOICES,
+            "Verdict": verdict.VERDICT_CHOICES,
             "Lead Priority": score_leads.LEAD_PRIORITY_CHOICES,
             "Offer Fit": airtable_sync.OFFER_FIT_CHOICES,
             "Site Status": airtable_sync.SITE_STATUS_CHOICES,
-            "Commercial Fit State": score_schema.COMMERCIAL_FIT_STATES,
-            "Contact Eligibility": score_schema.CONTACT_ELIGIBILITY_STATES,
-            "Asset State": score_schema.ASSET_STATES,
-            "Promise State": score_schema.PROMISE_STATES,
             "AI Confidence": airtable_sync.AI_CONFIDENCE_CHOICES,
             "ICP Lane": airtable_sync.ICP_LANE_CHOICES,
             "Status": queue_state.PROSPECT_STATUS_CHOICE_SET,

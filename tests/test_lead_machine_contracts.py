@@ -204,7 +204,7 @@ class LeadMachineContractsTest(unittest.TestCase):
         # Offer Fit, Next Action restated Status.
         self.assertNotIn("Best Service Angle", fields)
         self.assertNotIn("Next Action", fields)
-        self.assertEqual(fields["Packet Tier"], "Sendable Packet")
+        self.assertEqual(fields["Verdict"], "send")
         # Form detail stays in the scored CSV and packet; the CRM keeps only
         # the surviving visible-pain summary fields.
         self.assertNotIn("Form Strength", fields)
@@ -457,7 +457,7 @@ class LeadMachineContractsTest(unittest.TestCase):
         # row carries Sendable=Yes but no commercial fit or contact eligibility,
         # so it fails the readiness contract and lands as a manual-review packet
         # rather than inheriting the bare Sendable string it used to sync.
-        self.assertEqual(fields["Packet Tier"], "Manual Review Packet")
+        self.assertEqual(fields["Verdict"], "review")
         self.assertNotIn("Sendable", fields)
         self.assertNotIn("Packet Eligible", fields)
         self.assertNotIn("Recommended Action", fields)
@@ -493,31 +493,80 @@ class LeadMachineContractsTest(unittest.TestCase):
         planned = self._dry_run_plan(stdout)
         self.assertEqual(len(planned), 1)
         fields = planned[0]["payload"]["fields"]  # type: ignore[index]
-        self.assertEqual(fields["Packet Tier"], "No Packet")
+        self.assertEqual(fields["Verdict"], "reject")
 
-    def test_airtable_derived_packet_tier_never_clobbers_an_existing_tier(self) -> None:
-        """A derived tier is a fallback for new records, not an overwrite.
+    def test_a_derived_verdict_never_clobbers_an_existing_one(self) -> None:
+        """A derived verdict is a fallback for new records, not an overwrite.
 
         The derivation only sees the CSV, so on a record that already exists it
-        could downgrade a tier the base got from a fuller scored run. Marking it
-        defaulted keeps it out of the PATCH payload.
+        could downgrade a verdict the base got from a fuller scored run. Marking
+        it defaulted keeps it out of the PATCH payload while still seeding a new
+        row on POST. This used to be spelled with `Packet Tier`, which no longer
+        reaches Airtable at all; `Verdict` is the field the mechanism protects
+        now, and the Call Queue reads it alone.
         """
         card = {
             "place_id_or_unique_key": "ChIJ-no-packet",
             "airtable_fields": {
                 "Business Name": "No Packet Landscaping",
-                "Packet Tier": "No Packet",
+                "Verdict": "reject",
             },
-            "defaulted_airtable_fields": ["Packet Tier"],
+            "defaulted_airtable_fields": ["Verdict"],
         }
 
         posted = plan_airtable_sync([card])
         patched = plan_airtable_sync([card], existing_records_by_key={"place:ChIJ-no-packet": "recExisting"})
 
         self.assertEqual(posted[0]["method"], "POST")
-        self.assertEqual(posted[0]["payload"]["fields"]["Packet Tier"], "No Packet")
+        self.assertEqual(posted[0]["payload"]["fields"]["Verdict"], "reject")
         self.assertEqual(patched[0]["method"], "PATCH")
-        self.assertNotIn("Packet Tier", patched[0]["payload"]["fields"])
+        self.assertNotIn("Verdict", patched[0]["payload"]["fields"])
+
+    def test_the_seven_superseded_columns_are_never_written(self) -> None:
+        """`Verdict` replaced them, and step 4 of the cutover deletes them.
+
+        A payload naming a field the base does not have is a 422, not a blank,
+        so the write path has to stop naming them *before* the columns go. The
+        allowlist is the one chokepoint every payload passes through, which is
+        why this asserts on both the list and a built payload.
+        """
+        from lead_machine.airtable_sync import AIRTABLE_ALLOWED_FIELDS
+
+        superseded = [
+            "Packet Tier",
+            "Commercial Fit State",
+            "Contact Eligibility",
+            "Asset State",
+            "Promise State",
+            "Send Blockers",
+            "Skip Reason",
+        ]
+        for field in superseded:
+            self.assertNotIn(field, AIRTABLE_ALLOWED_FIELDS, field)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            card = upload_airtable.csv_row_to_record(
+                {
+                    "Business Name": "Everything Set Co",
+                    "Place Key": "ChIJ-everything",
+                    "Packet Tier": "Sendable Packet",
+                    "Sendable": "Yes",
+                    "Packet Eligible": "Yes",
+                    "Commercial Fit State": "commercially-sendable",
+                    "Contact Eligibility": "contact-now",
+                    "Asset State": "ready",
+                    "Promise State": "kept",
+                    "Send Blockers": "something",
+                    "Skip Reason": "something",
+                },
+                Path(tmp),
+            )
+
+        posted = plan_airtable_sync([card])[0]["payload"]["fields"]
+        for field in superseded:
+            self.assertNotIn(field, posted, field)
+        # The tier still drives the verdict internally; only the column is gone.
+        self.assertEqual(posted["Verdict"], "send")
 
     def test_airtable_derived_verdict_travels_with_the_derived_tier(self) -> None:
         """A Verdict minted from a defaulted tier is just as much a guess.
@@ -942,9 +991,9 @@ class LeadMachineContractsTest(unittest.TestCase):
             planned = plan_airtable_sync(records, existing_records_by_key={})
 
         fields = planned[0]["payload"]["fields"]
-        self.assertEqual(fields["Packet Tier"], "Manual Review Packet")
+        self.assertEqual(fields["Verdict"], "review")
         self.assertEqual(fields["Status"], "Manual Review")
-        self.assertNotEqual(fields["Packet Tier"], "Sendable Packet")
+        self.assertNotEqual(fields["Verdict"], "send")
 
     def test_airtable_plan_tightens_stale_sendable_tier_to_none_when_not_packet_eligible(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -962,7 +1011,7 @@ class LeadMachineContractsTest(unittest.TestCase):
             planned = plan_airtable_sync(records, existing_records_by_key={})
 
         fields = planned[0]["payload"]["fields"]
-        self.assertEqual(fields["Packet Tier"], "No Packet")
+        self.assertEqual(fields["Verdict"], "reject")
         self.assertNotEqual(fields.get("Status"), "Manual Review")
 
     def test_airtable_retired_subset_flags_fail_in_parser_before_network(self) -> None:

@@ -36,26 +36,33 @@ AIRTABLE_ALLOWED_FIELDS = [
     "Visible Pain Reasons",
     "Send Trigger",
     "Buyer Intent Signals",
-    "Commercial Fit State",
     "LPM Offer Component",
-    "Contact Eligibility",
-    "Asset State",
-    "Promise State",
     "Evidence Refs",
     "Safe Outreach Claims",
     "AI Confidence",
-    "Skip Reason",
     "Place Key",
     "Score Total",
     "ICP Lane",
     "Opportunity Score",
-    "Packet Tier",
     "Verdict",
     "Verdict Reasons",
     "Opener",
-    "Send Blockers",
     "Packet Path",
 ]
+# Deleted from the base by step 4 of the verdict cutover, and dropped from this
+# allowlist first: a payload naming a field the base does not have is a 422, not
+# a blank, so the write path had to stop naming them before the columns went.
+# `Packet Tier` is still computed inside `csv_row_to_record` — `Verdict` is
+# derived from it — it just no longer reaches Airtable.
+SUPERSEDED_BY_VERDICT = (
+    "Packet Tier",
+    "Commercial Fit State",
+    "Contact Eligibility",
+    "Asset State",
+    "Promise State",
+    "Send Blockers",
+    "Skip Reason",
+)
 
 INTEGER_FIELDS = {"Reviews", "Score Total", "Visible Pain Score", "Opportunity Score"}
 FLOAT_FIELDS = {"Rating"}

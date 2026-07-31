@@ -24,6 +24,7 @@ except ModuleNotFoundError:
 from lead_machine.email_hygiene import clean_airtable_email
 from lead_machine.airtable_sync import (
     AI_CONFIDENCE_CHOICES,
+    AIRTABLE_ALLOWED_FIELDS,
     ICP_LANE_CHOICES,
     OFFER_FIT_CHOICES,
     SITE_STATUS_CHOICES,
@@ -71,17 +72,18 @@ _TIER_SENDABLE = PACKET_TIER_SENDABLE
 _TIER_MANUAL = PACKET_TIER_MANUAL
 _TIER_NONE = PACKET_TIER_NONE
 
+# Every single select the write path actually sends. `airtable_required_choices`
+# reads this to refuse when the base lacks a choice the code can write, so a
+# column the write path no longer sends must not be listed: after step 4 of the
+# verdict cutover the field is gone, and demanding it would fail the gate over a
+# column nobody writes. The five readiness selects left here alongside `Packet
+# Tier` — `Verdict` is the one that replaced all six.
 WRITE_PATH_SELECT_CHOICES: dict[str, frozenset[str]] = {
     "Vertical": VERTICAL_CHOICES,
-    "Packet Tier": PACKET_TIER_CHOICES,
     VERDICT_FIELD: VERDICT_CHOICES,
     "Lead Priority": LEAD_PRIORITY_CHOICES,
     "Offer Fit": OFFER_FIT_CHOICES,
     "Site Status": SITE_STATUS_CHOICES,
-    "Commercial Fit State": COMMERCIAL_FIT_STATES,
-    "Contact Eligibility": CONTACT_ELIGIBILITY_STATES,
-    "Asset State": ASSET_STATES,
-    "Promise State": PROMISE_STATES,
     "AI Confidence": AI_CONFIDENCE_CHOICES,
     "ICP Lane": ICP_LANE_CHOICES,
     "Status": PROSPECT_STATUS_CHOICE_SET,
@@ -107,7 +109,6 @@ _FIELD_SCHEMA: List[tuple[str, str, str]] = [
     ("Reviews",                "Number",             "Integer; set field to 'Integer' precision"),
     ("Rating",                 "Number",             "Decimal; set field to 2 decimal places"),
     ("Specific Observation",   "Long text",          ""),
-    ("Packet Tier",            "Single select",      _select_options_note("Packet Tier")),
     (VERDICT_FIELD,            "Single select",      _select_options_note(VERDICT_FIELD)),
     (VERDICT_REASONS_FIELD,    "Long text",          "Why the verdict is what it is; machine-owned"),
     # Skip is a real grade the scorer writes on every disqualified lead, not a
@@ -120,11 +121,7 @@ _FIELD_SCHEMA: List[tuple[str, str, str]] = [
     ("Visible Pain Reasons",   "Long text",          ""),
     ("Send Trigger",           "Single line text",   ""),
     ("Buyer Intent Signals",   "Long text",          "Comma-separated signals detected by LLM"),
-    ("Commercial Fit State",   "Single select",      _select_options_note("Commercial Fit State")),
     ("LPM Offer Component",    "Single line text",   "One authoritative offer component"),
-    ("Contact Eligibility",    "Single select",      _select_options_note("Contact Eligibility")),
-    ("Asset State",            "Single select",      _select_options_note("Asset State")),
-    ("Promise State",          "Single select",      _select_options_note("Promise State")),
     ("Evidence Refs",          "Long text",          "Structured evidence identifiers"),
     ("Safe Outreach Claims",   "Long text",          "Claims bound to evidence identifiers"),
     ("AI Confidence",          "Single select",      _select_options_note("AI Confidence")),
@@ -132,8 +129,6 @@ _FIELD_SCHEMA: List[tuple[str, str, str]] = [
     ("ICP Lane",               "Single select",      _select_options_note("ICP Lane")),
     ("Opportunity Score",      "Number",             "Integer 0–100; the icp_lanes score behind ICP Lane"),
     ("Opener",                 "Long text",          ""),
-    ("Send Blockers",          "Long text",          ""),
-    ("Skip Reason",            "Single line text",   ""),
     ("Place Key",              "Single line text",   "Used as upsert key; must be unique per business"),
     ("Status",                 "Single select",      _select_options_note("Status")),
     ("Outreach Channel",       "Single select",      _select_options_note("Outreach Channel")),
@@ -1047,7 +1042,21 @@ def main() -> int:
                 remove_airtable_field(records, field)
 
         if input_path.suffix.lower() == ".csv":
-            validate_airtable_fields(args.base_id, args.table, args.token, CSV_AIRTABLE_FIELDS + OPERATIONAL_FIELDS)
+            # Only the columns a payload can actually carry. `CSV_AIRTABLE_FIELDS`
+            # is the CSV-side contract and still names the seven the verdict
+            # cutover deletes — `Packet Tier` among them, because the verdict is
+            # derived from it in-process — so validating the raw list would
+            # demand columns the base no longer has and refuse every live run.
+            validate_airtable_fields(
+                args.base_id,
+                args.table,
+                args.token,
+                [
+                    field
+                    for field in CSV_AIRTABLE_FIELDS + OPERATIONAL_FIELDS
+                    if field in set(AIRTABLE_ALLOWED_FIELDS)
+                ],
+            )
         else:
             validate_airtable_fields(args.base_id, args.table, args.token, payload_field_names(records))
 

@@ -73,8 +73,12 @@ LEGACY_FIELDS = {
 CANONICAL_FIELDS = {
     "Send Trigger",
     "Last Contacted",
-    "Skip Reason",
 }
+# `Skip Reason` was the canonical half of a Legacy* pair the 2026-07-30 cutover
+# migrated onto. The verdict collapse then superseded it outright — the reason a
+# lead is not sendable lives in `Verdict Reasons` now — so step 4 deletes the
+# column and the write path stopped naming it first.
+SUPERSEDED_BY_VERDICT = {"Skip Reason"}
 # The 13 columns the writer used to fill that the 2026-07 CRM rebuild deletes.
 # Airtable answers a write to a deleted field with a 422 for the whole record,
 # so the code has to stop writing them before the base loses them — never the
@@ -147,13 +151,16 @@ class SchemaReportContentTest(unittest.TestCase):
             "Business Name", "Owner Name", "Vertical", "City", "Phone", "Email",
             "Website URL", "Google Maps URL", "Reviews", "Rating",
             "Specific Observation",
-            "Packet Tier", "Lead Priority", "Offer Fit",
+            "Lead Priority", "Offer Fit",
             "Site Status",
             "Visible Pain Score", "Visible Pain Reasons", "Send Trigger",
             "Buyer Intent Signals", "AI Confidence", "Score Total",
             "ICP Lane", "Opportunity Score",
             "Opener",
-            "Send Blockers", "Skip Reason", "Place Key", "Status",
+            # `Packet Tier`, `Send Blockers` and `Skip Reason` are gone from the
+            # report on purpose — step 4 of the verdict cutover deletes them, and
+            # the report is the list of columns the base is required to have.
+            "Place Key", "Status",
             "Outreach Channel", "Last Contacted", "Next Follow-Up",
             "Mockup URL", "Video URL", "Packet Path",
         }
@@ -317,9 +324,18 @@ class LegacyOrphanRegistrationTest(unittest.TestCase):
                 self.assertIn(f"Legacy {canonical}", LEGACY_ORPHAN_FIELDS)
 
     def test_every_surviving_pair_still_points_at_a_live_column(self):
+        """A migration must not strand its target — unless a later one retires it.
+
+        `LEGACY_FIELD_PAIRS` is the record of the completed 2026-07-30 migration,
+        so it keeps naming `Skip Reason` even though the verdict collapse has
+        since superseded that column. Both halves of the pair are gone from the
+        base; what must stay true is that no *other* pair points at nothing.
+        """
         from airtable_schema_cutover import LEGACY_FIELD_PAIRS
 
-        self.assertTrue(set(LEGACY_FIELD_PAIRS.values()).issubset(set(AIRTABLE_ALLOWED_FIELDS)))
+        still_expected = set(LEGACY_FIELD_PAIRS.values()) - SUPERSEDED_BY_VERDICT
+        self.assertTrue(still_expected.issubset(set(AIRTABLE_ALLOWED_FIELDS)))
+        self.assertTrue(SUPERSEDED_BY_VERDICT.isdisjoint(set(AIRTABLE_ALLOWED_FIELDS)))
 
 
 class TypedFieldNormalizationCoverageTest(unittest.TestCase):
