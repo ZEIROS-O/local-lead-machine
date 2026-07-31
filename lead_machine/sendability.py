@@ -114,6 +114,29 @@ PACKET_TIER_CHOICES = frozenset(
 
 PACKET_TIERS_WITH_PACKET = {PACKET_TIER_SENDABLE, PACKET_TIER_MANUAL}
 
+# --- Verdict --------------------------------------------------------------
+# The one machine-owned verdict, declared beside the tiers because it is a
+# rename of them rather than a second decision. `lead_machine.verdict` imports
+# this and owns the evaluation API; the vocabulary lives here so there is one
+# declaration, and so `readiness_flags` below can read a base row that now
+# carries `Verdict` where it used to carry `Packet Tier` without importing the
+# module that imports this one.
+VERDICT_SEND = "send"
+VERDICT_REVIEW = "review"
+VERDICT_WATCH = "watch"
+VERDICT_REJECT = "reject"
+
+TIER_VERDICTS = {
+    PACKET_TIER_SENDABLE: VERDICT_SEND,
+    PACKET_TIER_MANUAL: VERDICT_REVIEW,
+    PACKET_TIER_WATCHLIST: VERDICT_WATCH,
+    PACKET_TIER_NONE: VERDICT_REJECT,
+}
+VERDICT_CHOICES = frozenset(TIER_VERDICTS.values())
+# The inverse. It exists only because the mapping is a bijection, which
+# tests/test_verdict.py pins — a lossy mapping would make this silently wrong.
+VERDICT_PACKET_TIERS = {verdict: tier for tier, verdict in TIER_VERDICTS.items()}
+
 MANUAL_REVIEW_MIN_RATING = 4.5
 MANUAL_REVIEW_MIN_REVIEWS = 10
 MANUAL_REVIEW_MIN_PAIN_SCORE = 35
@@ -587,6 +610,12 @@ def readiness_flags(row: Dict[str, Any]) -> tuple[str, str]:
     tier = _pick(row, "Packet Tier", "packet_tier").strip()
     sendable = _pick(row, "Sendable", "sendable").strip()
     packet_eligible = _pick(row, "Packet Eligible", "packet_eligible").strip()
+    verdict = _pick(row, "Verdict", "verdict").strip()
+    if not tier and verdict:
+        # A base row now carries `Verdict` where it used to carry `Packet Tier`.
+        # Reconstruct the tier so the rules below stay written against one
+        # concept: `Verdict` is a rename of the tier, so this loses nothing.
+        tier = VERDICT_PACKET_TIERS.get(verdict, "")
     if not sendable and tier:
         # Reconstructing the flag from the tier is still a way to declare a lead
         # sendable, so it goes through `admit` like every other one.
@@ -608,10 +637,12 @@ def contact_readiness_failures(row: Dict[str, Any]) -> List[str]:
     Packet eligibility by itself is intentionally insufficient: manual-review
     packets may be uploadable while remaining unsafe to contact.
 
-    Only the first clause is load-bearing for pipeline-written rows — a lead is
-    Sendable only if it is already commercially-sendable and contact-now. The
-    rest are kept as cross-checks against hand-edits in the base, which is what
-    query_ready_to_send uses this for on read-back.
+    The commercially-sendable and contact-now clauses are gone from
+    READINESS_CLAUSES because `Verdict` folds them in — `send` is unreachable
+    unless both hold. What does not go away is re-deriving the stored value:
+    `Verdict` in the base is still a snapshot, and a snapshot is exactly what let
+    a hard-skipped lead ride a stale cell into the send queue. `readiness_flags`
+    re-runs the admission over it, in the tightening direction only.
     """
     failures: List[str] = []
     sendable, packet_eligible = readiness_flags(row)
@@ -619,9 +650,19 @@ def contact_readiness_failures(row: Dict[str, Any]) -> List[str]:
         failures.append(queue_state.READINESS_CLAUSES[0].failure)
     if packet_eligible.casefold() != "yes":
         failures.append("Packet Eligible must be Yes")
-    for clause in queue_state.READINESS_CLAUSES[1:]:
+    # A row carrying a Verdict is a base row read back after the cutover, where
+    # these two columns no longer exist. Anything else — a scored CSV, a legacy
+    # row — is expected to carry them, and their absence is the scorer never
+    # having established commercial fit. Blank must keep meaning "failed" there,
+    # or a legacy row asserting Sendable=Yes with no evidence at all uploads as
+    # a sendable packet.
+    carries_verdict = bool(_pick(row, "Verdict", "verdict").strip())
+    for clause in queue_state.READINESS_CROSS_CHECKS:
         snake_case = clause.field.casefold().replace(" ", "_")
-        if _pick(row, clause.field, snake_case).strip().casefold() != clause.expected.casefold():
+        declared = _pick(row, clause.field, snake_case).strip()
+        if not declared and carries_verdict:
+            continue
+        if declared.casefold() != clause.expected.casefold():
             failures.append(clause.failure)
     return failures
 
@@ -833,6 +874,12 @@ def apply_sendability(row: Dict[str, Any]) -> Dict[str, Any]:
     tier, review_reason = evaluate_packet_tier(updated, result)
     updated["Packet Tier"] = tier
     updated["Manual Review Reason"] = review_reason
+    # Written from the tier that was just computed, in the one function that
+    # computes it. `lead_machine.verdict.evaluate_verdict` is the same
+    # projection for callers holding only a row; both read TIER_VERDICTS, so a
+    # scored CSV cannot carry a verdict that disagrees with its own tier.
+    updated["Verdict"] = TIER_VERDICTS[tier]
+    updated["Verdict Reasons"] = blockers
 
     if tier == PACKET_TIER_SENDABLE:
         updated["Packet Eligible"] = "Yes"

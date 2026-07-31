@@ -19,10 +19,10 @@ from lead_machine import queue_state
 from lead_machine import sendability
 
 
+# A base row as it reads back after the collapse: one verdict column plus the
+# human-owned Status. The three readiness columns it replaces are gone.
 READY_FIELDS = {
-    "Packet Tier": "Sendable Packet",
-    "Commercial Fit State": "commercially-sendable",
-    "Contact Eligibility": "contact-now",
+    "Verdict": "send",
     "Status": "New",
     "Consent Posture": "express written consent",
 }
@@ -48,9 +48,7 @@ class TestBuildFormula(unittest.TestCase):
         formula = qrs.build_formula("")
         self.assertEqual(
             formula,
-            "AND({Packet Tier}='Sendable Packet',"
-            "{Commercial Fit State}='commercially-sendable',{Contact Eligibility}='contact-now',"
-            "OR({Status}='New',{Status}='Mockup Needed'))",
+            "AND({Verdict}='send',OR({Status}='New',{Status}='Mockup Needed'))",
         )
 
     def test_vertical_clause_added_and_quotes_escaped(self):
@@ -238,8 +236,8 @@ class TestMarkSent(unittest.TestCase):
                 self._apply(suppression, {**READY_FIELDS, "Consent Posture": "unknown"})
             with self.assertRaisesRegex(mark_sent.MarkSentError, "Packet Eligible"):
                 self._apply(suppression, {**READY_FIELDS, "Packet Eligible": "No"}, channel="Email")
-            with self.assertRaisesRegex(mark_sent.MarkSentError, "Sendable"):
-                self._apply(suppression, {**READY_FIELDS, "Packet Tier": "Watchlist"}, channel="Email")
+            with self.assertRaisesRegex(mark_sent.MarkSentError, "Verdict must be send"):
+                self._apply(suppression, {**READY_FIELDS, "Verdict": "watch"}, channel="Email")
 
     def test_unknown_outreach_channel_is_refused_before_any_airtable_request(self):
         with tempfile.TemporaryDirectory() as tmp:

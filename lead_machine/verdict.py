@@ -9,8 +9,12 @@ So this is a projection, not a second gate. `evaluate_verdict` calls
 `evaluate_sendability` + `evaluate_packet_tier` and renames the result. There is
 no rule here that is not already there, which is what makes "the collapse
 changed no decision" provable by `evals/reproducibility.py` rather than argued:
-the mapping below is a bijection on the packet tiers, so the recomputed verdict
+`TIER_VERDICTS` is a bijection on the packet tiers, so the recomputed verdict
 set is the recomputed tier set under another name.
+
+The vocabulary itself lives in `sendability` beside the tiers it renames — one
+declaration, and `readiness_flags` needs the inverse without importing the
+module that imports it. This module owns the evaluation API.
 
 Ownership: `Verdict` is machine-written and never hand-edited. `Status` is
 human-owned and never machine-written except by `mark_sent` / `mark_outcome`.
@@ -24,31 +28,30 @@ from dataclasses import dataclass
 from typing import Any, Dict
 
 from .sendability import (
-    PACKET_TIER_MANUAL,
-    PACKET_TIER_NONE,
-    PACKET_TIER_SENDABLE,
-    PACKET_TIER_WATCHLIST,
+    TIER_VERDICTS,
+    VERDICT_CHOICES,
+    VERDICT_REJECT,
+    VERDICT_REVIEW,
+    VERDICT_SEND,
+    VERDICT_WATCH,
     evaluate_packet_tier,
     evaluate_sendability,
 )
 
-
-VERDICT_SEND = "send"
-VERDICT_REVIEW = "review"
-VERDICT_WATCH = "watch"
-VERDICT_REJECT = "reject"
-
-# The bijection that makes the collapse provable. Declared over
-# PACKET_TIER_CHOICES rather than written out loose, so a fifth tier cannot be
-# added without deciding what it means here — the alternative is a KeyError in
-# production or, worse, a silent default to `reject`.
-TIER_VERDICTS: Dict[str, str] = {
-    PACKET_TIER_SENDABLE: VERDICT_SEND,
-    PACKET_TIER_MANUAL: VERDICT_REVIEW,
-    PACKET_TIER_WATCHLIST: VERDICT_WATCH,
-    PACKET_TIER_NONE: VERDICT_REJECT,
-}
-VERDICT_CHOICES = frozenset(TIER_VERDICTS.values())
+__all__ = [
+    "TIER_VERDICTS",
+    "VERDICT_CHOICES",
+    "VERDICT_FIELD",
+    "VERDICT_REASONS_FIELD",
+    "VERDICT_REJECT",
+    "VERDICT_REVIEW",
+    "VERDICT_SEND",
+    "VERDICT_WATCH",
+    "VerdictResult",
+    "apply_verdict",
+    "evaluate_verdict",
+    "verdict_for_tier",
+]
 
 VERDICT_FIELD = "Verdict"
 VERDICT_REASONS_FIELD = "Verdict Reasons"

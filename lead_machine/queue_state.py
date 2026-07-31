@@ -28,8 +28,36 @@ class QueueStatusClause:
         return "OR(" + ",".join(f"{{{self.field}}}='{value}'" for value in self.allowed) + ")"
 
 
+# One clause, because there is now one verdict. The three it replaces were a
+# compound guard against the base storing this decision across three
+# independently hand-editable columns: `Packet Tier` said sendable while
+# `Commercial Fit State` disagreed, and the queue had to check all three to
+# notice. `Verdict` is machine-owned and `verdict.evaluate_verdict` already
+# folds both other conditions in — `send` cannot be reached unless the lead is
+# commercially-sendable and contact-now, since both are blockers inside the same
+# admission (pinned by tests/test_verdict.py).
+#
+# The literal `"send"` is spelled here rather than imported: `verdict` imports
+# `sendability`, which imports this module, so an import would cycle. It is
+# pinned against `verdict.VERDICT_SEND` by tests/test_queue_state_formula.py —
+# the same way QUEUE_STATUS_CLAUSE is pinned against PROSPECT_STATUS_CHOICES
+# rather than derived from it.
 READINESS_CLAUSES = (
-    ReadinessClause("Packet Tier", "Sendable Packet", "Sendable must be Yes"),
+    ReadinessClause("Verdict", "send", "Verdict must be send"),
+)
+
+# Cross-checks, not filter clauses — and the distinction is the whole reason
+# they survive the collapse. As base filter clauses they were redundant, because
+# `send` already implies both. As row-level checks they are not: a scored CSV row
+# carries this evidence beside its declared tier, and a row whose declared
+# verdict disagrees with its own commercial-fit evidence is precisely the drift
+# the dashboard exists to surface. Dropping them entirely would have made
+# `sendable_readiness_mismatch` unreachable.
+#
+# Applied only to fields the row actually carries. A base row after the cutover
+# has neither column, and treating absent as failing would empty the send queue
+# — the exact failure mode the blank-Packet-Tier rows already demonstrated.
+READINESS_CROSS_CHECKS = (
     ReadinessClause(
         "Commercial Fit State",
         "commercially-sendable",

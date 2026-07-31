@@ -31,8 +31,13 @@ from lead_machine import queue_state
 from lead_machine.sendability import is_contact_ready
 
 
+# Requested from Airtable by name, so this list cannot outlive the columns: a
+# `fields[]` naming a deleted field is a 422, not a blank. The seven the cutover
+# removes are gone from here in the same change that adds Verdict, which is why
+# the runbook can delete them without the morning queue going down.
 DISPLAY_FIELDS = [
-    "Packet Tier",
+    "Verdict",
+    "Verdict Reasons",
     "Business Name",
     "Owner Name",
     "Vertical",
@@ -52,11 +57,7 @@ DISPLAY_FIELDS = [
     "Opener",
     "Safe Outreach Claims",
     "Evidence Refs",
-    "Commercial Fit State",
     "LPM Offer Component",
-    "Contact Eligibility",
-    "Asset State",
-    "Promise State",
     "Outreach Channel",
     "Consent Posture",
     "Mockup URL",
@@ -69,10 +70,12 @@ DISPLAY_FIELDS = [
 ]
 
 _PRIORITY_RANK = {"A": 0, "B": 1, "C": 2}
+# The fields the read-back guard must actually receive to mean anything. It is
+# two now because the base answers the send question in one column: asking for
+# `Commercial Fit State` after the cutover would request a field that no longer
+# exists, and a guard whose evidence never arrives is one that cannot fail.
 REQUIRED_READINESS_FIELDS = {
-    "Packet Tier",
-    "Commercial Fit State",
-    "Contact Eligibility",
+    "Verdict",
     "Status",
 }
 

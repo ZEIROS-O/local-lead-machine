@@ -298,11 +298,75 @@ class OnlyVerdictModuleMintsAVerdict(unittest.TestCase):
 
         self.assertEqual(len(self.verdict_writes(smuggled, "smuggled.py")), 3)
 
-    def test_the_verdict_module_is_the_one_that_spells_them(self) -> None:
-        source = Path(verdict_module.__file__).read_text(encoding="utf-8")
+    def test_the_vocabulary_has_exactly_one_declaration_site(self) -> None:
+        # The four strings live in `sendability`, beside the tiers they rename,
+        # so there is one declaration and `readiness_flags` can read them without
+        # importing the module that imports it. A second module assigning them to
+        # its own constants would be the drift this whole collapse removes.
+        import lead_machine.sendability as sendability_module
 
-        for choice in sorted(VERDICT_CHOICES):
-            self.assertIn(f'"{choice}"', source)
+        declaring = Path(sendability_module.__file__).resolve()
+        offenders: list[str] = []
+        for path in self.production_sources():
+            if path.resolve() == declaring:
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Assign):
+                    continue
+                if not (
+                    isinstance(node.value, ast.Constant)
+                    and node.value.value in VERDICT_CHOICES
+                ):
+                    continue
+                for target in node.targets:
+                    # Module constants only. `scoring_v3` has its own unrelated
+                    # disposition vocabulary that happens to include the word
+                    # "reject"; a local in a different vocabulary is a collision,
+                    # not a second declaration of this one.
+                    if isinstance(target, ast.Name) and target.id.isupper():
+                        offenders.append(
+                            f"{path.relative_to(REPO_ROOT).as_posix()}:{target.id}"
+                        )
+
+        self.assertEqual(offenders, [])
+
+    def test_that_scan_catches_a_second_declaration(self) -> None:
+        smuggled = "VERDICT_SEND = 'send'\nVERDICT_REJECT = 'reject'\n"
+        tree = ast.parse(smuggled)
+        found = [
+            target.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Constant)
+            and node.value.value in VERDICT_CHOICES
+            for target in node.targets
+            if isinstance(target, ast.Name) and target.id.isupper()
+        ]
+
+        self.assertEqual(found, ["VERDICT_SEND", "VERDICT_REJECT"])
+
+    def test_the_verdict_module_re_exports_the_vocabulary(self) -> None:
+        import lead_machine.sendability as sendability_module
+
+        self.assertIs(verdict_module.VERDICT_CHOICES, sendability_module.VERDICT_CHOICES)
+        self.assertIs(verdict_module.TIER_VERDICTS, sendability_module.TIER_VERDICTS)
+        for name in ("VERDICT_SEND", "VERDICT_REVIEW", "VERDICT_WATCH", "VERDICT_REJECT"):
+            self.assertEqual(
+                getattr(verdict_module, name), getattr(sendability_module, name)
+            )
+
+    def test_the_tier_mapping_and_its_inverse_stay_consistent(self) -> None:
+        import lead_machine.sendability as sendability_module
+
+        self.assertEqual(
+            sendability_module.VERDICT_PACKET_TIERS,
+            {verdict: tier for tier, verdict in TIER_VERDICTS.items()},
+        )
+        for tier, verdict_value in TIER_VERDICTS.items():
+            self.assertEqual(
+                sendability_module.VERDICT_PACKET_TIERS[verdict_value], tier
+            )
 
 
 if __name__ == "__main__":

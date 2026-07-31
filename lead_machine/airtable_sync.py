@@ -50,6 +50,8 @@ AIRTABLE_ALLOWED_FIELDS = [
     "ICP Lane",
     "Opportunity Score",
     "Packet Tier",
+    "Verdict",
+    "Verdict Reasons",
     "Opener",
     "Send Blockers",
     "Packet Path",

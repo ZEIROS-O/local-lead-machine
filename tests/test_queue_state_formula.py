@@ -34,43 +34,57 @@ class TestQueueStateFormula(unittest.TestCase):
     def test_filter_formula_is_the_canonical_static_queue_expression(self):
         self.assertEqual(
             getattr(queue_state, "QUEUE_FILTER_FORMULA", None),
-            "AND({Packet Tier}='Sendable Packet',"
-            "{Commercial Fit State}='commercially-sendable',"
-            "{Contact Eligibility}='contact-now',"
-            "OR({Status}='New',{Status}='Mockup Needed'))",
+            "AND({Verdict}='send',OR({Status}='New',{Status}='Mockup Needed'))",
         )
 
     def test_generated_formula_reports_the_first_failed_clause(self):
         self.assertEqual(
             queue_state.queue_state_formula(),
-            "IF({Packet Tier}='Sendable Packet',"
-            "IF({Commercial Fit State}='commercially-sendable',"
-            "IF({Contact Eligibility}='contact-now',"
+            "IF({Verdict}='send',"
             "IF(OR({Status}='New',{Status}='Mockup Needed'),\"Ready to Dial\","
             "\"Blocked: Status must be New or Mockup Needed\"),"
-            "\"Blocked: Contact Eligibility must be contact-now\"),"
-            "\"Blocked: Commercial Fit State must be commercially-sendable\"),"
-            "\"Blocked: Sendable must be Yes\")",
+            "\"Blocked: Verdict must be send\")",
         )
 
     def test_clause_list_is_the_single_source_for_base_readiness(self):
         clauses = getattr(queue_state, "READINESS_CLAUSES", ())
         self.assertEqual(
             tuple((clause.field, clause.expected, clause.failure) for clause in clauses),
-            (
-                ("Packet Tier", "Sendable Packet", "Sendable must be Yes"),
-                (
-                    "Commercial Fit State",
-                    "commercially-sendable",
-                    "Commercial Fit State must be commercially-sendable",
-                ),
-                (
-                    "Contact Eligibility",
-                    "contact-now",
-                    "Contact Eligibility must be contact-now",
-                ),
-            ),
+            (("Verdict", "send", "Verdict must be send"),),
         )
+
+    def test_the_readiness_clause_is_pinned_to_the_verdict_vocabulary(self):
+        # The clause spells "send" as a literal because importing `verdict` here
+        # would cycle (verdict -> sendability -> queue_state). This is the pin
+        # that keeps the literal honest, the same way the queue status clause is
+        # pinned against PROSPECT_STATUS_CHOICES rather than derived from it.
+        from lead_machine import verdict
+
+        clause = queue_state.READINESS_CLAUSES[0]
+
+        self.assertEqual(clause.field, verdict.VERDICT_FIELD)
+        self.assertEqual(clause.expected, verdict.VERDICT_SEND)
+        self.assertIn(clause.expected, verdict.VERDICT_CHOICES)
+
+    def test_the_dropped_clauses_are_implied_by_the_verdict(self):
+        # The two clauses this collapse removed are not lost, they are folded in:
+        # `send` is unreachable unless the lead is commercially-sendable and
+        # contact-now, because both are blockers inside the same admission. If
+        # that ever stopped holding, the shorter queue filter would start
+        # selecting leads the longer one excluded.
+        from lead_machine.sendability import apply_sendability
+        from lead_machine.verdict import evaluate_verdict
+        from tests.test_verdict import rows_across_the_tier_space
+
+        sends = 0
+        for row in rows_across_the_tier_space():
+            if not evaluate_verdict(row).is_send:
+                continue
+            sends += 1
+            scored = apply_sendability(row)
+            self.assertEqual(scored["Commercial Fit State"], "commercially-sendable")
+            self.assertEqual(scored["Contact Eligibility"], "contact-now")
+        self.assertGreater(sends, 0)
 
     def test_prospect_status_vocabulary_is_the_post_split_eight(self):
         # Exact tuple, not a subset: without typecast every one of these has to
@@ -144,9 +158,7 @@ class TestQueueStateFormula(unittest.TestCase):
                 self.assertEqual(
                     queue_state.queue_state_for_row(
                         {
-                            "Packet Tier": "Sendable Packet",
-                            "Commercial Fit State": "commercially-sendable",
-                            "Contact Eligibility": "contact-now",
+                            "Verdict": "send",
                             "Status": closed,
                         }
                     ),
@@ -172,30 +184,29 @@ class TestQueueStateFormula(unittest.TestCase):
         if not callable(evaluator):
             self.fail("queue_state_for_row is required to evaluate formula logic in Python")
 
+        # A base row after the collapse: one verdict column, plus the
+        # human-owned Status. The commercial-fit and contact-eligibility columns
+        # are gone, and the verdict already carries what they asserted.
         ready = {
-            "Packet Tier": "Sendable Packet",
+            "Verdict": "send",
             "Commercial Fit State": "commercially-sendable",
             "Contact Eligibility": "contact-now",
             "Status": "New",
         }
         cases = (
             (
-                "packet tier",
-                {"Packet Tier": "Manual Review Packet"},
-                ["Sendable must be Yes"],
-                "Blocked: Sendable must be Yes",
+                # `review` still carries a packet, so packet eligibility holds
+                # and only the send clause fails. `reject` fails both.
+                "verdict review",
+                {"Verdict": "review"},
+                ["Verdict must be send"],
+                "Blocked: Verdict must be send",
             ),
             (
-                "commercial fit",
-                {"Commercial Fit State": "minor-fix/nurture"},
-                ["Commercial Fit State must be commercially-sendable"],
-                "Blocked: Commercial Fit State must be commercially-sendable",
-            ),
-            (
-                "contact eligibility",
-                {"Contact Eligibility": "contact-after-asset"},
-                ["Contact Eligibility must be contact-now"],
-                "Blocked: Contact Eligibility must be contact-now",
+                "verdict reject",
+                {"Verdict": "reject"},
+                ["Verdict must be send", "Packet Eligible must be Yes"],
+                "Blocked: Verdict must be send",
             ),
             (
                 "status",
@@ -211,13 +222,12 @@ class TestQueueStateFormula(unittest.TestCase):
                 self.assertEqual(contact_readiness_failures(row), readiness_failures)
                 self.assertEqual(evaluator(row), queue_state_value)
 
-    def test_sendability_uses_the_shared_commercial_clause_reason(self):
-        clauses = list(queue_state.READINESS_CLAUSES)
-        clauses[1] = replace(clauses[1], failure="Shared commercial readiness failure")
-        row = {
-            "Packet Tier": "Sendable Packet",
-            "Commercial Fit State": "minor-fix/nurture",
-            "Contact Eligibility": "contact-now",
-        }
-        with patch.object(queue_state, "READINESS_CLAUSES", tuple(clauses)):
-            self.assertEqual(contact_readiness_failures(row), ["Shared commercial readiness failure"])
+    def test_sendability_reads_the_clause_reason_rather_than_its_own_copy(self):
+        # `contact_readiness_failures` must report the clause's own failure
+        # string, not a duplicate literal that could drift from the formula the
+        # base evaluates.
+        clauses = (replace(queue_state.READINESS_CLAUSES[0], failure="Shared readiness failure"),)
+        row = {"Verdict": "reject", "Packet Eligible": "Yes"}
+
+        with patch.object(queue_state, "READINESS_CLAUSES", clauses):
+            self.assertEqual(contact_readiness_failures(row), ["Shared readiness failure"])

@@ -54,6 +54,12 @@ from lead_machine.sendability import (
     hard_icp_skip_blockers,
     is_contact_ready,
 )
+from lead_machine.verdict import (
+    VERDICT_CHOICES,
+    VERDICT_FIELD,
+    VERDICT_REASONS_FIELD,
+    verdict_for_tier,
+)
 from mark_sent import OUTREACH_CHANNEL_CHOICES
 from score_leads import LEAD_PRIORITY_CHOICES
 
@@ -68,6 +74,7 @@ _TIER_NONE = PACKET_TIER_NONE
 WRITE_PATH_SELECT_CHOICES: dict[str, frozenset[str]] = {
     "Vertical": VERTICAL_CHOICES,
     "Packet Tier": PACKET_TIER_CHOICES,
+    VERDICT_FIELD: VERDICT_CHOICES,
     "Lead Priority": LEAD_PRIORITY_CHOICES,
     "Offer Fit": OFFER_FIT_CHOICES,
     "Site Status": SITE_STATUS_CHOICES,
@@ -101,6 +108,8 @@ _FIELD_SCHEMA: List[tuple[str, str, str]] = [
     ("Rating",                 "Number",             "Decimal; set field to 2 decimal places"),
     ("Specific Observation",   "Long text",          ""),
     ("Packet Tier",            "Single select",      _select_options_note("Packet Tier")),
+    (VERDICT_FIELD,            "Single select",      _select_options_note(VERDICT_FIELD)),
+    (VERDICT_REASONS_FIELD,    "Long text",          "Why the verdict is what it is; machine-owned"),
     # Skip is a real grade the scorer writes on every disqualified lead, not a
     # placeholder. It was missing from this line while the live base also carried
     # junk choices next to it, which is exactly the reading that gets it deleted.
@@ -228,6 +237,8 @@ CSV_AIRTABLE_FIELDS = [
     "Rating",
     "Specific Observation",
     "Packet Tier",
+    VERDICT_FIELD,
+    VERDICT_REASONS_FIELD,
     "Lead Priority",
     "Offer Fit",
     "Site Status",
@@ -524,6 +535,18 @@ def csv_row_to_record(row: Dict[str, str], packet_dir: Path) -> Dict[str, Any]:
             derived_tier = _TIER_NONE
         fields["Packet Tier"] = derived_tier
         defaulted_fields.append("Packet Tier")
+
+    # Derived from the final tier rather than copied from the CSV column, and
+    # placed after every rule that can still move the tier — the stale-sendable
+    # tighten above included. The two cannot disagree in a payload if one is
+    # computed from the other, which is the whole point of the collapse: the
+    # nine surfaces drifted because each was written independently.
+    fields[VERDICT_FIELD] = verdict_for_tier(clean_cell(fields["Packet Tier"]))
+    fields[VERDICT_REASONS_FIELD] = clean_cell(
+        row.get(VERDICT_REASONS_FIELD) or row.get("Send Blockers")
+    )
+    if not fields[VERDICT_REASONS_FIELD]:
+        del fields[VERDICT_REASONS_FIELD]
 
     if row_is_sendable:
         if not clean_cell(fields.get("Status")):
