@@ -277,7 +277,6 @@ def build_packets_command(paths: BatchPaths, *, python_path: Path | str | None =
 def build_sync_command(
     paths: BatchPaths,
     *,
-    include_manual: bool,
     live: bool,
     python_path: Path | str | None = None,
 ) -> list[str]:
@@ -286,7 +285,6 @@ def build_sync_command(
         "--input", str(paths.tiered_csv),
         "--packet-dir", str(paths.packets_dir),
     ]
-    cmd.append("--include-manual-review" if include_manual else "--only-sendable")
     cmd.append("--live" if live else "--dry-run")
     return cmd
 
@@ -1273,7 +1271,7 @@ def cmd_sync_dry(
     if not paths.packet_index.exists():
         raise CommandError(f"Packet index missing: {paths.packet_index}")
     current_sync_hash(paths, include_manual=include_manual)
-    cmd = build_sync_command(paths, include_manual=include_manual, live=False, python_path=python_path)
+    cmd = build_sync_command(paths, live=False, python_path=python_path)
     if not execute:
         return CommandResult(_preview("/sync-dry", cmd, root=root_path))
     result = run_streaming(cmd, cwd=root_path, resume_hint=f"/sync-dry {batch}", tail_limit=5000)
@@ -1327,7 +1325,7 @@ def cmd_sync_live(
     current_hash = current_sync_hash(paths, include_manual=include_manual)
     if state.get("dry_run_input_hash") != current_hash:
         raise CommandError("Refusing live sync: packet/scored input changed since last dry-run.")
-    cmd = build_sync_command(paths, include_manual=include_manual, live=True, python_path=python_path)
+    cmd = build_sync_command(paths, live=True, python_path=python_path)
     if not execute:
         return CommandResult(_preview("/sync-live", cmd, root=root_path))
     result = run_streaming(cmd, cwd=root_path, resume_hint=f"/sync-live {batch}", tail_limit=5000)

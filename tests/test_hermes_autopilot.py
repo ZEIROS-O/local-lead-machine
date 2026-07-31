@@ -416,7 +416,8 @@ class HermesAutopilotTest(unittest.TestCase):
                     )
                     return StreamResult(0, False, ["packets"])
                 if "upload_airtable.py" in cmd and "--dry-run" in cmd:
-                    self.assertIn("--include-manual-review", cmd)
+                    self.assertNotIn("--include-manual-review", cmd)
+                    self.assertNotIn("--only-sendable", cmd)
                     return StreamResult(
                         0,
                         False,
@@ -580,7 +581,8 @@ class HermesAutopilotTest(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertIn("Live sync complete", out)
             self.assertIn("--live", run.call_args.args[0])
-            self.assertIn("--include-manual-review", run.call_args.args[0])
+            self.assertNotIn("--include-manual-review", run.call_args.args[0])
+            self.assertNotIn("--only-sendable", run.call_args.args[0])
 
             paths = self._seed_live_approval(root, include_manual=True)
             paths.packet_index.write_text("Business Name,Packet Tier\nchanged,Sendable Packet\n", encoding="utf-8")

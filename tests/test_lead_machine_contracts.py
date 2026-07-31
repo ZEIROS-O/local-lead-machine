@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import subprocess
 import tempfile
 import unittest
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
@@ -547,7 +548,7 @@ class LeadMachineContractsTest(unittest.TestCase):
             csv_path = Path(tmp) / "scored.csv"
             self._write_airtable_csv(csv_path, [self._airtable_csv_row(**{"Outreach Channel": ""})])
 
-            records = upload_airtable.read_input_records(csv_path, only_sendable=False, packet_dir=Path(tmp))
+            records = upload_airtable.read_input_records(csv_path, packet_dir=Path(tmp))
             planned = plan_airtable_sync(records, existing_records_by_key={"place:ChIJ123": "rec-existing"})
 
         self.assertEqual(planned[0]["method"], "PATCH")
@@ -645,7 +646,7 @@ class LeadMachineContractsTest(unittest.TestCase):
                 )
 
                 code, stdout, stderr = self._run_upload(
-                    ["upload_airtable.py", "--input", str(csv_path), "--only-sendable"]
+                    ["upload_airtable.py", "--input", str(csv_path)]
                 )
             finally:
                 os.chdir(old_cwd)
@@ -800,7 +801,6 @@ class LeadMachineContractsTest(unittest.TestCase):
 
                 records = upload_airtable.read_input_records(
                     csv_path,
-                    only_sendable=True,
                     packet_dir=Path("packets_current_batch_manual"),
                 )
                 planned = plan_airtable_sync(records, existing_records_by_key={})
@@ -810,51 +810,91 @@ class LeadMachineContractsTest(unittest.TestCase):
         fields = planned[0]["payload"]["fields"]  # type: ignore[index]
         self.assertEqual(fields["Packet Path"], current_path)
 
-    def test_airtable_only_sendable_excludes_non_sendable_csv_rows(self) -> None:
+    def test_airtable_csv_reader_plans_every_scored_row(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             csv_path = Path(tmp) / "scored.csv"
             rows = [
-                self._airtable_csv_row(),
                 self._airtable_csv_row(
-                    **{"Business Name": "Not Sendable LLC", "Sendable": "No", "Place Key": "ChIJ999"}
+                    **{"Business Name": "Sendable Co", "Packet Tier": "Sendable Packet", "Place Key": "ChIJ1"}
                 ),
                 self._airtable_csv_row(
-                    **{"Business Name": "No Packet LLC", "Packet Eligible": "No", "Place Key": "ChIJ888"}
+                    **{
+                        "Business Name": "Manual Co",
+                        "Sendable": "No",
+                        "Packet Tier": "Manual Review Packet",
+                        "Place Key": "ChIJ2",
+                    }
+                ),
+                self._airtable_csv_row(
+                    **{
+                        "Business Name": "Watchlist Co",
+                        "Sendable": "No",
+                        "Packet Eligible": "",
+                        "Packet Tier": "Watchlist",
+                        "Place Key": "ChIJ3",
+                    }
+                ),
+                self._airtable_csv_row(
+                    **{
+                        "Business Name": "No Packet Co",
+                        "Sendable": "No",
+                        "Packet Eligible": "No",
+                        "Packet Tier": "No Packet",
+                        "Place Key": "ChIJ4",
+                    }
                 ),
             ]
             self._write_airtable_csv(csv_path, rows)
+            records = upload_airtable.read_csv_records(csv_path, packet_dir=Path(tmp))
+            planned = plan_airtable_sync(records, existing_records_by_key={})
 
-            code, stdout, stderr = self._run_upload(
-                ["upload_airtable.py", "--input", str(csv_path), "--only-sendable"]
-            )
-
-        self.assertEqual(code, 0, stderr)
-        planned = self._dry_run_plan(stdout)
-        self.assertEqual(len(planned), 1)
-        fields = planned[0]["payload"]["fields"]  # type: ignore[index]
-        self.assertEqual(fields["Business Name"], "A+ Landscaping LLC")
-
-    def test_airtable_include_manual_review_excludes_watchlist_and_no_packet(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            csv_path = Path(tmp) / "scored.csv"
-            rows = [
-                self._airtable_csv_row(**{"Business Name": "Sendable Co", "Packet Tier": "Sendable Packet", "Place Key": "ChIJ1"}),
-                self._airtable_csv_row(**{"Business Name": "Manual Co", "Sendable": "No", "Packet Tier": "Manual Review Packet", "Place Key": "ChIJ2"}),
-                self._airtable_csv_row(**{"Business Name": "Watchlist Co", "Sendable": "No", "Packet Eligible": "", "Packet Tier": "Watchlist", "Place Key": "ChIJ3"}),
-                self._airtable_csv_row(**{"Business Name": "No Packet Co", "Sendable": "No", "Packet Eligible": "No", "Packet Tier": "No Packet", "Place Key": "ChIJ4"}),
-            ]
-            self._write_airtable_csv(csv_path, rows)
-            code, stdout, stderr = self._run_upload(
-                ["upload_airtable.py", "--input", str(csv_path), "--include-manual-review"]
-            )
-        self.assertEqual(code, 0, stderr)
-        planned = self._dry_run_plan(stdout)
         names = {p["payload"]["fields"]["Business Name"] for p in planned}
-        self.assertEqual(len(planned), 2)
-        self.assertIn("Sendable Co", names)
-        self.assertIn("Manual Co", names)
-        self.assertNotIn("Watchlist Co", names)
-        self.assertNotIn("No Packet Co", names)
+        self.assertEqual(
+            names,
+            {"Sendable Co", "Manual Co", "Watchlist Co", "No Packet Co"},
+        )
+
+    def test_airtable_retired_subset_flags_fail_in_parser_before_network(self) -> None:
+        for retired_flag in ("--only-sendable", "--include-manual-review"):
+            with self.subTest(flag=retired_flag):
+                stderr = io.StringIO()
+                with (
+                    patch("sys.argv", ["upload_airtable.py", "--input", "missing.csv", retired_flag]),
+                    patch("upload_airtable.requests.get") as get,
+                    patch("upload_airtable.requests.post") as post,
+                    patch("upload_airtable.requests.patch") as patch_request,
+                    redirect_stderr(stderr),
+                    self.assertRaises(SystemExit) as raised,
+                ):
+                    upload_airtable.main()
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn("unrecognized arguments", stderr.getvalue())
+                get.assert_not_called()
+                post.assert_not_called()
+                patch_request.assert_not_called()
+
+    def test_make_airtable_targets_upload_all_rows_without_subset_flags(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        for target in ("airtable-dry", "airtable-live"):
+            with self.subTest(target=target):
+                result = subprocess.run(
+                    ["make", "-n", target],
+                    cwd=repo_root,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("upload_airtable.py", result.stdout)
+                self.assertNotIn("--only-sendable", result.stdout)
+                self.assertNotIn("--include-manual-review", result.stdout)
+
+    def test_run_lead_batch_skill_retrieves_total_upload_command(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        skill = (repo_root / ".claude/skills/run-lead-batch/SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("upload_airtable.py --dry-run", skill)
+        self.assertNotIn("--only-sendable", skill)
+        self.assertNotIn("--include-manual-review", skill)
 
     def test_airtable_manual_review_packet_gets_status_manual_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -863,9 +903,7 @@ class LeadMachineContractsTest(unittest.TestCase):
                 self._airtable_csv_row(**{"Business Name": "Manual Co", "Sendable": "No", "Packet Tier": "Manual Review Packet", "Place Key": "ChIJ2"}),
             ]
             self._write_airtable_csv(csv_path, rows)
-            code, stdout, stderr = self._run_upload(
-                ["upload_airtable.py", "--input", str(csv_path), "--include-manual-review"]
-            )
+            code, stdout, stderr = self._run_upload(["upload_airtable.py", "--input", str(csv_path)])
         self.assertEqual(code, 0, stderr)
         planned = self._dry_run_plan(stdout)
         self.assertEqual(len(planned), 1)
@@ -886,9 +924,7 @@ class LeadMachineContractsTest(unittest.TestCase):
                 }),
             ]
             self._write_airtable_csv(csv_path, rows)
-            code, stdout, stderr = self._run_upload(
-                ["upload_airtable.py", "--input", str(csv_path), "--include-manual-review"]
-            )
+            code, stdout, stderr = self._run_upload(["upload_airtable.py", "--input", str(csv_path)])
         self.assertEqual(code, 0, stderr)
         planned = self._dry_run_plan(stdout)
         self.assertEqual(len(planned), 1)
@@ -911,7 +947,7 @@ class LeadMachineContractsTest(unittest.TestCase):
                 }),
             ]
             self._write_airtable_csv(csv_path, rows)
-            records = upload_airtable.read_input_records(csv_path, only_sendable=False, packet_dir=Path(tmp))
+            records = upload_airtable.read_input_records(csv_path, packet_dir=Path(tmp))
         zimon = next(r for r in records if r["business_name"] == "Zimon Detailing")
         haynes = next(r for r in records if r["business_name"] == "Haynes Auto")
         self.assertEqual(zimon["airtable_fields"].get("Email"), "zimon@gmail.com")
@@ -926,7 +962,7 @@ class LeadMachineContractsTest(unittest.TestCase):
             ]
             self._write_airtable_csv(csv_path, rows)
 
-            records = upload_airtable.read_input_records(csv_path, only_sendable=False, packet_dir=Path(tmp))
+            records = upload_airtable.read_input_records(csv_path, packet_dir=Path(tmp))
             planned = plan_airtable_sync(
                 records,
                 existing_records_by_key={"place:ChIJ123": "rec-place", "phone:4405550101": "rec-phone"},
@@ -2961,7 +2997,6 @@ class LeadMachineContractsTest(unittest.TestCase):
             with self._default_csv_field_limit():
                 records = upload_airtable.read_csv_records(
                     scored_path,
-                    only_sendable=False,
                     packet_dir=Path(tmp),
                 )
             self.assertEqual(len(records), 1)

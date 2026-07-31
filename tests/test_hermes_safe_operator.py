@@ -90,21 +90,21 @@ class HermesCommandPlanningTest(unittest.TestCase):
             hc.build_score_command(paths, limit=15, budget=2, batch_size=3, max_tokens=4096)[0],
             hc.build_refresh_command(paths),
             hc.build_packets_command(paths),
-            hc.build_sync_command(paths, include_manual=False, live=False),
+            hc.build_sync_command(paths, live=False),
         ]
         for cmd in commands:
             self.assertNotIn("--live", cmd)
-        self.assertIn("--live", hc.build_sync_command(paths, include_manual=False, live=True))
+        self.assertIn("--live", hc.build_sync_command(paths, live=True))
 
-    def test_sync_dry_builds_dry_run_and_manual_flag(self) -> None:
+    def test_sync_commands_upload_all_rows_without_subset_flags(self) -> None:
         paths = BatchPaths.for_batch("detailing_cleveland_medium_001")
-        sendable = hc.build_sync_command(paths, include_manual=False, live=False)
-        manual = hc.build_sync_command(paths, include_manual=True, live=False)
-        self.assertIn("--dry-run", sendable)
-        self.assertIn("--only-sendable", sendable)
-        self.assertNotIn("--include-manual-review", sendable)
-        self.assertIn("--dry-run", manual)
-        self.assertIn("--include-manual-review", manual)
+        dry_run = hc.build_sync_command(paths, live=False)
+        live = hc.build_sync_command(paths, live=True)
+        self.assertIn("--dry-run", dry_run)
+        self.assertIn("--live", live)
+        for command in (dry_run, live):
+            self.assertNotIn("--only-sendable", command)
+            self.assertNotIn("--include-manual-review", command)
 
 
 class HermesBatchStateTest(unittest.TestCase):

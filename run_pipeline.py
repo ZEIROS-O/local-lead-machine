@@ -80,7 +80,7 @@ def count_sendable(rows: list[dict[str, str]]) -> int:
 
 
 def count_airtable_rows(rows: list[dict[str, str]]) -> int:
-    return sum(1 for row in rows if yes(row.get("Sendable")) and yes(row.get("Packet Eligible")))
+    return len(rows)
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -171,7 +171,7 @@ def build_summary(
         },
         "airtable": {
             "status": airtable_status,
-            "only_sendable": True,
+            "scope": "all_scored_rows",
         },
         "review_signals": {
             "status": review_signals_status,
@@ -650,7 +650,6 @@ def main() -> int:
             "upload_airtable.py",
             "--input",
             str(scored),
-            "--only-sendable",
             "--packet-dir",
             str(packets),
         ]

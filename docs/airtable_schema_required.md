@@ -37,7 +37,7 @@ Also observed 2026-07-29: the base has five tables (`Prospects`, `Sales Activiti
 | Rating | Number | ? | Decimal; set field to 2 decimal places |
 | Specific Observation | Long text | ? |  |
 | Packet Tier | Single select | ? | Options: Sendable Packet, Manual Review Packet, Watchlist, No Packet |
-| Lead Priority | Single select | yes (2026-07-30) | Code writes **A, B, C, Skip** only (`score_leads.PRIORITY_RANK`; `classify_priority` can return `Skip`, and an upload without `--only-sendable` carries it through). Live choices are the same clean four: `A`, `B`, `C`, `Skip`. The junk `(440) 537-2459` choice and unused `D`/`New` choices were deleted during the cutover. |
+| Lead Priority | Single select | yes (2026-07-30) | Code writes **A, B, C, Skip** only (`score_leads.PRIORITY_RANK`; `classify_priority` can return `Skip`, and the total scored-row upload carries it through). Live choices are the same clean four: `A`, `B`, `C`, `Skip`. The junk `(440) 537-2459` choice and unused `D`/`New` choices were deleted during the cutover. |
 | Offer Fit | Single select | ? | Options: No-Site Launch, Website Rebuild, Estimate Funnel, Automation / Follow-Up |
 | Site Status | Single select | ? | Options: Missing, Broken, No Website, Loaded, Redirect Issue, Social Only, Unknown |
 | Visible Pain Score | Number | ? | Integer 0–100 (sendability thresholds fire at 10/16/30/35/40) |

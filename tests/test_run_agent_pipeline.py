@@ -174,32 +174,21 @@ class AgentPipelineTest(unittest.TestCase):
             rap.main(self._argv("packets-only", airtable="dry-run"))
         airtable_cmd = next((cmd for cmd in commands if "upload_airtable.py" in cmd), None)
         self.assertIsNotNone(airtable_cmd)
-        self.assertIn("--only-sendable", airtable_cmd)
+        self.assertNotIn("--only-sendable", airtable_cmd)
+        self.assertNotIn("--include-manual-review", airtable_cmd)
         self.assertIn("--dry-run", airtable_cmd)
 
-    def test_airtable_include_manual_review_passes_flag_not_only_sendable(self) -> None:
+    def test_airtable_synced_count_includes_every_scored_row(self) -> None:
         self._write_config()
         self._write_scored("detailing_cleveland_medium_001")
         commands: list[list[str]] = []
         with patch.object(rap, "run", side_effect=self._fake_run(commands)), redirect_stdout(io.StringIO()):
-            rap.main(self._argv("packets-only", airtable="dry-run", include_manual_review_airtable=None))
-        airtable_cmd = next((cmd for cmd in commands if "upload_airtable.py" in cmd), None)
-        self.assertIsNotNone(airtable_cmd)
-        self.assertIn("--include-manual-review", airtable_cmd)
-        self.assertNotIn("--only-sendable", airtable_cmd)
-
-    def test_airtable_synced_count_manual_review_mode_counts_sendable_plus_manual(self) -> None:
-        # _write_scored writes: A=Sendable Packet, B=Manual Review Packet, C=Watchlist
-        # With sendable_only=False the count should be 2 (A + B), not 3
-        self._write_config()
-        self._write_scored("detailing_cleveland_medium_001")
-        commands: list[list[str]] = []
-        with patch.object(rap, "run", side_effect=self._fake_run(commands)), redirect_stdout(io.StringIO()):
-            rap.main(self._argv("packets-only", airtable="dry-run", include_manual_review_airtable=None))
+            rap.main(self._argv("packets-only", airtable="dry-run"))
         summary = json.loads(
             (self.root / "output" / "agent_run_summary_detailing_cleveland_medium_001.json").read_text()
         )
-        self.assertEqual(summary["counts"]["airtable_synced"], 2)
+        self.assertEqual(summary["counts"]["airtable_synced"], 3)
+        self.assertEqual(summary["airtable"]["scope"], "all_scored_rows")
 
     def test_summary_counts_packet_tiers(self) -> None:
         self._write_config()

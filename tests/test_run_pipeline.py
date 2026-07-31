@@ -213,6 +213,43 @@ class RunPipelineTest(unittest.TestCase):
         self.assertEqual(summary["airtable"]["status"], "skipped")
         self.assertEqual(summary["counts"]["airtable_rows"], 0)
 
+    def test_airtable_push_uploads_all_scored_rows_without_subset_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_enriched(root / "output/enriched_test.jsonl")
+            old_cwd = Path.cwd()
+            os.chdir(root)
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str]) -> None:
+                commands.append(cmd)
+                if "score_leads.py" in cmd:
+                    self._write_scored(Path("output/scored_test.csv"))
+                if "make_packets.py" in cmd:
+                    self._write_packet_index(Path("packets_test"))
+
+            try:
+                argv = [
+                    "run_pipeline.py",
+                    "--batch",
+                    "test",
+                    "--vertical",
+                    "detailing",
+                    "--skip-search",
+                    "--skip-enrich",
+                ]
+                with patch("sys.argv", argv), patch("run_pipeline.run", side_effect=fake_run), redirect_stdout(io.StringIO()):
+                    run_pipeline.main()
+                summary = json.loads(Path("output/run_summary_test.json").read_text(encoding="utf-8"))
+            finally:
+                os.chdir(old_cwd)
+
+        upload_cmd = next(cmd for cmd in commands if "upload_airtable.py" in cmd)
+        self.assertNotIn("--only-sendable", upload_cmd)
+        self.assertNotIn("--include-manual-review", upload_cmd)
+        self.assertEqual(summary["counts"]["airtable_rows"], 2)
+        self.assertEqual(summary["airtable"]["scope"], "all_scored_rows")
+
     def test_cap_hit_partial_scoring_still_writes_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

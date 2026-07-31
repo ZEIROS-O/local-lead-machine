@@ -40,7 +40,7 @@ Use `run_pipeline.py` so the stages chain with the right inputs/outputs:
 python run_pipeline.py --batch <config_name> --vertical <vertical>
 ```
 - The stages are: `places_search.py` → `enrich_leads.py` → `score_leads.py` →
-  `make_packets.py` → `upload_airtable.py --only-sendable --dry-run`. Outputs
+  `make_packets.py` → `upload_airtable.py --dry-run`. Outputs
   land in `output/`, `packets_*/`, and `output/run_summary_<batch>.json`.
 - **Respect the stop point.** In `manual-llm` mode the run halts and asks for
   scores in the scores dir. Generate them and re-run the same command to resume.
@@ -49,7 +49,7 @@ python run_pipeline.py --batch <config_name> --vertical <vertical>
   contract doing its job — do not raise caps to push past it without a reason.
 - Add `--skip-airtable` for local/test runs that should not even dry-run the
   Airtable tail. Add `--airtable-live` only when credentials are configured and
-  the sendable rows have been reviewed.
+  the total scored-row plan has been reviewed.
 
 ## Verify before trusting the output
 - Run the contract tests after any code change touched scoring/enrichment/ICP:

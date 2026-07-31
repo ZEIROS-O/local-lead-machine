@@ -85,14 +85,12 @@ PY
 echo "[AIRTABLE DRY-RUN]"
 python upload_airtable.py \
   --input "$OUTPUT" \
-  --only-sendable \
   --packet-dir "$PACKETS"
 
 if [ "$MODE" = "live" ]; then
   echo "[AIRTABLE LIVE]"
   python upload_airtable.py \
     --input "$OUTPUT" \
-    --only-sendable \
     --packet-dir "$PACKETS" \
     --live
 else

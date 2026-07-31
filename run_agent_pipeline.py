@@ -454,9 +454,7 @@ def build_packets_cmd(scored: Path, packets: Path) -> list[str]:
     ]
 
 
-def build_airtable_cmd(
-    *, scored: Path, packets: Path, sendable_only: bool, live: bool
-) -> list[str]:
+def build_airtable_cmd(*, scored: Path, packets: Path, live: bool) -> list[str]:
     cmd = [
         sys.executable,
         "upload_airtable.py",
@@ -465,10 +463,6 @@ def build_airtable_cmd(
         "--packet-dir",
         str(packets),
     ]
-    if sendable_only:
-        cmd.append("--only-sendable")
-    else:
-        cmd.append("--include-manual-review")
     cmd.append("--live" if live else "--dry-run")
     return cmd
 
@@ -529,20 +523,8 @@ def count_jsonl(path: Path) -> int:
     return sum(1 for line in path.read_text(encoding="utf-8", errors="ignore").splitlines() if line.strip())
 
 
-def _is_yes(value: Any) -> bool:
-    return str(value or "").strip().lower() in {"yes", "true", "1"}
-
-
-def count_airtable_rows(rows: list[dict[str, str]], *, sendable_only: bool) -> int:
-    count = 0
-    for row in rows:
-        tier = row.get("Packet Tier", "")
-        if sendable_only:
-            if _is_yes(row.get("Sendable")) and _is_yes(row.get("Packet Eligible")):
-                count += 1
-        elif tier in {PACKET_TIER_SENDABLE, PACKET_TIER_MANUAL}:
-            count += 1
-    return count
+def count_airtable_rows(rows: list[dict[str, str]]) -> int:
+    return len(rows)
 
 
 def build_summary(
@@ -553,7 +535,6 @@ def build_summary(
     scored: Path,
     packets: Path,
     airtable_status: str,
-    airtable_sendable_only: bool,
 ) -> dict[str, Any]:
     rows = read_csv_rows(scored)
     tier_counts = {
@@ -570,7 +551,7 @@ def build_summary(
     airtable_rows = (
         0
         if airtable_status == "skipped"
-        else count_airtable_rows(rows, sendable_only=airtable_sendable_only)
+        else count_airtable_rows(rows)
     )
     return {
         "batch": batch,
@@ -584,7 +565,7 @@ def build_summary(
             "no_packet": tier_counts[PACKET_TIER_NONE],
             "airtable_synced": airtable_rows,
         },
-        "airtable": {"status": airtable_status, "sendable_only": airtable_sendable_only},
+        "airtable": {"status": airtable_status, "scope": "all_scored_rows"},
         "artifacts": {
             "scored_csv": str(scored),
             "packet_index": str(packet_index),
@@ -641,8 +622,6 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                              "(default scored_<batch>_api_tiered.csv when source is *_api.csv)")
     parser.add_argument("--allow-empty-scored", action="store_true",
                         help="Permit building packets from a 0-row scored CSV")
-    parser.add_argument("--airtable-sendable-only", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--include-manual-review-airtable", action="store_true", default=False)
     parser.add_argument(
         "--airtable",
         choices=["skip", "dry-run", "live"],
@@ -754,7 +733,6 @@ def _run_pipeline(args: argparse.Namespace) -> int:
     # ---- Airtable -------------------------------------------------------- #
     report_csv = paths.report_csv
     airtable_status = "skipped"
-    sendable_only = args.airtable_sendable_only and not args.include_manual_review_airtable
     if args.airtable == "skip":
         status("AIRTABLE", "skipped (not requested)")
     elif not report_csv.exists():
@@ -762,9 +740,8 @@ def _run_pipeline(args: argparse.Namespace) -> int:
     else:
         live = args.airtable == "live"
         airtable_status = "live" if live else "dry-run"
-        scope = "sendable-only" if sendable_only else "sendable+manual-review"
-        status("AIRTABLE", f"Syncing ({airtable_status}, {scope})")
-        run(build_airtable_cmd(scored=report_csv, packets=packets, sendable_only=sendable_only, live=live))
+        status("AIRTABLE", f"Syncing ({airtable_status}, all scored rows)")
+        run(build_airtable_cmd(scored=report_csv, packets=packets, live=live))
 
     # ---- Summary --------------------------------------------------------- #
     summary = build_summary(
@@ -774,7 +751,6 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         scored=report_csv,
         packets=packets,
         airtable_status=airtable_status,
-        airtable_sendable_only=sendable_only,
     )
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

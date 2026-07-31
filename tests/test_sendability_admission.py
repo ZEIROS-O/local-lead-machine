@@ -474,13 +474,13 @@ class ReviewDemandBandsAreASeparateAxisTest(unittest.TestCase):
 
 
 class AStoredSendableYesCannotOutrankTheIcpGateTest(unittest.TestCase):
-    """The upload path, which is where the invariant was actually violable.
+    """The packet-tier derivation, which is where the invariant is enforced.
 
-    `upload_airtable.read_csv_records` filters `--only-sendable` with
-    `is_contact_ready`, not with anything that re-scores the lead. That reaches
-    `readiness_flags`, which used to return a stored `Sendable: Yes` verbatim —
-    so a row scored before it acquired a hard skip kept riding a stale cell all
-    the way into the Airtable send queue, whose readiness clause is
+    Total Airtable mirroring no longer filters rows in the uploader, so rep
+    readiness depends on the derived packet tier. `readiness_flags` used to
+    return a stored `Sendable: Yes` verbatim, allowing a row scored before it
+    acquired a hard skip to keep a stale Sendable Packet tier. The Airtable
+    send queue's readiness clause is
     `Packet Tier = 'Sendable Packet'` (queue_state.py).
 
     Tightening is still allowed to skip the gate: a human writing "No" never
@@ -507,9 +507,9 @@ class AStoredSendableYesCannotOutrankTheIcpGateTest(unittest.TestCase):
     def test_a_stored_yes_is_withdrawn_when_the_lead_is_skipped(self) -> None:
         self.assertEqual(readiness_flags(self._row(sendable="Yes", skipped=True))[0], "No")
 
-    def test_the_upload_filter_drops_the_skipped_lead(self) -> None:
-        # is_contact_ready IS the --only-sendable filter. Before this fix it
-        # returned True here and the lead was uploaded as a Sendable Packet.
+    def test_contact_readiness_drops_the_skipped_lead(self) -> None:
+        # Before the gate fix this returned True and packet-tier derivation
+        # incorrectly left the lead in the rep's sendable queue.
         self.assertFalse(is_contact_ready(self._row(sendable="Yes", skipped=True)))
 
     def test_an_unskipped_lead_is_still_uploadable(self) -> None:

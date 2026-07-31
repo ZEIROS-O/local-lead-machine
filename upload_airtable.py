@@ -574,7 +574,7 @@ def raise_csv_field_limit() -> None:
 
 
 def read_csv_records(
-    path: Path, *, only_sendable: bool, include_manual_review: bool = False, packet_dir: Path
+    path: Path, *, packet_dir: Path
 ) -> List[Dict[str, Any]]:
     raise_csv_field_limit()
     with path.open(newline="", encoding="utf-8") as f:
@@ -586,33 +586,16 @@ def read_csv_records(
 
         records: List[Dict[str, Any]] = []
         for row in reader:
-            if only_sendable and not is_contact_ready(row):
-                continue
-            if include_manual_review and not only_sendable:
-                tier = (row.get("Packet Tier") or "").strip()
-                if tier not in {_TIER_SENDABLE, _TIER_MANUAL}:
-                    continue
             records.append(csv_row_to_record(row, packet_dir))
         return records
 
 
 def read_input_records(
-    path: Path, *, only_sendable: bool, include_manual_review: bool = False, packet_dir: Path
+    path: Path, *, packet_dir: Path
 ) -> List[Dict[str, Any]]:
     if path.suffix.lower() == ".csv":
-        return read_csv_records(
-            path, only_sendable=only_sendable, include_manual_review=include_manual_review, packet_dir=packet_dir
-        )
-
-    cards = read_cards(path)
-    if only_sendable:
-        return [card for card in cards if is_sendable_record(card)]
-    if include_manual_review:
-        def _is_manual_review(card: Dict[str, Any]) -> bool:
-            fields = card.get("airtable_fields") or card
-            return str(fields.get("Packet Tier", "")).strip() == _TIER_MANUAL
-        return [card for card in cards if is_sendable_record(card) or _is_manual_review(card)]
-    return cards
+        return read_csv_records(path, packet_dir=packet_dir)
+    return read_cards(path)
 
 
 def airtable_base_url(base_id: str, table: str) -> str:
@@ -936,16 +919,6 @@ def main() -> int:
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", default="", help="Scored CSV or lead cards JSONL")
-    parser.add_argument(
-        "--only-sendable",
-        action="store_true",
-        help="Only upload rows that pass the four-field contact-readiness contract",
-    )
-    parser.add_argument(
-        "--include-manual-review",
-        action="store_true",
-        help="Upload Sendable Packet and Manual Review Packet rows; exclude Watchlist and No Packet",
-    )
     parser.add_argument("--dry-run", action="store_true", help="Print planned Airtable writes without sending")
     parser.add_argument("--live", action="store_true", help="Send planned writes to Airtable")
     parser.add_argument(
@@ -1007,8 +980,6 @@ def main() -> int:
 
         records = read_input_records(
             input_path,
-            only_sendable=args.only_sendable,
-            include_manual_review=args.include_manual_review,
             packet_dir=packet_dir,
         )
 
