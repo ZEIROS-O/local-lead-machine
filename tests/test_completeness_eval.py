@@ -28,16 +28,51 @@ def base_record(
     place_key: str,
     *,
     name: str = "Acme Services",
-    verdict: str = "No Packet",
+    verdict: str = "reject",
 ) -> dict[str, object]:
+    # The base side speaks verdicts; the scored CSVs above still speak tiers.
     return {
         "id": record_id,
         "fields": {
             "Place Key": place_key,
             "Business Name": name,
-            "Packet Tier": verdict,
+            "Verdict": verdict,
         },
     }
+
+
+class CompletenessVocabularyTests(unittest.TestCase):
+    """The base side and the scored-CSV side no longer name the same column.
+
+    `Verdict` is what the base stores after the verdict cutover, and step 4
+    deletes `Packet Tier` outright — a base read still naming it 422s. The
+    scored CSVs are unchanged and still carry `Packet Tier`, so the corpus
+    conflict check has to keep reading that one.
+    """
+
+    def module(self):
+        return importlib.import_module("evals.completeness")
+
+    def test_the_base_column_is_the_machine_owned_verdict(self) -> None:
+        from lead_machine import verdict as verdict_module
+
+        self.assertEqual(
+            self.module().DEFAULT_VERDICT_FIELD, verdict_module.VERDICT_FIELD
+        )
+
+    def test_corpus_conflicts_still_read_the_scored_csv_column(self) -> None:
+        module = self.module()
+        conflicts = module._corpus_conflicts(
+            {
+                "place-1": [
+                    {"_source": "a.csv:2", "Packet Tier": "Sendable Packet"},
+                    {"_source": "b.csv:2", "Packet Tier": "No Packet"},
+                ]
+            },
+            module.SCORED_VERDICT_FIELD,
+        )
+        self.assertEqual(len(conflicts), 1)
+        self.assertIn("Packet Tier", conflicts[0]["fields"])
 
 
 class CompletenessEvalTests(unittest.TestCase):

@@ -51,14 +51,14 @@ def base_record(
     place_key: str,
     *,
     name: str = "Acme Services",
-    verdict: str = "No Packet",
+    verdict: str = "reject",
 ) -> dict[str, object]:
     return {
         "id": record_id,
         "fields": {
             "Place Key": place_key,
             "Business Name": name,
-            "Packet Tier": verdict,
+            "Verdict": verdict,
         },
     }
 
@@ -115,7 +115,44 @@ class ReproducibilityEvalTests(unittest.TestCase):
             sendability.evaluate_packet_tier = real_tier
 
         self.assertEqual(calls, ["evaluate_sendability", "evaluate_packet_tier"])
-        self.assertEqual(verdict, sendability.PACKET_TIER_NONE)
+        self.assertEqual(verdict, sendability.TIER_VERDICTS[sendability.PACKET_TIER_NONE])
+
+    def test_the_eval_speaks_the_verdict_vocabulary_the_base_now_stores(self) -> None:
+        """Recompute and base row have to be in one vocabulary to be comparable.
+
+        The eval used to recompute a packet tier and compare it against the tier
+        column. `Packet Tier` is deleted in step 4 of the verdict cutover, so it
+        reads `Verdict` now — and a recompute still spelling tiers would call
+        every single row drifted while comparing `send` against
+        `Sendable Packet`.
+        """
+        module = self.module()
+        from lead_machine import verdict as verdict_module
+
+        self.assertEqual(module.DEFAULT_VERDICT_FIELD, verdict_module.VERDICT_FIELD)
+        recomputed = module.recompute_verdict(scored_row("place-1"))
+        self.assertIn(recomputed, verdict_module.VERDICT_CHOICES)
+
+    def test_a_base_verdict_matching_the_recompute_is_not_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self.evaluate(
+                tmp,
+                {"scored_a.csv": [scored_row("place-1")]},
+                [
+                    {
+                        "id": "rec1",
+                        "fields": {
+                            "Place Key": "place-1",
+                            "Business Name": "Acme Services",
+                            "Verdict": "reject",
+                        },
+                    }
+                ],
+                recompute=self.fixed_verdict("reject"),
+            )
+
+        self.assertEqual(report["counts"]["matched"], 1)
+        self.assertEqual(report["counts"]["findings"]["verdict_drift"], 0)
 
     def test_module_does_not_reimplement_the_verdict(self) -> None:
         """No packet-tier literal may be spelled here; they are imported."""
@@ -138,8 +175,8 @@ class ReproducibilityEvalTests(unittest.TestCase):
             report = self.evaluate(
                 tmp,
                 {"scored_a.csv": [scored_row("place-1")]},
-                [base_record("rec1", "place-1", verdict="Watchlist")],
-                recompute=self.fixed_verdict("Watchlist"),
+                [base_record("rec1", "place-1", verdict="watch")],
+                recompute=self.fixed_verdict("watch"),
             )
 
         self.assertTrue(report["ok"])
@@ -152,8 +189,8 @@ class ReproducibilityEvalTests(unittest.TestCase):
             report = self.evaluate(
                 tmp,
                 {"scored_a.csv": [scored_row("place-1")]},
-                [base_record("rec1", "place-1", verdict="Sendable Packet")],
-                recompute=self.fixed_verdict("No Packet"),
+                [base_record("rec1", "place-1", verdict="send")],
+                recompute=self.fixed_verdict("reject"),
             )
 
         self.assertFalse(report["ok"])
@@ -164,8 +201,8 @@ class ReproducibilityEvalTests(unittest.TestCase):
                     "place_key": "place-1",
                     "business_name": "Acme Services",
                     "record_id": "rec1",
-                    "base_verdict": "Sendable Packet",
-                    "recomputed_verdict": "No Packet",
+                    "base_verdict": "send",
+                    "recomputed_verdict": "reject",
                     "schema_version": 2,
                     "source": "scored_a.csv:2",
                 }
@@ -183,8 +220,8 @@ class ReproducibilityEvalTests(unittest.TestCase):
             report = self.evaluate(
                 tmp,
                 {"scored_a.csv": [legacy_row("place-1")]},
-                [base_record("rec1", "place-1", verdict="Sendable Packet")],
-                recompute=self.fixed_verdict("No Packet"),
+                [base_record("rec1", "place-1", verdict="send")],
+                recompute=self.fixed_verdict("reject"),
             )
 
         self.assertFalse(report["ok"])
@@ -196,8 +233,8 @@ class ReproducibilityEvalTests(unittest.TestCase):
                     "place_key": "place-1",
                     "business_name": "Acme Services",
                     "record_id": "rec1",
-                    "base_verdict": "Sendable Packet",
-                    "recomputed_verdict": "No Packet",
+                    "base_verdict": "send",
+                    "recomputed_verdict": "reject",
                     "schema_version": 0,
                     "source": "scored_a.csv:2",
                 }
@@ -215,7 +252,7 @@ class ReproducibilityEvalTests(unittest.TestCase):
                     base_record("rec1", "place-1"),
                     base_record("rec2", "no-evidence", name="Ghost LLC"),
                 ],
-                recompute=self.fixed_verdict("No Packet"),
+                recompute=self.fixed_verdict("reject"),
             )
 
         self.assertTrue(report["ok"])
@@ -239,8 +276,8 @@ class ReproducibilityEvalTests(unittest.TestCase):
                     "scored_a.csv": [legacy_row("place-1")],
                     "scored_b.csv": [scored_row("place-1")],
                 },
-                [base_record("rec1", "place-1", verdict="Sendable Packet")],
-                recompute=self.fixed_verdict("Sendable Packet"),
+                [base_record("rec1", "place-1", verdict="send")],
+                recompute=self.fixed_verdict("send"),
             )
 
         self.assertTrue(report["ok"])
@@ -253,7 +290,7 @@ class ReproducibilityEvalTests(unittest.TestCase):
                 tmp,
                 {"scored_a.csv": [scored_row(" ", **{"Business Name": "No Key LLC"})]},
                 [],
-                recompute=self.fixed_verdict("No Packet"),
+                recompute=self.fixed_verdict("reject"),
             )
 
         self.assertEqual(report["counts"]["blank_scored_keys"], 1)
@@ -267,8 +304,8 @@ class ReproducibilityEvalTests(unittest.TestCase):
                 tmp,
                 {"scored_a.csv": [scored_row("place-1")]},
                 [],
-                recompute=self.fixed_verdict("Watchlist"),
-                baseline={"place-1": {"verdict": "Watchlist"}},
+                recompute=self.fixed_verdict("watch"),
+                baseline={"place-1": {"verdict": "watch"}},
             )
 
         self.assertTrue(report["ok"])
@@ -280,8 +317,8 @@ class ReproducibilityEvalTests(unittest.TestCase):
                 tmp,
                 {"scored_a.csv": [scored_row("place-1")]},
                 [],
-                recompute=self.fixed_verdict("No Packet"),
-                baseline={"place-1": {"verdict": "Watchlist"}},
+                recompute=self.fixed_verdict("reject"),
+                baseline={"place-1": {"verdict": "watch"}},
             )
 
         self.assertFalse(report["ok"])
@@ -290,8 +327,8 @@ class ReproducibilityEvalTests(unittest.TestCase):
             [
                 {
                     "place_key": "place-1",
-                    "baseline_verdict": "Watchlist",
-                    "recomputed_verdict": "No Packet",
+                    "baseline_verdict": "watch",
+                    "recomputed_verdict": "reject",
                 }
             ],
         )
@@ -302,8 +339,8 @@ class ReproducibilityEvalTests(unittest.TestCase):
                 tmp,
                 {"scored_a.csv": [scored_row("place-new")]},
                 [],
-                recompute=self.fixed_verdict("No Packet"),
-                baseline={"place-gone": {"verdict": "No Packet"}},
+                recompute=self.fixed_verdict("reject"),
+                baseline={"place-gone": {"verdict": "reject"}},
             )
 
         self.assertFalse(report["ok"])
@@ -312,13 +349,13 @@ class ReproducibilityEvalTests(unittest.TestCase):
             [
                 {
                     "place_key": "place-gone",
-                    "baseline_verdict": "No Packet",
+                    "baseline_verdict": "reject",
                     "recomputed_verdict": "",
                 },
                 {
                     "place_key": "place-new",
                     "baseline_verdict": "",
-                    "recomputed_verdict": "No Packet",
+                    "recomputed_verdict": "reject",
                 },
             ],
         )
@@ -332,7 +369,7 @@ class ReproducibilityEvalTests(unittest.TestCase):
             write_scored(scored, [scored_row("place-1")])
             records = Path(tmp) / "base.json"
             records.write_text(
-                json.dumps([base_record("rec1", "place-1", verdict="Sendable Packet")]),
+                json.dumps([base_record("rec1", "place-1", verdict="send")]),
                 encoding="utf-8",
             )
             snapshot = Path(tmp) / "snapshot.json"
@@ -349,7 +386,7 @@ class ReproducibilityEvalTests(unittest.TestCase):
 
             self.assertEqual(code, 2)
             written = json.loads(snapshot.read_text(encoding="utf-8"))
-            self.assertEqual(written["place-1"]["verdict"], "No Packet")
+            self.assertEqual(written["place-1"]["verdict"], "reject")
 
     def test_main_reads_a_baseline_snapshot_it_wrote(self) -> None:
         module = self.module()

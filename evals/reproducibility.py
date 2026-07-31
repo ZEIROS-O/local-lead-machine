@@ -33,6 +33,7 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from lead_machine import sendability  # noqa: E402
+from lead_machine import verdict as verdict_module  # noqa: E402
 from lead_machine.score_schema import (  # noqa: E402
     CSV_SCORE_ALIASES,
     SCORE_SCHEMA_VERSION,
@@ -40,7 +41,11 @@ from lead_machine.score_schema import (  # noqa: E402
 
 
 DEFAULT_PATTERN = "scored_*.csv"
-DEFAULT_VERDICT_FIELD = "Packet Tier"
+# The base column this eval reads, and the vocabulary `recompute_verdict`
+# answers in, have to be the same one or every row compares unequal. `Packet
+# Tier` is deleted by step 4 of the verdict cutover; `Verdict` is the
+# machine-owned column that replaced it.
+DEFAULT_VERDICT_FIELD = verdict_module.VERDICT_FIELD
 FINDING_CATEGORIES = ("snapshot_drift", "stale_evidence", "verdict_drift")
 # `unverifiable` is reported, never failed: base rows with no scored evidence are
 # the completeness eval's finding, and two gates red for one defect teaches
@@ -102,10 +107,15 @@ def schema_version(row: dict[str, Any]) -> int:
 
 
 def recompute_verdict(row: dict[str, Any]) -> str:
-    """The verdict the pipeline would write for *row* today."""
+    """The verdict the pipeline would write for *row* today.
+
+    Still routed through the tier, because `evaluate_packet_tier` is the
+    authority and `TIER_VERDICTS` is a bijection over it — the rename cannot
+    change which leads are sendable, only what the answer is called.
+    """
     result = sendability.evaluate_sendability(row)
     tier, _reason = sendability.evaluate_packet_tier(row, result)
-    return tier
+    return sendability.TIER_VERDICTS[tier]
 
 
 def _read_scored_rows(paths: Sequence[Path]) -> tuple[list[dict[str, str]], int]:

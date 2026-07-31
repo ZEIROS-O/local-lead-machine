@@ -16,9 +16,19 @@ from urllib.parse import quote
 import requests
 from dotenv import load_dotenv
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from lead_machine import verdict as verdict_module  # noqa: E402
+
 
 DEFAULT_PATTERN = "scored_*.csv"
-DEFAULT_VERDICT_FIELD = "Packet Tier"
+# Two sides, two vocabularies. The base stores `Verdict` after the verdict
+# cutover and step 4 deletes `Packet Tier` outright, so a base read still naming
+# the tier 422s. The scored CSVs on disk are unchanged and still carry the tier
+# column, so the corpus-conflict check keeps reading that one — pointing it at
+# `Verdict` would silently find nothing, because no CSV has such a column.
+DEFAULT_VERDICT_FIELD = verdict_module.VERDICT_FIELD
+SCORED_VERDICT_FIELD = "Packet Tier"
 FINDING_CATEGORIES = (
     "base_orphans",
     "blank_base_keys",
@@ -192,7 +202,9 @@ def evaluate_completeness(
                 }
             )
 
-    findings["corpus_conflicts"] = _corpus_conflicts(scored_by_key, verdict_field)
+    findings["corpus_conflicts"] = _corpus_conflicts(
+        scored_by_key, SCORED_VERDICT_FIELD
+    )
     for category in ("blank_base_keys", "blank_base_verdicts", "blank_scored_keys"):
         findings[category].sort(
             key=lambda item: tuple(_text(item.get(key)) for key in sorted(item))
