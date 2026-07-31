@@ -77,21 +77,22 @@ sequence, so the rep-facing dropdown reads `send → review → watch → reject
 - [x] `.venv/bin/python airtable_required_choices.py check` exits **0** — all 17
       select fields OK, `missing: []`
 
-## Step 2 — Merge and backfill — merged 2026-07-31, backfill PENDING
+## Step 2 — Merge and backfill — done 2026-07-31
 
 - [x] Backed up first — 145 records + schema to
       `~/lead-machine-backups/2026-07-31-verdict-cutover/` and
       `run_state/backups/2026-07-31-verdict-cutover/`, plus the seven-column
       `prepare` artifact (`safe_to_delete: true`) in both
 - [x] Merged (fast-forward, 23 commits); 955 tests green on `main`
-- [ ] **Backfill `Verdict` — not yet run. The rep queue is DOWN until it is.**
+- [x] Backfilled — 124 of 145 rows patched, receipts in the backup dir
 - [x] `evals/reproducibility.py` — `verdict_drift: 0`, `snapshot_drift: 0`
 
-### The queue is empty right now, and that is the expected in-between state
+### The queue went empty between the merge and the backfill
 
-`query_ready_to_send.py` returns `[]` the moment the merge lands, because the
-filter reads `Verdict` and no row has one yet. This is the outage the step
-ordering exists to keep short. It ends when the backfill runs.
+`query_ready_to_send.py` returned `[]` the moment the merge landed, because the
+filter reads `Verdict` and no row had one yet. That is the outage the step
+ordering exists to keep short, and it is over — the query returns its 12 leads
+again.
 
 ### "Re-run the upload" was the wrong instruction — do not do it
 
@@ -110,15 +111,16 @@ only to rows that already exist**: `run_state/verdict-cutover/backfill_verdict.p
 (`--live` to write; dry-run otherwise). 124 of 145 rows,
 `review 85 · reject 25 · watch 2 · send 12`.
 
-### The acceptance test already passed, on real data
+### The acceptance test passed, on real data, twice
 
-Computed from the backup rather than argued from the code:
+Predicted from the backup before writing, then re-run against the live base
+after the backfill — same answer both times:
 
 ```
-OLD queue size: 12 | NEW queue size: 12
-identical set: True
-lost (in old, not new): 0
-gained (in new, not old): 0
+old queue: 12 | live queue: 12
+IDENTICAL SET: True
+lost: none
+gained: none
 ```
 
 The 36 rows carrying a stale `Sendable Packet` beside `hold-commercial-case` do
@@ -137,7 +139,11 @@ because the verdicts are recomputed from evidence, not read off the stale tier.
   be re-derived from their own evidence. Real debt; a rescore is its remedy, not
   this backfill.
 
-## Step 3 — Rebuild the views
+## Step 3 — Rebuild the views (hand step — the API cannot do this)
+
+**This one has to be done in the Airtable UI.** View filters are not writable
+through the REST API or the MCP server: fields, records, tables and automations
+all are, views are not. Steps 1 and 2 were automatable; this is not.
 
 `READINESS_CLAUSES` is now one clause, so the queue filter is:
 
@@ -149,13 +155,23 @@ The two clauses this drops — `Commercial Fit State` and `Contact Eligibility` 
 are not lost. `send` is unreachable unless both hold, because both are blockers
 inside the same admission; `tests/test_verdict.py` and
 `tests/test_queue_state_formula.py` pin that implication. The shorter filter
-selects the same leads.
+selects the same leads, and step 2 confirmed that against live data.
+
+The four rep views, and the one that matters:
+
+| View | ID | Change |
+|---|---|---|
+| 🔥 Call Queue | `viwTIS6NX47jK412Z` | rebuild on the formula above |
+| 📅 Follow-Ups Due | `viwT8IoxEWyCOMA5M` | repoint off `Packet Tier` onto `Verdict` |
+| 📊 Pipeline | `viwb3nZQ3lW0aIQBD` | repoint off `Packet Tier` onto `Verdict` |
+| 🧪 Manual Review | `viw41G0duU8rwglL0` | `{Verdict}='review'` |
 
 - [ ] 🔥 Call Queue rebuilt on the formula above
 - [ ] The other three rep views repointed off `Packet Tier` onto `Verdict`
 - [ ] **Call Queue returns the identical set `query_ready_to_send.py` returns** —
       the same records, not merely the same count. This was the 2026-07-30
-      acceptance test and it is the one that matters.
+      acceptance test and it is the one that matters. The 12 to expect today:
+      9 garage-door and 3 plumbing leads, all `Status = New`.
 
 ## Step 4 — Delete the seven superseded columns (hand step)
 
@@ -170,6 +186,16 @@ naming a deleted field is a 422 rather than a blank.
 
 `Score Total` and `Lead Priority` **survive as display only.** They are not
 authoritative and must not appear in any view filter.
+
+Both gates were repointed off the tier ahead of this step (commit `dc3bbae`):
+`evals/reproducibility.py` and `evals/completeness.py` named `Packet Tier` as
+the base column they read, and a `fields[]` naming a deleted field is a 422, so
+the daily workflow would have gone red the moment the column went away.
+`reproducibility` also recomputed *into* tier vocabulary — it answers in
+verdicts now, with the live numbers unchanged (`matched 35`,
+`verdict_drift 0`). `completeness` needed the two sides split: the scored CSVs
+on disk still carry `Packet Tier` and have no `Verdict` column, so its
+corpus-conflict check still reads the tier.
 
 Still to do in code before this step, and deliberately not done yet — it would
 be dead code until the column is actually gone:
