@@ -25,14 +25,15 @@ claims) — never the scorer's own "this is an A".
 1. **Load** the scored output (`output/scored_*.csv` or the packet index) and the
    sendability result per row. The blockers are defined in `lead_machine/sendability.py`
    (e.g. `SCORE_BLOCKER`, `CONVERSION_ISSUE_BLOCKER`, `OPENER_BLOCKER`,
-   `NO_SAFE_CLAIM_BLOCKER`, `INVALID_REF_BLOCKER`, and — once G3 lands —
-   `MONEY_SIGNAL_BLOCKER`).
+   `NO_SAFE_CLAIM_BLOCKER`, and `INVALID_REF_BLOCKER`).
 2. **For each lead marked sendable, confirm the non-negotiables hold:**
    - a real, *named, verifiable* leak/pain (not a generic "your site could be better");
    - an evidence-backed opener that cites that leak;
    - safe outreach claims with valid `evidence_refs` (no fabricated results/metrics);
-   - (post-G3) a `money_signal` — fixable gap × money, not bad-site-no-money.
    Flag any "sendable" lead that fails one of these — that's a verifier catch.
+   A confirmed money signal relaxes the mature-band visible-pain threshold from
+   40 to 35 and counts as demand evidence.
+   Missing money signal is not a standalone blocker; the planned tightener did not ship.
 3. **For a sample of skipped/low leads**, confirm the block reason is correct
    (catch false-skips — good leads wrongly gated).
 4. **Report** the grade distribution (A/B/C/Skip), the sendable count, every

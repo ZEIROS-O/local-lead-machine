@@ -41,7 +41,7 @@ A loop is *cron + a decision-maker in the body*, closed by a verifier, capped by
 | **Trigger / heartbeat** | scheduled run; a `$0` change-detector so the model spends tokens only on new/changed leads | Phase C (not built) |
 | **Persistent state** | `output/*.jsonl|*.csv` + scores dir + Airtable as system-of-record ("the agent forgets, the repo doesn't") | yes |
 | **Decision-maker** | LLM scoring of fit/pain/buyer-intent + warmth-tier routing + next-touch selection | Phase A G1 (being automated onto the Anthropic API) |
-| **Verifier (decisive edge)** | maker≠checker on an *objective* gate: `lead_machine/sendability.py` (24 evidence blockers + the new `MONEY_SIGNAL_BLOCKER`) — **no send without a real, named, verifiable leak** | yes — `sendability.py`, `lead_machine/feedback.py` |
+| **Verifier (decisive edge)** | maker≠checker on an *objective* gate: `lead_machine/sendability.py` — **no send without a real, named, verifiable leak**. G3's planned no-money tightener did not ship; only the money-signal relaxation is live. | yes — `sendability.py`, `lead_machine/feedback.py` |
 | **Halt** | `MAX_LLM_CALLS/TOKENS/USD_PER_RUN` + Places caps + opt-out suppression + reply-stops-sequence | Phase A G1 caps (being added) |
 
 The verifier is why this is a loop and not a spam cannon. `sendability.py` already enforces

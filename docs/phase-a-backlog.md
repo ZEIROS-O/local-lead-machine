@@ -29,7 +29,8 @@ The pipeline was `places_search.py` → `enrich_leads.py` → `make_llm_batch.bu
 2. **No buyer-money signal.** Enrichment detected *site weakness* but nothing about whether a
    business *has money + growth intent*. So the funnel surfaced broke contractors with bad sites
    ("doesn't find good leads"). **Fixed:** `lead_machine/buyer_signals.build_buyer_intent`
-   + `score_leads.score_buyer_intent` + `sendability.MONEY_SIGNAL_BLOCKER`.
+   + `score_leads.score_buyer_intent`; sendability also uses a confirmed signal to relax the
+   mature-band visible-pain threshold.
 
 Phase A fixes both and closes the loop: automate scoring via the Anthropic API, **switch the live
 vertical from hardscaping to car detailing** (multi-metro-ready), add a buyer-intent signal + scoring
@@ -55,9 +56,10 @@ Two scorers exist; keep them distinct:
 - **Deterministic path** (`score_leads.py`: `score_business_strength` + `score_online_weakness`): rule-based, `--mode deterministic`.
 
 Buyer-intent (G3) flows **two ways**: (a) the `buyer_intent` evidence block feeds `build_batch_prompt()`
-so the LLM's subscores reflect it; **and** (b) a deterministic `money_signal` gate in `sendability.py`
-+ a `score_buyer_intent()` axis in the deterministic scorer. The sendability money-gate is the
-objective verifier enforcing "fixable gap × money signal" in **both** modes.
+so the LLM's subscores reflect it; **and** (b) a `score_buyer_intent()` axis in the deterministic
+scorer. In `sendability.py`, a confirmed `money_signal` relaxes the mature-band visible-pain
+threshold from 40 to 35 and counts as demand evidence. The planned compensating no-money tightener
+did not ship, so missing money is not a standalone sendability blocker.
 
 ---
 
@@ -202,18 +204,22 @@ after each refactor step.
   40→30, weakness 40→35, buyer-intent 15, offer 20). Fold `money_signal` into
   `fit_ceiling`/`classify_priority` (money lets a high-review business hold a tier higher; no money +
   bad site caps at C).
-- [x] **`sendability.py` retune** — new `MONEY_SIGNAL_BLOCKER` in `EVIDENCE_BLOCKERS`. **Relax:**
-  `money_signal AND concrete_issue` → skip `VISIBLE_PAIN_BLOCKER`; count toward `has_demand_signal`.
-  **Tighten:** no money + only-signal-is-bad-site → `MONEY_SIGNAL_BLOCKER`. Surface `Money Signal` +
-  `Buyer Intent Signals` columns; if pushed to Airtable, add to `upload_airtable.py` field allowlist.
-  Feed the `buyer_intent` summary into `build_batch_prompt()` evidence so LLM subscores see it.
+- [x] **`sendability.py` relaxation** — a confirmed `money_signal` lowers the mature-band visible-pain
+  threshold from 40 to 35 and counts toward `has_demand_signal`. `Money Signal` + `Buyer Intent
+  Signals` are surfaced in output, and the `buyer_intent` summary feeds `build_batch_prompt()` so
+  LLM subscores see it.
+- [ ] **Planned compensating tightener** — no money + only-signal-is-bad-site was meant to add a
+  dedicated blocker, but its constant and helper were never wired into evaluation. The relaxation
+  shipped alone; the dead declarations were subsequently deleted.
 
 **Done when:** every enriched lead carries `buyer_intent` with ≥ CRM + review-velocity (ads
-best-effort); A-grade = fixable-gap × money-signal; spot-check 10 leads — broke/no-intent drop to C/Skip.
+best-effort); buyer intent informs both scoring modes, and confirmed money can relax the mature-band
+visible-pain threshold. Missing money does not independently force Skip.
 
 **Verify:** unit-test `build_buyer_intent` (ServiceTitan in text → `has_paid_crm`; `ads_check=False` →
-all "unknown", no network). Sendability tests: (a) weak-form + money_signal → Sendable=Yes; (b) bad
-site + no money → `MONEY_SIGNAL_BLOCKER`, Sendable=No.
+all "unknown", no network). Sendability tests preserve tri-state handling and the mature-band
+threshold relaxation; a bad-site/no-money lead may still be sendable when every live evidence gate
+passes.
 
 ---
 
@@ -238,7 +244,7 @@ cap — the first real loop (passes the 4-condition test: repeats weekly · auto
 budget cap absorbs waste · senior-engineer tooling).
 
 **Loop-contract mapping:** trigger = the single command (scheduling is Phase C); state =
-`output/*.jsonl|*.csv` + scores_dir + summary; verifier = G1 parity test + `sendability` money/quality
+`output/*.jsonl|*.csv` + scores_dir + summary; verifier = G1 parity test + `sendability` quality
 gate (judged on evidence, not the LLM's "done"); halt = `MAX_LLM_CALLS/TOKENS/USD_PER_RUN` + existing
 search/details caps.
 
@@ -250,7 +256,8 @@ search/details caps.
    `test_icp_lanes.py`). Bare `python -m unittest` discovers **zero** tests here and reports OK.
 2. G1 parity unittest (stubbed `score_batch`): api-llm CSV == manual-llm CSV.
 3. `build_buyer_intent` unit test (CRM detect; `ads_check=False` → no network).
-4. Sendability tests: weak-form+money → Sendable; bad-site+no-money → blocked.
+4. Sendability tests: weak-form+money → Sendable; unknown money never relaxes the mature-band
+   visible-pain threshold.
 5. Live smoke: `python run_pipeline.py --batch detailing_cleveland_medium_001 --vertical detailing`
    (api-llm) — runs straight through under cap, returns detailing shops (not washes), emits packets +
    Airtable rows + $-spend summary, `buyer_intent.ads.errors` stay non-fatal.

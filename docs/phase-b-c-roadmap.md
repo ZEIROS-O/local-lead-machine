@@ -36,7 +36,7 @@ The gap: the pipeline produces A-grade sendable packets but **nothing sends them
 |---|---|---|
 | G1 | `llm_client.py` + `--mode api-llm` + caps | ✓ |
 | G2 | `verticals.py` (detailing + hardscaping profiles) + search configs | ✓ (seven profiles now) |
-| G3 | `buyer_signals.py` + `score_buyer_intent()` + sendability money gate | ✓ |
+| G3 | `buyer_signals.py` + `score_buyer_intent()` + sendability money relaxation | ✓ (planned no-money tightener did not ship) |
 | G4 | `run_pipeline.py` defaults api-llm, Airtable push, per-run summary | ✓ |
 
 Live niche **at the time this was written**: car detailing (Cleveland metro), configs
