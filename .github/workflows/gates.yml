@@ -5,14 +5,18 @@ on:
     - cron: "37 11 * * *"
   workflow_dispatch:
 
-# One-time repository setup: add AIRTABLE_PAT and AIRTABLE_BASE_ID as
-# Actions secrets under Settings > Secrets and variables > Actions.
+# One-time repository setup:
+# 1. Install a self-hosted Linux runner on the machine that owns the scored
+#    corpus, and give it the `lpm` label (in addition to self-hosted + linux).
+# 2. Add LPM_SCORED_OUTPUT_DIR as an Actions repository variable containing the
+#    absolute path to that machine's scored-output directory.
+# 3. Add AIRTABLE_PAT and AIRTABLE_BASE_ID as Actions repository secrets.
 permissions:
   contents: read
 
 jobs:
   airtable-gates:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, lpm]
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -26,6 +30,20 @@ jobs:
         run: |
           python -m venv .venv
           .venv/bin/pip install requests python-dotenv
+
+      - name: Preflight scored corpus
+        env:
+          LPM_SCORED_OUTPUT_DIR: ${{ vars.LPM_SCORED_OUTPUT_DIR }}
+        run: |
+          set -euo pipefail
+          if [ -z "${LPM_SCORED_OUTPUT_DIR:-}" ]; then
+            printf '%s\n' '::error::LPM_SCORED_OUTPUT_DIR repository variable is unset'
+            exit 2
+          fi
+          if [ ! -d "$LPM_SCORED_OUTPUT_DIR" ]; then
+            printf '%s\n' "::error::Scored output directory does not exist: $LPM_SCORED_OUTPUT_DIR"
+            exit 2
+          fi
 
       - name: Check required Airtable choices
         env:
@@ -63,6 +81,7 @@ jobs:
         env:
           AIRTABLE_PAT: ${{ secrets.AIRTABLE_PAT }}
           AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
+          LPM_SCORED_OUTPUT_DIR: ${{ vars.LPM_SCORED_OUTPUT_DIR }}
         run: |
           set -euo pipefail
           report_failure() {
@@ -71,6 +90,6 @@ jobs:
             exit "$status"
           }
           trap report_failure ERR
-          .venv/bin/python evals/completeness.py
+          .venv/bin/python evals/completeness.py --output-dir "$LPM_SCORED_OUTPUT_DIR"
           trap - ERR
           printf '%s\n' '- PASS: scored corpus completeness' >> "$GITHUB_STEP_SUMMARY"

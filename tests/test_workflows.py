@@ -95,10 +95,36 @@ class WorkflowContractTests(unittest.TestCase):
         self.assert_daily_schedule(workflow)
         self.assertIn("workflow_dispatch", workflow["on"])
         self.assertEqual(workflow["permissions"], {"contents": "read"})
-        self.assertEqual(job["runs-on"], "ubuntu-latest")
+        self.assertEqual(job["runs-on"], ["self-hosted", "linux", "lpm"])
         self.assertEqual(steps[0]["uses"], "actions/checkout@v6")
         self.assertEqual(steps[1]["uses"], "actions/setup-python@v6")
         self.assertEqual(steps[1]["with"]["python-version"], "3.12")
+
+    def test_gates_workflow_preflights_self_hosted_corpus_before_eval(self) -> None:
+        workflow, _ = self.load_workflow("gates.yml")
+        steps = self.only_job(workflow)["steps"]
+        corpus_env = {
+            "LPM_SCORED_OUTPUT_DIR": "${{ vars.LPM_SCORED_OUTPUT_DIR }}",
+        }
+        preflight_indexes = [
+            index
+            for index, step in enumerate(steps)
+            if step["name"] == "Preflight scored corpus"
+        ]
+        self.assertEqual(len(preflight_indexes), 1)
+        preflight_index = preflight_indexes[0]
+        eval_index = next(
+            index
+            for index, step in enumerate(steps)
+            if step["name"] == "Check scored corpus completeness"
+        )
+        preflight = steps[preflight_index]
+
+        self.assertLess(preflight_index, eval_index)
+        self.assertEqual(preflight["env"], corpus_env)
+        self.assertIn('if [ -z "${LPM_SCORED_OUTPUT_DIR:-}" ]; then', preflight["run"])
+        self.assertIn('if [ ! -d "$LPM_SCORED_OUTPUT_DIR" ]; then', preflight["run"])
+        self.assertNotIn("continue-on-error", preflight)
 
     def test_gates_workflow_wires_secrets_and_runs_gates_in_order(self) -> None:
         workflow, source = self.load_workflow("gates.yml")
@@ -115,10 +141,17 @@ class WorkflowContractTests(unittest.TestCase):
             if ".venv/bin/python " in step.get("run", "")
         ]
         self.assertEqual(len(gate_steps), 3)
-        for step in gate_steps:
-            self.assertEqual(step.get("env"), expected_secret_env)
+        self.assertEqual(gate_steps[0].get("env"), expected_secret_env)
+        self.assertEqual(gate_steps[1].get("env"), expected_secret_env)
+        self.assertEqual(
+            gate_steps[2].get("env"),
+            {
+                **expected_secret_env,
+                "LPM_SCORED_OUTPUT_DIR": "${{ vars.LPM_SCORED_OUTPUT_DIR }}",
+            },
+        )
         for step in job["steps"]:
-            if step not in gate_steps:
+            if step not in gate_steps and step["name"] != "Preflight scored corpus":
                 self.assertNotIn("env", step)
         commands = [
             line.strip()
@@ -131,7 +164,7 @@ class WorkflowContractTests(unittest.TestCase):
             [
                 ".venv/bin/python airtable_required_choices.py check",
                 ".venv/bin/python upload_airtable.py --schema-report",
-                ".venv/bin/python evals/completeness.py",
+                '.venv/bin/python evals/completeness.py --output-dir "$LPM_SCORED_OUTPUT_DIR"',
             ],
         )
         self.assertNotRegex(source, r"\.venv/bin/python[^\n]*secrets\.")
