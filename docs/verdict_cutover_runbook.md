@@ -77,21 +77,65 @@ sequence, so the rep-facing dropdown reads `send → review → watch → reject
 - [x] `.venv/bin/python airtable_required_choices.py check` exits **0** — all 17
       select fields OK, `missing: []`
 
-## Step 2 — Merge and backfill
+## Step 2 — Merge and backfill — merged 2026-07-31, backfill PENDING
 
-Merging without step 1 breaks every upload. With step 1 done:
+- [x] Backed up first — 145 records + schema to
+      `~/lead-machine-backups/2026-07-31-verdict-cutover/` and
+      `run_state/backups/2026-07-31-verdict-cutover/`, plus the seven-column
+      `prepare` artifact (`safe_to_delete: true`) in both
+- [x] Merged (fast-forward, 23 commits); 955 tests green on `main`
+- [ ] **Backfill `Verdict` — not yet run. The rep queue is DOWN until it is.**
+- [x] `evals/reproducibility.py` — `verdict_drift: 0`, `snapshot_drift: 0`
 
-- [ ] Merge this branch
-- [ ] Back up the base first — `airtable_schema_cutover.py` snapshot, held in
-      more than one place, as 2026-07-30 did
-- [ ] Backfill `Verdict` across all rows by re-running the upload
-- [ ] `.venv/bin/python evals/reproducibility.py --output-dir output` — the
-      `verdict_drift` count must be **0**
+### The queue is empty right now, and that is the expected in-between state
 
-`stale_evidence` is expected to be non-zero until the base is re-uploaded in
-full: 80 rows today were scored before schema v2 and cannot be re-derived from
-their own evidence. That is real debt, not a false alarm, and the total upload
-is its remedy.
+`query_ready_to_send.py` returns `[]` the moment the merge lands, because the
+filter reads `Verdict` and no row has one yet. This is the outage the step
+ordering exists to keep short. It ends when the backfill runs.
+
+### "Re-run the upload" was the wrong instruction — do not do it
+
+Measured against the live base before writing anything, a full corpus re-upload
+(31 files, 1297 rows) would have done two things nobody asked for:
+
+- **POST 1077 new rows**, taking `Prospects` from 145 to ~1222. The corpus holds
+  666 distinct leads; only 145 were ever promoted into the base. Importing the
+  rest is a business decision, not a backfill.
+- **Revert 32 rows from `Manual Review` to `New`.** `Status` and
+  `Outreach Channel` are in `OPERATIONAL_FIELDS`, which are written from the CSV
+  and *not* marked defaulted, so a stale CSV overwrites the base's newer value.
+
+So the backfill was narrowed to write **only `Verdict` and `Verdict Reasons`, and
+only to rows that already exist**: `run_state/verdict-cutover/backfill_verdict.py`
+(`--live` to write; dry-run otherwise). 124 of 145 rows,
+`review 85 · reject 25 · watch 2 · send 12`.
+
+### The acceptance test already passed, on real data
+
+Computed from the backup rather than argued from the code:
+
+```
+OLD queue size: 12 | NEW queue size: 12
+identical set: True
+lost (in old, not new): 0
+gained (in new, not old): 0
+```
+
+The 36 rows carrying a stale `Sendable Packet` beside `hold-commercial-case` do
+**not** become sends — they recompute to `review`. The one-clause filter is safe
+because the verdicts are recomputed from evidence, not read off the stale tier.
+
+### Known, and deliberately left
+
+- **21 rows get no `Verdict`** (19 already had a blank tier). None are in the
+  queue today, so the queue is unaffected; they stay invisible until rescored.
+- **8 rows are scored in more than one CSV with disagreeing verdicts**
+  (`reject` vs `review`, `review` vs `watch`). None is a `send`, so the queue is
+  unaffected. Freshest file by mtime wins, which is what makes the run
+  deterministic rather than file-order dependent.
+- `stale_evidence: 80` stays non-zero — those rows predate schema v2 and cannot
+  be re-derived from their own evidence. Real debt; a rescore is its remedy, not
+  this backfill.
 
 ## Step 3 — Rebuild the views
 
