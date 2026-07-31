@@ -110,3 +110,20 @@ jobs:
           .venv/bin/python evals/reproducibility.py --output-dir "$LPM_SCORED_OUTPUT_DIR"
           trap - ERR
           printf '%s\n' '- PASS: verdict reproducibility' >> "$GITHUB_STEP_SUMMARY"
+
+      # No Airtable secrets: this one replays the corpus through the gates and
+      # never reads the base.
+      - name: Check gate liveness
+        env:
+          LPM_SCORED_OUTPUT_DIR: ${{ vars.LPM_SCORED_OUTPUT_DIR }}
+        run: |
+          set -euo pipefail
+          report_failure() {
+            status=$?
+            printf '%s\n' '- FAIL: gate liveness' >> "$GITHUB_STEP_SUMMARY"
+            exit "$status"
+          }
+          trap report_failure ERR
+          .venv/bin/python evals/gate_liveness.py --output-dir "$LPM_SCORED_OUTPUT_DIR"
+          trap - ERR
+          printf '%s\n' '- PASS: gate liveness' >> "$GITHUB_STEP_SUMMARY"

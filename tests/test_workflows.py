@@ -32,6 +32,11 @@ EXPECTED_GATES = (
         '.venv/bin/python evals/reproducibility.py --output-dir "$LPM_SCORED_OUTPUT_DIR"',
         {**SECRET_ENV, **CORPUS_ENV},
     ),
+    # Corpus only: a gate that never reads the base is never handed the PAT.
+    (
+        '.venv/bin/python evals/gate_liveness.py --output-dir "$LPM_SCORED_OUTPUT_DIR"',
+        CORPUS_ENV,
+    ),
 )
 
 
