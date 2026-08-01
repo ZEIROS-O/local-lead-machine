@@ -1,6 +1,11 @@
 # Verdict Cutover Runbook
 
-Status: **STEP 1 DONE — the two fields exist; the branch is clear to merge.**
+Status: **COMPLETE — all four steps executed 2026-07-31.**
+
+Nine judgment surfaces are one machine-owned `Verdict`. The base went 50 → 43
+fields, the Call Queue filter went from four clauses to two, and the queue
+returns the identical 12 leads it returned before any of it — the acceptance
+test that mattered, run against live data rather than argued.
 
 Base: `appLbCDdUDSZf7qaK` (`Local Lead Machine CRM`)
 
@@ -183,30 +188,49 @@ grouping (`Vertical`) are unchanged.
 
 Sort (`Opportunity Score` desc → `Score Total` desc) unchanged.
 
-Hidden fields need no action: the seven deleted columns simply stop existing in
-step 4, and they are already hidden from every rep-facing view.
+Hidden fields: the seven deleted columns needed no action — already hidden from
+every rep-facing view, and gone outright in step 4. The two *new* columns did,
+because a field created through the API lands in every view. `Verdict` was
+hidden from both rep views (it is a constant inside a view filtered on it) and
+`Verdict Reasons` hidden from Call Queue but kept in Manual Review, where it is
+the only column saying *why* a lead is sitting there. Populated on 38 of the 85.
 
-- [ ] 🔥 Call Queue: swap the tier condition for `Verdict = send`, delete the
-      two now-redundant ones
-- [ ] 🧪 Manual Review: swap the tier condition for `Verdict = review`
-- [ ] **Call Queue returns the identical set `query_ready_to_send.py` returns** —
-      the same records, not merely the same count. This was the 2026-07-30
-      acceptance test and it is the one that matters. The 12 to expect today:
-      9 garage-door and 3 plumbing leads, all `Status = New`.
-- [ ] Manual Review should show **85** rows (`Verdict = review`), up from the 39
-      the tier filter showed — the collapse folded `Watchlist`-era leads and the
-      stale `Sendable Packet` rows into `review`, which is where they belong.
+- [x] 🔥 Call Queue: tier condition swapped for `Verdict = send`, the two
+      now-redundant ones deleted
+- [x] 🧪 Manual Review: tier condition swapped for `Verdict = review`
+- [x] **Call Queue returns the identical set `query_ready_to_send.py` returns** —
+      12 records, 9 garage-door and 3 plumbing, all `Status = New`
+- [x] Manual Review shows **85** (`Verdict = review`), up from 39 — the collapse
+      folded `Watchlist`-era leads and the stale `Sendable Packet` rows into
+      `review`, which is where they belong
 
-## Step 4 — Delete the seven superseded columns (hand step)
+## Step 4 — Delete the seven superseded columns — done 2026-07-31
 
-Only after steps 1–3 verify. Delete from `Prospects`:
+Deleted from `Prospects`:
 
 `Packet Tier` · `Commercial Fit State` · `Contact Eligibility` · `Asset State` ·
 `Promise State` · `Send Blockers` · `Skip Reason`
 
-The code no longer requests any of them: `query_ready_to_send.DISPLAY_FIELDS`
-dropped all seven in the same commit that added `Verdict`, because a `fields[]`
-naming a deleted field is a 422 rather than a blank.
+### The "code no longer requests any of them" claim was half true
+
+It held for the **read** path — `query_ready_to_send.DISPLAY_FIELDS` dropped all
+seven alongside adding `Verdict`. It was false for the **write** path, which
+still put five of them in every payload. A payload naming a field the base does
+not have is a 422 for the whole record, so deleting first would have broken
+every upload: the same failure step 1's ordering avoids, inverted.
+
+Four registries had to move together (commit `b23c470`), not one:
+
+| Registry | Why it mattered |
+|---|---|
+| `AIRTABLE_ALLOWED_FIELDS` | the chokepoint every payload passes through |
+| `WRITE_PATH_SELECT_CHOICES` | drives `airtable_required_choices`, which **refuses on a field the base lacks** — the five readiness selects would have failed the daily gate over columns nobody writes |
+| `_FIELD_SCHEMA` | the list of columns the base is required to have |
+| the `validate_airtable_fields` call | narrowed to fields a payload can actually carry |
+
+`CSV_AIRTABLE_FIELDS` deliberately **keeps** `Packet Tier`: it is the CSV-side
+contract, and the verdict is still derived from the tier in-process. Only the
+tier's route to Airtable is closed, not its use.
 
 `Score Total` and `Lead Priority` **survive as display only.** They are not
 authoritative and must not appear in any view filter.
@@ -221,18 +245,51 @@ verdicts now, with the live numbers unchanged (`matched 35`,
 on disk still carry `Packet Tier` and have no `Verdict` column, so its
 corpus-conflict check still reads the tier.
 
-Still to do in code before this step, and deliberately not done yet — it would
-be dead code until the column is actually gone:
+### The last code item was wrong — the path is not dead, and stays
 
-- [ ] Remove the reconstruct-from-tier path in `sendability.readiness_flags`.
-      It exists because the base stored only the tier; `Verdict` replaces its
-      reason for existing. The `Verdict`-to-tier branch beside it stays.
+This runbook said to remove the reconstruct-from-tier path in
+`sendability.readiness_flags` once the tier column was gone. **Do not.** It was
+written speculatively and is the opposite of true. After the deletion a base row
+carries `Verdict` and none of `Packet Tier`, `Sendable`, `Packet Eligible` — so
+the verdict maps back to a tier and the tier derives the booleans. That branch
+is now the *only* thing that resolves a row read back from Airtable:
 
-- [ ] Seven columns deleted
-- [ ] Prospects field count drops by 7
-- [ ] `query_ready_to_send.py` returns the same leads as before the cutover
-- [ ] Both gates exit 0
-- [ ] Receipt JSON written to `docs/`, as `airtable_cutover_receipt_2026-07-30.json`
+```
+post-cutover base row (send):   ('Yes', 'Yes')
+post-cutover base row (review): ('No', 'Yes')
+```
+
+Remove it and every base row silently becomes `("", "")` — not sendable — and
+`is_contact_ready` starts refusing the leads the queue is built on. Pinned by
+`test_a_verdict_only_row_is_what_the_base_returns_now` so the next reader who
+finds it looking dead has the counter-example in front of them.
+
+- [x] Seven columns deleted
+- [x] Prospects field count dropped 50 → 43
+- [x] `query_ready_to_send.py` returns the same 12 leads as before the cutover
+- [x] Gates exit 0 — required-choices over 12 fields, `verdict_drift 0`,
+      `snapshot_drift 0`, `matched 35`
+- [x] 961 tests green
+- [x] Receipt written to
+      [`docs/verdict_cutover_receipt_2026-07-31.json`](verdict_cutover_receipt_2026-07-31.json)
+
+## Debt this left behind, on purpose
+
+Neither is a backfill problem; both want a rescore:
+
+- **21 rows carry no `Verdict`** — never rescored, so nothing to derive one
+  from. 19 already had a blank tier. None are queue-eligible, so the queue is
+  unaffected; they are simply invisible until rescored.
+- **80 rows are `stale_evidence`** — scored before schema v2 and not derivable
+  from their own evidence, so the eval reports `ok: false` until they are
+  rescored. Real debt, correctly flagged, not a false alarm.
+
+The 551 leads sitting in the scored corpus but not the base were **not**
+imported, and should not be. 12 of the 31 corpus files are debug or superseded
+artifacts (`scored_debug_*`, `*.before_131_fix.csv`, `*_tiered` re-scores of
+batches already in the base). "Upload every scored lead, not just the sendable
+ones" (`39160cc`) is a rule about not filtering *within a batch you run* — it
+was never a mandate to retro-import every CSV on disk.
 
 ## What stays
 

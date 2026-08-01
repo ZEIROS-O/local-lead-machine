@@ -1,0 +1,138 @@
+{
+  "cutover": "verdict-collapse",
+  "date": "2026-07-31",
+  "base_id": "appLbCDdUDSZf7qaK",
+  "table": {
+    "id": "tblUwMo16aVtOnCEE",
+    "name": "Prospects"
+  },
+  "fields_added": [
+    {
+      "name": "Verdict",
+      "id": "fldKQrryUKS29zMH9",
+      "type": "singleSelect",
+      "choices": [
+        "send",
+        "review",
+        "watch",
+        "reject"
+      ]
+    },
+    {
+      "name": "Verdict Reasons",
+      "id": "fldq0ua0VeSoIOFb0",
+      "type": "multilineText"
+    }
+  ],
+  "fields_deleted": [
+    "Packet Tier",
+    "Commercial Fit State",
+    "Contact Eligibility",
+    "Asset State",
+    "Promise State",
+    "Send Blockers",
+    "Skip Reason"
+  ],
+  "field_count": {
+    "before": 50,
+    "after": 43
+  },
+  "record_count": 145,
+  "backfill": {
+    "rows_patched": 124,
+    "rows_untouched": 21,
+    "verdicts": {
+      "review": 85,
+      "reject": 25,
+      "watch": 2,
+      "send": 12
+    },
+    "scope": "Verdict and Verdict Reasons only; no POSTs, no other columns"
+  },
+  "acceptance_test": {
+    "description": "the one-clause queue filter selects the same records as the four-clause one",
+    "old_queue_size": 12,
+    "new_queue_size": 12,
+    "identical_set": true,
+    "lost": 0,
+    "gained": 0
+  },
+  "views": {
+    "changed": {
+      "🔥 Call Queue": "viwTIS6NX47jK412Z",
+      "🧪 Manual Review": "viw41G0duU8rwglL0"
+    },
+    "unchanged": {
+      "📅 Follow-Ups Due": "viwT8IoxEWyCOMA5M",
+      "📊 Pipeline": "viwb3nZQ3lW0aIQBD"
+    },
+    "counts_after": {
+      "Call Queue": 12,
+      "Manual Review": 85
+    }
+  },
+  "gates_after": {
+    "airtable_required_choices": 0,
+    "reproducibility": {
+      "verdict_drift": 0,
+      "snapshot_drift": 0,
+      "matched": 35,
+      "stale_evidence": 80
+    }
+  },
+  "tests": 961,
+  "known_debt": {
+    "blank_base_verdicts": 21,
+    "stale_evidence": 80,
+    "note": "21 rows never rescored so carry no Verdict; none queue-eligible. 80 rows predate schema v2. Both need a rescore, not a backfill."
+  },
+  "backups": [
+    "~/lead-machine-backups/2026-07-31-verdict-cutover/",
+    "run_state/backups/2026-07-31-verdict-cutover/"
+  ],
+  "fields_after": [
+    "AI Confidence",
+    "Business Name",
+    "Buyer Intent Signals",
+    "City",
+    "Clients",
+    "Consent Posture",
+    "Deals",
+    "Email",
+    "Evidence Refs",
+    "Google Maps URL",
+    "ICP Lane",
+    "LPM Offer Component",
+    "Last Contacted",
+    "Lead Priority",
+    "Lead Source",
+    "Metro Context",
+    "Mockup URL",
+    "Next Follow-Up",
+    "Notes",
+    "Offer Fit",
+    "Opener",
+    "Opportunity Score",
+    "Outreach Channel",
+    "Owner Name",
+    "Packet Path",
+    "Phone",
+    "Place Key",
+    "Rating",
+    "Reviews",
+    "Safe Outreach Claims",
+    "Sales Activities",
+    "Score Total",
+    "Send Trigger",
+    "Site Status",
+    "Specific Observation",
+    "Status",
+    "Verdict",
+    "Verdict Reasons",
+    "Vertical",
+    "Video URL",
+    "Visible Pain Reasons",
+    "Visible Pain Score",
+    "Website URL"
+  ]
+}

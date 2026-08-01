@@ -450,6 +450,29 @@ class TestReadinessFlagsFromPacketTier(unittest.TestCase):
             with self.subTest(tier=tier):
                 self.assertEqual(sendability.readiness_flags({"Packet Tier": tier}), expected)
 
+    def test_a_verdict_only_row_is_what_the_base_returns_now(self):
+        """The reconstruct-from-tier path looks dead and is not. Do not remove it.
+
+        After step 4 of the verdict cutover a base row carries `Verdict` and
+        none of `Packet Tier`, `Sendable` or `Packet Eligible` — those columns
+        were deleted. The verdict maps back to a tier and the tier derives the
+        booleans, so this branch is the *only* thing that resolves a row read
+        back from Airtable. Delete it as "dead now the tier column is gone" and
+        every base row silently becomes `("", "")` — not sendable — and
+        `is_contact_ready` starts refusing the leads the queue is built on.
+        """
+        cases = {
+            "send": ("Yes", "Yes"),
+            "review": ("No", "Yes"),
+            "watch": ("No", "No"),
+            "reject": ("No", "No"),
+        }
+        for verdict, expected in cases.items():
+            with self.subTest(verdict=verdict):
+                self.assertEqual(
+                    sendability.readiness_flags({"Verdict": verdict}), expected
+                )
+
     def test_explicit_columns_win_over_the_tier(self):
         row = {"Packet Tier": "Sendable Packet", "Sendable": "No"}
         self.assertEqual(sendability.readiness_flags(row), ("No", "Yes"))
