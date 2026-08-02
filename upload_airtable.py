@@ -490,10 +490,26 @@ def csv_row_to_record(row: Dict[str, str], packet_dir: Path) -> Dict[str, Any]:
     # already carry rather than the other way round.
     fields.update(icp_lane_fields(row))
 
+    def mark_defaulted(field: str) -> None:
+        if field not in defaulted_fields:
+            defaulted_fields.append(field)
+
+    # Operational columns are human-owned the moment a rep touches the lead, and
+    # a scored CSV always carries a machine-written `Status: "New"`
+    # (score_leads.py) — so copying them through to a PATCH overwrites whatever
+    # the human set. That is how a dialled lead went back to `New`, re-entered
+    # `queue_state.QUEUE_FILTER_FORMULA`, and got contacted a second time, and
+    # how a `Won` reverted and stopped counting toward the accept-rate KPI.
+    #
+    # Marking them defaulted keeps them on the POST that creates the record and
+    # strips them from every PATCH (airtable_sync.plan_airtable_sync), which is
+    # the ownership contract `lead_machine/verdict.py` already documents:
+    # `Status` is never machine-written except by mark_sent / mark_outcome.
     for field in OPERATIONAL_FIELDS:
         value = clean_cell(row.get(field, ""))
         if value:
             fields[field] = value
+            mark_defaulted(field)
 
     # Judge readiness on the source row, not the filtered payload: Sendable and
     # Packet Eligible are no longer Airtable columns, so they survive only in the
@@ -553,10 +569,10 @@ def csv_row_to_record(row: Dict[str, str], packet_dir: Path) -> Dict[str, Any]:
     if row_is_sendable:
         if not clean_cell(fields.get("Status")):
             fields["Status"] = "Mockup Needed"
-            defaulted_fields.append("Status")
+            mark_defaulted("Status")
     elif clean_cell(fields.get("Packet Tier")) == _TIER_MANUAL:
         fields["Status"] = "Manual Review"
-        defaulted_fields.append("Status")
+        mark_defaulted("Status")
 
     # Filter platform/system emails before Airtable payload creation.
     if "Email" in fields:
@@ -570,7 +586,7 @@ def csv_row_to_record(row: Dict[str, str], packet_dir: Path) -> Dict[str, Any]:
         channel = "Phone" if clean_cell(fields.get("Phone")) else "Email" if clean_cell(fields.get("Email")) else ""
         if channel:
             fields["Outreach Channel"] = channel
-            defaulted_fields.append("Outreach Channel")
+            mark_defaulted("Outreach Channel")
 
     packet_path = current_packet_path(row, packet_dir)
     if packet_path:

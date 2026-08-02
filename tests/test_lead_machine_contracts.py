@@ -600,6 +600,79 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertNotIn("Packet Tier", patched[0]["payload"]["fields"])
         self.assertNotIn("Verdict", patched[0]["payload"]["fields"])
 
+    def test_airtable_patch_never_carries_human_owned_operational_fields(self) -> None:
+        """Re-uploading a scored CSV must not reset a lead the rep already moved.
+
+        `score_leads` writes `Status: "New"` on every scored row, so the CSV
+        always supplies a non-blank Status. Copying it into a PATCH overwrote
+        whatever the human set: a lead that was dialled and marked `Sent` went
+        back to `New`, which is exactly `queue_state.QUEUE_FILTER_FORMULA`, so
+        the morning queue served it again and the prospect was contacted twice.
+        The same PATCH reverted `Won` / `Lost` / `Not Fit`.
+
+        `lead_machine/verdict.py` already documents the contract: `Status` is
+        human-owned and never machine-written except by mark_sent / mark_outcome.
+        """
+        # Deliberately a row no readiness branch rewrites, so what reaches the
+        # payload is the CSV's own `Status` and nothing else. A sendable or
+        # manual-review row is covered by the same rule — those branches choose a
+        # Status themselves and mark it defaulted — but they would mask which
+        # value is under test here.
+        scored_row = {
+            "Business Name": "Twice Dialled Detailing",
+            "Place Key": "ChIJ-twice-dialled",
+            "Phone": "+1 216 555 0134",
+            # What score_leads.py actually writes on every scored row.
+            "Status": "New",
+            "Outreach Channel": "Phone",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            card = upload_airtable.csv_row_to_record(scored_row, Path(tmp))
+
+        # Creating the record still seeds both — a new lead has no human state
+        # to protect, and a blank Status would never match the queue filter.
+        posted = plan_airtable_sync([card])[0]
+        self.assertEqual(posted["method"], "POST")
+        self.assertEqual(posted["payload"]["fields"]["Status"], "New")
+        self.assertEqual(posted["payload"]["fields"]["Outreach Channel"], "Phone")
+
+        patched = plan_airtable_sync(
+            [card], existing_records_by_key={"place:ChIJ-twice-dialled": "recDialled"}
+        )[0]
+        self.assertEqual(patched["method"], "PATCH")
+        self.assertNotIn("Status", patched["payload"]["fields"])
+        self.assertNotIn("Outreach Channel", patched["payload"]["fields"])
+        # The machine-owned half of the payload still travels; this is a
+        # narrowing of who owns two columns, not a stop on updating the record.
+        self.assertEqual(patched["payload"]["fields"]["Business Name"], "Twice Dialled Detailing")
+
+    def test_airtable_patch_holds_back_a_machine_chosen_status_too(self) -> None:
+        """The manual-review branch picks a Status; it is still not the owner.
+
+        `csv_row_to_record` overwrites the CSV's `New` with `Manual Review` for a
+        manual-review packet. That is a machine decision about a lead the rep has
+        not seen yet, so it belongs on the POST — and must still never land on a
+        PATCH, where it would drag a lead the rep had already moved back into the
+        review pile.
+        """
+        manual_row = {
+            "Business Name": "Needs A Look Landscaping",
+            "Place Key": "ChIJ-needs-a-look",
+            "Packet Eligible": "Yes",
+            "Status": "New",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            card = upload_airtable.csv_row_to_record(manual_row, Path(tmp))
+
+        posted = plan_airtable_sync([card])[0]
+        self.assertEqual(posted["payload"]["fields"]["Status"], "Manual Review")
+
+        patched = plan_airtable_sync(
+            [card], existing_records_by_key={"place:ChIJ-needs-a-look": "recLooked"}
+        )[0]
+        self.assertEqual(patched["method"], "PATCH")
+        self.assertNotIn("Status", patched["payload"]["fields"])
+
     def test_airtable_patch_clears_verdict_reasons_when_the_verdict_is_send(self) -> None:
         """An empty reason list is an answer, not a missing value.
 
