@@ -53,12 +53,9 @@ class CompletenessVocabularyTests(unittest.TestCase):
     def module(self):
         return importlib.import_module("evals.completeness")
 
-    def test_the_base_column_is_the_machine_owned_verdict(self) -> None:
-        from lead_machine import verdict as verdict_module
-
-        self.assertEqual(
-            self.module().DEFAULT_VERDICT_FIELD, verdict_module.VERDICT_FIELD
-        )
+    # The base-column assertion that lived here is now discovered for every eval
+    # by tests/test_eval_verdict_field_contract.py — it was present in two of the
+    # three base-reading evals and absent from the one that broke.
 
     def test_corpus_conflicts_still_read_the_scored_csv_column(self) -> None:
         module = self.module()

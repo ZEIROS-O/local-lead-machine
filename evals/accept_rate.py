@@ -40,10 +40,16 @@ from lead_machine.queue_state import (  # noqa: E402
     REJECTED_STATUSES,
     UNDECIDED_STATUSES,
 )
-from lead_machine.sendability import PACKET_TIER_SENDABLE  # noqa: E402
+from lead_machine import verdict as verdict_module  # noqa: E402
 
 
-DEFAULT_VERDICT_FIELD = "Packet Tier"
+# Step 4 of the verdict cutover deleted `Packet Tier` from the base, so a read
+# still naming it 422s on every run. Both other base-reading evals were migrated
+# in dc3bbae and this one was missed, because its test pinned the old name in a
+# fixture rather than asserting against `verdict`. Derived, never spelled, so the
+# next rename cannot leave a third eval behind.
+DEFAULT_VERDICT_FIELD = verdict_module.VERDICT_FIELD
+DEFAULT_PROPOSED_VERDICT = verdict_module.VERDICT_SEND
 STATUS_FIELD = "Status"
 # AGENTS.md: "KPI = accept-rate; below ~50% the loop is losing."
 ACCEPT_RATE_FLOOR = 0.5
@@ -69,7 +75,7 @@ def evaluate_accept_rate(
     base_records: Iterable[dict[str, Any]],
     *,
     verdict_field: str = DEFAULT_VERDICT_FIELD,
-    proposed_verdict: str = PACKET_TIER_SENDABLE,
+    proposed_verdict: str = DEFAULT_PROPOSED_VERDICT,
     floor: float = ACCEPT_RATE_FLOOR,
     minimum_decided: int = MINIMUM_DECIDED,
 ) -> dict[str, Any]:

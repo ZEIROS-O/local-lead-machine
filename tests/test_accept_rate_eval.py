@@ -14,15 +14,25 @@ def base_record(
     record_id: str,
     status: str,
     *,
-    verdict: str = "Sendable Packet",
+    verdict: str | None = None,
     name: str = "Acme Services",
 ) -> dict[str, object]:
+    """Build a base row keyed by the *live* verdict column.
+
+    Spelled through `verdict` rather than as a literal: this fixture pinned
+    `"Packet Tier"` through the whole cutover, which is why `accept_rate` kept
+    reading a deleted column while the suite stayed green.
+    """
+    from lead_machine import verdict as verdict_module
+
     return {
         "id": record_id,
         "fields": {
             "Place Key": record_id,
             "Business Name": name,
-            "Packet Tier": verdict,
+            verdict_module.VERDICT_FIELD: (
+                verdict_module.VERDICT_SEND if verdict is None else verdict
+            ),
             "Status": status,
         },
     }
@@ -48,11 +58,13 @@ class AcceptRateEvalTests(unittest.TestCase):
 
     def test_only_machine_proposed_leads_are_judged(self) -> None:
         """A lead the machine never proposed cannot accept or reject it."""
+        from lead_machine import verdict as verdict_module
+
         report = self.evaluate(
             [
                 base_record("sendable", "Sent"),
-                base_record("watchlist", "Not Fit", verdict="Watchlist"),
-                base_record("none", "Not Fit", verdict="No Packet"),
+                base_record("watchlist", "Not Fit", verdict=verdict_module.VERDICT_WATCH),
+                base_record("none", "Not Fit", verdict=verdict_module.VERDICT_REJECT),
             ],
             minimum_decided=1,
         )
