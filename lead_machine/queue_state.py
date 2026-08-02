@@ -78,10 +78,11 @@ READINESS_CROSS_CHECKS = (
 #
 # `Closed` was split into `Won`/`Lost` (2026-07-29). One closed state cannot say
 # which, so a won deal and a dead lead landed in the same cell and no conversion
-# rate was recoverable from the base. The base still offers `Closed` and neither
-# new choice: code leads, the Airtable runbook follows, and a write of `Won`
-# 422s until a human has created it. That ordering is deliberate — removing the
-# choice before the code stopped writing it would 422 every upload instead.
+# rate was recoverable from the base. `Do Not Contact` is the terminal
+# compliance state a setter applies after an opt-out, while `Booked`
+# distinguishes an appointment from a generic follow-up. Code leads, the
+# Airtable runbook follows: either new value 422s until a human pre-creates it,
+# because no write path may use typecast.
 PROSPECT_STATUS_CHOICES = (
     "New",
     "Mockup Needed",
@@ -91,6 +92,8 @@ PROSPECT_STATUS_CHOICES = (
     "Follow-Up",
     "Won",
     "Lost",
+    "Do Not Contact",
+    "Booked",
 )
 PROSPECT_STATUS_CHOICE_SET = frozenset(PROSPECT_STATUS_CHOICES)
 
@@ -101,9 +104,11 @@ PROSPECT_STATUS_CHOICE_SET = frozenset(PROSPECT_STATUS_CHOICES)
 # Status set that had moved underneath it.
 #
 # Accepted means "taken into outreach", not "won". A lead that was sent and lost
-# was still accepted — the machine's job is to propose leads worth contacting,
-# and conversion is a separate question with a separate metric.
-ACCEPTED_STATUSES = frozenset({"Sent", "Follow-Up", "Won", "Lost"})
+# or opted out was still accepted for contact — the machine's job is to propose
+# leads worth contacting, and conversion/compliance outcomes are separate.
+ACCEPTED_STATUSES = frozenset(
+    {"Sent", "Follow-Up", "Won", "Lost", "Do Not Contact", "Booked"}
+)
 REJECTED_STATUSES = frozenset({"Not Fit"})
 UNDECIDED_STATUSES = frozenset({"New", "Mockup Needed", "Manual Review"})
 # Pinned as a partition by tests/test_queue_state_formula.py: a new Status must

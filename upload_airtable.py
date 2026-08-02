@@ -31,6 +31,8 @@ from lead_machine.airtable_sync import (
     TYPED_AIRTABLE_FIELDS,
     VERTICAL_CHOICES,
     build_airtable_payload,
+    card_phone_key,
+    card_place_key,
     normalize_business_name,
     normalize_city,
     normalize_airtable_value,
@@ -45,6 +47,11 @@ from lead_machine.score_schema import (
     PROMISE_STATES,
 )
 from lead_machine.schema import GENERIC_DOMAINS, normalize_domain, normalize_phone
+from lead_machine.setter_assignment import (
+    assign_setter,
+    assignment_identity,
+    configured_setter_roster,
+)
 from lead_machine.sendability import (
     PACKET_TIER_MANUAL,
     PACKET_TIER_NONE,
@@ -88,10 +95,22 @@ WRITE_PATH_SELECT_CHOICES: dict[str, frozenset[str]] = {
     "ICP Lane": ICP_LANE_CHOICES,
     "Status": PROSPECT_STATUS_CHOICE_SET,
     "Outreach Channel": OUTREACH_CHANNEL_CHOICES,
+    # The actual choices are runtime configuration, not a checked-in roster.
+    # `configured_write_path_select_choices()` fills this from the same source
+    # the assignment writer uses before the live-schema gate runs.
+    "Assigned Setter": frozenset(),
 }
 
 
+def configured_write_path_select_choices() -> dict[str, frozenset[str]]:
+    choices = dict(WRITE_PATH_SELECT_CHOICES)
+    choices["Assigned Setter"] = frozenset(configured_setter_roster())
+    return choices
+
+
 def _select_options_note(field: str) -> str:
+    if field == "Assigned Setter":
+        return "Options: configured by LPM_SETTER_ROSTER"
     return "Options: " + ", ".join(sorted(WRITE_PATH_SELECT_CHOICES[field]))
 
 
@@ -130,6 +149,7 @@ _FIELD_SCHEMA: List[tuple[str, str, str]] = [
     ("Opportunity Score",      "Number",             "Integer 0–100; the icp_lanes score behind ICP Lane"),
     ("Opener",                 "Long text",          ""),
     ("Place Key",              "Single line text",   "Used as upsert key; must be unique per business"),
+    ("Assigned Setter",        "Single select",      _select_options_note("Assigned Setter")),
     ("Status",                 "Single select",      _select_options_note("Status")),
     ("Outreach Channel",       "Single select",      _select_options_note("Outreach Channel")),
     ("Consent Posture",        "Single line text",   "Required and documented before any SMS draft can pass"),
@@ -264,6 +284,7 @@ CSV_AIRTABLE_FIELDS = [
 ]
 
 OPERATIONAL_FIELDS = ["Status", "Outreach Channel"]
+GENERATED_OPERATIONAL_FIELDS = ["Assigned Setter"]
 OPTIONAL_FIELDS = ["Packet Path"]
 DEFAULT_PACKET_DIR = Path("packets_manual_existing_manual")
 
@@ -602,6 +623,17 @@ def csv_row_to_record(row: Dict[str, str], packet_dir: Path) -> Dict[str, Any]:
         name = clean_cell(row.get("Business Name")) or "<unnamed>"
         raise ValueError(f"CSV row cannot be upserted because Place Key and Phone are blank: {name}")
 
+    # After the upsert key is settled, so a row carrying neither identifier
+    # fails with the message that names the business rather than with a less
+    # specific assignment error, and so assignment hashes the same identity the
+    # upsert does.
+    roster = configured_setter_roster()
+    if roster:
+        fields["Assigned Setter"] = assign_setter(
+            assignment_identity(place_key, row.get("Phone", "")), roster
+        )
+        mark_defaulted("Assigned Setter")
+
     return {
         "place_id_or_unique_key": place_key,
         "upsert_key": upsert_key,
@@ -646,8 +678,61 @@ def read_input_records(
     path: Path, *, packet_dir: Path
 ) -> List[Dict[str, Any]]:
     if path.suffix.lower() == ".csv":
-        return read_csv_records(path, packet_dir=packet_dir)
-    return read_cards(path)
+        records = read_csv_records(path, packet_dir=packet_dir)
+    else:
+        records = read_cards(path)
+    return enforce_setter_assignment_ownership(records)
+
+
+def enforce_setter_assignment_ownership(
+    records: Iterable[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Normalize every uploader input to the create-only setter contract.
+
+    CSV conversion already derives this field, but JSONL cards are another
+    supported front door. Keeping the final ownership check here means neither
+    format can inject an arbitrary assignment or PATCH a rep's manual choice.
+    """
+    roster = configured_setter_roster()
+    normalized: List[Dict[str, Any]] = []
+    for record in records:
+        fields = record.get("airtable_fields")
+        if not isinstance(fields, dict):
+            fields = {}
+            record["airtable_fields"] = fields
+        supplied = clean_cell(fields.get("Assigned Setter"))
+        defaulted = [
+            str(field)
+            for field in (record.get("defaulted_airtable_fields") or [])
+            if str(field) != "Assigned Setter"
+        ]
+        if not roster:
+            fields.pop("Assigned Setter", None)
+            record["defaulted_airtable_fields"] = defaulted
+            normalized.append(record)
+            continue
+
+        identity = card_place_key(record) or card_phone_key(record)
+        if not identity:
+            # Nothing to upsert on either. `plan_airtable_sync` refuses this
+            # record by name a moment later; pre-empting it here would replace
+            # that message with a vaguer one.
+            fields.pop("Assigned Setter", None)
+            record["defaulted_airtable_fields"] = defaulted
+            normalized.append(record)
+            continue
+
+        expected = assign_setter(identity, roster)
+        if supplied and supplied != expected:
+            raise ValueError(
+                f"Assigned Setter {supplied!r} does not match deterministic assignment "
+                f"{expected!r} for {identity}"
+            )
+        fields["Assigned Setter"] = expected
+        defaulted.append("Assigned Setter")
+        record["defaulted_airtable_fields"] = defaulted
+        normalized.append(record)
+    return normalized
 
 
 def airtable_base_url(base_id: str, table: str) -> str:
@@ -673,6 +758,33 @@ def validate_airtable_fields(base_id: str, table: str, token: str, fields: Itera
         raise RuntimeError(
             "Airtable field validation failed. Create the required fields before running live sync: "
             f"{', '.join(field_list)}. Airtable response {resp.status_code}: {resp.text[:1000]}"
+        )
+
+
+def assert_required_choices_ready(
+    base_id: str,
+    token: str,
+    prospects_table: str,
+) -> None:
+    """Refuse a live upload before any write if declared selects are absent."""
+    # Lazy import avoids a module cycle: the checker derives uploader choices
+    # from this module, while the uploader reuses its read-only audit here.
+    from airtable_required_choices import (
+        audit_choices,
+        fetch_base_tables,
+        missing_choices,
+        required_choices,
+        resolve_table_names,
+    )
+
+    tables = fetch_base_tables(base_id, token)
+    table_names = resolve_table_names({"Prospects": prospects_table})
+    missing = missing_choices(audit_choices(tables, required_choices(), table_names))
+    if missing:
+        raise ValueError(
+            "Airtable select-choice gate is incomplete; run "
+            "`.venv/bin/python airtable_required_choices.py check` and add: "
+            + "; ".join(missing)
         )
 
 
@@ -1052,6 +1164,8 @@ def main() -> int:
             )
             return 1
 
+        assert_required_choices_ready(args.base_id, args.token, args.table)
+
         for field in OPTIONAL_FIELDS:
             has_value = any((record.get("airtable_fields") or {}).get(field) for record in records)
             if has_value and not airtable_field_exists(args.base_id, args.table, args.token, field):
@@ -1069,7 +1183,7 @@ def main() -> int:
                 args.token,
                 [
                     field
-                    for field in CSV_AIRTABLE_FIELDS + OPERATIONAL_FIELDS
+                    for field in CSV_AIRTABLE_FIELDS + OPERATIONAL_FIELDS + GENERATED_OPERATIONAL_FIELDS
                     if field in set(AIRTABLE_ALLOWED_FIELDS)
                 ],
             )

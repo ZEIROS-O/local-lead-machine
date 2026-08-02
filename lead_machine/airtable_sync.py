@@ -41,6 +41,7 @@ AIRTABLE_ALLOWED_FIELDS = [
     "Safe Outreach Claims",
     "AI Confidence",
     "Place Key",
+    "Assigned Setter",
     "Score Total",
     "ICP Lane",
     "Opportunity Score",

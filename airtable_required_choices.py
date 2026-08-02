@@ -42,10 +42,12 @@ to migrate 145 records onto would be a destructive rename dance on the CRM's
 most-read column, with no way to delete the original afterwards.
 
 The target vocabulary is READ FROM THE CODE, never transcribed here:
-`mark_outcome.REQUIRED_SELECT_CHOICES` is the declaration of what the base must
-offer, and `queue_state.PROSPECT_STATUS_CHOICES` is the canonical Status
-vocabulary. Restating either one in this file would create exactly the drift
-channel those declarations exist to close.
+`mark_outcome.REQUIRED_SELECT_CHOICES` owns writer-emitted choices,
+`mark_outcome.OPERATOR_REQUIRED_SELECT_CHOICES` owns manual workflow choices,
+`queue_state.PROSPECT_STATUS_CHOICES` is the canonical Status vocabulary, and
+`upload_airtable.configured_write_path_select_choices()` adds the active setter
+roster. Restating any of them here would create exactly the drift channel those
+declarations exist to close.
 """
 from __future__ import annotations
 
@@ -61,8 +63,8 @@ import requests
 from dotenv import load_dotenv
 
 from lead_machine.queue_state import PROSPECT_STATUS_CHOICES
-from mark_outcome import REQUIRED_SELECT_CHOICES
-from upload_airtable import WRITE_PATH_SELECT_CHOICES
+from mark_outcome import OPERATOR_REQUIRED_SELECT_CHOICES, REQUIRED_SELECT_CHOICES
+from upload_airtable import configured_write_path_select_choices
 
 META_TABLES_URL = "https://api.airtable.com/v0/meta/bases/{base_id}/tables"
 
@@ -86,30 +88,39 @@ class FieldStatus:
     field_name: str
     live: tuple[str, ...]
     missing: tuple[str, ...]
+    # A field the base does not have at all. Its own state, not an empty
+    # `missing`: with an unconfigured roster `Assigned Setter` declares no
+    # choices, and "absent with nothing declared" must not read as satisfied.
+    present: bool = True
 
     @property
     def satisfied(self) -> bool:
-        return not self.missing
+        return self.present and not self.missing
 
 
 def required_choices() -> dict[str, dict[str, frozenset[str]]]:
     """The choices the live base must offer, derived from the code that writes them.
 
     `REQUIRED_SELECT_CHOICES` states only what `mark_outcome` sends, so for
-    `Prospects.Status` it names three of the eight canonical values. The base
+    `Prospects.Status` it names three of the ten canonical values. The base
     needs the whole vocabulary, and `PROSPECT_STATUS_CHOICES` is the module that
     owns it — union rather than replace, so a value declared in one and not the
-    other is still reported.
+    other is still reported. Operator-only and configured upload choices are
+    unioned for the same reason.
     """
     required = {
         table: {field: frozenset(choices) for field, choices in fields.items()}
         for table, fields in REQUIRED_SELECT_CHOICES.items()
     }
+    for table, fields in OPERATOR_REQUIRED_SELECT_CHOICES.items():
+        target = required.setdefault(table, {})
+        for field, choices in fields.items():
+            target[field] = frozenset(target.get(field, frozenset())) | frozenset(choices)
     prospects = required.setdefault("Prospects", {})
     prospects["Status"] = frozenset(prospects.get("Status", frozenset())) | frozenset(
         PROSPECT_STATUS_CHOICES
     )
-    for field, choices in WRITE_PATH_SELECT_CHOICES.items():
+    for field, choices in configured_write_path_select_choices().items():
         prospects[field] = frozenset(prospects.get(field, frozenset())) | choices
     return required
 
@@ -140,7 +151,14 @@ def _find_table(tables: list[Any], wanted: str) -> dict[str, Any]:
     return matches[0]
 
 
-def _find_field(table: dict[str, Any], wanted: str) -> dict[str, Any]:
+def _find_field(
+    table: dict[str, Any], wanted: str, *, absent_ok: bool = False
+) -> dict[str, Any] | None:
+    """The named field, or None when `absent_ok` and the base does not have it.
+
+    Absence is a reportable gap with UI steps that close it. Two fields sharing
+    a name is still a wrong assumption about the base and stops the check.
+    """
     fields = table.get("fields")
     if not isinstance(fields, list):
         raise ValueError(f"table {table.get('name')!r} schema has no fields list")
@@ -150,6 +168,8 @@ def _find_field(table: dict[str, Any], wanted: str) -> dict[str, Any]:
         if isinstance(item, dict)
         and (item.get("id") == wanted or item.get("name") == wanted)
     ]
+    if not matches and absent_ok:
+        return None
     if len(matches) != 1:
         raise ValueError(
             f"expected one field named/id {wanted!r} in table "
@@ -192,7 +212,20 @@ def audit_choices(
     for table_label in sorted(required):
         table = _find_table(tables, table_names[table_label])
         for field_name in sorted(required[table_label]):
-            field = _find_field(table, field_name)
+            field = _find_field(table, field_name, absent_ok=True)
+            if field is None:
+                statuses.append(
+                    FieldStatus(
+                        table_label=table_label,
+                        table_id=str(table.get("id") or ""),
+                        field_id="",
+                        field_name=field_name,
+                        live=(),
+                        missing=tuple(sorted(required[table_label][field_name])),
+                        present=False,
+                    )
+                )
+                continue
             live = live_choice_names(field)
             # Sorted so repeated runs, the report and the hand steps all agree.
             missing = tuple(sorted(required[table_label][field_name] - set(live)))
@@ -210,12 +243,24 @@ def audit_choices(
 
 
 def missing_choices(statuses: list[FieldStatus]) -> list[str]:
-    """Declared choices the live schema still does not offer."""
-    return [
-        f"{status.table_label}.{status.field_name}: {name}"
-        for status in statuses
-        for name in status.missing
-    ]
+    """What the live schema still does not offer.
+
+    An absent field is one entry naming the field rather than one per choice:
+    the field has to exist before any choice can be added to it, and an absent
+    field whose declaration is empty would otherwise report nothing at all.
+    """
+    reported: list[str] = []
+    for status in statuses:
+        if not status.present:
+            reported.append(
+                f"{status.table_label}.{status.field_name}: field does not exist"
+            )
+            continue
+        reported.extend(
+            f"{status.table_label}.{status.field_name}: {name}"
+            for name in status.missing
+        )
+    return reported
 
 
 def hand_steps(statuses: list[FieldStatus], base_id: str) -> list[str]:
@@ -234,9 +279,17 @@ def hand_steps(statuses: list[FieldStatus], base_id: str) -> list[str]:
             f"  {status.table_label} -> {status.field_name}  "
             f"https://airtable.com/{base_id}/{status.table_id}"
         )
-        lines.append("    Customize field type -> add each option, exact spelling:")
+        if status.present:
+            lines.append("    Customize field type -> add each option, exact spelling:")
+        else:
+            lines.append(
+                "    This field does not exist. Create it as a single select, then"
+            )
+            lines.append("    add each option, exact spelling:")
         for name in status.missing:
             lines.append(f"      - {name}")
+        if not status.missing:
+            lines.append("      (no choices declared yet — set LPM_SETTER_ROSTER)")
         lines.append("")
     lines.append("Then re-run this check; it must exit 0 before mark_outcome can run.")
     return lines
@@ -279,6 +332,11 @@ def run_check(args: argparse.Namespace) -> int:
     for status in statuses:
         if status.satisfied:
             print(f"[OK] {status.table_label}.{status.field_name}")
+        elif not status.present:
+            print(
+                f"[ABSENT] {status.table_label}.{status.field_name}: "
+                "field does not exist in the base"
+            )
         else:
             print(
                 f"[MISSING] {status.table_label}.{status.field_name} "
@@ -297,6 +355,7 @@ def run_check(args: argparse.Namespace) -> int:
                         "table": status.table_label,
                         "field": status.field_name,
                         "field_id": status.field_id,
+                        "present": status.present,
                         "live_choice_count": len(status.live),
                         "missing": list(status.missing),
                     }

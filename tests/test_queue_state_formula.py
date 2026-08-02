@@ -86,7 +86,7 @@ class TestQueueStateFormula(unittest.TestCase):
             self.assertEqual(scored["Contact Eligibility"], "contact-now")
         self.assertGreater(sends, 0)
 
-    def test_prospect_status_vocabulary_is_the_post_split_eight(self):
+    def test_prospect_status_vocabulary_includes_mvp_terminal_states(self):
         # Exact tuple, not a subset: without typecast every one of these has to
         # exist as a choice in the base, so adding or renaming one is a schema
         # change that needs the Airtable runbook, not an edit.
@@ -101,6 +101,8 @@ class TestQueueStateFormula(unittest.TestCase):
                 "Follow-Up",
                 "Won",
                 "Lost",
+                "Do Not Contact",
+                "Booked",
             ),
         )
         # The split is the point: `Closed` could not say which of the two
@@ -139,6 +141,12 @@ class TestQueueStateFormula(unittest.TestCase):
             for second in names[index + 1 :]:
                 with self.subTest(pair=(first, second)):
                     self.assertEqual(buckets[first] & buckets[second], frozenset())
+
+    def test_dnc_and_booked_are_terminal_accepted_outcomes(self):
+        for status in ("Do Not Contact", "Booked"):
+            with self.subTest(status=status):
+                self.assertIn(status, queue_state.ACCEPTED_STATUSES)
+                self.assertNotIn(status, queue_state.QUEUE_STATUS_CLAUSE.allowed)
 
     def test_undecided_statuses_contain_the_whole_dial_queue(self):
         # A queued lead has not been judged yet. If one ever counted as accepted,

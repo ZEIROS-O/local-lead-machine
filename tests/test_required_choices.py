@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import io
+import os
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -23,7 +24,7 @@ from airtable_required_choices import (
 )
 from lead_machine.queue_state import PROSPECT_STATUS_CHOICES
 from lead_machine import airtable_sync, queue_state, score_schema, sendability, verdict
-from mark_outcome import REQUIRED_SELECT_CHOICES
+from mark_outcome import OPERATOR_REQUIRED_SELECT_CHOICES, REQUIRED_SELECT_CHOICES
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -136,6 +137,7 @@ def complete_tables() -> list[dict]:
             choice("selE", "Meeting Booked"),
             choice("selF", "Won"),
             choice("selG", "Lost"),
+            choice("selH", "Held"),
         ],
     )
 
@@ -151,7 +153,7 @@ def status_named(statuses: list[FieldStatus], field: str) -> FieldStatus:
 class RequiredVocabularyIsDerivedTest(unittest.TestCase):
     """The target set must come from the code that writes it, never a local copy."""
 
-    def test_status_target_is_the_canonical_eight_value_vocabulary(self):
+    def test_status_target_is_the_full_canonical_vocabulary(self):
         self.assertEqual(
             required_choices()["Prospects"]["Status"],
             frozenset(PROSPECT_STATUS_CHOICES)
@@ -170,6 +172,14 @@ class RequiredVocabularyIsDerivedTest(unittest.TestCase):
                     f"{table}.{field} lost declared choices",
                 )
 
+    def test_mvp_operator_choices_are_required_even_when_not_code_written(self):
+        required = required_choices()
+        self.assertIn("Do Not Contact", required["Prospects"]["Status"])
+        self.assertIn("Booked", required["Prospects"]["Status"])
+        self.assertIn("Held", required["Sales Activities"]["Outcome"])
+        self.assertIn("Held", OPERATOR_REQUIRED_SELECT_CHOICES["Sales Activities"]["Outcome"])
+        self.assertNotIn("Held", REQUIRED_SELECT_CHOICES["Sales Activities"]["Outcome"])
+
     def test_target_moves_when_the_declaration_moves(self):
         """A value added to the module must reach the check without editing it."""
         extended = {
@@ -182,6 +192,17 @@ class RequiredVocabularyIsDerivedTest(unittest.TestCase):
         }
         with patch.object(checker, "REQUIRED_SELECT_CHOICES", extended):
             self.assertIn("Ghosted", required_choices()["Sales Activities"]["Outcome"])
+
+    def test_target_moves_when_operator_required_choices_move(self):
+        extended = {
+            **OPERATOR_REQUIRED_SELECT_CHOICES,
+            "Sales Activities": {
+                "Outcome": OPERATOR_REQUIRED_SELECT_CHOICES["Sales Activities"]["Outcome"]
+                | {"No Show"},
+            },
+        }
+        with patch.object(checker, "OPERATOR_REQUIRED_SELECT_CHOICES", extended):
+            self.assertIn("No Show", required_choices()["Sales Activities"]["Outcome"])
 
     def test_status_target_follows_queue_state(self):
         with patch.object(
@@ -211,6 +232,7 @@ class ProspectWritePathVocabularyTest(unittest.TestCase):
             field: "Options: " + ", ".join(sorted(choices))
             for field, choices in upload_airtable.WRITE_PATH_SELECT_CHOICES.items()
         }
+        expected["Assigned Setter"] = "Options: configured by LPM_SETTER_ROSTER"
         self.assertEqual(schema_notes, expected)
 
     def test_required_choices_unions_the_complete_prospect_write_path(self):
@@ -254,14 +276,70 @@ class ProspectWritePathVocabularyTest(unittest.TestCase):
 class AuditChoicesTest(unittest.TestCase):
     def test_reports_exactly_what_the_live_base_lacks(self):
         statuses = statuses_for(live_tables())
-        self.assertEqual(status_named(statuses, "Status").missing, ("Lost", "Won"))
+        self.assertEqual(
+            status_named(statuses, "Status").missing,
+            ("Booked", "Do Not Contact", "Lost", "Won"),
+        )
         self.assertEqual(
             status_named(statuses, "Activity Type").missing, ("Close", "Reply")
         )
         self.assertEqual(
             status_named(statuses, "Outcome").missing,
-            ("Lost", "Meeting Booked", "Replied", "Won"),
+            ("Held", "Lost", "Meeting Booked", "Replied", "Won"),
         )
+
+    def test_an_absent_field_is_reported_rather_than_raised(self):
+        # The live base has no `Assigned Setter` until it is hand-created, and
+        # the fixtures derive their fields from WRITE_PATH_SELECT_CHOICES, so
+        # that state had no coverage. It must read as an actionable gap, not as
+        # a crash inside _find_field.
+        tables = live_tables()
+        prospects = next(table for table in tables if table["name"] == "Prospects")
+        prospects["fields"] = [
+            field for field in prospects["fields"] if field["name"] != "Assigned Setter"
+        ]
+        statuses = statuses_for(tables)
+        absent = status_named(statuses, "Assigned Setter")
+        self.assertFalse(absent.present)
+        self.assertFalse(absent.satisfied)
+        self.assertIn(
+            "Prospects.Assigned Setter: field does not exist",
+            missing_choices(statuses),
+        )
+
+    def test_an_absent_field_fails_the_gate_even_with_no_choices_declared(self):
+        # With an unconfigured roster the declaration is empty, so `missing`
+        # is empty too. Satisfied must still be False, or the uploader would
+        # sail past a field it is about to write to.
+        tables = live_tables()
+        prospects = next(table for table in tables if table["name"] == "Prospects")
+        prospects["fields"] = [
+            field for field in prospects["fields"] if field["name"] != "Assigned Setter"
+        ]
+        with patch.dict(os.environ, {"LPM_SETTER_ROSTER": ""}, clear=False):
+            statuses = audit_choices(tables, required_choices(), TABLE_NAMES)
+        absent = status_named(statuses, "Assigned Setter")
+        self.assertEqual(absent.missing, ())
+        self.assertFalse(absent.satisfied)
+        self.assertIn(
+            "Prospects.Assigned Setter: field does not exist", missing_choices(statuses)
+        )
+
+    def test_absent_field_instructions_say_to_create_it(self):
+        tables = live_tables()
+        prospects = next(table for table in tables if table["name"] == "Prospects")
+        prospects["fields"] = [
+            field for field in prospects["fields"] if field["name"] != "Assigned Setter"
+        ]
+        lines = "\n".join(hand_steps(statuses_for(tables), "appTest"))
+        self.assertIn("This field does not exist. Create it as a single select", lines)
+
+    def test_two_fields_sharing_a_name_still_stops_the_check(self):
+        tables = live_tables()
+        prospects = next(table for table in tables if table["name"] == "Prospects")
+        prospects["fields"].append(dict(prospects["fields"][0]))
+        with self.assertRaisesRegex(ValueError, "expected one field"):
+            statuses_for(tables)
 
     def test_a_satisfied_field_reports_nothing_missing(self):
         deal_status = status_named(statuses_for(live_tables()), "Deal Status")
@@ -295,13 +373,20 @@ class AuditChoicesTest(unittest.TestCase):
         self.assertIn("singleSelect", str(caught.exception))
 
     def test_a_missing_field_is_refused_rather_than_skipped(self):
+        # Still refused — reported as an absent field with UI steps rather than
+        # raised, because a base that has not been built out yet is the normal
+        # state this check exists to describe, not a malformed schema.
         tables = live_tables()
         tables[1]["fields"] = [
             field for field in tables[1]["fields"] if field["name"] != "Outcome"
         ]
-        with self.assertRaises(ValueError) as caught:
-            statuses_for(tables)
-        self.assertIn("Outcome", str(caught.exception))
+        statuses = statuses_for(tables)
+        outcome = status_named(statuses, "Outcome")
+        self.assertFalse(outcome.present)
+        self.assertFalse(outcome.satisfied)
+        self.assertIn(
+            "Sales Activities.Outcome: field does not exist", missing_choices(statuses)
+        )
 
     def test_live_choice_names_rejects_a_field_with_no_options(self):
         with self.assertRaises(ValueError):
@@ -311,7 +396,7 @@ class AuditChoicesTest(unittest.TestCase):
 class HandStepsTest(unittest.TestCase):
     def test_every_missing_choice_appears_in_the_instructions(self):
         lines = "\n".join(hand_steps(statuses_for(live_tables()), "appTest"))
-        for name in ("Won", "Lost", "Reply", "Close", "Replied", "Meeting Booked"):
+        for name in ("Won", "Lost", "Reply", "Close", "Held", "Replied", "Meeting Booked"):
             self.assertIn(name, lines)
 
     def test_instructions_link_the_table_that_holds_the_field(self):
@@ -407,10 +492,20 @@ class CommandExitCodeTest(unittest.TestCase):
 
     def test_a_schema_shaped_wrong_exits_two_rather_than_tracebacks(self):
         tables = live_tables()
-        tables[1]["fields"] = []
+        # Wrong shape, not merely incomplete: a field whose type cannot hold the
+        # declared choices at all.
+        tables[1]["fields"][1]["type"] = "singleLineText"
         code, output = self._run(tables)
         self.assertEqual(code, 2)
         self.assertIn("REFUSED", output)
+
+    def test_a_base_missing_the_field_entirely_exits_two_with_ui_steps(self):
+        tables = live_tables()
+        tables[1]["fields"] = []
+        code, output = self._run(tables)
+        self.assertEqual(code, 2)
+        self.assertIn("[ABSENT] Sales Activities.Outcome", output)
+        self.assertIn("This field does not exist. Create it as a single select", output)
 
 
 if __name__ == "__main__":

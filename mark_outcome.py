@@ -36,9 +36,10 @@ mark_outcome event 422s — this script cannot record a single outcome. That
 runbook step is a hard prerequisite, not a cleanup task. Restoring typecast is
 not the fix; it is the drift channel this removal closed.
 
-`REQUIRED_SELECT_CHOICES` states that prerequisite as data — the exact
-table/field/choice set the base must offer — so the runbook can be generated from
-this module instead of transcribed alongside it and left to drift.
+`REQUIRED_SELECT_CHOICES` states the exact choices this writer emits.
+`OPERATOR_REQUIRED_SELECT_CHOICES` separately declares operator-marked values
+such as `Held`, preserving the writer's exact-vocabulary invariant while giving
+the schema gate one source for manual workflow requirements.
 `preflight_select_values` checks the values a run is about to send against it
 before the first request, so a value the declaration has not caught up with fails
 by name instead of as an opaque Airtable 422. It cannot see the other direction —
@@ -135,6 +136,15 @@ REQUIRED_SELECT_CHOICES: dict[str, dict[str, frozenset[str]]] = {
     },
     "Deals": {
         "Deal Status": frozenset({"Deposit Pending"}),
+    },
+}
+
+# Values required by the same CRM workflow but applied by a human rather than
+# emitted by `apply_mark_outcome`. Keep this separate: REQUIRED_SELECT_CHOICES
+# is pinned exactly to the writer's on-the-wire vocabulary.
+OPERATOR_REQUIRED_SELECT_CHOICES: dict[str, dict[str, frozenset[str]]] = {
+    "Sales Activities": {
+        "Outcome": frozenset({"Held"}),
     },
 }
 
