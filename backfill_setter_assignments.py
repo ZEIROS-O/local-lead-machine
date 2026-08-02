@@ -164,10 +164,15 @@ def apply_blank_assignment_backfill(
             record_id = str(item.get("record_id") or "").strip()
             label = str(item.get("upsert_key") or record_id)
             record_url = f"{base_url}/{quote(record_id, safe='')}"
+            # No `fields[]` here. It is a list-records parameter; the
+            # single-record endpoint takes only cellFormat and
+            # returnFieldsByFieldId and 422s the whole request otherwise
+            # (INVALID_REQUEST_UNKNOWN, observed against the live base
+            # 2026-08-02). Reading the whole record and picking one field out
+            # of it costs a little bandwidth and is the only shape that works.
             current = session.get(
                 record_url,
                 headers={"Authorization": f"Bearer {token}"},
-                params=[("fields[]", "Assigned Setter")],
                 timeout=30,
             )
             if current.status_code >= 400:

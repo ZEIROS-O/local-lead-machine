@@ -224,6 +224,38 @@ class BackfillApplySafetyTest(unittest.TestCase):
         self.assertEqual(session.request.call_args.args[0], "PATCH")
         self.assertNotIn("typecast", session.request.call_args.kwargs["json"])
 
+    def test_recheck_sends_no_list_only_parameters(self) -> None:
+        # `fields[]` is a list-records parameter. Sending it to the
+        # single-record endpoint 422s the request as INVALID_REQUEST_UNKNOWN,
+        # which took the whole backfill down on its first row against the live
+        # base. Mocked sessions cannot see that, so pin the call shape.
+        current = MagicMock(status_code=200)
+        current.json.return_value = {"id": "rec1", "fields": {}}
+        written = MagicMock(status_code=200)
+        written.json.return_value = {"id": "rec1", "fields": {"Assigned Setter": "Michael"}}
+        session = MagicMock()
+        session.__enter__.return_value = session
+        session.get.return_value = current
+        session.request.return_value = written
+        with patch("backfill_setter_assignments.requests.Session", return_value=session):
+            backfill.apply_blank_assignment_backfill(
+                "appBase",
+                "Prospects",
+                "patToken",
+                [
+                    {
+                        "method": "PATCH",
+                        "record_id": "rec1",
+                        "place_key": "ChIJ123",
+                        "upsert_key": "place:ChIJ123",
+                        "payload": {"fields": {"Assigned Setter": "Michael"}},
+                    }
+                ],
+            )
+
+        self.assertNotIn("params", session.get.call_args.kwargs)
+        self.assertTrue(session.get.call_args.args[0].endswith("/rec1"))
+
     def test_patch_response_must_confirm_the_assignment(self) -> None:
         current = MagicMock(status_code=200)
         current.json.return_value = {"id": "rec1", "fields": {}}

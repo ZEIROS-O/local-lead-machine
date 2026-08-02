@@ -79,7 +79,14 @@ def live_tables(
             field_name,
             [choice(f"selProspect{index}_{choice_index}", name) for choice_index, name in enumerate(sorted(choices))],
         )
-        for index, (field_name, choices) in enumerate(upload_airtable.WRITE_PATH_SELECT_CHOICES.items())
+        # The configured form, not the module constant: `Assigned Setter` draws
+        # its choices from LPM_SETTER_ROSTER at call time, so a fixture built
+        # from the bare constant would claim a complete base offers no setter
+        # names while `required_choices()` demanded them. That made three tests
+        # here pass or fail on whether the developer's own .env had a roster.
+        for index, (field_name, choices) in enumerate(
+            upload_airtable.configured_write_path_select_choices().items()
+        )
         if field_name != "Status"
     )
     return [
@@ -340,6 +347,16 @@ class AuditChoicesTest(unittest.TestCase):
         prospects["fields"].append(dict(prospects["fields"][0]))
         with self.assertRaisesRegex(ValueError, "expected one field"):
             statuses_for(tables)
+
+    def test_a_complete_base_stays_complete_whatever_the_roster_is(self):
+        # Pins the isolation directly: this suite must not read the operator's
+        # own LPM_SETTER_ROSTER out of the ambient environment.
+        for roster in ("", "Michael", "Michael,Setter Two,Setter Three"):
+            with self.subTest(roster=roster):
+                with patch.dict(
+                    os.environ, {"LPM_SETTER_ROSTER": roster}, clear=False
+                ):
+                    self.assertEqual(missing_choices(statuses_for(complete_tables())), [])
 
     def test_a_satisfied_field_reports_nothing_missing(self):
         deal_status = status_named(statuses_for(live_tables()), "Deal Status")
