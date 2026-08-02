@@ -59,7 +59,8 @@ Also observed 2026-07-29: the base has five tables (`Prospects`, `Sales Activiti
 | Send Blockers | Long text | ? |  |
 | Skip Reason | Single line text | ? |  |
 | Place Key | Single line text | ? | Used as upsert key; must be unique per business |
-| Status | Single select | yes (2026-07-30) | Canonical code vocabulary and live choices: New, Mockup Needed, Manual Review, Not Fit, Sent, Follow-Up, Won, Lost. `Won` and `Lost` were added by hand during the cutover and `Closed` was removed; 0 rows used `Closed` at execution time. `Not Fit` is applied by hand, never by code |
+| Assigned Setter | Single select | ? | One exact choice per name in `LPM_SETTER_ROSTER`. Upload seeds a stable assignment only on create; it never PATCHes an existing assignment |
+| Status | Single select | partially verified (2026-07-30) | Canonical code vocabulary: New, Mockup Needed, Manual Review, Not Fit, Sent, Follow-Up, Won, Lost, **Do Not Contact**, **Booked**. The first eight were live on 2026-07-30; the two MVP additions require manual creation and have not been verified live. `Not Fit` and `Do Not Contact` are applied by hand |
 | Outreach Channel | Single select | yes (2026-07-29) | Live choices match exactly: Email, Phone, Instagram DM, SMS. This is why `mark_sent.py` is safe without `typecast` and `mark_outcome.py` is not — see below |
 | Consent Posture | Single line text | ? | Required and documented before any SMS draft can pass |
 | Last Contacted | Date | ? |  |
@@ -80,17 +81,20 @@ call-sheet state. Do not wire a script to both.
 Written only by `mark_outcome.py`, after Lou reports something that already happened. Nothing in
 the automated pipeline creates rows here.
 
-> **Unblocked 2026-07-30.** `mark_outcome.py` was unable to write a single row from `91c7131`
+> **Previously unblocked 2026-07-30; MVP schema work is now pending.** `mark_outcome.py` was unable to write a single row from `91c7131`
 > (typecast removal) until the eight missing select choices were created by hand — six in
 > `Sales Activities`, plus `Won` and `Lost` on `Prospects.Status`. All eight now exist and the
-> module is operational.
+> module became operational. The MVP now additionally requires `Sales Activities.Outcome = Held`,
+> `Prospects.Status = Do Not Contact / Booked`, the `Assigned Setter` field and choices, and
+> `Deals.Cash Collected`. These additions are code-declared/documented but not verified live.
 >
 > **If a write starts 422-ing, run this first:**
 > `.venv/bin/python airtable_required_choices.py check` — it derives the requirement from
-> `mark_outcome.REQUIRED_SELECT_CHOICES` and `queue_state.PROSPECT_STATUS_CHOICES`, so it cannot go
-> stale the way this page can. Exit 0 means the base is complete; exit 2 prints exactly which choice
-> is missing and the UI steps to add it. Adding a value to either declaration without adding it to
-> the base puts the module straight back into the blocked state, and this check is what catches that.
+> `mark_outcome.REQUIRED_SELECT_CHOICES`, `mark_outcome.OPERATOR_REQUIRED_SELECT_CHOICES`,
+> `queue_state.PROSPECT_STATUS_CHOICES`, and the configured setter roster, so it cannot go stale the
+> way this page can. Exit 0 means the select vocabulary is complete; exit 2 prints exactly which
+> choice is missing and the UI steps to add it. Adding a value to any declaration without adding it
+> to the base puts the workflow straight back into the blocked state, and this check catches that.
 > `mark_outcome.RUNBOOK_DOC` points a failing operator at this file, so this is the page that has to
 > be right.
 
@@ -104,11 +108,11 @@ in-CRM record of what happened on a lead after `Status=Sent`.
 | Activity Name | Single line text | Primary field; `"<Activity Type> — <Business Name>"` |
 | Activity Type | Single select | `mark_outcome` writes **Reply, Call, Close** |
 | Activity Date | Date/time | When the event happened (12:00 UTC on the reported date) |
-| Outcome | Single select | `mark_outcome` writes **Replied, Meeting Booked, Won, Lost** |
+| Outcome | Single select | `mark_outcome` writes **Replied, Meeting Booked, Won, Lost**; the closer marks **Held** manually |
 | Details | Long text | `--notes` |
 | Linked Prospect | Link → Prospects | Join back to the lead |
 
-#### Every choice here must be PRE-CREATED by hand. All eight now exist.
+#### Every choice here must be PRE-CREATED by hand. The original eight exist; `Held` is pending live verification.
 
 The field's stock choices describe meeting logistics and cannot express a funnel outcome. They used
 to be minted on first write by Airtable's `typecast` flag; **`typecast` was removed from every write
@@ -124,8 +128,8 @@ until the eight were added by hand on 2026-07-30:
 | Field | Added by hand 2026-07-30 | Live vocabulary now |
 |-------|--------------------------|---------------------|
 | `Sales Activities.Activity Type` | **Reply**, **Close** | Call, Email, Meeting, Follow Up, Demo, Note, Other, Reply, Close |
-| `Sales Activities.Outcome` | **Replied**, **Meeting Booked**, **Won**, **Lost** | Completed, Scheduled, Rescheduled, Cancelled, No Show, Outcome Pending, Replied, Meeting Booked, Won, Lost |
-| `Prospects.Status` | **Won**, **Lost** (and `Closed` removed) | New, Mockup Needed, Manual Review, Not Fit, Sent, Follow-Up, Won, Lost |
+| `Sales Activities.Outcome` | **Replied**, **Meeting Booked**, **Won**, **Lost** | Completed, Scheduled, Rescheduled, Cancelled, No Show, Outcome Pending, Replied, Meeting Booked, Won, Lost. Add **Held** for the MVP closer workflow |
+| `Prospects.Status` | **Won**, **Lost** (and `Closed` removed) | New, Mockup Needed, Manual Review, Not Fit, Sent, Follow-Up, Won, Lost. Add **Do Not Contact** and **Booked** for the MVP |
 
 The same obligation applies to any value added later: it is a hard prerequisite, not cleanup, and
 restoring `typecast` is not the fix — it is the drift channel the removal closed.
@@ -160,15 +164,15 @@ The two alternatives are both worse than a hand step: restoring `typecast` is th
 that removal closed, and creating a replacement field to migrate 145 records onto would be a
 destructive rename dance on the CRM's most-read column with no way to delete the original.
 
-`mark_outcome.REQUIRED_SELECT_CHOICES` is the machine-readable form of this table — the exact
-`{table: {field: choices}}` set the base must offer — so a runbook can be generated from the module
-rather than transcribed beside it. `preflight_select_values` checks a run's values against that
-declaration before the first request, so code that outruns the declaration fails by name instead of
-as an opaque 422; a *base* that is behind the declaration still surfaces as the 422 above.
+`mark_outcome.REQUIRED_SELECT_CHOICES` is the exact machine-readable writer vocabulary;
+`mark_outcome.OPERATOR_REQUIRED_SELECT_CHOICES` separately owns manual values such as `Held`.
+The read-only checker unions both, while `preflight_select_values` checks only values the writer is
+about to send. Code that outruns its declaration fails by name instead of as an opaque 422; a
+*base* that is behind either declaration is reported by `airtable_required_choices.py check`.
 
-The vocabulary is deliberately **closed** and pinned by `tests/test_mark_outcome.py`. Adding a
-seventh value is a schema change in four places: the code map, `REQUIRED_SELECT_CHOICES`, this
-table, and the base itself.
+The writer vocabulary is deliberately **closed** and pinned by `tests/test_mark_outcome.py`. Adding
+a writer-emitted value changes the event map, `REQUIRED_SELECT_CHOICES`, this table and the base.
+Adding an operator-only value changes `OPERATOR_REQUIRED_SELECT_CHOICES`, this table and the base.
 
 ### `Deals` (`AIRTABLE_DEALS_TABLE`, default `Deals`)
 
@@ -177,6 +181,7 @@ table, and the base itself.
 | Package | Single line text | Primary field; `--deal-package`, falling back to the business name |
 | Deal Status | Single select | Created as **Deposit Pending** — the win is recorded, the money has not moved. Live choices observed 2026-07-29: Proposed, Deposit Pending, Deposit Paid, Contract Pending, Contract Signed, In Progress, Launched, Retainer Active, Lost. `Deposit Pending` is present, so this field needs no runbook work |
 | Setup Price / Retainer Price | Currency | Optional, from CLI flags |
+| Cash Collected | Currency | New MVP field, created by hand. The closer records the first cleared payment; setter commission is calculated on collected cash, never signature value |
 | Prospect | Link → Prospects | Set on create |
 | Deposit/Contract/Invoice checkboxes, Kickoff / Launch / Retainer Start dates | — | Hand-kept |
 | Clients | Link → Clients | Hand-linked at onboarding |
@@ -217,6 +222,19 @@ the point of removing `typecast`. All of it landed in the cutover. Full record:
 ### Standing obligation
 
 The debt is cleared, not abolished. Any select value added to
-`mark_outcome.REQUIRED_SELECT_CHOICES` or `queue_state.PROSPECT_STATUS_CHOICES` must be created in
-the base by hand before that code path can run. `airtable_required_choices.py check` is what catches
-it — exit 2 names the missing choice and prints the UI steps.
+`mark_outcome.REQUIRED_SELECT_CHOICES`, `mark_outcome.OPERATOR_REQUIRED_SELECT_CHOICES`,
+`queue_state.PROSPECT_STATUS_CHOICES`, or the configured `LPM_SETTER_ROSTER` must be created in the
+base by hand before that code path can run.
+`airtable_required_choices.py check` is what catches it — exit 2 names the missing choice and prints
+the UI steps. Field creation and non-select types (`Deals.Cash Collected`) remain manual checks.
+
+## MVP setter-assignment cutover (manual, not yet verified live)
+
+1. Create `Prospects.Assigned Setter` as single select and add every exact name from
+   `LPM_SETTER_ROSTER`.
+2. Add `Do Not Contact` and `Booked` to `Prospects.Status`.
+3. Add `Held` to `Sales Activities.Outcome`.
+4. Create `Deals.Cash Collected` as currency.
+5. Run `.venv/bin/python airtable_required_choices.py check`; it must exit 0.
+6. Follow [`setter-assignment-sop.md`](setter-assignment-sop.md) for the blank-only dry-run and
+   backfill. Per-rep views and permissions are manual and are not verified by repository tests.

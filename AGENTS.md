@@ -78,10 +78,12 @@ Key in-flight facts (2026-07-29):
   choice must be pre-created in the base by hand** — verified 2026-07-30, the Airtable API cannot
   add a choice to an existing select at all (`PATCH .../fields/{id}` takes `description` but 422s on
   `options.choices`, five body shapes tried). So **adding a value to
-  `mark_outcome.REQUIRED_SELECT_CHOICES` or `queue_state.PROSPECT_STATUS_CHOICES` is half a change**:
-  the base has to be edited by hand too, or that write path 422s. `airtable_required_choices.py
-  check` catches it — exit 2 names the missing choice and prints the UI steps. The base was brought
-  level on 2026-07-30 and the check exits 0. Background in
+  `mark_outcome.REQUIRED_SELECT_CHOICES`, `mark_outcome.OPERATOR_REQUIRED_SELECT_CHOICES`,
+  `queue_state.PROSPECT_STATUS_CHOICES`, or `LPM_SETTER_ROSTER` is half a change**: the base has to
+  be edited by hand too, or that write path 422s. `airtable_required_choices.py check` catches it —
+  exit 2 names the missing choice and prints the UI steps. The pre-MVP vocabulary was brought level
+  on 2026-07-30; the MVP additions (`Do Not Contact`, `Booked`, `Held`, and the setter roster) are
+  code-declared but not verified live, so do not claim the checker currently exits 0. Background in
   [`docs/airtable_schema_required.md`](docs/airtable_schema_required.md); full record in
   [`docs/airtable_cutover_runbook_2026-07-30.md`](docs/airtable_cutover_runbook_2026-07-30.md).
 - **Scoring runs on the Anthropic Messages API** (`claude-sonnet-5`, `LLM_SCORING_MODEL` in `.env`,
@@ -115,8 +117,9 @@ The cadence itself lives in `lead_machine/follow_up.py` (`FOLLOW_UP_CADENCE_DAYS
 two writers cannot disagree about it. Table names and the exact select vocabularies these scripts
 write are in [`docs/airtable_schema_required.md`](docs/airtable_schema_required.md).
 
-Two read-only tools guard the base against the code drifting ahead of it. Both exit 0 as of
-2026-07-30; a non-zero exit means the base has fallen behind and a write path is about to 422:
+Two read-only tools guard the base against the code drifting ahead of it. Both exited 0 for the
+pre-MVP schema on 2026-07-30. The MVP select additions have not been created or verified live; a
+non-zero exit means the base has fallen behind and a write path is about to 422:
 
 - `airtable_required_choices.py check` — does the base offer every select choice the code writes?
 - `airtable_schema_cutover.py verify <snapshot>` — are the retired fields gone and the record count
@@ -127,6 +130,8 @@ Two read-only tools guard the base against the code drifting ahead of it. Both e
   `AIRTABLE_PAT` (with `AIRTABLE_API_KEY` as a fallback in some scripts), `AIRTABLE_BASE_ID`,
   `AIRTABLE_PROSPECTS_TABLE`, `AIRTABLE_SALES_ACTIVITIES_TABLE` (default `Sales Activities`),
   `AIRTABLE_DEALS_TABLE` (default `Deals`), `AIRTABLE_RECEIPTS_PATH`, `ANTHROPIC_API_KEY`,
+  `LPM_SETTER_ROSTER` (ordered comma-separated active setters; assignment is stable for new leads
+  and never overwrites an existing assignee),
   `LLM_SCORING_MODEL`, the `MAX_LLM_*` caps, the Places caps (`MAX_SEARCH_CALLS_PER_RUN` 3,
   `MAX_DETAILS_CALLS_PER_RUN` 50, `MAX_TOTAL_PLACES_PER_RUN` 50, `MAX_WEBSITES_PER_RUN` 40),
   `ENRICH_WORKERS`, `BUYER_INTENT_ADS_CHECK` (off), `FOLLOW_UP_CADENCE_DAYS` (4), and
