@@ -86,10 +86,13 @@ Key in-flight facts (2026-07-29):
   code-declared but not verified live, so do not claim the checker currently exits 0. Background in
   [`docs/airtable_schema_required.md`](docs/airtable_schema_required.md); full record in
   [`docs/airtable_cutover_runbook_2026-07-30.md`](docs/airtable_cutover_runbook_2026-07-30.md).
-- **Scoring runs on the Anthropic Messages API** (`claude-sonnet-5`, `LLM_SCORING_MODEL` in `.env`,
-  no SDK — uses `requests`). Spend caps price the resolved model from
-  `score_leads.LLM_PRICING_USD_PER_MILLION_TOKENS`; an unpriced model fails the run rather than
-  being costed as something else, so a new model needs a table entry.
+- **Scoring runs through a provider chain** in `lead_machine/llm_client.py`: kimi (Moonshot API,
+  `KIMI_API_KEY` / `KIMI_SCORING_MODEL`, default `kimi-k3`) → codex CLI (ChatGPT subscription) →
+  claude CLI (subscription). Order via `LLM_SCORING_PROVIDER_CHAIN`; `anthropic` (Messages API,
+  `ANTHROPIC_API_KEY`) remains an optional provider. Fallback happens only on provider
+  unavailability — invalid output stays with the repair flow in `score_leads.py`. Every model the
+  chain can resolve must have a price in `score_leads.LLM_PRICING_USD_PER_MILLION_TOKENS` or the
+  run aborts at cost estimation; `[LLM PROVIDER]` in the run log says who actually served.
 - **`buyer_intent.money_signal` is tri-state** (`yes`/`no`/`unknown`). "unknown" means there was no
   crawlable site text to read a paid stack from, which is not the same claim as "does not spend".
   Only `yes` may count as truthy in a gate — `sendability.required_visible_pain_score` drops the
