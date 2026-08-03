@@ -225,6 +225,64 @@ class UploadSetterAssignmentTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "missing upsert key"):
             plan_airtable_sync([card])
 
+    def test_jsonl_upload_cannot_patch_a_human_status_away(self) -> None:
+        # A packet card carries the scorer's Status: "New" and no
+        # defaulted_airtable_fields, so before this the JSONL door PATCHed an
+        # opt-out back to New and returned the lead to QUEUE_FILTER_FORMULA.
+        # 063ed4e fixed the same defect on the CSV door.
+        source = {
+            "place_id_or_unique_key": "ChIJDNC",
+            "upsert_key": "place:ChIJDNC",
+            "business_name": "Opted Out Co",
+            "airtable_fields": {
+                "Business Name": "Opted Out Co",
+                "Place Key": "ChIJDNC",
+                "Status": "New",
+                "Outreach Channel": "Phone",
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cards.jsonl"
+            path.write_text(json.dumps(source) + "\n", encoding="utf-8")
+            card = upload_airtable.read_input_records(path, packet_dir=Path(tmp))[0]
+
+        # Still present on the POST that creates a record...
+        posted = plan_airtable_sync([card])[0]
+        self.assertEqual(posted["method"], "POST")
+        self.assertEqual(posted["payload"]["fields"]["Status"], "New")
+
+        # ...and stripped from every PATCH over an existing row.
+        patched = plan_airtable_sync(
+            [card], existing_records_by_key={"place:ChIJDNC": "recDNC"}
+        )[0]
+        self.assertEqual(patched["method"], "PATCH")
+        for field in upload_airtable.OPERATIONAL_FIELDS:
+            self.assertNotIn(field, patched["payload"]["fields"])
+
+    def test_operational_ownership_covers_every_declared_operational_field(self) -> None:
+        # Generic, so a field added to OPERATIONAL_FIELDS later cannot quietly
+        # skip the stripping that makes it human-owned.
+        fields = {field: "x" for field in upload_airtable.OPERATIONAL_FIELDS}
+        fields["Place Key"] = "ChIJGeneric"
+        record = {
+            "place_id_or_unique_key": "ChIJGeneric",
+            "upsert_key": "place:ChIJGeneric",
+            "airtable_fields": fields,
+        }
+        normalized = upload_airtable.enforce_operational_field_ownership([record])[0]
+        for field in upload_airtable.OPERATIONAL_FIELDS:
+            self.assertIn(field, normalized["defaulted_airtable_fields"])
+
+    def test_operational_ownership_is_idempotent_for_the_csv_door(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            card = upload_airtable.csv_row_to_record(
+                {"Business Name": "Dialled Co", "Place Key": "ChIJ123", "Status": "Sent"},
+                Path(tmp),
+            )
+        before = list(card["defaulted_airtable_fields"])
+        after = upload_airtable.enforce_operational_field_ownership([card])[0]
+        self.assertEqual(after["defaulted_airtable_fields"], before)
+
     def test_jsonl_cannot_supply_a_different_configured_assignment(self) -> None:
         source = {
             "place_id_or_unique_key": "ChIJLANE",

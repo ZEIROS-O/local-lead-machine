@@ -104,12 +104,22 @@ PROSPECT_STATUS_CHOICE_SET = frozenset(PROSPECT_STATUS_CHOICES)
 # Status set that had moved underneath it.
 #
 # Accepted means "taken into outreach", not "won". A lead that was sent and lost
-# or opted out was still accepted for contact — the machine's job is to propose
-# leads worth contacting, and conversion/compliance outcomes are separate.
-ACCEPTED_STATUSES = frozenset(
-    {"Sent", "Follow-Up", "Won", "Lost", "Do Not Contact", "Booked"}
-)
-REJECTED_STATUSES = frozenset({"Not Fit"})
+# was still accepted — the machine's job is to propose leads worth contacting,
+# and conversion is a separate question with a separate metric. `Booked` joins
+# them: an appointment is unambiguously a lead taken into outreach.
+#
+# `Do Not Contact` is rejected, not accepted, and the asymmetry is deliberate.
+# It is hand-applied and reachable straight from `New`, so a rep who declines a
+# lead because it is a competitor or a known DNC number would otherwise score as
+# an approval of the machine's proposal — while a rep who writes `Not Fit` for
+# the same reason scores against it. Every other accepted status is downstream
+# of mark_sent, which is what made the bucket evidence rather than assertion.
+# Bucketing it here can only depress the rate, never inflate it, and inflation
+# is the one direction that makes a losing loop read as passing. Distinguishing
+# "opted out after we called" from "rep refused to call it" needs evidence of
+# contact — `Last Contacted` — which the eval does not read yet.
+ACCEPTED_STATUSES = frozenset({"Sent", "Follow-Up", "Won", "Lost", "Booked"})
+REJECTED_STATUSES = frozenset({"Not Fit", "Do Not Contact"})
 UNDECIDED_STATUSES = frozenset({"New", "Mockup Needed", "Manual Review"})
 # Pinned as a partition by tests/test_queue_state_formula.py: a new Status must
 # be classified as accept, reject or undecided, because the alternative is a KPI

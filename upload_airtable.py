@@ -681,7 +681,37 @@ def read_input_records(
         records = read_csv_records(path, packet_dir=packet_dir)
     else:
         records = read_cards(path)
-    return enforce_setter_assignment_ownership(records)
+    return enforce_setter_assignment_ownership(
+        enforce_operational_field_ownership(records)
+    )
+
+
+def enforce_operational_field_ownership(
+    records: Iterable[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Mark human-owned operational columns defaulted on every front door.
+
+    `csv_row_to_record` already does this, which is what `063ed4e` fixed after
+    a dialled lead was PATCHed back to `New` and contacted twice. Packet cards
+    are the other front door and never got the same treatment: `lead_card`
+    copies the scorer's `Status: "New"` into `airtable_fields` and returns no
+    `defaulted_airtable_fields` at all, so a JSONL re-upload of a lead a human
+    had moved to `Do Not Contact` PATCHed the opt-out away and put the row back
+    in `QUEUE_FILTER_FORMULA`. Idempotent, so the CSV path is unaffected.
+    """
+    normalized: List[Dict[str, Any]] = []
+    for record in records:
+        fields = record.get("airtable_fields")
+        if not isinstance(fields, dict):
+            normalized.append(record)
+            continue
+        defaulted = [str(field) for field in (record.get("defaulted_airtable_fields") or [])]
+        for field in OPERATIONAL_FIELDS:
+            if clean_cell(fields.get(field)) and field not in defaulted:
+                defaulted.append(field)
+        record["defaulted_airtable_fields"] = defaulted
+        normalized.append(record)
+    return normalized
 
 
 def enforce_setter_assignment_ownership(
@@ -1212,7 +1242,16 @@ def main() -> int:
         print(f"[DONE] Synced records: {applied} of {len(planned)} planned")
         print(f"[DONE] Write receipts: {receipts_path}")
         return 0
-    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+    except (
+        FileNotFoundError,
+        RuntimeError,
+        ValueError,
+        # The schema gate calls raise_for_status, and HTTPError is not a
+        # subclass of any of the above: a 403 from a PAT without
+        # schema.bases:read, or a 429 from the meta endpoint, would traceback
+        # instead of printing [ERROR] and exiting 1.
+        requests.RequestException,
+    ) as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         return 1
 

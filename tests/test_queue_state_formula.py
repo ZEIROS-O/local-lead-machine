@@ -142,11 +142,19 @@ class TestQueueStateFormula(unittest.TestCase):
                 with self.subTest(pair=(first, second)):
                     self.assertEqual(buckets[first] & buckets[second], frozenset())
 
-    def test_dnc_and_booked_are_terminal_accepted_outcomes(self):
+    def test_dnc_and_booked_are_terminal_and_leave_the_dial_queue(self):
         for status in ("Do Not Contact", "Booked"):
             with self.subTest(status=status):
-                self.assertIn(status, queue_state.ACCEPTED_STATUSES)
                 self.assertNotIn(status, queue_state.QUEUE_STATUS_CLAUSE.allowed)
+
+    def test_booked_is_accepted_and_dnc_is_not(self):
+        # Asymmetric on purpose. `Booked` is only reachable after contact;
+        # `Do Not Contact` is hand-applied and reachable straight from `New`,
+        # so counting it as an approval would let a rep who declines to dial a
+        # lead inflate the KPI that says whether the loop is working.
+        self.assertIn("Booked", queue_state.ACCEPTED_STATUSES)
+        self.assertIn("Do Not Contact", queue_state.REJECTED_STATUSES)
+        self.assertNotIn("Do Not Contact", queue_state.ACCEPTED_STATUSES)
 
     def test_undecided_statuses_contain_the_whole_dial_queue(self):
         # A queued lead has not been judged yet. If one ever counted as accepted,
