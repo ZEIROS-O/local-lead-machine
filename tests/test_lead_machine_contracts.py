@@ -3195,6 +3195,107 @@ class LeadMachineContractsTest(unittest.TestCase):
         _, kwargs = post.call_args
         self.assertEqual(kwargs["json"]["model"], "kimi-k2.6")
 
+    def test_codex_cli_provider_serves_bundle(self) -> None:
+        from lead_machine import llm_client
+        import score_batch_subscription as subs
+
+        bundle = {"batch_id": "batch_001", "scores": [{"score_file": "chij123.json", "score": self._manual_score(total_score=75, grade="B")}]}
+        runner_result = subs.RunnerResult(
+            result="ok",
+            raw_text=json.dumps(bundle),
+            usage={"input_tokens": 10, "output_tokens": 5},
+            stderr_tail="",
+            duration_seconds=1.0,
+        )
+
+        with patch.dict(os.environ, {"LLM_SCORING_PROVIDER_CHAIN": "codex"}, clear=False):
+            with patch("score_batch_subscription.preflight_subscription_auth", return_value=subs.AuthResult(True, "chatgpt_subscription", "ok")) as auth:
+                with patch("score_batch_subscription.run_runner_attempt", return_value=runner_result) as attempt:
+                    result = llm_client.score_batch("score this batch", model=None, max_tokens=4096)
+
+        self.assertEqual(result["provider"], "codex")
+        self.assertEqual(result["bundle"]["batch_id"], "batch_001")
+        self.assertEqual(result["usage"]["total_tokens"], 15)
+        self.assertEqual(auth.call_args.args[0], "codex")
+        _, kwargs = attempt.call_args
+        self.assertEqual(kwargs["prompt_text"], "score this batch")
+        self.assertTrue(kwargs["use_output_schema"])
+
+    def test_codex_cli_auth_failure_falls_back_to_claude(self) -> None:
+        from lead_machine import llm_client
+        import score_batch_subscription as subs
+
+        bundle = {"batch_id": "batch_001", "scores": [{"score_file": "chij123.json", "score": self._manual_score(total_score=75, grade="B")}]}
+        runner_result = subs.RunnerResult(result="ok", raw_text=json.dumps(bundle), usage=None, stderr_tail="", duration_seconds=1.0)
+
+        def fake_auth(runner, *, env, process_runner=subs.run_process):
+            if runner == "codex":
+                return subs.AuthResult(False, "unverified", "not logged in")
+            return subs.AuthResult(True, "claude_subscription:max", "ok")
+
+        with patch.dict(os.environ, {"LLM_SCORING_PROVIDER_CHAIN": "codex,claude"}, clear=False):
+            with patch("score_batch_subscription.preflight_subscription_auth", side_effect=fake_auth):
+                with patch("score_batch_subscription.run_runner_attempt", return_value=runner_result) as attempt:
+                    result = llm_client.score_batch("score this batch", model=None, max_tokens=4096)
+
+        self.assertEqual(result["provider"], "claude")
+        self.assertEqual(result["usage"], {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+        self.assertEqual(attempt.call_args.args[0], "claude")
+
+    def test_cli_runner_quota_result_falls_back(self) -> None:
+        from lead_machine import llm_client
+        import score_batch_subscription as subs
+
+        bundle = {"batch_id": "batch_001", "scores": [{"score_file": "chij123.json", "score": self._manual_score(total_score=75, grade="B")}]}
+        quota = subs.RunnerResult(result="quota_exhausted", raw_text="", usage=None, stderr_tail="usage limit", duration_seconds=0.5)
+        ok = subs.RunnerResult(result="ok", raw_text=json.dumps(bundle), usage=None, stderr_tail="", duration_seconds=1.0)
+
+        def fake_attempt(runner, **kwargs):
+            return quota if runner == "codex" else ok
+
+        with patch.dict(os.environ, {"LLM_SCORING_PROVIDER_CHAIN": "codex,claude"}, clear=False):
+            with patch("score_batch_subscription.preflight_subscription_auth", return_value=subs.AuthResult(True, "sub", "ok")):
+                with patch("score_batch_subscription.run_runner_attempt", side_effect=fake_attempt):
+                    result = llm_client.score_batch("score this batch", model=None, max_tokens=4096)
+
+        self.assertEqual(result["provider"], "claude")
+
+    def test_cli_provider_invalid_json_does_not_fall_back(self) -> None:
+        from lead_machine import llm_client
+        import score_batch_subscription as subs
+
+        bad = subs.RunnerResult(result="ok", raw_text="{not json", usage=None, stderr_tail="", duration_seconds=1.0)
+
+        with patch.dict(os.environ, {"LLM_SCORING_PROVIDER_CHAIN": "codex,claude"}, clear=False):
+            with patch("score_batch_subscription.preflight_subscription_auth", return_value=subs.AuthResult(True, "sub", "ok")):
+                with patch("score_batch_subscription.run_runner_attempt", return_value=bad):
+                    with self.assertRaises(llm_client.InvalidLlmResponse):
+                        llm_client.score_batch("score this batch", model=None, max_tokens=4096)
+
+    def test_resolve_scoring_model_follows_the_first_provider_in_the_chain(self) -> None:
+        from lead_machine import llm_client
+
+        with patch.dict(os.environ, {"LLM_SCORING_PROVIDER_CHAIN": "kimi,codex"}, clear=False):
+            os.environ.pop("KIMI_SCORING_MODEL", None)
+            os.environ.pop("LLM_SCORING_MODEL", None)
+            # resolve_scoring_model() calls load_dotenv(); the real repo .env one
+            # directory up (outside this worktree) sets LLM_SCORING_MODEL, and
+            # dotenv's override=False only protects keys still present in
+            # os.environ — popped keys get repopulated from disk. Patch it out
+            # here, same as the kimi provider tests above, so the assertions
+            # below reflect the env this test actually set, not ambient .env.
+            with patch("lead_machine.llm_client.load_dotenv"):
+                self.assertEqual(llm_client.resolve_scoring_model(), llm_client.DEFAULT_KIMI_SCORING_MODEL)
+
+        with patch.dict(os.environ, {"LLM_SCORING_PROVIDER_CHAIN": "codex,kimi"}, clear=False):
+            with patch("lead_machine.llm_client.load_dotenv"):
+                self.assertEqual(llm_client.resolve_scoring_model(), "subscription:codex")
+
+        with patch.dict(os.environ, {"LLM_SCORING_PROVIDER_CHAIN": "anthropic"}, clear=False):
+            os.environ.pop("LLM_SCORING_MODEL", None)
+            with patch("lead_machine.llm_client.load_dotenv"):
+                self.assertEqual(llm_client.resolve_scoring_model(), llm_client.DEFAULT_LLM_SCORING_MODEL)
+
     def test_api_llm_caps_stop_before_next_batch_call(self) -> None:
         from score_leads import score_records_api_run
 

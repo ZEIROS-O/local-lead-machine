@@ -359,8 +359,65 @@ def _anthropic_provider(prompt: str, *, model: str | None, max_tokens: int) -> D
         raise ProviderUnavailable(str(exc)) from exc
 
 
+DEFAULT_CLI_TIMEOUT_SECONDS = 900
+
+
+def _normalize_cli_usage(raw: Dict[str, Any] | None) -> Dict[str, int]:
+    raw = raw or {}
+
+    def _pick(*keys: str) -> int:
+        for key in keys:
+            try:
+                value = int(raw.get(key) or 0)
+            except (TypeError, ValueError):
+                continue
+            if value:
+                return value
+        return 0
+
+    input_tokens = _pick("input_tokens", "prompt_tokens")
+    output_tokens = _pick("output_tokens", "completion_tokens")
+    total = _pick("total_tokens") or input_tokens + output_tokens
+    return {"input_tokens": input_tokens, "output_tokens": output_tokens, "total_tokens": total}
+
+
+def _score_batch_cli(runner: str, prompt: str, *, model: str | None, max_tokens: int) -> Dict[str, Any]:
+    import score_batch_subscription as subscription_runner
+
+    env = subscription_runner.sanitized_environment()
+    auth = subscription_runner.preflight_subscription_auth(runner, env=env)
+    if not auth.ok:
+        raise ProviderUnavailable(f"{runner} subscription auth not verified: {auth.detail}")
+
+    env_key = "CODEX_SUBSCRIPTION_SCORING_MODEL" if runner == "codex" else "CLAUDE_SUBSCRIPTION_SCORING_MODEL"
+    selected_model = (os.getenv(env_key) or "").strip()
+    timeout_seconds = max(1, _getenv_int("LLM_CLI_TIMEOUT_SECONDS", DEFAULT_CLI_TIMEOUT_SECONDS))
+    print(f"[LLM REQUEST] provider={runner} model={selected_model or 'runner-default'} via CLI subscription")
+    result = subscription_runner.run_runner_attempt(
+        runner,
+        prompt_text=prompt,
+        model=selected_model,
+        timeout_seconds=timeout_seconds,
+        env=env,
+        use_output_schema=(runner == "codex"),
+    )
+    if result.result != "ok":
+        raise ProviderUnavailable(f"{runner} CLI runner result={result.result}: {result.stderr_tail}")
+
+    text = subscription_runner.clean_bundle_text(result.raw_text)
+    bundle = _parse_score_bundle(text)  # InvalidLlmResponse propagates: no fallback on bad output
+    usage = _normalize_cli_usage(result.usage)
+    print(
+        f"[LLM REQUEST OK] provider={runner} "
+        f"input_tokens={usage['input_tokens']} output_tokens={usage['output_tokens']}"
+    )
+    return {"bundle": bundle, "usage": usage, "provider": runner, "model": selected_model or "runner-default"}
+
+
 _PROVIDERS: Dict[str, Callable] = {
     "kimi": _score_batch_kimi,
+    "codex": lambda prompt, *, model, max_tokens: _score_batch_cli("codex", prompt, model=model, max_tokens=max_tokens),
+    "claude": lambda prompt, *, model, max_tokens: _score_batch_cli("claude", prompt, model=model, max_tokens=max_tokens),
     "anthropic": _anthropic_provider,
 }
 
@@ -413,3 +470,26 @@ def score_batch(prompt: str, *, model: str | None = None, max_tokens: int) -> Di
         result.setdefault("provider", provider)
         return result
     raise RuntimeError("All LLM scoring providers unavailable: " + "; ".join(failures))
+
+
+def resolve_scoring_model() -> str:
+    """Model id the chain's first provider will use — for cost estimation and logging.
+
+    `score_leads.py` needs one model string up front to price the run against
+    `MAX_LLM_USD_PER_RUN`. Reading `LLM_SCORING_MODEL` directly (as it used to)
+    names a provider that may not be in the chain at all. Subscription runners
+    have no per-token price, so they report a `subscription:<runner>` id that the
+    pricing table registers at $0.
+    """
+    load_dotenv()
+    chain = _provider_chain()
+    first = chain[0] if chain else "anthropic"
+    if first == "kimi":
+        return (
+            os.getenv("KIMI_SCORING_MODEL")
+            or os.getenv("LLM_SCORING_MODEL")  # legacy alias
+            or DEFAULT_KIMI_SCORING_MODEL
+        ).strip()
+    if first in {"codex", "claude"}:
+        return f"subscription:{first}"
+    return (os.getenv("LLM_SCORING_MODEL") or DEFAULT_LLM_SCORING_MODEL).strip()
