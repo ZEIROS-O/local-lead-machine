@@ -2,6 +2,7 @@
 
 Date: 2026-07-24
 Status: approved (design), pre-implementation
+Revised: 2026-08-03 — see `## Revision 2026-08-03` at the end; it supersedes two statements below.
 
 ## Goal
 
@@ -125,3 +126,37 @@ Run `python -m unittest discover -s tests` (must pass in full).
 - Update `.env.example` with the new variables.
 - Update `AGENTS.md`: the "Scoring is being automated ... (Sonnet 4.6,
   `LLM_SCORING_MODEL` ...)" line reflects the kimi-default chain after this change.
+
+## Revision 2026-08-03
+
+Found during a pre-implementation review of this design against the live code. Two statements above
+are wrong as written; the plan
+(`docs/superpowers/plans/2026-07-24-multi-provider-llm-scoring.md`) implements the corrections.
+
+**1. `score_leads.py` is in scope.** The non-goals implied the pipeline was untouched. It isn't:
+
+- `score_leads.main()` resolves `llm_model = os.getenv("LLM_SCORING_MODEL") or "claude-sonnet-5"` and
+  passes it as the explicit `model=` into `score_batch`. Under the rule below ("the explicit `model=`
+  argument overrides the kimi model"), a live run would POST `claude-sonnet-5` to Moonshot and 400.
+  `main()` must resolve its model from the chain instead — `llm_client.resolve_scoring_model()`.
+- `score_leads.llm_pricing()` raises `UnknownLlmModelError` for unregistered ids and the caller
+  `return 1`s before any scoring call, so the kimi model must be registered in
+  `LLM_PRICING_USD_PER_MILLION_TOKENS`, alongside `subscription:codex` / `subscription:claude` at
+  `(0.0, 0.0)` for the CLI providers. Prices come from the Moonshot console, never from an estimate:
+  a wrong price silently miscalibrates `MAX_LLM_USD_PER_RUN` and `--dry-run-llm-cost`.
+
+**2. An explicit `model=` is forwarded only to the chain's first provider.** The original rule
+("the explicit `model=` argument, when given, overrides the kimi model") breaks the moment the chain
+advances between two API providers — the second would receive a model id belonging to the first.
+`score_batch` now passes the caller's model to the first provider only; every provider after it
+resolves its own model from env.
+
+**Also unverified at design time:** `kimi-k3` and `https://api.moonshot.ai/v1` were assumed, never
+exercised. Confirm both against `GET {KIMI_BASE_URL}/models` before implementing (plan Task 0);
+a `platform.moonshot.ai` key is not valid against `api.moonshot.cn`.
+
+**Accepted limitation:** a non-transient kimi 4xx (bad model, quota, billing) is classified as
+unavailability, so a misconfigured kimi degrades to the subscription CLIs and the run still
+succeeds — spending subscription capacity instead of Kimi credits. The mitigations are operational,
+not structural: a `[LLM PROVIDER]` line in the run log, and a first live batch run with
+`LLM_SCORING_PROVIDER_CHAIN=kimi` pinned.

@@ -9,15 +9,81 @@
 **Tech Stack:** Python 3.10+ stdlib + `requests` + `python-dotenv` (already used); stdlib `unittest` tests; no new dependencies.
 
 **Spec:** `docs/superpowers/specs/2026-07-24-multi-provider-llm-scoring-design.md`
+(see its `## Revision 2026-08-03` section — it supersedes two statements in the original design)
 
 ## Global Constraints
 
-- Tests are stdlib `unittest`; run `python -m unittest discover -s tests` (bare `python -m unittest` discovers 0 tests here).
+- Tests are stdlib `unittest`; run `.venv/bin/python -m unittest discover -s tests` (bare `python -m unittest` discovers 0 tests here).
 - No new heavy deps; HTTP via `requests` only.
 - Follow the existing `_getenv_int`/`_getenv_float` + `[WARN]` pattern in `lead_machine/llm_client.py` for env config.
 - Fallback only on unavailability; `InvalidLlmResponse` always propagates without trying the next provider.
 - CLI subprocesses are never spawned in unit tests — patch `score_batch_subscription.run_runner_attempt` / `preflight_subscription_auth`.
 - Default chain (when `LLM_SCORING_PROVIDER_CHAIN` is unset): `kimi,codex,claude`. `anthropic` is a valid but non-default provider name.
+- **Line numbers in this plan are from 2026-07-24 and have drifted.** Locate every edit site by symbol
+  name, not by line number, and re-read the surrounding code before editing.
+
+## Readiness review (2026-08-03)
+
+This plan was reviewed against the live code before implementation. Everything it reaches for in
+`lead_machine/llm_client.py` and `score_batch_subscription.py` exists with the assumed signatures.
+Two gaps were found and are now fixed **in this plan**, not left to the implementer:
+
+1. `score_leads.py` resolves `llm_model = os.getenv("LLM_SCORING_MODEL") or "claude-sonnet-5"` and
+   passes it as the explicit `model=` into `score_batch`, which would override the kimi model and
+   make a live run POST `claude-sonnet-5` to Moonshot. Tests here all pass `model=None`, so the
+   suite would be green while the pipeline was dead. → Task 4 + the first-provider-only model rule
+   in Task 1.
+2. `score_leads.llm_pricing()` raises `UnknownLlmModelError` on unregistered model ids and the
+   caller `return 1`s before any scoring call, so a kimi model id aborts the run at cost
+   estimation. → Task 4 pricing entries.
+
+Original scope said `score_leads.py` was untouched. That is no longer true: **Task 4 is required for
+Kimi to score anything.**
+
+---
+
+### Task 0: Preflight — confirm the Moonshot model id, endpoint, and prices
+
+Gate, not code. Do this first; Tasks 2 and 4 hardcode its answers.
+
+`kimi-k3` and `https://api.moonshot.ai/v1` are assumptions carried from the design doc and have
+never been exercised. A wrong model id 400s (and, per Task 1's semantics, silently degrades to a
+subscription provider). A guessed price silently miscalibrates `MAX_LLM_USD_PER_RUN` — which is the
+exact failure the comment at `score_leads.py:278-285` was written about.
+
+- [ ] **Step 1: Confirm `KIMI_API_KEY` is present in `.env`** (the operator adds it; never commit it).
+
+- [ ] **Step 2: List the real model ids**
+
+```bash
+.venv/bin/python - <<'PY'
+import os, requests
+from dotenv import load_dotenv
+load_dotenv()
+base = (os.getenv("KIMI_BASE_URL") or "https://api.moonshot.ai/v1").rstrip("/")
+key = os.getenv("KIMI_API_KEY") or os.getenv("MOONSHOT_API_KEY")
+r = requests.get(f"{base}/models", headers={"Authorization": f"Bearer {key}"}, timeout=(15, 60))
+print(r.status_code)
+print(sorted(m.get("id") for m in (r.json().get("data") or [])))
+PY
+```
+
+One call validates the model id, the base URL, and the key's region together. A
+`platform.moonshot.ai` key is **not** valid against `api.moonshot.cn` and vice versa — a 401 here
+means the wrong endpoint for that key, not a bad key.
+
+- [ ] **Step 3: Record the answers below before continuing**
+
+```
+Confirmed model id:      ____________________   (replaces `kimi-k3` everywhere in Tasks 2 and 4)
+Confirmed base URL:      ____________________
+Input  USD / 1M tokens:  ____________________   (from the Moonshot console pricing page — do NOT estimate)
+Output USD / 1M tokens:  ____________________
+```
+
+If the confirmed id is not `kimi-k3`, substitute it in `DEFAULT_KIMI_SCORING_MODEL` (Task 2), the
+pricing table (Task 4), `.env.example` and `AGENTS.md` (Task 5). Do not leave `kimi-k3` in place
+"as a default" if it isn't real — an unregistered id aborts the run at cost estimation.
 
 ---
 
@@ -25,7 +91,9 @@
 
 **Files:**
 - Modify: `lead_machine/llm_client.py` (whole file restructure)
-- Test: `tests/test_lead_machine_contracts.py` (update existing `test_llm_client_*` tests ~lines 2345-2517; add new tests after them)
+- Test: `tests/test_lead_machine_contracts.py` (update the existing `test_llm_client_*` tests — they
+  were at ~2345-2517 when this plan was written and are at ~2813-2985 as of 2026-08-03; find them by
+  name — and add new tests after them)
 
 **Interfaces:**
 - Consumes: existing `validate_bundle_scores` import; existing `InvalidLlmResponse`, `_parse_score_bundle`, `_usage`, `_estimate_prompt_tokens`.
@@ -38,7 +106,9 @@
 
 - [ ] **Step 1: Update existing tests to pin the anthropic chain**
 
-The six existing tests at `tests/test_lead_machine_contracts.py:2345-2517` (`test_llm_client_posts_anthropic_message_and_parses_score_bundle`, `..._uses_configured_connect_and_read_timeout_tuple`, `..._retries_timeout_up_to_max_retries`, `..._retries_500_and_503_responses`, `..._does_not_retry_deterministic_400_response`, `..._final_retry_error_includes_timeout_settings_and_attempts`) each use `patch.dict(os.environ, {...}, clear=False)`. Add `"LLM_SCORING_PROVIDER_CHAIN": "anthropic"` to every one of those env dicts so they keep exercising the Anthropic provider directly regardless of the new default chain.
+The six existing tests (`test_llm_client_posts_anthropic_message_and_parses_score_bundle`, `..._uses_configured_connect_and_read_timeout_tuple`, `..._retries_timeout_up_to_max_retries`, `..._retries_500_and_503_responses`, `..._does_not_retry_deterministic_400_response`, `..._final_retry_error_includes_timeout_settings_and_attempts`) each use `patch.dict(os.environ, {...}, clear=False)`. Add `"LLM_SCORING_PROVIDER_CHAIN": "anthropic"` to every one of those env dicts so they keep exercising the Anthropic provider directly regardless of the new default chain.
+
+Their `assertIn` message checks (`"Anthropic API error 400"`, `"model=claude-sonnet-5"`, `"attempts=3"`, …) still hold after the refactor: the driver wraps the provider's text into `"All LLM scoring providers unavailable: anthropic: <original text>"`, so the substrings survive. Do not weaken those assertions.
 
 - [ ] **Step 2: Write the failing tests**
 
@@ -81,6 +151,29 @@ Add after the existing llm_client tests:
         self.assertEqual(result["provider"], "codex")
         self.assertEqual(result["bundle"]["batch_id"], "batch_001")
 
+    def test_llm_client_forwards_explicit_model_only_to_the_first_provider(self) -> None:
+        from lead_machine import llm_client
+
+        bundle = {"batch_id": "batch_001", "scores": [{"score_file": "chij123.json", "score": self._manual_score(total_score=75, grade="B")}]}
+        seen: list = []
+
+        def fake_down(prompt, *, model, max_tokens):
+            seen.append(model)
+            raise llm_client.ProviderUnavailable("down")
+
+        def fake_up(prompt, *, model, max_tokens):
+            seen.append(model)
+            return {"bundle": bundle, "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}, "model": "m"}
+
+        providers = {"kimi": fake_down, "anthropic": fake_up}
+        with patch.dict(os.environ, {"LLM_SCORING_PROVIDER_CHAIN": "kimi,anthropic"}, clear=False):
+            with patch.dict(llm_client._PROVIDERS, providers, clear=True):
+                llm_client.score_batch("score this batch", model="kimi-k3", max_tokens=4096)
+
+        # The caller's model belongs to the provider it was chosen for. Handing
+        # "kimi-k3" to the next API provider would 400 the whole chain.
+        self.assertEqual(seen, ["kimi-k3", None])
+
     def test_llm_client_does_not_fall_back_on_invalid_llm_response(self) -> None:
         from lead_machine import llm_client
 
@@ -120,8 +213,8 @@ Add after the existing llm_client tests:
 
 - [ ] **Step 3: Run new tests to verify they fail**
 
-Run: `python -m unittest tests.test_lead_machine_contracts -v 2>&1 | tail -20`
-Expected: the five new tests FAIL (`ProviderUnavailable` / `_provider_chain` do not exist — ImportError/AttributeError); the six updated anthropic tests FAIL or error because `LLM_SCORING_PROVIDER_CHAIN` is not yet honored.
+Run: `.venv/bin/python -m unittest tests.test_lead_machine_contracts -v 2>&1 | tail -20`
+Expected: the six new tests FAIL (`ProviderUnavailable` / `_provider_chain` do not exist — ImportError/AttributeError); the six updated anthropic tests FAIL or error because `LLM_SCORING_PROVIDER_CHAIN` is not yet honored.
 
 - [ ] **Step 4: Implement the registry and chain driver**
 
@@ -176,9 +269,13 @@ def _provider_chain() -> List[str]:
 def score_batch(prompt: str, *, model: str | None = None, max_tokens: int) -> Dict[str, Any]:
     load_dotenv()
     failures: List[str] = []
-    for provider in _provider_chain():
+    for index, provider in enumerate(_provider_chain()):
+        # An explicit model belongs to the provider it was chosen for. Handing a
+        # kimi id to a fallback API provider would 400 the rest of the chain, so
+        # every provider after the first resolves its own model from env.
+        requested_model = model if index == 0 else None
         try:
-            result = _PROVIDERS[provider](prompt, model=model, max_tokens=max_tokens)
+            result = _PROVIDERS[provider](prompt, model=requested_model, max_tokens=max_tokens)
         except InvalidLlmResponse:
             raise
         except ProviderUnavailable as exc:
@@ -196,8 +293,8 @@ Note: `_score_batch_anthropic` keeps its own `load_dotenv()` call — harmless d
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `python -m unittest tests.test_lead_machine_contracts 2>&1 | tail -5`
-Expected: `OK` (all tests, including the 11 touched/added llm_client ones).
+Run: `.venv/bin/python -m unittest tests.test_lead_machine_contracts 2>&1 | tail -5`
+Expected: `OK` (all tests, including the 12 touched/added llm_client ones).
 
 - [ ] **Step 6: Commit**
 
@@ -220,6 +317,10 @@ git commit -m "refactor: provider registry + fallback chain driver in llm_client
   - `_score_batch_kimi(prompt: str, *, model: str | None, max_tokens: int) -> Dict[str, Any]`
   - `_PROVIDERS["kimi"]` registered.
   - Env: `KIMI_API_KEY` (alias `MOONSHOT_API_KEY`), `KIMI_BASE_URL` (default `https://api.moonshot.ai/v1`), `KIMI_SCORING_MODEL` (default `kimi-k3`; legacy alias `LLM_SCORING_MODEL` when `KIMI_SCORING_MODEL` unset), `KIMI_CONNECT_TIMEOUT_SECONDS` / `KIMI_READ_TIMEOUT_SECONDS` / `KIMI_MAX_RETRIES` / `KIMI_RETRY_BACKOFF_SECONDS` (same defaults as the ANTHROPIC_* ones: 15 / 180 / 2 / 2).
+
+**Use the model id and base URL confirmed in Task 0** wherever this task writes `kimi-k3` or
+`https://api.moonshot.ai/v1` — in `DEFAULT_KIMI_SCORING_MODEL`, `DEFAULT_KIMI_BASE_URL`, and the
+test assertions.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -356,7 +457,7 @@ git commit -m "refactor: provider registry + fallback chain driver in llm_client
 
 - [ ] **Step 2: Run new tests to verify they fail**
 
-Run: `python -m unittest tests.test_lead_machine_contracts -v 2>&1 | tail -20`
+Run: `.venv/bin/python -m unittest tests.test_lead_machine_contracts -v 2>&1 | tail -20`
 Expected: the five kimi tests FAIL (`_PROVIDERS` has no `"kimi"` → `[WARN] Unknown LLM provider` → chain empty or falls through).
 
 - [ ] **Step 3: Implement the kimi provider**
@@ -477,7 +578,7 @@ Register it in `_PROVIDERS` (add `"kimi": _score_batch_kimi` above `"anthropic"`
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `python -m unittest tests.test_lead_machine_contracts 2>&1 | tail -5`
+Run: `.venv/bin/python -m unittest tests.test_lead_machine_contracts 2>&1 | tail -5`
 Expected: `OK`.
 
 - [ ] **Step 5: Commit**
@@ -501,6 +602,9 @@ git commit -m "feat: kimi (Moonshot API) scoring provider"
   - `_normalize_cli_usage(raw: dict | None) -> Dict[str, int]`
   - `_score_batch_cli(runner: str, prompt: str, *, model: str | None, max_tokens: int) -> Dict[str, Any]`
   - `_PROVIDERS["codex"]` and `_PROVIDERS["claude"]` registered (via `functools.partial`-free lambdas or thin wrappers).
+  - `resolve_scoring_model() -> str` — public; the model id the chain's **first** provider will use.
+    `score_leads.py` consumes it for cost estimation and logging (Task 4). Defined here because it
+    needs every provider's env conventions.
   - Env: `CODEX_SUBSCRIPTION_SCORING_MODEL`, `CLAUDE_SUBSCRIPTION_SCORING_MODEL` (already used by `score_batch_subscription.py`), `LLM_CLI_TIMEOUT_SECONDS` (default 900).
 
 - [ ] **Step 1: Write the failing tests**
@@ -582,12 +686,27 @@ git commit -m "feat: kimi (Moonshot API) scoring provider"
                 with patch("score_batch_subscription.run_runner_attempt", return_value=bad):
                     with self.assertRaises(llm_client.InvalidLlmResponse):
                         llm_client.score_batch("score this batch", model=None, max_tokens=4096)
+
+    def test_resolve_scoring_model_follows_the_first_provider_in_the_chain(self) -> None:
+        from lead_machine import llm_client
+
+        with patch.dict(os.environ, {"LLM_SCORING_PROVIDER_CHAIN": "kimi,codex"}, clear=False):
+            os.environ.pop("KIMI_SCORING_MODEL", None)
+            os.environ.pop("LLM_SCORING_MODEL", None)
+            self.assertEqual(llm_client.resolve_scoring_model(), llm_client.DEFAULT_KIMI_SCORING_MODEL)
+
+        with patch.dict(os.environ, {"LLM_SCORING_PROVIDER_CHAIN": "codex,kimi"}, clear=False):
+            self.assertEqual(llm_client.resolve_scoring_model(), "subscription:codex")
+
+        with patch.dict(os.environ, {"LLM_SCORING_PROVIDER_CHAIN": "anthropic"}, clear=False):
+            os.environ.pop("LLM_SCORING_MODEL", None)
+            self.assertEqual(llm_client.resolve_scoring_model(), llm_client.DEFAULT_LLM_SCORING_MODEL)
 ```
 
 - [ ] **Step 2: Run new tests to verify they fail**
 
-Run: `python -m unittest tests.test_lead_machine_contracts -v 2>&1 | tail -20`
-Expected: four CLI tests FAIL (unknown providers `codex`/`claude` → chain empty → exhaustion `RuntimeError`).
+Run: `.venv/bin/python -m unittest tests.test_lead_machine_contracts -v 2>&1 | tail -20`
+Expected: the four CLI tests FAIL (unknown providers `codex`/`claude` → chain empty → exhaustion `RuntimeError`) and the `resolve_scoring_model` test FAILs with `AttributeError`.
 
 - [ ] **Step 3: Implement the CLI providers**
 
@@ -662,9 +781,39 @@ _PROVIDERS = {
 
 (The explicit `model=` argument is intentionally ignored for CLI providers — their model comes from `CODEX_SUBSCRIPTION_SCORING_MODEL` / `CLAUDE_SUBSCRIPTION_SCORING_MODEL`, per the spec.)
 
+Then add the public model resolver the pipeline prices against:
+
+```python
+def resolve_scoring_model() -> str:
+    """Model id the chain's first provider will use — for cost estimation and logging.
+
+    `score_leads.py` needs one model string up front to price the run against
+    `MAX_LLM_USD_PER_RUN`. Reading `LLM_SCORING_MODEL` directly (as it used to)
+    names a provider that may not be in the chain at all. Subscription runners
+    have no per-token price, so they report a `subscription:<runner>` id that the
+    pricing table registers at $0.
+    """
+    load_dotenv()
+    chain = _provider_chain()
+    first = chain[0] if chain else "anthropic"
+    if first == "kimi":
+        return (
+            os.getenv("KIMI_SCORING_MODEL")
+            or os.getenv("LLM_SCORING_MODEL")  # legacy alias
+            or DEFAULT_KIMI_SCORING_MODEL
+        ).strip()
+    if first in {"codex", "claude"}:
+        return f"subscription:{first}"
+    return (os.getenv("LLM_SCORING_MODEL") or DEFAULT_LLM_SCORING_MODEL).strip()
+```
+
+Known ambiguity, accepted: `LLM_SCORING_MODEL` is the legacy alias for *both* the kimi and the
+anthropic model, so a chain of `anthropic` plus a kimi-shaped `LLM_SCORING_MODEL` resolves wrong.
+Prefer the provider-specific vars (`KIMI_SCORING_MODEL`) in `.env`; Task 5 documents that.
+
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `python -m unittest tests.test_lead_machine_contracts 2>&1 | tail -5`
+Run: `.venv/bin/python -m unittest tests.test_lead_machine_contracts 2>&1 | tail -5`
 Expected: `OK`.
 
 - [ ] **Step 5: Commit**
@@ -676,7 +825,126 @@ git commit -m "feat: codex/claude CLI subscription scoring providers"
 
 ---
 
-### Task 4: Config, docs, and full verification
+### Task 4: Wire the pipeline to the chain — pricing + model resolution
+
+**Required for Kimi to score anything.** Without this task, Tasks 1-3 ship a green test suite and a
+dead pipeline: `score_leads.py` overrides the kimi model with `claude-sonnet-5`, and if you set
+`LLM_SCORING_MODEL` to a kimi id instead, the run aborts at cost estimation because that id has no
+registered price.
+
+**Files:**
+- Modify: `score_leads.py`
+- Test: `tests/test_infrastructure_robustness.py` (the existing `llm_pricing` / `estimate_llm_usd` tests live here, ~lines 220-255)
+
+**Interfaces:**
+- Consumes: `llm_client.resolve_scoring_model()` (Task 3).
+- Produces:
+  - `LLM_PRICING_USD_PER_MILLION_TOKENS` entries for the confirmed kimi model and for
+    `subscription:codex` / `subscription:claude` at `(0.0, 0.0)`.
+  - `score_leads.main()` resolving its scoring model from the chain instead of from `LLM_SCORING_MODEL`.
+  - A `[LLM PROVIDER]` log line per scored batch.
+
+- [ ] **Step 1: Write the failing tests**
+
+Add to `tests/test_infrastructure_robustness.py`, next to the existing pricing tests:
+
+```python
+    def test_every_chain_resolvable_model_has_a_registered_price(self) -> None:
+        from lead_machine import llm_client
+
+        # The run aborts at cost estimation if the chain resolves a model the
+        # pricing table does not know, so every provider's model must price.
+        for chain in ("kimi", "codex", "claude", "anthropic"):
+            with patch.dict(os.environ, {"LLM_SCORING_PROVIDER_CHAIN": chain}, clear=False):
+                os.environ.pop("LLM_SCORING_MODEL", None)
+                os.environ.pop("KIMI_SCORING_MODEL", None)
+                model = llm_client.resolve_scoring_model()
+                llm_pricing(model)  # must not raise UnknownLlmModelError
+
+    def test_subscription_runners_price_at_zero(self) -> None:
+        usage = {"input_tokens": 100_000, "output_tokens": 50_000}
+        self.assertEqual(estimate_llm_usd(usage, model="subscription:codex"), 0.0)
+        self.assertEqual(estimate_llm_usd(usage, model="subscription:claude"), 0.0)
+```
+
+(Add `from unittest.mock import patch` / `import os` to the module imports if absent.)
+
+- [ ] **Step 2: Run new tests to verify they fail**
+
+Run: `.venv/bin/python -m unittest tests.test_infrastructure_robustness -v 2>&1 | tail -20`
+Expected: both FAIL with `UnknownLlmModelError` — no kimi or `subscription:*` entry exists yet.
+
+- [ ] **Step 3: Register the prices**
+
+In `score_leads.py`, add to `LLM_PRICING_USD_PER_MILLION_TOKENS` (keep the existing explanatory
+comment above it intact — it is the reason this table refuses unknown models):
+
+```python
+    # Moonshot list price, confirmed in Task 0 against the Moonshot console.
+    "<confirmed kimi model id>": (<input_usd_per_1m>, <output_usd_per_1m>),
+    # Subscription runners are $0 marginal; they still count against
+    # MAX_LLM_CALLS_PER_RUN and MAX_LLM_TOKENS_PER_RUN.
+    "subscription:codex": (0.0, 0.0),
+    "subscription:claude": (0.0, 0.0),
+```
+
+Use the real numbers from Task 0. Do not estimate — a wrong price here silently miscalibrates
+`MAX_LLM_USD_PER_RUN`, `--dry-run-llm-cost` and the spend-confirm threshold, which is exactly the
+bug the comment above this table records.
+
+- [ ] **Step 4: Resolve the scoring model from the chain**
+
+In `score_leads.main()`, replace:
+
+```python
+        llm_model = (os.getenv("LLM_SCORING_MODEL") or DEFAULT_LLM_SCORING_MODEL).strip()
+```
+
+with:
+
+```python
+        llm_model = llm_client.resolve_scoring_model()
+```
+
+`score_leads.py` already imports `llm_client` (`from lead_machine import llm_client`). `llm_model`
+keeps flowing unchanged into `estimate_api_llm_cost(...)`, the `[LLM COST] model=` line and
+`score_records_api_run(model=llm_model)` — and from there into `score_batch(model=...)`, where it is
+now the *correct* provider's model, which is what makes the kimi request valid.
+
+Leave `DEFAULT_LLM_SCORING_MODEL` in place; `resolve_scoring_model()` still uses it for the
+anthropic branch.
+
+- [ ] **Step 5: Surface which provider actually served**
+
+Silent fallback is the operational risk of this whole change: a bad kimi model id or an exhausted
+quota degrades to the codex/claude CLI and the run still succeeds — spending subscription capacity
+while you believe you are spending Kimi credits. Make it visible.
+
+In `score_records_api_run`, after each successful `_score_batch_with_debug(...)` call, print:
+
+```python
+            print(f"[LLM PROVIDER] provider={result.get('provider', 'unknown')} model={result.get('model', llm_model_display)}")
+```
+
+(name the local however it reads best; `result` already carries `provider`/`model` from Task 1.)
+
+Also make the dry-run line provider-neutral: `"[DRY-RUN] No Anthropic call made."` → `"[DRY-RUN] No LLM API call made."` (no test asserts this string).
+
+- [ ] **Step 6: Run tests to verify they pass**
+
+Run: `.venv/bin/python -m unittest tests.test_infrastructure_robustness tests.test_lead_machine_contracts 2>&1 | tail -5`
+Expected: `OK`.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add score_leads.py tests/test_infrastructure_robustness.py
+git commit -m "feat: price and resolve the scoring model from the provider chain"
+```
+
+---
+
+### Task 5: Config, docs, and full verification
 
 **Files:**
 - Modify: `.env.example`
@@ -684,12 +952,13 @@ git commit -m "feat: codex/claude CLI subscription scoring providers"
 - Modify: `docs/superpowers/specs/2026-07-24-multi-provider-llm-scoring-design.md` (one-line addendum: `anthropic` kept as optional non-default provider)
 
 **Interfaces:**
-- Consumes: Tasks 1-3 env vars.
+- Consumes: Tasks 1-4 env vars.
 - Produces: documented configuration; green full test suite.
 
 - [ ] **Step 1: Update `.env.example`**
 
-Replace lines 1-6 (`ANTHROPIC_API_KEY=` through `ANTHROPIC_RETRY_BACKOFF_SECONDS=2`) with:
+Replace the leading `ANTHROPIC_*` block (`ANTHROPIC_API_KEY=` through
+`ANTHROPIC_RETRY_BACKOFF_SECONDS=2` — it was lines 1-6 in 2026-07, verify before editing) with:
 
 ```
 # LLM scoring provider chain: comma-separated subset/reordering of kimi,codex,claude,anthropic
@@ -717,7 +986,16 @@ ANTHROPIC_MAX_RETRIES=2
 ANTHROPIC_RETRY_BACKOFF_SECONDS=2
 ```
 
-Keep `LLM_SCORING_MODEL=claude-sonnet-5` removed from the example (it survives only as a legacy alias) and leave the `MAX_LLM_*` cap lines untouched.
+Use the model id and base URL confirmed in Task 0, not literally `kimi-k3` / `api.moonshot.ai`
+unless Task 0 confirmed them.
+
+Keep `LLM_SCORING_MODEL=claude-sonnet-5` removed from the example and add a comment that it is a
+legacy alias resolved for whichever provider leads the chain — set `KIMI_SCORING_MODEL` instead, so
+a stale `LLM_SCORING_MODEL` in a real `.env` can't name a model that belongs to a different
+provider. Leave the `MAX_LLM_*` cap lines untouched.
+
+Note for the operator (not a file edit): `.env` reads are blocked by this repo's permission hooks,
+so the implementing agent cannot verify `KIMI_API_KEY` by reading it. Confirm via Task 0's probe.
 
 - [ ] **Step 2: Update `AGENTS.md`**
 
@@ -728,7 +1006,9 @@ In the "Key in-flight facts" section, replace the bullet "Scoring is being autom
   `KIMI_API_KEY` / `KIMI_SCORING_MODEL`, default `kimi-k3`) → codex CLI (ChatGPT subscription) →
   claude CLI (subscription). Order via `LLM_SCORING_PROVIDER_CHAIN`; `anthropic` (Messages API,
   `ANTHROPIC_API_KEY`) remains an optional provider. Fallback happens only on provider
-  unavailability — invalid output stays with the repair flow in `score_leads.py`.
+  unavailability — invalid output stays with the repair flow in `score_leads.py`. Every model the
+  chain can resolve must have a price in `score_leads.LLM_PRICING_USD_PER_MILLION_TOKENS` or the
+  run aborts at cost estimation; `[LLM PROVIDER]` in the run log says who actually served.
 ```
 
 - [ ] **Step 3: Add the spec addendum**
@@ -744,10 +1024,15 @@ Append to `docs/superpowers/specs/2026-07-24-multi-provider-llm-scoring-design.m
 pin `LLM_SCORING_PROVIDER_CHAIN=anthropic`.
 ```
 
+(The design file's `## Revision 2026-08-03` section already records the `score_leads.py` scope
+change and the first-provider-only model rule; do not duplicate them here.)
+
 - [ ] **Step 4: Run the full test suite**
 
-Run: `python -m unittest discover -s tests 2>&1 | tail -5`
-Expected: `OK` — zero failures/errors across the whole suite (including `tests.test_icp_lanes`, `tests.test_lead_machine_contracts`, and `tests.test_score_batch_subscription`, which must be untouched and still green).
+Run: `.venv/bin/python -m unittest discover -s tests 2>&1 | tail -5`
+Expected: `OK` — zero failures/errors across the whole suite (~960 tests, ~22s), including
+`tests.test_icp_lanes`, `tests.test_lead_machine_contracts`, `tests.test_infrastructure_robustness`
+and `tests.test_score_batch_subscription`.
 
 - [ ] **Step 5: Commit**
 
@@ -758,8 +1043,34 @@ git commit -m "docs: kimi-default LLM scoring chain config + AGENTS.md update"
 
 ---
 
+### Task 6: One-batch live smoke test before any fleet run
+
+Gate, not code. A green suite does not prove the Moonshot call works — every unit test mocks
+`requests.post`. Do not report the chain as working, and do not fire the remaining batches, until
+this passes.
+
+- [ ] **Step 1: Score exactly one batch with the chain pinned to kimi**
+
+Pin `LLM_SCORING_PROVIDER_CHAIN=kimi` for this run (env var on the command, not a `.env` edit) so a
+misconfigured kimi cannot silently degrade to the codex/claude subscription. Run the smallest
+available batch through the normal path (`run-lead-batch` / `score_leads.py`), with
+`--dry-run-llm-cost` first to confirm the projected USD is computed off the kimi price.
+
+- [ ] **Step 2: Confirm from the run log, not from the exit code**
+
+- `[LLM COST] model=` shows the confirmed kimi model id.
+- `[LLM PROVIDER] provider=kimi` appears for the batch.
+- The scored bundle validates and lands (no `_invalid_response_*` debug artifacts).
+- Moonshot's console shows the spend.
+
+- [ ] **Step 3: Only then unpin the chain and run the remaining batches.**
+
+---
+
 ## Self-Review Notes
 
-- **Spec coverage:** provider chain (Tasks 1-3), kimi API (Task 2), CLI reuse (Task 3), fallback-only-on-unavailability (Tasks 1-3 tests), legacy `LLM_SCORING_MODEL` alias (Task 2), env docs (Task 4), AGENTS.md (Task 4), full-suite run (Task 4). One deliberate deviation from the spec: `anthropic` kept as an optional provider so existing Anthropic tests/setups keep working — recorded in the Task 4 spec addendum.
+- **Spec coverage:** provider chain (Tasks 1-3), kimi API (Task 2), CLI reuse (Task 3), fallback-only-on-unavailability (Tasks 1-3 tests), legacy `LLM_SCORING_MODEL` alias (Task 2), pipeline pricing + model resolution (Task 4), env docs and AGENTS.md (Task 5), full-suite run (Task 5), live smoke (Task 6). Deliberate deviations from the original design, both recorded in the spec's `## Revision 2026-08-03`: `anthropic` kept as an optional provider, and an explicit `model=` is forwarded only to the chain's first provider rather than to whichever provider serves.
 - **Type consistency:** provider functions uniformly `(prompt, *, model, max_tokens) -> Dict[str, Any]`; `ProviderUnavailable` and `InvalidLlmResponse` names used identically across tasks; `_PROVIDERS` patchable dict is what the tests patch.
-- **Out of scope (unchanged):** `score_leads.py` call sites (signature preserved), `score_batch_subscription.py` CLI contract, `MAX_LLM_*` cap accounting in `score_leads.py` (usage dict shape preserved).
+- **Verified against the live code (2026-08-03):** every symbol Tasks 1-3 consume exists with the assumed signature — `llm_client._getenv_int/_getenv_float/_parse_score_bundle/_estimate_prompt_tokens/_seconds_for_log/_transient_request_reason/TRANSIENT_HTTP_STATUSES/DEFAULT_ANTHROPIC_*`, and `score_batch_subscription.sanitized_environment/preflight_subscription_auth/run_runner_attempt/clean_bundle_text/RunnerResult/AuthResult`. No import cycle (`score_batch_subscription` imports only `import_llm_score_bundle`); repo root is already on `sys.path` via `llm_client`'s existing top-level import. Extra `provider`/`model` keys are inert to `_score_batch_with_debug`, which reads only `bundle`/`usage`/`call_count`/`debug_notes`.
+- **Out of scope (unchanged):** `score_batch_subscription.py`'s CLI contract; `MAX_LLM_*` cap accounting in `score_leads.py` (usage dict shape preserved); the scoring prompt, score schema, sendability gate, and repair flow. `score_leads.py` is **no longer** out of scope — see Task 4.
+- **Known limitation, accepted:** a non-transient kimi 4xx (bad model id, quota, billing) is classified as unavailability and degrades to the next provider, so a misconfiguration reads as success while spending subscription capacity. Mitigated by the `[LLM PROVIDER]` line (Task 4) and the pinned-chain smoke test (Task 6), not by the code.
