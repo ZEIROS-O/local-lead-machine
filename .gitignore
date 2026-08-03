@@ -16,6 +16,11 @@ __pycache__/
 .ruff_cache/
 .worktrees/
 
+# Packaging build output — `pip install -e .` (how both CI workflows install) writes these
+*.egg-info/
+build/
+dist/
+
 # Dashboard frontend build/install output
 dashboard-ui/node_modules/
 dashboard-ui/dist/
