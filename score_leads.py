@@ -292,6 +292,12 @@ LLM_PRICING_USD_PER_MILLION_TOKENS: Dict[str, Tuple[float, float]] = {
     "claude-sonnet-4-5": (3.0, 15.0),
     "claude-opus-4-1": (15.0, 75.0),
     "claude-3-5-haiku-20241022": (0.8, 4.0),
+    # Moonshot list price, confirmed in Task 0 against the Moonshot console.
+    "kimi-k3": (3.0, 15.0),
+    # Subscription runners are $0 marginal; they still count against
+    # MAX_LLM_CALLS_PER_RUN and MAX_LLM_TOKENS_PER_RUN.
+    "subscription:codex": (0.0, 0.0),
+    "subscription:claude": (0.0, 0.0),
 }
 
 
@@ -3192,6 +3198,7 @@ def score_records_api_run(
                     ),
                 )
             raise
+        print(f"[LLM PROVIDER] provider={result.get('provider', 'unknown')} model={result.get('model', model)}")
         bundle = result["bundle"]
         usage = result.get("usage") or {}
         calls += safe_int(result.get("call_count")) or 1
@@ -3479,7 +3486,7 @@ def main() -> int:
         max_tokens_per_run = getenv_int("MAX_LLM_TOKENS_PER_RUN", DEFAULT_MAX_LLM_TOKENS_PER_RUN)
         max_usd_per_run = getenv_float("MAX_LLM_USD_PER_RUN", DEFAULT_MAX_LLM_USD_PER_RUN)
 
-        llm_model = (os.getenv("LLM_SCORING_MODEL") or DEFAULT_LLM_SCORING_MODEL).strip()
+        llm_model = llm_client.resolve_scoring_model()
         try:
             estimate = estimate_api_llm_cost(
                 records,
@@ -3503,7 +3510,7 @@ def main() -> int:
         )
 
         if args.dry_run_llm_cost:
-            print("[DRY-RUN] No Anthropic call made.")
+            print("[DRY-RUN] No LLM API call made.")
             return 0
 
         scores_dir_path = Path(args.scores_dir)

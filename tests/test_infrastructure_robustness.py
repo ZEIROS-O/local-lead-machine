@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -251,6 +252,31 @@ class LlmPricingTest(unittest.TestCase):
     def test_an_empty_model_is_refused(self) -> None:
         with self.assertRaises(UnknownLlmModelError):
             llm_pricing("")
+
+    def test_every_chain_resolvable_model_has_a_registered_price(self) -> None:
+        from lead_machine import llm_client
+
+        # The run aborts at cost estimation if the chain resolves a model the
+        # pricing table does not know, so every provider's model must price.
+        for chain in ("kimi", "codex", "claude", "anthropic"):
+            with patch.dict(os.environ, {"LLM_SCORING_PROVIDER_CHAIN": chain}, clear=False):
+                os.environ.pop("LLM_SCORING_MODEL", None)
+                os.environ.pop("KIMI_SCORING_MODEL", None)
+                # resolve_scoring_model() calls load_dotenv(); popped keys get
+                # repopulated from the real repo .env one directory up (outside
+                # this worktree), which currently sets a stale LLM_SCORING_MODEL.
+                # Patch it out so this test reflects the env it just set, not
+                # ambient .env — same guard used in
+                # test_resolve_scoring_model_follows_the_first_provider_in_the_chain
+                # in tests/test_lead_machine_contracts.py.
+                with patch("lead_machine.llm_client.load_dotenv"):
+                    model = llm_client.resolve_scoring_model()
+                llm_pricing(model)  # must not raise UnknownLlmModelError
+
+    def test_subscription_runners_price_at_zero(self) -> None:
+        usage = {"input_tokens": 100_000, "output_tokens": 50_000}
+        self.assertEqual(estimate_llm_usd(usage, model="subscription:codex"), 0.0)
+        self.assertEqual(estimate_llm_usd(usage, model="subscription:claude"), 0.0)
 
 
 if __name__ == "__main__":
