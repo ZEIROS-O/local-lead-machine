@@ -2796,7 +2796,7 @@ class LeadMachineContractsTest(unittest.TestCase):
             def json(self) -> dict:
                 return response
 
-        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}, clear=False):
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key", "LLM_SCORING_PROVIDER_CHAIN": "anthropic"}, clear=False):
             with patch("lead_machine.llm_client.requests.post", return_value=FakeResponse()) as post:
                 result = score_batch("score this batch", model="claude-sonnet-5", max_tokens=4096)
 
@@ -2832,6 +2832,7 @@ class LeadMachineContractsTest(unittest.TestCase):
             "ANTHROPIC_API_KEY": "test-key",
             "ANTHROPIC_CONNECT_TIMEOUT_SECONDS": "7",
             "ANTHROPIC_READ_TIMEOUT_SECONDS": "88",
+            "LLM_SCORING_PROVIDER_CHAIN": "anthropic",
         }
         with patch.dict(os.environ, env, clear=False):
             with patch("lead_machine.llm_client.requests.post", return_value=FakeResponse()) as post:
@@ -2861,6 +2862,7 @@ class LeadMachineContractsTest(unittest.TestCase):
             "ANTHROPIC_API_KEY": "test-key",
             "ANTHROPIC_MAX_RETRIES": "2",
             "ANTHROPIC_RETRY_BACKOFF_SECONDS": "2",
+            "LLM_SCORING_PROVIDER_CHAIN": "anthropic",
         }
         with patch.dict(os.environ, env, clear=False):
             with patch(
@@ -2896,6 +2898,7 @@ class LeadMachineContractsTest(unittest.TestCase):
             "ANTHROPIC_API_KEY": "test-key",
             "ANTHROPIC_MAX_RETRIES": "2",
             "ANTHROPIC_RETRY_BACKOFF_SECONDS": "2",
+            "LLM_SCORING_PROVIDER_CHAIN": "anthropic",
         }
         with patch.dict(os.environ, env, clear=False):
             with patch(
@@ -2916,7 +2919,11 @@ class LeadMachineContractsTest(unittest.TestCase):
             status_code = 400
             text = "bad request"
 
-        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key", "ANTHROPIC_MAX_RETRIES": "2"}, clear=False):
+        with patch.dict(
+            os.environ,
+            {"ANTHROPIC_API_KEY": "test-key", "ANTHROPIC_MAX_RETRIES": "2", "LLM_SCORING_PROVIDER_CHAIN": "anthropic"},
+            clear=False,
+        ):
             with patch("lead_machine.llm_client.requests.post", return_value=FakeResponse()) as post:
                 with patch("time.sleep") as sleep:
                     with self.assertRaises(RuntimeError) as caught:
@@ -2936,6 +2943,7 @@ class LeadMachineContractsTest(unittest.TestCase):
             "ANTHROPIC_READ_TIMEOUT_SECONDS": "180",
             "ANTHROPIC_MAX_RETRIES": "2",
             "ANTHROPIC_RETRY_BACKOFF_SECONDS": "2",
+            "LLM_SCORING_PROVIDER_CHAIN": "anthropic",
         }
         with patch.dict(os.environ, env, clear=False):
             with patch(
@@ -2953,6 +2961,99 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertIn("read_timeout=180", message)
         self.assertIn("attempts=3", message)
         self.assertIn("read timed out", message)
+
+    def test_llm_client_chain_skips_unknown_provider_names(self) -> None:
+        from lead_machine import llm_client
+
+        with patch.dict(os.environ, {"LLM_SCORING_PROVIDER_CHAIN": "kimi,bogus,claude"}, clear=False):
+            chain = llm_client._provider_chain()
+
+        self.assertEqual(chain, ["kimi", "claude"])
+
+    def test_llm_client_chain_defaults_to_kimi_codex_claude(self) -> None:
+        from lead_machine import llm_client
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LLM_SCORING_PROVIDER_CHAIN", None)
+            chain = llm_client._provider_chain()
+
+        self.assertEqual(chain, ["kimi", "codex", "claude"])
+
+    def test_llm_client_falls_back_to_next_provider_on_unavailable(self) -> None:
+        from lead_machine import llm_client
+
+        bundle = {"batch_id": "batch_001", "scores": [{"score_file": "chij123.json", "score": self._manual_score(total_score=75, grade="B")}]}
+
+        def fake_down(prompt, *, model, max_tokens):
+            raise llm_client.ProviderUnavailable("no api key")
+
+        def fake_up(prompt, *, model, max_tokens):
+            return {"bundle": bundle, "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}, "model": "m"}
+
+        providers = {"kimi": fake_down, "codex": fake_up, "claude": fake_down}
+        with patch.dict(os.environ, {"LLM_SCORING_PROVIDER_CHAIN": "kimi,codex"}, clear=False):
+            with patch.dict(llm_client._PROVIDERS, providers, clear=True):
+                result = llm_client.score_batch("score this batch", model=None, max_tokens=4096)
+
+        self.assertEqual(result["provider"], "codex")
+        self.assertEqual(result["bundle"]["batch_id"], "batch_001")
+
+    def test_llm_client_forwards_explicit_model_only_to_the_first_provider(self) -> None:
+        from lead_machine import llm_client
+
+        bundle = {"batch_id": "batch_001", "scores": [{"score_file": "chij123.json", "score": self._manual_score(total_score=75, grade="B")}]}
+        seen: list = []
+
+        def fake_down(prompt, *, model, max_tokens):
+            seen.append(model)
+            raise llm_client.ProviderUnavailable("down")
+
+        def fake_up(prompt, *, model, max_tokens):
+            seen.append(model)
+            return {"bundle": bundle, "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}, "model": "m"}
+
+        providers = {"kimi": fake_down, "anthropic": fake_up}
+        with patch.dict(os.environ, {"LLM_SCORING_PROVIDER_CHAIN": "kimi,anthropic"}, clear=False):
+            with patch.dict(llm_client._PROVIDERS, providers, clear=True):
+                llm_client.score_batch("score this batch", model="kimi-k3", max_tokens=4096)
+
+        # The caller's model belongs to the provider it was chosen for. Handing
+        # "kimi-k3" to the next API provider would 400 the whole chain.
+        self.assertEqual(seen, ["kimi-k3", None])
+
+    def test_llm_client_does_not_fall_back_on_invalid_llm_response(self) -> None:
+        from lead_machine import llm_client
+
+        def fake_bad_json(prompt, *, model, max_tokens):
+            raise llm_client.InvalidLlmResponse("bad json", raw_text="{nope")
+
+        def fake_up(prompt, *, model, max_tokens):
+            raise AssertionError("next provider must not be tried")
+
+        providers = {"kimi": fake_bad_json, "codex": fake_up}
+        with patch.dict(os.environ, {"LLM_SCORING_PROVIDER_CHAIN": "kimi,codex"}, clear=False):
+            with patch.dict(llm_client._PROVIDERS, providers, clear=True):
+                with self.assertRaises(llm_client.InvalidLlmResponse):
+                    llm_client.score_batch("score this batch", model=None, max_tokens=4096)
+
+    def test_llm_client_chain_exhaustion_lists_provider_reasons(self) -> None:
+        from lead_machine import llm_client
+
+        def fake_down(reason):
+            def _fn(prompt, *, model, max_tokens):
+                raise llm_client.ProviderUnavailable(reason)
+            return _fn
+
+        providers = {"kimi": fake_down("missing KIMI_API_KEY"), "codex": fake_down("quota_exhausted"), "claude": fake_down("auth fail")}
+        with patch.dict(os.environ, {"LLM_SCORING_PROVIDER_CHAIN": "kimi,codex,claude"}, clear=False):
+            with patch.dict(llm_client._PROVIDERS, providers, clear=True):
+                with self.assertRaises(RuntimeError) as caught:
+                    llm_client.score_batch("score this batch", model=None, max_tokens=4096)
+
+        message = str(caught.exception)
+        self.assertIn("missing KIMI_API_KEY", message)
+        self.assertIn("quota_exhausted", message)
+        self.assertIn("auth fail", message)
 
     def test_api_llm_caps_stop_before_next_batch_call(self) -> None:
         from score_leads import score_records_api_run

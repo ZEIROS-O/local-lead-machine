@@ -4,7 +4,7 @@ import json
 import os
 import sys
 import time
-from typing import Any, Dict
+from typing import Any, Callable, Dict, List
 
 import requests
 from dotenv import load_dotenv
@@ -20,6 +20,12 @@ DEFAULT_ANTHROPIC_READ_TIMEOUT_SECONDS = 180
 DEFAULT_ANTHROPIC_MAX_RETRIES = 2
 DEFAULT_ANTHROPIC_RETRY_BACKOFF_SECONDS = 2
 TRANSIENT_HTTP_STATUSES = {429, 500, 502, 503, 504}
+
+DEFAULT_PROVIDER_CHAIN = ("kimi", "codex", "claude")
+
+
+class ProviderUnavailable(RuntimeError):
+    """A scoring provider cannot serve this call (missing key, auth, quota, transport)."""
 
 
 class InvalidLlmResponse(ValueError):
@@ -145,11 +151,11 @@ def _transient_request_reason(exc: requests.RequestException) -> str:
     return exc.__class__.__name__
 
 
-def score_batch(prompt: str, *, model: str | None = None, max_tokens: int) -> Dict[str, Any]:
+def _score_batch_anthropic(prompt: str, *, model: str | None = None, max_tokens: int) -> Dict[str, Any]:
     load_dotenv()
     api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     if not api_key:
-        raise RuntimeError("Missing ANTHROPIC_API_KEY in .env")
+        raise ProviderUnavailable("Missing ANTHROPIC_API_KEY in .env")
 
     selected_model = (model or os.getenv("LLM_SCORING_MODEL") or DEFAULT_LLM_SCORING_MODEL).strip()
     connect_timeout = _getenv_int("ANTHROPIC_CONNECT_TIMEOUT_SECONDS", DEFAULT_ANTHROPIC_CONNECT_TIMEOUT_SECONDS)
@@ -236,6 +242,72 @@ def score_batch(prompt: str, *, model: str | None = None, max_tokens: int) -> Di
             f"[LLM REQUEST OK] attempt={attempt} "
             f"input_tokens={usage['input_tokens']} output_tokens={usage['output_tokens']}"
         )
-        return {"bundle": bundle, "usage": usage}
+        return {"bundle": bundle, "usage": usage, "provider": "anthropic", "model": selected_model}
 
     raise RuntimeError("Anthropic API request failed without making an attempt")
+
+
+def _anthropic_provider(prompt: str, *, model: str | None, max_tokens: int) -> Dict[str, Any]:
+    try:
+        return _score_batch_anthropic(prompt, model=model, max_tokens=max_tokens)
+    except ProviderUnavailable:
+        raise
+    except InvalidLlmResponse:
+        raise
+    except RuntimeError as exc:
+        raise ProviderUnavailable(str(exc)) from exc
+
+
+_PROVIDERS: Dict[str, Callable] = {
+    "anthropic": _anthropic_provider,
+}
+
+
+def _provider_chain() -> List[str]:
+    raw = os.getenv("LLM_SCORING_PROVIDER_CHAIN", "").strip()
+    names = [name.strip().lower() for name in raw.split(",") if name.strip()]
+    if not names:
+        names = list(DEFAULT_PROVIDER_CHAIN)
+    # A name is "recognized" if it's a documented chain member or a currently
+    # registered provider, even if this build hasn't wired its implementation
+    # in yet (e.g. kimi/codex land in later tasks). Only genuinely unknown
+    # names (typos, retired providers) get skipped here.
+    known_names = set(DEFAULT_PROVIDER_CHAIN) | set(_PROVIDERS)
+    chain: List[str] = []
+    for name in names:
+        if name not in known_names:
+            print(f"[WARN] Unknown LLM provider {name!r} in LLM_SCORING_PROVIDER_CHAIN; skipping", file=sys.stderr)
+            continue
+        if name not in chain:
+            chain.append(name)
+    return chain
+
+
+def score_batch(prompt: str, *, model: str | None = None, max_tokens: int) -> Dict[str, Any]:
+    load_dotenv()
+    failures: List[str] = []
+    for index, provider in enumerate(_provider_chain()):
+        # An explicit model belongs to the provider it was chosen for. Handing a
+        # kimi id to a fallback API provider would 400 the rest of the chain, so
+        # every provider after the first resolves its own model from env.
+        requested_model = model if index == 0 else None
+        provider_fn = _PROVIDERS.get(provider)
+        if provider_fn is None:
+            # Recognized chain member (e.g. kimi/codex before their provider
+            # lands) but not registered yet in this build. Treat like any
+            # other unavailability rather than crashing the whole chain.
+            reason = "provider not registered"
+            failures.append(f"{provider}: {reason}")
+            print(f"[LLM FALLBACK] provider={provider} reason={reason}", file=sys.stderr)
+            continue
+        try:
+            result = provider_fn(prompt, model=requested_model, max_tokens=max_tokens)
+        except InvalidLlmResponse:
+            raise
+        except ProviderUnavailable as exc:
+            failures.append(f"{provider}: {exc}")
+            print(f"[LLM FALLBACK] provider={provider} reason={exc}", file=sys.stderr)
+            continue
+        result.setdefault("provider", provider)
+        return result
+    raise RuntimeError("All LLM scoring providers unavailable: " + "; ".join(failures))
