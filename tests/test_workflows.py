@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
-from shlex import split
 from typing import Any
 
 import yaml
@@ -109,16 +108,14 @@ class WorkflowContractTests(unittest.TestCase):
             [".venv/bin/python -m unittest discover -s tests"],
         )
         install_step = next(step for step in steps if step["name"] == "Install test dependencies")
-        install_tokens = set(split(install_step["run"]))
-        self.assertTrue(
-            {
-                "requirements-dashboard.txt",
-                "beautifulsoup4",
-                "playwright",
-                "python-dotenv",
-                "PyYAML",
-                "tldextract",
-            }.issubset(install_tokens)
+        install_commands = [
+            line.strip()
+            for line in install_step["run"].splitlines()
+            if "pip install" in line
+        ]
+        self.assertEqual(
+            install_commands,
+            ['.venv/bin/pip install -e ".[runtime,dashboard,browser,test]"'],
         )
         lowered = source.lower()
         self.assertNotIn("secrets.", lowered)
@@ -138,6 +135,16 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertEqual(steps[0]["uses"], "actions/checkout@v6")
         self.assertEqual(steps[1]["uses"], "actions/setup-python@v6")
         self.assertEqual(steps[1]["with"]["python-version"], "3.12")
+        install_step = next(step for step in steps if step["name"] == "Install gate dependencies")
+        install_commands = [
+            line.strip()
+            for line in install_step["run"].splitlines()
+            if "pip install" in line
+        ]
+        self.assertEqual(
+            install_commands,
+            ['.venv/bin/pip install -e ".[runtime]"'],
+        )
 
     def test_gates_workflow_preflights_self_hosted_corpus_before_eval(self) -> None:
         workflow, _ = self.load_workflow("gates.yml")
