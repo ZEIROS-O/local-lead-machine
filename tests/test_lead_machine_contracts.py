@@ -3055,6 +3055,146 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertIn("quota_exhausted", message)
         self.assertIn("auth fail", message)
 
+    def test_kimi_provider_posts_chat_completion_and_parses_bundle(self) -> None:
+        from lead_machine import llm_client
+
+        bundle = {"batch_id": "batch_001", "scores": [{"score_file": "chij123.json", "score": self._manual_score(total_score=75, grade="B")}]}
+        response = {
+            "choices": [{"message": {"role": "assistant", "content": json.dumps(bundle)}}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
+        }
+
+        class FakeResponse:
+            status_code = 200
+            text = json.dumps(response)
+
+            def json(self) -> dict:
+                return response
+
+        env = {"KIMI_API_KEY": "kimi-key", "LLM_SCORING_PROVIDER_CHAIN": "kimi"}
+        with patch.dict(os.environ, env, clear=False):
+            os.environ.pop("KIMI_SCORING_MODEL", None)
+            os.environ.pop("LLM_SCORING_MODEL", None)
+            with patch("lead_machine.llm_client.load_dotenv"):
+                with patch("lead_machine.llm_client.requests.post", return_value=FakeResponse()) as post:
+                    result = llm_client.score_batch("score this batch", model=None, max_tokens=4096)
+
+        self.assertEqual(result["provider"], "kimi")
+        self.assertEqual(result["model"], "kimi-k3")
+        self.assertEqual(result["usage"], {"input_tokens": 100, "output_tokens": 50, "total_tokens": 150})
+        url, kwargs = post.call_args
+        self.assertEqual(url[0], "https://api.moonshot.ai/v1/chat/completions")
+        self.assertEqual(kwargs["headers"]["Authorization"], "Bearer kimi-key")
+        self.assertEqual(kwargs["json"]["model"], "kimi-k3")
+        self.assertEqual(kwargs["json"]["max_tokens"], 4096)
+        self.assertEqual(kwargs["json"]["messages"][0]["content"], "score this batch")
+        self.assertEqual(kwargs["timeout"], (15, 180))
+
+    def test_kimi_provider_missing_key_is_unavailable_and_falls_back(self) -> None:
+        from lead_machine import llm_client
+
+        bundle = {"batch_id": "batch_001", "scores": [{"score_file": "chij123.json", "score": self._manual_score(total_score=75, grade="B")}]}
+
+        def fake_up(prompt, *, model, max_tokens):
+            return {"bundle": bundle, "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}, "model": "m"}
+
+        env = {"LLM_SCORING_PROVIDER_CHAIN": "kimi,codex"}
+        with patch.dict(os.environ, env, clear=False):
+            os.environ.pop("KIMI_API_KEY", None)
+            os.environ.pop("MOONSHOT_API_KEY", None)
+            with patch("lead_machine.llm_client.load_dotenv"):
+                with patch.dict(llm_client._PROVIDERS, {"codex": fake_up}, clear=False):
+                    result = llm_client.score_batch("score this batch", model=None, max_tokens=4096)
+
+        self.assertEqual(result["provider"], "codex")
+
+    def test_kimi_provider_retries_429_then_serves(self) -> None:
+        import requests  # noqa: F401  (parity with existing tests)
+        from lead_machine import llm_client
+
+        bundle = {"batch_id": "batch_001", "scores": [{"score_file": "chij123.json", "score": self._manual_score(total_score=75, grade="B")}]}
+        success = {
+            "choices": [{"message": {"role": "assistant", "content": json.dumps(bundle)}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        }
+
+        class FakeResponse:
+            def __init__(self, status_code: int, payload: dict | None = None) -> None:
+                self.status_code = status_code
+                self._payload = payload or {}
+                self.text = json.dumps(payload or {"error": "rate limited"})
+
+            def json(self) -> dict:
+                return self._payload
+
+        env = {"KIMI_API_KEY": "kimi-key", "LLM_SCORING_PROVIDER_CHAIN": "kimi", "KIMI_RETRY_BACKOFF_SECONDS": "2"}
+        with patch.dict(os.environ, env, clear=False):
+            os.environ.pop("KIMI_SCORING_MODEL", None)
+            os.environ.pop("LLM_SCORING_MODEL", None)
+            with patch("lead_machine.llm_client.load_dotenv"):
+                with patch("lead_machine.llm_client.requests.post", side_effect=[FakeResponse(429), FakeResponse(200, success)]) as post:
+                    with patch("time.sleep") as sleep:
+                        result = llm_client.score_batch("score this batch", model=None, max_tokens=4096)
+
+        self.assertEqual(result["bundle"]["batch_id"], "batch_001")
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [2])
+
+    def test_kimi_provider_persistent_429_falls_back_to_next_provider(self) -> None:
+        from lead_machine import llm_client
+
+        class FakeResponse:
+            status_code = 429
+            text = '{"error": "rate limited"}'
+
+            def json(self) -> dict:
+                return {"error": "rate limited"}
+
+        bundle = {"batch_id": "batch_001", "scores": [{"score_file": "chij123.json", "score": self._manual_score(total_score=75, grade="B")}]}
+
+        def fake_up(prompt, *, model, max_tokens):
+            return {"bundle": bundle, "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}, "model": "m"}
+
+        env = {"KIMI_API_KEY": "kimi-key", "LLM_SCORING_PROVIDER_CHAIN": "kimi,codex", "KIMI_MAX_RETRIES": "1"}
+        with patch.dict(os.environ, env, clear=False):
+            os.environ.pop("KIMI_SCORING_MODEL", None)
+            os.environ.pop("LLM_SCORING_MODEL", None)
+            with patch("lead_machine.llm_client.load_dotenv"):
+                with patch("lead_machine.llm_client.requests.post", return_value=FakeResponse()) as post:
+                    with patch("time.sleep"):
+                        with patch.dict(llm_client._PROVIDERS, {"codex": fake_up}, clear=False):
+                            result = llm_client.score_batch("score this batch", model=None, max_tokens=4096)
+
+        self.assertEqual(result["provider"], "codex")
+        self.assertEqual(post.call_count, 2)
+
+    def test_kimi_provider_uses_legacy_llm_scoring_model_alias(self) -> None:
+        from lead_machine import llm_client
+
+        bundle = {"batch_id": "batch_001", "scores": [{"score_file": "chij123.json", "score": self._manual_score(total_score=75, grade="B")}]}
+        response = {
+            "choices": [{"message": {"role": "assistant", "content": json.dumps(bundle)}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+
+        class FakeResponse:
+            status_code = 200
+            text = json.dumps(response)
+
+            def json(self) -> dict:
+                return response
+
+        env = {"KIMI_API_KEY": "kimi-key", "LLM_SCORING_PROVIDER_CHAIN": "kimi", "LLM_SCORING_MODEL": "kimi-k2.6"}
+        with patch.dict(os.environ, env, clear=False):
+            os.environ.pop("KIMI_SCORING_MODEL", None)
+            with patch("lead_machine.llm_client.load_dotenv"):
+                with patch("lead_machine.llm_client.requests.post", return_value=FakeResponse()) as post:
+                    result = llm_client.score_batch("score this batch", model=None, max_tokens=4096)
+
+        self.assertEqual(result["model"], "kimi-k2.6")
+        _, kwargs = post.call_args
+        self.assertEqual(kwargs["json"]["model"], "kimi-k2.6")
+
     def test_api_llm_caps_stop_before_next_batch_call(self) -> None:
         from score_leads import score_records_api_run
 

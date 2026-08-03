@@ -19,6 +19,8 @@ DEFAULT_ANTHROPIC_CONNECT_TIMEOUT_SECONDS = 15
 DEFAULT_ANTHROPIC_READ_TIMEOUT_SECONDS = 180
 DEFAULT_ANTHROPIC_MAX_RETRIES = 2
 DEFAULT_ANTHROPIC_RETRY_BACKOFF_SECONDS = 2
+DEFAULT_KIMI_BASE_URL = "https://api.moonshot.ai/v1"
+DEFAULT_KIMI_SCORING_MODEL = "kimi-k3"
 TRANSIENT_HTTP_STATUSES = {429, 500, 502, 503, 504}
 
 DEFAULT_PROVIDER_CHAIN = ("kimi", "codex", "claude")
@@ -80,6 +82,30 @@ def _usage(data: Dict[str, Any]) -> Dict[str, int]:
     raw_usage = data.get("usage") or {}
     input_tokens = int(raw_usage.get("input_tokens") or 0)
     output_tokens = int(raw_usage.get("output_tokens") or 0)
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+    }
+
+
+def _response_text_openai(data: Dict[str, Any]) -> str:
+    choices = data.get("choices") or []
+    if choices and isinstance(choices[0], dict):
+        message = choices[0].get("message") or {}
+        text = str(message.get("content") or "").strip()
+        if text:
+            return text
+    raise InvalidLlmResponse(
+        "Kimi response did not include message content",
+        raw_text=json.dumps(data, ensure_ascii=False, indent=2),
+    )
+
+
+def _usage_openai(data: Dict[str, Any]) -> Dict[str, int]:
+    raw_usage = data.get("usage") or {}
+    input_tokens = int(raw_usage.get("prompt_tokens") or raw_usage.get("input_tokens") or 0)
+    output_tokens = int(raw_usage.get("completion_tokens") or raw_usage.get("output_tokens") or 0)
     return {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
@@ -247,6 +273,81 @@ def _score_batch_anthropic(prompt: str, *, model: str | None = None, max_tokens:
     raise RuntimeError("Anthropic API request failed without making an attempt")
 
 
+def _score_batch_kimi(prompt: str, *, model: str | None, max_tokens: int) -> Dict[str, Any]:
+    api_key = (os.getenv("KIMI_API_KEY") or os.getenv("MOONSHOT_API_KEY") or "").strip()
+    if not api_key:
+        raise ProviderUnavailable("Missing KIMI_API_KEY (or MOONSHOT_API_KEY) in .env")
+
+    base_url = (os.getenv("KIMI_BASE_URL") or DEFAULT_KIMI_BASE_URL).strip().rstrip("/")
+    selected_model = (
+        model
+        or os.getenv("KIMI_SCORING_MODEL")
+        or os.getenv("LLM_SCORING_MODEL")  # legacy alias
+        or DEFAULT_KIMI_SCORING_MODEL
+    ).strip()
+    connect_timeout = _getenv_int("KIMI_CONNECT_TIMEOUT_SECONDS", DEFAULT_ANTHROPIC_CONNECT_TIMEOUT_SECONDS)
+    read_timeout = _getenv_int("KIMI_READ_TIMEOUT_SECONDS", DEFAULT_ANTHROPIC_READ_TIMEOUT_SECONDS)
+    max_retries = max(0, _getenv_int("KIMI_MAX_RETRIES", DEFAULT_ANTHROPIC_MAX_RETRIES))
+    backoff_seconds = max(
+        0.0,
+        _getenv_float("KIMI_RETRY_BACKOFF_SECONDS", float(DEFAULT_ANTHROPIC_RETRY_BACKOFF_SECONDS)),
+    )
+    max_attempts = max_retries + 1
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    body = {
+        "model": selected_model,
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    url = f"{base_url}/chat/completions"
+    prompt_tokens_est = _estimate_prompt_tokens(prompt)
+
+    for attempt in range(1, max_attempts + 1):
+        print(
+            f"[LLM REQUEST] provider=kimi attempt={attempt} model={selected_model} "
+            f"prompt_tokens_est={prompt_tokens_est} max_tokens={max_tokens}"
+        )
+        try:
+            response = requests.post(url, headers=headers, json=body, timeout=(connect_timeout, read_timeout))
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            if attempt >= max_attempts:
+                raise ProviderUnavailable(f"kimi request failed after {attempt} attempts: {exc}") from exc
+            sleeping = backoff_seconds * (2 ** (attempt - 1))
+            print(f"[LLM RETRY] provider=kimi attempt={attempt} reason={_transient_request_reason(exc)} sleeping={_seconds_for_log(sleeping)}s")
+            time.sleep(sleeping)
+            continue
+
+        if response.status_code >= 400:
+            error = ProviderUnavailable(f"kimi API error {response.status_code}: {response.text[:1000]}")
+            if response.status_code not in TRANSIENT_HTTP_STATUSES:
+                raise error
+            if attempt >= max_attempts:
+                raise error
+            sleeping = backoff_seconds * (2 ** (attempt - 1))
+            print(f"[LLM RETRY] provider=kimi attempt={attempt} reason=http_{response.status_code} sleeping={_seconds_for_log(sleeping)}s")
+            time.sleep(sleeping)
+            continue
+
+        data = response.json()
+        usage = _usage_openai(data)
+        try:
+            text = _response_text_openai(data)
+            bundle = _parse_score_bundle(text)
+        except InvalidLlmResponse as exc:
+            exc.usage = usage
+            raise
+        print(
+            f"[LLM REQUEST OK] provider=kimi attempt={attempt} "
+            f"input_tokens={usage['input_tokens']} output_tokens={usage['output_tokens']}"
+        )
+        return {"bundle": bundle, "usage": usage, "provider": "kimi", "model": selected_model}
+
+    raise ProviderUnavailable("kimi request failed without making an attempt")
+
+
 def _anthropic_provider(prompt: str, *, model: str | None, max_tokens: int) -> Dict[str, Any]:
     try:
         return _score_batch_anthropic(prompt, model=model, max_tokens=max_tokens)
@@ -259,6 +360,7 @@ def _anthropic_provider(prompt: str, *, model: str | None, max_tokens: int) -> D
 
 
 _PROVIDERS: Dict[str, Callable] = {
+    "kimi": _score_batch_kimi,
     "anthropic": _anthropic_provider,
 }
 
