@@ -125,6 +125,15 @@ non-zero exit means the base has fallen behind and a write path is about to 422:
 - `airtable_schema_cutover.py verify <snapshot>` — are the retired fields gone and the record count
   unchanged? `prepare` writes the snapshot, backup and deletion checklist first; it is GET-only.
 
+## Where things live
+
+The checkout holds code, search configs, and vertical/market profiles. Local operational state is
+gitignored: `output/`, `screenshots/`, `runs/`, `run_state/`, `data/`, and `manual_leads/`. Move
+completed packet and review-queue runs into `runs/`; keep the current live run at the repo root.
+Bulk history lives outside the checkout at `~/local-lead-machine-archive/`, and retired secret
+backups live at `~/.config/local-lead-machine/backups/`. The active `.env` remains in the checkout
+and must be owner-readable only.
+
 ## Conventions
 - Config/secrets via `.env` (`python-dotenv`); env vars include `GOOGLE_PLACES_API_KEY`,
   `AIRTABLE_PAT` (with `AIRTABLE_API_KEY` as a fallback in some scripts), `AIRTABLE_BASE_ID`,
