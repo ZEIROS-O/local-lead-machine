@@ -57,11 +57,16 @@ FORM_ABSENCE_FLAGS = {
     "missing_estimate_path",
 }
 
+# Flags about *our* crawl rather than about their site. `_status_from_site`
+# reads any other flag as evidence the site is weak, and "weak" is worth pain
+# points that move a lead toward sendable — so a marker meaning "we stopped
+# looking" must live here, or it grades the business on our own budget.
 STATIC_FETCH_REVIEW_FLAGS = {
     "static_fetch_failed",
     "homepage_fetch_failed",
     "rendered_check_needed",
     "manual_visual_review_needed",
+    "candidate_page_budget_exhausted",
 }
 
 HARD_SITE_FAILURE_FLAGS = {

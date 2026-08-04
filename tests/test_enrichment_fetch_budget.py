@@ -14,6 +14,7 @@ pin wall clock — the point is that the removed work changed no verdict.
 """
 from __future__ import annotations
 
+import os
 import threading
 import unittest
 from contextlib import ExitStack
@@ -36,11 +37,29 @@ def _homepage(body: str) -> str:
     return f"<html><body>{body}</body></html>"
 
 
+STRONG_FORM = _homepage(
+    """
+    <h1>Request your estimate</h1>
+    <p>Complete the request form below to schedule your estimate appointment.</p>
+    <form>
+      <input name="first_name"><input name="last_name">
+      <input type="email" name="email"><input type="tel" name="phone">
+      <input name="address"><textarea name="service_details"></textarea>
+      <input type="file" name="image_upload">
+      <div class="recaptcha"></div>
+      <button type="submit">Submit</button>
+    </form>
+    """
+)
+
+
 def _record_fetches(homepage_html: str, calls: list[str]):
     """Serve the homepage and anything it links; 404 every unlinked guess.
 
     A page the homepage links resolves — that is what makes a site "well
-    linked". Only the blind guesses miss.
+    linked" — and a linked contact page carries a form, because a contact
+    page that loads and offers nothing does not answer the contact group and
+    the crawl correctly keeps looking.
     """
 
     def fake_fetch(url: str, timeout: int = 15) -> dict[str, object]:
@@ -48,7 +67,10 @@ def _record_fetches(homepage_html: str, calls: list[str]):
         if url == "https://example.com":
             return {"ok": True, "status_code": 200, "final_url": url, "html": homepage_html, "error": ""}
         if f'href="{url.replace("https://example.com", "")}"' in homepage_html:
-            return {"ok": True, "status_code": 200, "final_url": url, "html": _homepage("<p>A page.</p>"), "error": ""}
+            path = url.replace("https://example.com", "").lower()
+            contactish = any(term in path for term in ("contact", "estimate", "quote", "schedule", "request"))
+            html = STRONG_FORM if contactish else _homepage("<p>A page.</p>")
+            return {"ok": True, "status_code": 200, "final_url": url, "html": html, "error": ""}
         return {"ok": False, "status_code": 404, "final_url": url, "html": "", "error": ""}
 
     return fake_fetch
@@ -302,6 +324,180 @@ class BrokenLinkedPageTest(unittest.TestCase):
 
         self.assertIn("https://example.com/contact-us", calls)
         self.assertNotIn("https://example.com/contact", calls)
+
+
+class PainIsAbsenceTest(unittest.TestCase):
+    """Cutting fetches is NOT uniformly a downgrade.
+
+    `score_leads.score_online_weakness` sells the pain, so absence *adds*
+    points: `no_form_detected` is +8 when corroborated, a missing services
+    page is +5 and is itself a corroborator. A higher `visible_pain_score`
+    clears `sendability.VISIBLE_PAIN_BLOCKER`. So a crawl that stops early
+    can make a lead *more* sendable on *less* evidence. Every skipped fetch
+    has to be a fetch that could not have changed the answer.
+    """
+
+    _FORM = """
+    <html><body>
+      <h1>Request your estimate</h1>
+      <p>Complete the request form below to schedule your estimate appointment.</p>
+      <form>
+        <input name="first_name"><input name="last_name">
+        <input type="email" name="email"><input type="tel" name="phone">
+        <input name="address"><textarea name="service_details"></textarea>
+        <input type="file" name="image_upload">
+        <div class="recaptcha"></div>
+        <button type="submit">Submit</button>
+      </form>
+    </body></html>
+    """
+
+    def test_a_formless_contact_page_does_not_call_off_the_search(self) -> None:
+        # The linked /contact-us resolves but carries no form. The form lives
+        # on an unlinked /estimate. Stopping at the linked page would report
+        # "no form detected" about a site that has one — and bank +8 pain for
+        # it.
+        calls: list[str] = []
+
+        def fake_fetch(url: str, timeout: int = 15) -> dict[str, object]:
+            calls.append(url)
+            if url == "https://example.com":
+                return {
+                    "ok": True,
+                    "status_code": 200,
+                    "final_url": url,
+                    "html": _homepage('<a href="/contact-us">Contact</a>'),
+                    "error": "",
+                }
+            if url == "https://example.com/contact-us":
+                return {
+                    "ok": True,
+                    "status_code": 200,
+                    "final_url": url,
+                    "html": _homepage("<p>Call us on the phone.</p>"),
+                    "error": "",
+                }
+            if url == "https://example.com/estimate":
+                return {"ok": True, "status_code": 200, "final_url": url, "html": self._FORM, "error": ""}
+            return {"ok": False, "status_code": 404, "final_url": url, "html": "", "error": ""}
+
+        with patch("enrich_leads.fetch_url", side_effect=fake_fetch):
+            site = scrape_site("https://example.com")
+
+        self.assertIn("https://example.com/estimate", calls)
+        self.assertTrue(site["forms_found"])
+        self.assertNotIn("no_form_detected", site["site_issue_flags"])
+
+    def test_a_soft_404_contact_page_does_not_call_off_the_search(self) -> None:
+        # Same hazard dressed as a 200: plenty of sites serve "page not found"
+        # with a success status.
+        calls: list[str] = []
+
+        def fake_fetch(url: str, timeout: int = 15) -> dict[str, object]:
+            calls.append(url)
+            if url == "https://example.com":
+                return {
+                    "ok": True,
+                    "status_code": 200,
+                    "final_url": url,
+                    "html": _homepage('<a href="/contact-us">Contact</a>'),
+                    "error": "",
+                }
+            if url == "https://example.com/contact-us":
+                return {
+                    "ok": True,
+                    "status_code": 200,
+                    "final_url": url,
+                    "html": _homepage("<h1>Page not found</h1>"),
+                    "error": "",
+                }
+            if url == "https://example.com/contact":
+                return {"ok": True, "status_code": 200, "final_url": url, "html": self._FORM, "error": ""}
+            return {"ok": False, "status_code": 404, "final_url": url, "html": "", "error": ""}
+
+        with patch("enrich_leads.fetch_url", side_effect=fake_fetch):
+            site = scrape_site("https://example.com")
+
+        self.assertTrue(site["forms_found"])
+
+    def test_a_link_heavy_nav_cannot_starve_the_services_probe(self) -> None:
+        # A nav and footer full of contact/quote links used to be harmless
+        # because nothing was capped. Under a ceiling they can eat the whole
+        # budget — and `weak_services` (+5, and a corroborator for two more
+        # +8s) then fires about a services page that was never requested.
+        nav = "".join(f'<a href="/contact-{index}">Contact {index}</a>' for index in range(12))
+        body = f'{nav}<a href="/services">Services</a><a href="/gallery">Gallery</a>'
+        calls: list[str] = []
+
+        def fake_fetch(url: str, timeout: int = 15) -> dict[str, object]:
+            calls.append(url)
+            html = _homepage(body) if url == "https://example.com" else _homepage("<p>A page.</p>")
+            return {"ok": True, "status_code": 200, "final_url": url, "html": html, "error": ""}
+
+        with patch("enrich_leads.fetch_url", side_effect=fake_fetch):
+            site = scrape_site("https://example.com")
+
+        self.assertIn("https://example.com/services", calls)
+        self.assertIn("https://example.com/gallery", calls)
+        self.assertTrue((site["pages"].get("services") or {}).get("ok"))
+
+
+class TruncationIsVisibleTest(unittest.TestCase):
+    """A capped crawl must not read downstream as a complete one.
+
+    The timeout path already flags itself (`per_lead_enrichment_timeout`).
+    The fetch ceiling was silent, which is what let a starved crawl look
+    like a site that genuinely had nothing.
+    """
+
+    def test_hitting_the_ceiling_is_recorded_on_the_lead(self) -> None:
+        nav = "".join(f'<a href="/contact-{index}">Contact {index}</a>' for index in range(30))
+        calls: list[str] = []
+
+        def fake_fetch(url: str, timeout: int = 15) -> dict[str, object]:
+            calls.append(url)
+            html = _homepage(nav) if url == "https://example.com" else _homepage("<p>A page.</p>")
+            return {"ok": True, "status_code": 200, "final_url": url, "html": html, "error": ""}
+
+        with patch("enrich_leads.fetch_url", side_effect=fake_fetch):
+            site = scrape_site("https://example.com")
+
+        self.assertIn("candidate_page_budget_exhausted", site["site_issue_flags"])
+
+    def test_a_crawl_that_fits_says_nothing(self) -> None:
+        body = '<a href="/contact-us">Contact</a><a href="/services">Services</a>'
+        calls: list[str] = []
+
+        with patch("enrich_leads.fetch_url", side_effect=_record_fetches(_homepage(body), calls)):
+            site = scrape_site("https://example.com")
+
+        self.assertNotIn("candidate_page_budget_exhausted", site["site_issue_flags"])
+
+    def test_the_flag_says_nothing_about_the_site_itself(self) -> None:
+        # `_status_from_site` treats ANY flag outside STATIC_FETCH_REVIEW_FLAGS
+        # as evidence the site is weak. This flag is a statement about our
+        # crawl, not about their business — and "weak" is worth pain points
+        # that push a lead toward sendable, so letting it grade would recreate
+        # the bug it exists to expose.
+        from lead_machine.evidence import _status_from_site
+
+        site = {
+            "site_status": "Loaded",
+            "rendered_site_status": "Loaded",
+            "combined_text": "Epoxy floors in Cleveland.",
+            "site_issue_flags": [enrich_leads.CANDIDATE_BUDGET_FLAG],
+        }
+
+        self.assertEqual(_status_from_site(site), "okay")
+
+    def test_the_ceiling_is_operator_tunable(self) -> None:
+        # AGENTS.md: every MAX_* cap reads from the environment.
+        with patch.dict(os.environ, {"MAX_CANDIDATE_PAGE_FETCHES": "3"}, clear=False):
+            self.assertEqual(enrich_leads.resolve_candidate_page_budget(), 3)
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                enrich_leads.resolve_candidate_page_budget(), enrich_leads.MAX_CANDIDATE_PAGE_FETCHES
+            )
 
 
 class InterPagePauseTest(unittest.TestCase):

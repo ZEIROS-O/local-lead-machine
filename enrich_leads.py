@@ -129,21 +129,41 @@ CONTACT_ESTIMATE_PATHS = [
     "/get-estimate",
 ]
 
-# The keyword groups one lead probes, and how many pages each may contribute
-# (0 = every match; the contact group is the one worth going deep on).
-CANDIDATE_PAGE_GROUPS: List[Tuple[List[str], str, int]] = [
-    (["contact", "estimate", "quote", "schedule", "request"], "contact", 0),
-    (["service"], "services", 1),
-    (["about"], "about", 1),
-    (["gallery"], "gallery", 1),
+# The keyword groups one lead probes: (keywords, page role, per-group page
+# cap, what counts as having found what the group is for). 0 = every match;
+# the contact group is the one worth going deep on.
+#
+# `needs_form` is the important column. A contact page that merely *loads* has
+# not answered the question the contact group exists to ask, and stopping
+# there reports "no form detected" about a site whose form sits one unlinked
+# URL away. That matters because absence is not neutral downstream —
+# `score_leads.score_online_weakness` sells the pain, so `no_form_detected`
+# is worth +8 and pushes a lead *past* sendability's visible-pain floor.
+CANDIDATE_PAGE_GROUPS: List[Tuple[List[str], str, int, bool]] = [
+    (["contact", "estimate", "quote", "schedule", "request"], "contact", 0, True),
+    (["service"], "services", 1, False),
+    (["about"], "about", 1, False),
+    (["gallery"], "gallery", 1, False),
 ]
 
 # Nothing but the wall-clock timeout used to bound a lead's crawl, so a
 # link-heavy site blew the per-lead budget and came back with a truncated
-# crawl plus a false manual_visual_review_needed. Eight is above what a
-# well-linked site needs (contact + services + about + gallery) and below
-# where the timeout starts firing.
-MAX_CANDIDATE_PAGE_FETCHES = 8
+# crawl plus a false manual_visual_review_needed.
+#
+# This is a backstop against the pathological shape — a nav and footer with
+# thirty contact URLs — not a trim on the fallback ladder. It has to leave
+# room for a group that found nothing to run its guesses out: the contact
+# ladder is eleven paths, plus one probe each for services, about and
+# gallery. Cutting below that would report "no form detected" on a site whose
+# form we simply stopped looking for, and downstream charges +8 for that.
+# A site that answers on its linked pages still finishes in four or five.
+MAX_CANDIDATE_PAGE_FETCHES = 16
+
+# A crawl stopped by the ceiling is not a site that had nothing. Downstream
+# infers pain from absence — a missing services page is +5 and corroborates
+# two more +8s — so a truncated crawl has to be distinguishable from a
+# complete one, the way the timeout path already is.
+CANDIDATE_BUDGET_FLAG = "candidate_page_budget_exhausted"
 
 FORM_PROVIDER_TERMS = [
     "hubspot",
@@ -254,6 +274,10 @@ def getenv_bool(name: str, default: bool = False) -> bool:
     if not raw:
         return default
     return raw in {"1", "true", "yes", "y", "on"}
+
+
+def resolve_candidate_page_budget() -> int:
+    return max(1, getenv_int("MAX_CANDIDATE_PAGE_FETCHES", MAX_CANDIDATE_PAGE_FETCHES))
 
 
 def elapsed_seconds(started_at: float) -> float:
@@ -1067,25 +1091,42 @@ def scrape_site(
             targets.append((default_name, page_url))
         return targets
 
-    resolved_groups: List[Tuple[str, List[str], List[str]]] = []
-    for keywords, default_name, limit in CANDIDATE_PAGE_GROUPS:
+    resolved_groups: List[Tuple[str, List[str], List[str], bool]] = []
+    for keywords, default_name, limit, needs_form in CANDIDATE_PAGE_GROUPS:
         linked, guessed = candidate_pages_split(final_url, links["internal_links"], keywords)
         if limit:
             linked, guessed = linked[:limit], guessed[:limit]
-        resolved_groups.append((default_name, linked, guessed))
+        resolved_groups.append((default_name, linked, guessed, needs_form))
+
+    def interleave(per_group: List[Tuple[str, List[str]]]) -> List[Tuple[str, str]]:
+        """Round-robin across groups so no one group can drain the budget.
+
+        A nav and footer full of contact links is ordinary, and taking them in
+        group order spent the whole ceiling there — leaving `weak_services` to
+        fire about a services page that was never requested.
+        """
+        targets: List[Tuple[str, str]] = []
+        for offset in range(max((len(urls) for _name, urls in per_group), default=0)):
+            for default_name, urls in per_group:
+                if offset < len(urls):
+                    targets += dedupe_targets([urls[offset]], default_name)
+        return targets
 
     combined_text_parts = [text]
     enrichment_timed_out = False
+    budget_exhausted = False
     fetched_pages = 0
+    page_budget = resolve_candidate_page_budget()
 
     def crawl_targets(targets: List[Tuple[str, str]]) -> Dict[str, bool]:
-        """Fetch each target; report which groups came back with a live page."""
+        """Fetch each target; report which groups answered their own question."""
         nonlocal emails, phones, ctas, high_ticket, generic_copy, form_signals
-        nonlocal enrichment_timed_out, fetched_pages
+        nonlocal enrichment_timed_out, fetched_pages, budget_exhausted
         group_ok: Dict[str, bool] = {}
 
         for default_page_name, page_url in targets:
-            if fetched_pages >= MAX_CANDIDATE_PAGE_FETCHES:
+            if fetched_pages >= page_budget:
+                budget_exhausted = True
                 break
             if timed_out():
                 enrichment_timed_out = True
@@ -1161,32 +1202,32 @@ def scrape_site(
                 },
             }
 
-            group_ok[default_page_name] = group_ok.get(default_page_name, False) or bool(result.get("ok"))
+            # Did this page answer what its group is for? For the contact
+            # group that means a form, not merely a 200 — a page that loads
+            # and offers nothing leaves the question open, and a soft 404
+            # loads too.
+            answered = bool(result.get("ok"))
+            if answered and needs_form_by_group.get(default_page_name):
+                answered = bool(page_form_signals.get("forms_found"))
+            group_ok[default_page_name] = group_ok.get(default_page_name, False) or answered
 
         return group_ok
 
-    # Pass 1: the pages the homepage actually links. A linked page beats any guess.
-    linked_ok = crawl_targets(
-        [target for name, linked, _guessed in resolved_groups for target in dedupe_targets(linked, name)]
-    )
+    needs_form_by_group = {name: needs_form for name, _l, _g, needs_form in resolved_groups}
 
-    # Pass 2: the blind guesses, for each group that came back with nothing
-    # live. "The HTML linked something" is not enough — a HubSpot template can
-    # emit an unrendered `/f/contact/$hs_path` that matches the keywords and
-    # 404s, and the guess it suppressed was the page actually serving the form.
-    #
-    # Round-robin across groups rather than group by group: the contact group
-    # alone guesses eleven paths, more than the whole ceiling, so draining it
-    # first would leave a site with no services, about or gallery probe at all.
-    pending = [
-        (name, guessed) for name, _linked, guessed in resolved_groups if not linked_ok.get(name)
-    ]
-    guess_targets: List[Tuple[str, str]] = []
-    for offset in range(max((len(guessed) for _name, guessed in pending), default=0)):
-        for name, guessed in pending:
-            if offset < len(guessed):
-                guess_targets += dedupe_targets([guessed[offset]], name)
-    crawl_targets(guess_targets)
+    # Pass 1: the pages the homepage actually links. A linked page beats any guess.
+    linked_ok = crawl_targets(interleave([(name, linked) for name, linked, _g, _f in resolved_groups]))
+
+    # Pass 2: the blind guesses, for each group whose linked pages did not
+    # answer it. "The HTML linked something" is not enough — a HubSpot
+    # template can emit an unrendered `/f/contact/$hs_path` that matches the
+    # keywords and 404s, and the guess it suppressed was the page actually
+    # serving the form.
+    crawl_targets(
+        interleave(
+            [(name, guessed) for name, _linked, guessed, _f in resolved_groups if not linked_ok.get(name)]
+        )
+    )
 
     combined_text = clean_text(" ".join(combined_text_parts), 30000)
     cta_strength = classify_cta_strength(ctas, combined_text)
@@ -1204,6 +1245,9 @@ def scrape_site(
         form_signals = merge_form_signals(form_signals, rendered_signals)
 
     forms_found = bool(form_signals.get("forms_found"))
+
+    if budget_exhausted:
+        flags.append(CANDIDATE_BUDGET_FLAG)
 
     if not forms_found:
         flags.append("no_form_detected")
