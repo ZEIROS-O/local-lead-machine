@@ -129,6 +129,22 @@ CONTACT_ESTIMATE_PATHS = [
     "/get-estimate",
 ]
 
+# The keyword groups one lead probes, and how many pages each may contribute
+# (0 = every match; the contact group is the one worth going deep on).
+CANDIDATE_PAGE_GROUPS: List[Tuple[List[str], str, int]] = [
+    (["contact", "estimate", "quote", "schedule", "request"], "contact", 0),
+    (["service"], "services", 1),
+    (["about"], "about", 1),
+    (["gallery"], "gallery", 1),
+]
+
+# Nothing but the wall-clock timeout used to bound a lead's crawl, so a
+# link-heavy site blew the per-lead budget and came back with a truncated
+# crawl plus a false manual_visual_review_needed. Eight is above what a
+# well-linked site needs (contact + services + about + gallery) and below
+# where the timeout starts firing.
+MAX_CANDIDATE_PAGE_FETCHES = 8
+
 FORM_PROVIDER_TERMS = [
     "hubspot",
     "jobber",
@@ -731,8 +747,28 @@ def detect_terms(text: str, terms: List[str]) -> List[str]:
     return sorted({term for term in terms if term in lowered})
 
 
+_fetch_local = threading.local()
+
+
+def fetch_session() -> requests.Session:
+    """One connection pool per worker thread.
+
+    A bare ``requests.get`` pays a fresh TCP+TLS handshake for every page, and a
+    lead fetches several pages off the same host in a row. ``requests.Session``
+    is not documented as thread-safe and enrichment runs a pool of workers, so
+    the pool is thread-local rather than shared — the same shape as
+    ``lead_machine.external_signals``.
+    """
+    session = getattr(_fetch_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        _fetch_local.session = session
+    return session
+
+
 def fetch_url(url: str, timeout: int = DEFAULT_TIMEOUT, retries: int = 1) -> Dict[str, Any]:
     headers = {"User-Agent": USER_AGENT}
+    session = fetch_session()
     last_result: Dict[str, Any] = {
         "ok": False,
         "status_code": "",
@@ -744,7 +780,7 @@ def fetch_url(url: str, timeout: int = DEFAULT_TIMEOUT, retries: int = 1) -> Dic
 
     for attempt in range(max(1, retries + 1)):
         try:
-            resp = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+            resp = session.get(url, headers=headers, timeout=timeout, allow_redirects=True)
             last_result = {
                 "ok": resp.status_code < 400,
                 "status_code": resp.status_code,
@@ -755,7 +791,10 @@ def fetch_url(url: str, timeout: int = DEFAULT_TIMEOUT, retries: int = 1) -> Dic
             }
             if resp.status_code < 400:
                 return last_result
-            if attempt < retries and (resp.status_code == 404 or resp.status_code >= 500):
+            # 5xx is the transient case worth a second look. A 404 is the
+            # server answering definitively, and most of this crawl's misses
+            # are 404s — retrying them doubled the cost of every miss.
+            if attempt < retries and resp.status_code >= 500:
                 time.sleep(0.2)
                 continue
             return last_result
@@ -792,7 +831,10 @@ def classify_hard_static_failure(fetch_result: Dict[str, Any]) -> Tuple[str, str
         code = 0
 
     if code == 404 or code >= 500:
-        return "homepage_http_hard_failure", f"Homepage returned HTTP {code} after retry."
+        # 5xx is retried once; 404 is taken at its word, so do not claim a
+        # retry the fetch never made.
+        suffix = " after retry" if code >= 500 else ""
+        return "homepage_http_hard_failure", f"Homepage returned HTTP {code}{suffix}."
 
     error_type = str(fetch_result.get("error_type") or "").lower()
     error = str(fetch_result.get("error") or "").lower()
@@ -816,22 +858,32 @@ def classify_hard_static_failure(fetch_result: Dict[str, Any]) -> Tuple[str, str
     return "", ""
 
 
-def find_candidate_pages(base_url: str, internal_links: List[str], keywords: List[str]) -> List[str]:
+def candidate_pages_split(
+    base_url: str, internal_links: List[str], keywords: List[str]
+) -> Tuple[List[str], List[str]]:
+    """Split this keyword group's candidates into linked pages and blind guesses.
+
+    The guessed paths are a safety net for sites that never link their contact
+    page. They used to be fetched unconditionally, so a site that properly
+    links ``/contact-us`` still paid ten blind 404s. Both lists are always
+    returned; it is the crawl that decides whether the net is needed, because
+    only the crawl knows whether a linked page actually resolved.
+    """
     root = f"{urlparse(base_url).scheme}://{urlparse(base_url).netloc}"
     base_domain = domain_of(base_url)
-    candidates: List[str] = []
 
-    def add(url: str) -> None:
+    def add(url: str, into: List[str]) -> None:
         absolute = urljoin(root, url)
         if domain_of(absolute) != base_domain:
             return
-        if absolute not in candidates:
-            candidates.append(absolute)
+        if absolute not in into:
+            into.append(absolute)
 
+    linked: List[str] = []
     for link in internal_links:
         lowered = link.lower()
         if any(k in lowered for k in keywords):
-            add(link)
+            add(link, linked)
 
     fallback_paths = []
     for keyword in keywords:
@@ -844,10 +896,16 @@ def find_candidate_pages(base_url: str, internal_links: List[str], keywords: Lis
         elif keyword == "gallery":
             fallback_paths += ["/gallery", "/portfolio", "/projects", "/project-pictures", "/work"]
 
+    guessed: List[str] = []
     for path in fallback_paths:
-        add(path)
+        add(path, guessed)
 
-    return candidates
+    return linked, [url for url in guessed if url not in linked]
+
+
+def find_candidate_pages(base_url: str, internal_links: List[str], keywords: List[str]) -> List[str]:
+    linked, guessed = candidate_pages_split(base_url, internal_links, keywords)
+    return linked or guessed
 
 
 def find_candidate_page(base_url: str, internal_links: List[str], keywords: List[str]) -> str:
@@ -998,97 +1056,137 @@ def scrape_site(
     def timed_out() -> bool:
         return elapsed_seconds(started_at) > per_lead_timeout
 
-    page_targets: List[Tuple[str, str]] = []
     seen_page_urls = set()
 
-    def add_page_targets(urls: List[str], default_name: str) -> None:
+    def dedupe_targets(urls: List[str], default_name: str) -> List[Tuple[str, str]]:
+        targets: List[Tuple[str, str]] = []
         for page_url in urls:
             if not page_url or page_url in seen_page_urls:
                 continue
             seen_page_urls.add(page_url)
-            page_targets.append((default_name, page_url))
+            targets.append((default_name, page_url))
+        return targets
 
-    add_page_targets(
-        find_candidate_pages(final_url, links["internal_links"], ["contact", "estimate", "quote", "schedule", "request"]),
-        "contact",
-    )
-    add_page_targets([find_candidate_page(final_url, links["internal_links"], ["service"])], "services")
-    add_page_targets([find_candidate_page(final_url, links["internal_links"], ["about"])], "about")
-    add_page_targets([find_candidate_page(final_url, links["internal_links"], ["gallery"])], "gallery")
+    resolved_groups: List[Tuple[str, List[str], List[str]]] = []
+    for keywords, default_name, limit in CANDIDATE_PAGE_GROUPS:
+        linked, guessed = candidate_pages_split(final_url, links["internal_links"], keywords)
+        if limit:
+            linked, guessed = linked[:limit], guessed[:limit]
+        resolved_groups.append((default_name, linked, guessed))
 
     combined_text_parts = [text]
     enrichment_timed_out = False
+    fetched_pages = 0
 
-    for default_page_name, page_url in page_targets:
-        if timed_out():
-            enrichment_timed_out = True
-            break
-        if not page_url:
-            continue
+    def crawl_targets(targets: List[Tuple[str, str]]) -> Dict[str, bool]:
+        """Fetch each target; report which groups came back with a live page."""
+        nonlocal emails, phones, ctas, high_ticket, generic_copy, form_signals
+        nonlocal enrichment_timed_out, fetched_pages
+        group_ok: Dict[str, bool] = {}
 
-        # Stay on same business domain.
-        if domain_of(page_url) != domain_of(final_url):
-            continue
+        for default_page_name, page_url in targets:
+            if fetched_pages >= MAX_CANDIDATE_PAGE_FETCHES:
+                break
+            if timed_out():
+                enrichment_timed_out = True
+                break
+            if not page_url:
+                continue
 
-        result = fetch_url(page_url, timeout=CANDIDATE_PAGE_FETCH_TIMEOUT)
-        page_html = result.get("html") or ""
-        page_text = extract_visible_text(page_html) if result.get("ok") else ""
-        page_title, page_meta = extract_title_meta(page_html) if page_html else ("", "")
+            # Stay on same business domain.
+            if domain_of(page_url) != domain_of(final_url):
+                continue
 
-        page_emails, page_phones = extract_emails_phones(page_text, page_html)
-        emails = clean_emails(emails + page_emails, business_domain=domain_of(final_url))
-        phones = sorted(set(phones + page_phones))
+            # Pace the crawl between pages, not after the last one — that
+            # trailing sleep bought nothing and every lead paid it.
+            if fetched_pages:
+                time.sleep(0.1)
+            fetched_pages += 1
 
-        if page_text:
-            combined_text_parts.append(page_text)
+            result = fetch_url(page_url, timeout=CANDIDATE_PAGE_FETCH_TIMEOUT)
+            page_html = result.get("html") or ""
+            page_text = extract_visible_text(page_html) if result.get("ok") else ""
+            page_title, page_meta = extract_title_meta(page_html) if page_html else ("", "")
 
-        page_form_signals = detect_form_signals(
-            page_html,
-            page_text=page_text,
-            page_url=page_url,
-            method="candidate_page",
-        )
-        form_signals = merge_form_signals(form_signals, page_form_signals)
+            page_emails, page_phones = extract_emails_phones(page_text, page_html)
+            emails = clean_emails(emails + page_emails, business_domain=domain_of(final_url))
+            phones = sorted(set(phones + page_phones))
 
-        ctas = sorted(set(ctas + detect_terms(page_text, CTA_TERMS)))
-        high_ticket = sorted(set(high_ticket + detect_terms(page_text, high_ticket_terms)))
-        generic_copy = sorted(set(generic_copy + detect_terms(page_text, GENERIC_COPY_TERMS)))
+            if page_text:
+                combined_text_parts.append(page_text)
 
-        page_name = _candidate_page_name(page_url, pages, default_page_name)
-        page_links = extract_links(result.get("final_url") or page_url, page_html) if page_html else {
-            "internal_links": [], "external_links": [], "social_links": []
-        }
-        page_soup = BeautifulSoup(page_html, "html.parser") if page_html else BeautifulSoup("", "html.parser")
-        pages[page_name] = {
-            "url": page_url,
-            "ok": result.get("ok"),
-            "status_code": result.get("status_code"),
-            "title": page_title,
-            "meta": page_meta,
-            "text": clean_text(page_text, 6000),
-            "contact_form_detected": page_form_signals.get("contact_form_detected", "No"),
-            "estimate_form_detected": page_form_signals.get("estimate_form_detected", "No"),
-            "form_strength": page_form_signals.get("form_strength", "None"),
-            "form_detection_method": page_form_signals.get("form_detection_method", "none"),
-            # Counted here so gallery/portfolio pages can be graded later on how
-            # much work they actually show, not just on the page existing.
-            "image_count": len(page_soup.find_all("img")) + len(page_soup.find_all("picture")),
-            "verification_snapshot": {
-                "page_role": default_page_name,
-                "requested_url": page_url,
-                "final_url": result.get("final_url") or page_url,
-                "retrieved_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
-                "response_status": result.get("status_code"),
+            page_form_signals = detect_form_signals(
+                page_html,
+                page_text=page_text,
+                page_url=page_url,
+                method="candidate_page",
+            )
+            form_signals = merge_form_signals(form_signals, page_form_signals)
+
+            ctas = sorted(set(ctas + detect_terms(page_text, CTA_TERMS)))
+            high_ticket = sorted(set(high_ticket + detect_terms(page_text, high_ticket_terms)))
+            generic_copy = sorted(set(generic_copy + detect_terms(page_text, GENERIC_COPY_TERMS)))
+
+            page_name = _candidate_page_name(page_url, pages, default_page_name)
+            page_links = extract_links(result.get("final_url") or page_url, page_html) if page_html else {
+                "internal_links": [], "external_links": [], "social_links": []
+            }
+            page_soup = BeautifulSoup(page_html, "html.parser") if page_html else BeautifulSoup("", "html.parser")
+            pages[page_name] = {
+                "url": page_url,
+                "ok": result.get("ok"),
+                "status_code": result.get("status_code"),
                 "title": page_title,
-                "visible_text": clean_text(page_text, 6000),
-                "visible_links": page_links.get("all_links", []),
-                "form_count": len(page_soup.find_all("form")),
-                "control_count": len(page_soup.find_all(["input", "textarea", "select", "button"])),
-                "render_outcome": "loaded" if result.get("ok") and page_text.strip() else "blank" if result.get("ok") else "connection_error",
-            },
-        }
+                "meta": page_meta,
+                "text": clean_text(page_text, 6000),
+                "contact_form_detected": page_form_signals.get("contact_form_detected", "No"),
+                "estimate_form_detected": page_form_signals.get("estimate_form_detected", "No"),
+                "form_strength": page_form_signals.get("form_strength", "None"),
+                "form_detection_method": page_form_signals.get("form_detection_method", "none"),
+                # Counted here so gallery/portfolio pages can be graded later on how
+                # much work they actually show, not just on the page existing.
+                "image_count": len(page_soup.find_all("img")) + len(page_soup.find_all("picture")),
+                "verification_snapshot": {
+                    "page_role": default_page_name,
+                    "requested_url": page_url,
+                    "final_url": result.get("final_url") or page_url,
+                    "retrieved_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+                    "response_status": result.get("status_code"),
+                    "title": page_title,
+                    "visible_text": clean_text(page_text, 6000),
+                    "visible_links": page_links.get("all_links", []),
+                    "form_count": len(page_soup.find_all("form")),
+                    "control_count": len(page_soup.find_all(["input", "textarea", "select", "button"])),
+                    "render_outcome": "loaded" if result.get("ok") and page_text.strip() else "blank" if result.get("ok") else "connection_error",
+                },
+            }
 
-        time.sleep(0.1)
+            group_ok[default_page_name] = group_ok.get(default_page_name, False) or bool(result.get("ok"))
+
+        return group_ok
+
+    # Pass 1: the pages the homepage actually links. A linked page beats any guess.
+    linked_ok = crawl_targets(
+        [target for name, linked, _guessed in resolved_groups for target in dedupe_targets(linked, name)]
+    )
+
+    # Pass 2: the blind guesses, for each group that came back with nothing
+    # live. "The HTML linked something" is not enough — a HubSpot template can
+    # emit an unrendered `/f/contact/$hs_path` that matches the keywords and
+    # 404s, and the guess it suppressed was the page actually serving the form.
+    #
+    # Round-robin across groups rather than group by group: the contact group
+    # alone guesses eleven paths, more than the whole ceiling, so draining it
+    # first would leave a site with no services, about or gallery probe at all.
+    pending = [
+        (name, guessed) for name, _linked, guessed in resolved_groups if not linked_ok.get(name)
+    ]
+    guess_targets: List[Tuple[str, str]] = []
+    for offset in range(max((len(guessed) for _name, guessed in pending), default=0)):
+        for name, guessed in pending:
+            if offset < len(guessed):
+                guess_targets += dedupe_targets([guessed[offset]], name)
+    crawl_targets(guess_targets)
 
     combined_text = clean_text(" ".join(combined_text_parts), 30000)
     cta_strength = classify_cta_strength(ctas, combined_text)

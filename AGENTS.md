@@ -97,6 +97,18 @@ Key in-flight facts (2026-07-29):
 - **Enrichment runs concurrently** (`ENRICH_WORKERS`, default 6; 3 when screenshots or rendered
   checks are on, since each launches its own Chromium) and streams records to disk as they finish.
   The per-lead ceiling scales with the worker count — it is wall-clock, and contention inflates it.
+- **A lead's crawl is budgeted, and the budget is evidence.** `scrape_site` fetches the homepage
+  plus at most `MAX_CANDIDATE_PAGE_FETCHES` candidate pages, in two passes: the pages the homepage
+  links, then the `CONTACT_ESTIMATE_PATHS`-style guesses. **The fallback is gated on a linked page
+  that actually resolved, not on one merely existing** — a HubSpot template emitting an unrendered
+  `/f/contact/$hs_path` matches the contact keywords and 404s, and the guess it would have
+  suppressed (`/contact`) was the page really serving the form. The guesses are taken round-robin
+  across keyword groups so the eleven contact paths cannot starve the services/about/gallery
+  probes. `fetch_url` retries 5xx but not 404 — a 404 is a deterministic answer. Cutting fetches
+  only ever removes evidence, and every consumer treats missing evidence as a downgrade
+  (`gallery_visibility_score` falls to `Weak`/`None`, `cta_visibility_score` to `Weak`, the
+  `no_*_detected` flags fire). Keep it that way: a change here must never let *less* crawling
+  produce a *better* grade.
 - **Review velocity needs two observations ≥14 days apart** in `run_state/review_velocity.sqlite3`
   (`REVIEW_SNAPSHOT_DB`). `enrich_row` banks one per lead per run; until a batch has been run twice,
   `velocity_band` is legitimately `unknown`.
