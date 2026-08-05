@@ -490,7 +490,11 @@ def run_runner_attempt(
             structured_error = (envelope_detail or raw_text or "Claude reported is_error") if envelope_error else ""
 
         combined_error = f"{process.stderr}\n{structured_error}"
-        if _contains_quota_error(process.stdout, process.stderr, raw_text, structured_error):
+        # Treat quota text as authoritative only when it comes from a runner
+        # error channel. A valid score bundle may legitimately mention a site
+        # crawl being rate-limited; scanning the model's final JSON would turn
+        # that lead evidence into a false subscription hard stop.
+        if _contains_quota_error(process.stderr, structured_error):
             result = "quota_exhausted"
         elif process.timed_out:
             result = "timeout"

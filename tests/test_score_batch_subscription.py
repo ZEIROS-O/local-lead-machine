@@ -328,6 +328,26 @@ class SubscriptionScoringTests(unittest.TestCase):
             self.assertEqual(len(records), 1)
             self.assertEqual(records[0]["validation_result"], "quota_exhausted")
 
+    def test_valid_bundle_mentioning_rate_limits_is_not_quota_exhausted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            queue = write_queue(root, {"batch_001": ["one.json"]})
+            ledger = root / "ledger.jsonl"
+            scored_bundle = bundle("batch_001", ["one.json"])
+            scored_bundle["scores"][0]["score"]["why_this_might_be_wrong"] = [
+                "The website crawl returned rate limits, so the evidence is incomplete."
+            ]
+            runner = FakeRunner(
+                [ProcessResult(0, "MODEL:" + json.dumps(scored_bundle), "", 0.1)]
+            )
+
+            rc = main(["--queue-dir", str(queue), "--ledger", str(ledger)], process_runner=runner)
+
+            self.assertEqual(rc, 0)
+            self.assertTrue((queue / "scores/one.json").is_file())
+            record = json.loads(ledger.read_text(encoding="utf-8").splitlines()[-1])
+            self.assertEqual(record["validation_result"], "imported")
+
     def test_claude_happy_path_parses_json_envelope(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
