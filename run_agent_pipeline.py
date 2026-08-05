@@ -631,7 +631,30 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--yes", "--confirm-spend", dest="yes", action="store_true",
                         help="Authorize paid scoring above the confirmation threshold")
     parser.add_argument("--overwrite", action="store_true", help="Reuse the existing batch instead of forking")
-    parser.add_argument("--lock-file", default=str(DEFAULT_LOCK_FILE))
+    parser.add_argument(
+        "--lock-file",
+        default=str(DEFAULT_LOCK_FILE),
+        help=(
+            f"Mutual-exclusion lockfile (default {DEFAULT_LOCK_FILE}). The default is global, so "
+            "two runs serialise. Every output this wrapper touches is keyed by batch name "
+            "(output/enriched_<batch>.jsonl, output/scored_<batch>*.csv, packets_<batch>/, "
+            "review_queue_<batch>/, data/raw/<batch>.csv, reports/search_<batch>.md, ...), so "
+            "giving each batch its own lock file (e.g. output/.agent_pipeline.<batch>.lock) lets "
+            "distinct batches run in parallel through search, enrich and score. NOT through the "
+            "Airtable sync: use --mode search-only or --airtable skip. The base is shared state no "
+            "batch-keyed path names, and upload_airtable's fetch_existing_records -> "
+            "plan_airtable_sync -> send_airtable_plan is an unlocked read-then-write that is the "
+            "only cross-batch dedupe there is -- two parallel syncs both read a base without the "
+            "other's records and both POST, and since batch geographies overlap that means two "
+            "records for one business, both Status=New, both served to the send queue. "
+            "Pass an explicit --batch when running parallel: two concurrent runs that share "
+            "--vertical/--market/--size and let the wrapper "
+            "fork a name would race on the same next-free index and land on the same batch. Once "
+            "parallel, the binding limits stop being this lock and become the Places API QPS/quota "
+            "and the LLM provider's rate limits, which the per-run MAX_* caps do not coordinate "
+            "across processes. See docs/hermes-commands.md#parallel-batch-runs."
+        ),
+    )
     return parser.parse_args(argv)
 
 

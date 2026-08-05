@@ -173,6 +173,15 @@ Key in-flight facts (2026-07-29):
     (`reset_fetch_session`, called from `enrich_row`): reuse is worth having across one site's
     pages and worth nothing across leads, while the cookie jar and open sockets should end with
     the crawl that opened them.
+- **Place Details are fetched concurrently too** (`PLACES_DETAILS_WORKERS`, default 6, clamped to 8),
+  replacing the old serial loop and its per-call 0.15s pacing sleep. Two things are load-bearing and
+  must not be "simplified" away: **`--max-details` is reserved atomically** through
+  `make_search_batch.DetailsBudget` (every Place Details call is billed, and the old
+  `if count >= cap: ... count += 1` is a check-then-act that over-fetches the moment a yield point
+  lands between the two), and **rows are collected in submit order, not completion order** — raw rows
+  go straight to `data/raw/<batch>.csv` and `dedupe_search_rows` is first-wins, so completion order
+  would silently change which duplicate survives. Workers only make the network call; every shared
+  structure is mutated on the calling thread, the same contract as `enrich_rows_concurrently`.
 - **Review velocity needs two observations ≥14 days apart** in `run_state/review_velocity.sqlite3`
   (`REVIEW_SNAPSHOT_DB`). `enrich_row` banks one per lead per run; until a batch has been run twice,
   `velocity_band` is legitimately `unknown`.
@@ -210,7 +219,8 @@ non-zero exit means the base has fallen behind and a write path is about to 422:
   and never overwrites an existing assignee),
   `LLM_SCORING_MODEL`, the `MAX_LLM_*` caps, the Places caps (`MAX_SEARCH_CALLS_PER_RUN` 3,
   `MAX_DETAILS_CALLS_PER_RUN` 50, `MAX_TOTAL_PLACES_PER_RUN` 50, `MAX_WEBSITES_PER_RUN` 40),
-  `ENRICH_WORKERS`, `BUYER_INTENT_ADS_CHECK` (off), `FOLLOW_UP_CADENCE_DAYS` (4), and
+  `ENRICH_WORKERS`, `PLACES_DETAILS_WORKERS` (6, max 8),
+  `BUYER_INTENT_ADS_CHECK` (off), `FOLLOW_UP_CADENCE_DAYS` (4), and
   `REVIEW_SNAPSHOT_DB`.
   **Compliance requires `SUPPRESSION_SOURCE` (or `LPM_OUTCOMES_JSONL`) to be set** or search,
   enrichment and scoring all fail closed with `[ERROR]` and exit 1. `ALLOW_MISSING_SUPPRESSION_INDEX=1`

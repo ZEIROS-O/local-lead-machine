@@ -7,8 +7,10 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import AbstractSet, Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
@@ -31,7 +33,7 @@ from enrich_leads import (
     resolve_enrich_workers,
     resolve_per_lead_timeout,
 )
-from places_search import normalize_place, place_details, text_search_paged
+from places_search import getenv_int, normalize_place, place_details, text_search_paged
 from lead_machine.compliance import ComplianceError, load_configured_suppression_index
 from lead_machine.review_velocity import ReviewSnapshotStore
 from lead_machine.schema import GENERIC_DOMAINS, normalize_domain, normalize_phone, slug
@@ -39,6 +41,10 @@ from lead_machine.verticals import resolve_profile
 
 
 DEFAULT_REVIEW_SNAPSHOT_DB = "run_state/review_velocity.sqlite3"
+
+# Place Details concurrency (PLACES_DETAILS_WORKERS). See resolve_details_workers.
+DEFAULT_DETAILS_WORKERS = 6
+MAX_DETAILS_WORKERS = 8
 
 REQUIRED_CONFIG_FIELDS = ["batch", "vertical", "location", "limit_per_query", "queries"]
 
@@ -610,6 +616,59 @@ def write_csv_rows(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
             writer.writerow({field: row.get(field, "") for field in fieldnames})
 
 
+class DetailsBudget:
+    """The hard ceiling on billed Place Details calls, held as one invariant.
+
+    Every Place Details call costs money, so ``--max-details`` is a spend
+    ceiling and not a hint. The pre-concurrency code spelled it as
+    ``if details_count >= max_details: ... ; details_count += 1`` -- a
+    check-then-act that is only safe because one thread ran both statements.
+    Rather than leave that safety as a property of the call site, the reserve
+    and the increment happen together under a lock here, so no caller can
+    over-fetch by moving the reserve onto a worker thread.
+    """
+
+    def __init__(self, cap: Optional[int]) -> None:
+        self._cap = cap
+        self._count = 0
+        self._lock = threading.Lock()
+
+    @property
+    def cap(self) -> Optional[int]:
+        return self._cap
+
+    @property
+    def count(self) -> int:
+        with self._lock:
+            return self._count
+
+    @property
+    def exhausted(self) -> bool:
+        with self._lock:
+            return self._cap is not None and self._count >= self._cap
+
+    def reserve(self) -> bool:
+        """Claim one billed call. False once the cap is spent."""
+        with self._lock:
+            if self._cap is not None and self._count >= self._cap:
+                return False
+            self._count += 1
+            return True
+
+
+def resolve_details_workers() -> int:
+    """How many Place Details calls to keep in flight.
+
+    Details lookups are one small HTTPS round-trip each and used to run
+    strictly serially with a 0.15s pacing sleep between them, so a search that
+    returned 60 places spent most of its wall-clock waiting. A bounded pool
+    replaces both the serialisation and the sleep. The ceiling is deliberately
+    low: the Places API bills and rate-limits per call, and the point of the
+    pool is to hide latency, not to sprint into a 429.
+    """
+    return max(1, min(getenv_int("PLACES_DETAILS_WORKERS", DEFAULT_DETAILS_WORKERS), MAX_DETAILS_WORKERS))
+
+
 def collect_raw_rows(
     config: SearchConfig,
     *,
@@ -624,10 +683,12 @@ def collect_raw_rows(
     queries_run: List[str] = []
     duplicate_reason_counts: Counter[str] = Counter()
     seen_place_ids: set[str] = set()
-    details_count = 0
+    details_budget = DetailsBudget(max_details)
     details_cap_reported = False
+    collected = 0
     pages_fetched_total = 0
     total_places_returned = 0
+    details_workers = resolve_details_workers()
 
     expanded_searches = expand_searches(config)
     searches = expanded_searches
@@ -640,6 +701,7 @@ def collect_raw_rows(
     )
     if len(searches) != len(expanded_searches):
         _progress(f"Search cap active: running {len(searches)} of {len(expanded_searches)} searches")
+    _progress(f"Place Details workers: {details_workers}")
 
     for search_index, search in enumerate(searches, start=1):
         queries_run.append(search.search_text)
@@ -664,44 +726,73 @@ def collect_raw_rows(
             f"(pages={pages_fetched})"
         )
 
-        for place in places:
-            place_id = _pick(place, "id", "place_id")
-            if not place_id:
-                warnings.append(f"Search result missing place id for {search.search_text!r}")
-                continue
-            if place_id in seen_place_ids:
-                duplicate_reason_counts["duplicate_place_id_early"] += 1
-                continue
-            seen_place_ids.add(place_id)
-            if max_details is not None and details_count >= max_details:
-                if not details_cap_reported:
-                    warnings.append(f"Hit --max-details={max_details}; skipped remaining Place Details calls")
-                    _progress(f"[DETAILS] hit max-details={max_details}; skipping remaining Place Details calls")
-                    details_cap_reported = True
-                continue
-            details_count += 1
+        # Submit in place order, collect in place order. Every mutation of the
+        # shared state below (seen_place_ids, raw_rows, warnings, errors,
+        # duplicate_reason_counts) stays on this thread; the workers only do
+        # the network call, exactly like enrich_rows_concurrently's contract.
+        # Row order is observable -- raw rows go straight to
+        # data/raw/<batch>.csv and dedupe_search_rows is first-wins -- so
+        # completion order would change which duplicate survives.
+        submitted: List[Tuple[str, Any]] = []
+        pool = ThreadPoolExecutor(max_workers=details_workers)
+        try:
             try:
-                details = place_details(api_key, place_id)
-                lead = normalize_place(details, search.search_text)
-                row = normalize_search_row(
-                    _row_dict(lead),
-                    config=config,
-                    source_query=search.source_query,
-                    source_geo=search.source_geo,
-                    source_search=search.search_text,
-                )
-                if not row.get("business_name"):
-                    warnings.append(f"Place details missing business name for place_id={place_id}")
-                    continue
-                raw_rows.append(row)
-            except Exception as exc:
-                errors.append(f"Place details failed for place_id={place_id}: {exc}")
-                continue
-            finally:
-                if details_count and details_count % 10 == 0:
-                    _progress(f"[DETAILS] raw={len(raw_rows)} details={details_count}")
-            if sleep_seconds > 0:
-                time.sleep(sleep_seconds)
+                for place in places:
+                    place_id = _pick(place, "id", "place_id")
+                    if not place_id:
+                        warnings.append(f"Search result missing place id for {search.search_text!r}")
+                        continue
+                    if place_id in seen_place_ids:
+                        duplicate_reason_counts["duplicate_place_id_early"] += 1
+                        continue
+                    seen_place_ids.add(place_id)
+                    # Reserve the billed slot before the call is queued, never
+                    # after. `details_budget.reserve()` is the only place the
+                    # counter moves, and it moves atomically -- the cap is a
+                    # money ceiling, so it must not depend on the caller
+                    # happening to be single-threaded.
+                    if not details_budget.reserve():
+                        if not details_cap_reported:
+                            warnings.append(f"Hit --max-details={max_details}; skipped remaining Place Details calls")
+                            _progress(f"[DETAILS] hit max-details={max_details}; skipping remaining Place Details calls")
+                            details_cap_reported = True
+                        continue
+                    submitted.append((place_id, pool.submit(place_details, api_key, place_id)))
+
+                for place_id, future in submitted:
+                    try:
+                        details = future.result()
+                        lead = normalize_place(details, search.search_text)
+                        row = normalize_search_row(
+                            _row_dict(lead),
+                            config=config,
+                            source_query=search.source_query,
+                            source_geo=search.source_geo,
+                            source_search=search.search_text,
+                        )
+                        if not row.get("business_name"):
+                            warnings.append(f"Place details missing business name for place_id={place_id}")
+                            continue
+                        raw_rows.append(row)
+                    except Exception as exc:
+                        errors.append(f"Place details failed for place_id={place_id}: {exc}")
+                        continue
+                    finally:
+                        collected += 1
+                        if collected % 10 == 0:
+                            _progress(
+                                f"[DETAILS] raw={len(raw_rows)} details={details_budget.count}"
+                            )
+            except KeyboardInterrupt:
+                # Every place is submitted up front, so the default shutdown
+                # (wait=True, cancel_futures=False) would drain the whole
+                # remaining queue before the interrupt landed. Drop what has
+                # not started; the in-flight calls finish in the `finally`,
+                # since a thread cannot be killed mid-request.
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
+        finally:
+            pool.shutdown(wait=True)
 
         if sleep_seconds > 0:
             time.sleep(sleep_seconds)
@@ -1005,9 +1096,19 @@ def main() -> int:
         action="store_true",
         help="Use Playwright browser rendering to classify loaded/broken/timeout site status during enrichment",
     )
-    parser.add_argument("--sleep", type=float, default=0.15, help="Seconds between Google/detail calls")
+    parser.add_argument(
+        "--sleep",
+        type=float,
+        default=0.15,
+        help="Seconds between text-search pages and between searches. Place Details calls are no "
+             "longer paced by this -- PLACES_DETAILS_WORKERS bounds them instead.",
+    )
     parser.add_argument("--max-searches", type=int, default=None, help="Optional cap on expanded query×geo searches")
-    parser.add_argument("--max-details", type=int, default=None, help="Optional cap on Place Details calls")
+    parser.add_argument(
+        "--max-details", type=int, default=None,
+        help="Hard cap on billed Place Details calls. Reserved atomically, so the concurrent "
+             "fetch cannot exceed it.",
+    )
     parser.add_argument("--max-enrich", type=int, default=None, help="Optional cap on enrichment rows")
     parser.add_argument(
         "--review-snapshot-db",
