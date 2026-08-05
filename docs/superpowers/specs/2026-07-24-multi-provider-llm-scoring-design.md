@@ -160,3 +160,9 @@ unavailability, so a misconfigured kimi degrades to the subscription CLIs and th
 succeeds — spending subscription capacity instead of Kimi credits. The mitigations are operational,
 not structural: a `[LLM PROVIDER]` line in the run log, and a first live batch run with
 `LLM_SCORING_PROVIDER_CHAIN=kimi` pinned.
+
+## Addendum (implementation)
+
+`anthropic` (the pre-existing Messages API path) is kept as a valid provider name in
+`_PROVIDERS` but is not in the default chain, so existing Anthropic setups and tests can
+pin `LLM_SCORING_PROVIDER_CHAIN=anthropic`.

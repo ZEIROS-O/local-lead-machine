@@ -292,6 +292,12 @@ LLM_PRICING_USD_PER_MILLION_TOKENS: Dict[str, Tuple[float, float]] = {
     "claude-sonnet-4-5": (3.0, 15.0),
     "claude-opus-4-1": (15.0, 75.0),
     "claude-3-5-haiku-20241022": (0.8, 4.0),
+    # Moonshot list price, confirmed in Task 0 against the Moonshot console.
+    "kimi-k3": (3.0, 15.0),
+    # Subscription runners are $0 marginal; they still count against
+    # MAX_LLM_CALLS_PER_RUN and MAX_LLM_TOKENS_PER_RUN.
+    "subscription:codex": (0.0, 0.0),
+    "subscription:claude": (0.0, 0.0),
 }
 
 
@@ -2046,6 +2052,58 @@ def estimate_llm_usd(usage: Dict[str, Any], *, model: str = DEFAULT_LLM_SCORING_
     return (input_tokens * input_price + output_tokens * output_price) / 1_000_000
 
 
+def resolve_projection_model() -> str:
+    """Priciest model the chain could reach — the model to project spend with.
+
+    `llm_client.resolve_scoring_model()` names the *first* provider's model, and
+    a $0 subscription runner first in the chain projects $0 for the whole run.
+    That silently disables the `LLM_SPEND_CONFIRM_USD` refusal gate even though
+    a fallback to Kimi or the Claude API spends real money. A pre-spend guard
+    has to assume the worst tier the chain can fall through to.
+    """
+    expected = llm_client.resolve_scoring_model()
+    try:
+        candidates = [llm_client.model_for_provider(p) for p in llm_client.provider_chain()]
+    except Exception:  # never let projection break a run
+        return expected
+    priced: List[Tuple[float, str]] = []
+    for candidate in {c for c in candidates if c} | {expected}:
+        try:
+            _, output_price = llm_pricing(candidate)
+        except UnknownLlmModelError:
+            continue
+        priced.append((output_price, candidate))
+    if not priced:
+        return expected
+    return max(priced)[1]
+
+
+def resolve_served_model(result: Dict[str, Any], fallback: str) -> str:
+    """Model id to price a served batch with, falling back to the run-level one.
+
+    The chain reports which provider served the batch so spend lands on the
+    right price row. But a provider is free-form about what it reports, and an
+    id with no pricing entry must not kill a run mid-flight — the call is
+    already paid for. Unknown ids fall back to the run-level model loudly;
+    MAX_LLM_TOKENS_PER_RUN still bounds the run either way.
+    """
+    candidate = result.get("model")
+    if not isinstance(candidate, str) or not candidate.strip():
+        return fallback
+    candidate = candidate.strip()
+    try:
+        llm_pricing(candidate)
+    except UnknownLlmModelError:
+        print(
+            f"[WARN] Provider reported unpriced model {candidate!r}; "
+            f"charging this batch at {fallback!r} instead. Add it to "
+            f"LLM_PRICING_USD_PER_MILLION_TOKENS so spend caps stay accurate.",
+            file=sys.stderr,
+        )
+        return fallback
+    return candidate
+
+
 def estimate_prompt_tokens(prompt: str) -> int:
     if not prompt:
         return 0
@@ -2877,6 +2935,9 @@ def _score_batch_with_debug(
     current_max_tokens = max_tokens
     # Track usage/calls from attempts that raised so they still count toward caps.
     failed_usage: Dict[str, int] = {}
+    # And which model burned it — the chain may have fallen past a $0
+    # subscription runner onto a paid API, so `model` is the wrong price here.
+    failed_model = ""
     calls_made = 0
     while True:
         try:
@@ -2884,6 +2945,7 @@ def _score_batch_with_debug(
             result = llm_client.score_batch(prompt, model=model, max_tokens=current_max_tokens)
         except llm_client.InvalidLlmResponse as exc:
             failed_usage = _accumulate_usage(failed_usage, getattr(exc, "usage", None))
+            failed_model = str(getattr(exc, "model", "") or "").strip() or failed_model
             parsed_json = getattr(exc, "parsed_json", None)
             if isinstance(parsed_json, dict):
                 validation_debug_path = _write_validation_failed_llm_response(
@@ -2911,6 +2973,7 @@ def _score_batch_with_debug(
                     return repaired
                 except llm_client.InvalidLlmResponse as repair_exc:
                     failed_usage = _accumulate_usage(failed_usage, getattr(repair_exc, "usage", None))
+                    failed_model = str(getattr(repair_exc, "model", "") or "").strip() or failed_model
                     repair_debug_path: Path | None = None
                     repair_parsed_json = getattr(repair_exc, "parsed_json", None)
                     if isinstance(repair_parsed_json, dict):
@@ -2925,6 +2988,7 @@ def _score_batch_with_debug(
                         return {
                             "bundle": fallback_bundle,
                             "usage": failed_usage,
+                            "model": failed_model,
                             "call_count": calls_made,
                             "debug_notes": [
                                 f"{fallback_note}; raw response saved to {validation_debug_path}; repair failed"
@@ -2937,6 +3001,7 @@ def _score_batch_with_debug(
                         repair_debug_path=repair_debug_path,
                     )
                     err.usage = failed_usage
+                    err.model = failed_model
                     err.call_count = calls_made
                     raise err from repair_exc
 
@@ -2953,6 +3018,7 @@ def _score_batch_with_debug(
                 continue
             err = ValueError(f"{exc}; raw LLM response saved to {debug_path}")
             err.usage = failed_usage
+            err.model = failed_model
             err.call_count = calls_made
             raise err from exc
         else:
@@ -3169,7 +3235,7 @@ def score_records_api_run(
             input_tokens += batch_input_tokens
             output_tokens += batch_output_tokens
             tokens += batch_total_tokens
-            usd += estimate_llm_usd(usage, model=model)
+            usd += estimate_llm_usd(usage, model=str(getattr(exc, "model", "") or "").strip() or model)
             if usage_output_path is not None:
                 _write_llm_usage_payload(
                     usage_output_path,
@@ -3192,6 +3258,17 @@ def score_records_api_run(
                     ),
                 )
             raise
+        # Price by the model that actually served the batch, not the run-level
+        # one. With a subscription runner first in the chain, `model` is
+        # "subscription:<runner>" at $0/$0 — so a fallback to a paid API would
+        # bill every token at zero and MAX_LLM_USD_PER_RUN would never trip.
+        served_model = resolve_served_model(result, model)
+        runner_model = result.get("runner_model")
+        runner_model = runner_model.strip() if isinstance(runner_model, str) else ""
+        print(
+            f"[LLM PROVIDER] provider={result.get('provider', 'unknown')} model={served_model}"
+            + (f" runner_model={runner_model}" if runner_model else "")
+        )
         bundle = result["bundle"]
         usage = result.get("usage") or {}
         calls += safe_int(result.get("call_count")) or 1
@@ -3202,7 +3279,7 @@ def score_records_api_run(
         input_tokens += batch_input_tokens
         output_tokens += batch_output_tokens
         tokens += batch_total_tokens
-        usd += estimate_llm_usd(usage, model=model)
+        usd += estimate_llm_usd(usage, model=served_model)
 
         bundle_dir.mkdir(parents=True, exist_ok=True)
         bundle_path = bundle_dir / f"{batch_id}_response.json"
@@ -3479,20 +3556,27 @@ def main() -> int:
         max_tokens_per_run = getenv_int("MAX_LLM_TOKENS_PER_RUN", DEFAULT_MAX_LLM_TOKENS_PER_RUN)
         max_usd_per_run = getenv_float("MAX_LLM_USD_PER_RUN", DEFAULT_MAX_LLM_USD_PER_RUN)
 
-        llm_model = (os.getenv("LLM_SCORING_MODEL") or DEFAULT_LLM_SCORING_MODEL).strip()
+        llm_model = llm_client.resolve_scoring_model()
+        # Project against the priciest tier the chain can fall through to, not
+        # the first one — otherwise a $0 subscription runner in front zeroes the
+        # projection and disables the LLM_SPEND_CONFIRM_USD refusal below.
+        projection_model = resolve_projection_model()
         try:
             estimate = estimate_api_llm_cost(
                 records,
                 fallback_vertical=args.vertical,
                 batch_size=args.llm_batch_size,
                 max_tokens=args.llm_max_tokens,
-                model=llm_model,
+                model=projection_model,
             )
         except UnknownLlmModelError as exc:
             print(f"[ERROR] {exc}", file=sys.stderr)
             return 1
 
-        print(f"[LLM COST] model={llm_model}")
+        print(
+            f"[LLM COST] model={llm_model}"
+            + (f" projected_as={projection_model}" if projection_model != llm_model else "")
+        )
         print(
             f"[LLM COST] records_selected={estimate.records_selected} "
             f"batches={estimate.batches} "
@@ -3503,7 +3587,7 @@ def main() -> int:
         )
 
         if args.dry_run_llm_cost:
-            print("[DRY-RUN] No Anthropic call made.")
+            print("[DRY-RUN] No LLM API call made.")
             return 0
 
         scores_dir_path = Path(args.scores_dir)

@@ -4,7 +4,7 @@ import json
 import os
 import sys
 import time
-from typing import Any, Dict
+from typing import Any, Callable, Dict, List
 
 import requests
 from dotenv import load_dotenv
@@ -19,7 +19,20 @@ DEFAULT_ANTHROPIC_CONNECT_TIMEOUT_SECONDS = 15
 DEFAULT_ANTHROPIC_READ_TIMEOUT_SECONDS = 180
 DEFAULT_ANTHROPIC_MAX_RETRIES = 2
 DEFAULT_ANTHROPIC_RETRY_BACKOFF_SECONDS = 2
+DEFAULT_KIMI_BASE_URL = "https://api.moonshot.ai/v1"
+DEFAULT_KIMI_SCORING_MODEL = "kimi-k3"
+# kimi-k3 always thinks; reasoning_effort only tunes how much. "low" is the
+# lightest setting Moonshot exposes — the default "max" burns the whole
+# max_tokens budget on reasoning_content before any score JSON is written,
+# which is unnecessary for a fixed-rubric scoring task and starves `content`.
+DEFAULT_KIMI_REASONING_EFFORT = "low"
 TRANSIENT_HTTP_STATUSES = {429, 500, 502, 503, 504}
+
+DEFAULT_PROVIDER_CHAIN = ("kimi", "codex", "claude")
+
+
+class ProviderUnavailable(RuntimeError):
+    """A scoring provider cannot serve this call (missing key, auth, quota, transport)."""
 
 
 class InvalidLlmResponse(ValueError):
@@ -37,6 +50,10 @@ class InvalidLlmResponse(ValueError):
         # Usage for the failed attempt, so callers can still charge it against
         # per-run token/USD caps even though the response never validated.
         self.usage = usage or {}
+        # Which model burned that usage. The chain can fall past a $0
+        # subscription runner onto a paid API, so the run-level model is the
+        # wrong price for a failed attempt too.
+        self.model = ""
 
 
 def _response_text(data: Dict[str, Any]) -> str:
@@ -74,6 +91,30 @@ def _usage(data: Dict[str, Any]) -> Dict[str, int]:
     raw_usage = data.get("usage") or {}
     input_tokens = int(raw_usage.get("input_tokens") or 0)
     output_tokens = int(raw_usage.get("output_tokens") or 0)
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+    }
+
+
+def _response_text_openai(data: Dict[str, Any]) -> str:
+    choices = data.get("choices") or []
+    if choices and isinstance(choices[0], dict):
+        message = choices[0].get("message") or {}
+        text = str(message.get("content") or "").strip()
+        if text:
+            return text
+    raise InvalidLlmResponse(
+        "Kimi response did not include message content",
+        raw_text=json.dumps(data, ensure_ascii=False, indent=2),
+    )
+
+
+def _usage_openai(data: Dict[str, Any]) -> Dict[str, int]:
+    raw_usage = data.get("usage") or {}
+    input_tokens = int(raw_usage.get("prompt_tokens") or raw_usage.get("input_tokens") or 0)
+    output_tokens = int(raw_usage.get("completion_tokens") or raw_usage.get("output_tokens") or 0)
     return {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
@@ -145,11 +186,11 @@ def _transient_request_reason(exc: requests.RequestException) -> str:
     return exc.__class__.__name__
 
 
-def score_batch(prompt: str, *, model: str | None = None, max_tokens: int) -> Dict[str, Any]:
+def _score_batch_anthropic(prompt: str, *, model: str | None = None, max_tokens: int) -> Dict[str, Any]:
     load_dotenv()
     api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     if not api_key:
-        raise RuntimeError("Missing ANTHROPIC_API_KEY in .env")
+        raise ProviderUnavailable("Missing ANTHROPIC_API_KEY in .env")
 
     selected_model = (model or os.getenv("LLM_SCORING_MODEL") or DEFAULT_LLM_SCORING_MODEL).strip()
     connect_timeout = _getenv_int("ANTHROPIC_CONNECT_TIMEOUT_SECONDS", DEFAULT_ANTHROPIC_CONNECT_TIMEOUT_SECONDS)
@@ -231,11 +272,283 @@ def score_batch(prompt: str, *, model: str | None = None, max_tokens: int) -> Di
             # Preserve the paid usage from this attempt so token/USD caps and
             # cost dashboards see it even when the response is unusable.
             exc.usage = usage
+            exc.model = selected_model
             raise
         print(
             f"[LLM REQUEST OK] attempt={attempt} "
             f"input_tokens={usage['input_tokens']} output_tokens={usage['output_tokens']}"
         )
-        return {"bundle": bundle, "usage": usage}
+        return {"bundle": bundle, "usage": usage, "provider": "anthropic", "model": selected_model}
 
     raise RuntimeError("Anthropic API request failed without making an attempt")
+
+
+def _score_batch_kimi(prompt: str, *, model: str | None, max_tokens: int) -> Dict[str, Any]:
+    api_key = (os.getenv("KIMI_API_KEY") or os.getenv("MOONSHOT_API_KEY") or "").strip()
+    if not api_key:
+        raise ProviderUnavailable("Missing KIMI_API_KEY (or MOONSHOT_API_KEY) in .env")
+
+    base_url = (os.getenv("KIMI_BASE_URL") or DEFAULT_KIMI_BASE_URL).strip().rstrip("/")
+    selected_model = (
+        model
+        or os.getenv("KIMI_SCORING_MODEL")
+        or os.getenv("LLM_SCORING_MODEL")  # legacy alias
+        or DEFAULT_KIMI_SCORING_MODEL
+    ).strip()
+    connect_timeout = _getenv_int("KIMI_CONNECT_TIMEOUT_SECONDS", DEFAULT_ANTHROPIC_CONNECT_TIMEOUT_SECONDS)
+    read_timeout = _getenv_int("KIMI_READ_TIMEOUT_SECONDS", DEFAULT_ANTHROPIC_READ_TIMEOUT_SECONDS)
+    max_retries = max(0, _getenv_int("KIMI_MAX_RETRIES", DEFAULT_ANTHROPIC_MAX_RETRIES))
+    backoff_seconds = max(
+        0.0,
+        _getenv_float("KIMI_RETRY_BACKOFF_SECONDS", float(DEFAULT_ANTHROPIC_RETRY_BACKOFF_SECONDS)),
+    )
+    max_attempts = max_retries + 1
+    reasoning_effort = (os.getenv("KIMI_REASONING_EFFORT") or DEFAULT_KIMI_REASONING_EFFORT).strip()
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    body = {
+        "model": selected_model,
+        "max_tokens": max_tokens,
+        "reasoning_effort": reasoning_effort,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    url = f"{base_url}/chat/completions"
+    prompt_tokens_est = _estimate_prompt_tokens(prompt)
+
+    for attempt in range(1, max_attempts + 1):
+        print(
+            f"[LLM REQUEST] provider=kimi attempt={attempt} model={selected_model} "
+            f"prompt_tokens_est={prompt_tokens_est} max_tokens={max_tokens} "
+            f"reasoning_effort={reasoning_effort}"
+        )
+        try:
+            response = requests.post(url, headers=headers, json=body, timeout=(connect_timeout, read_timeout))
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            if attempt >= max_attempts:
+                raise ProviderUnavailable(f"kimi request failed after {attempt} attempts: {exc}") from exc
+            sleeping = backoff_seconds * (2 ** (attempt - 1))
+            print(f"[LLM RETRY] provider=kimi attempt={attempt} reason={_transient_request_reason(exc)} sleeping={_seconds_for_log(sleeping)}s")
+            time.sleep(sleeping)
+            continue
+
+        if response.status_code >= 400:
+            error = ProviderUnavailable(f"kimi API error {response.status_code}: {response.text[:1000]}")
+            if response.status_code not in TRANSIENT_HTTP_STATUSES:
+                raise error
+            if attempt >= max_attempts:
+                raise error
+            sleeping = backoff_seconds * (2 ** (attempt - 1))
+            print(f"[LLM RETRY] provider=kimi attempt={attempt} reason=http_{response.status_code} sleeping={_seconds_for_log(sleeping)}s")
+            time.sleep(sleeping)
+            continue
+
+        data = response.json()
+        usage = _usage_openai(data)
+        try:
+            text = _response_text_openai(data)
+            bundle = _parse_score_bundle(text)
+        except InvalidLlmResponse as exc:
+            exc.usage = usage
+            exc.model = selected_model
+            raise
+        print(
+            f"[LLM REQUEST OK] provider=kimi attempt={attempt} "
+            f"input_tokens={usage['input_tokens']} output_tokens={usage['output_tokens']}"
+        )
+        return {"bundle": bundle, "usage": usage, "provider": "kimi", "model": selected_model}
+
+    raise ProviderUnavailable("kimi request failed without making an attempt")
+
+
+def _anthropic_provider(prompt: str, *, model: str | None, max_tokens: int) -> Dict[str, Any]:
+    try:
+        return _score_batch_anthropic(prompt, model=model, max_tokens=max_tokens)
+    except ProviderUnavailable:
+        raise
+    except InvalidLlmResponse:
+        raise
+    except RuntimeError as exc:
+        raise ProviderUnavailable(str(exc)) from exc
+
+
+DEFAULT_CLI_TIMEOUT_SECONDS = 900
+
+
+def _normalize_cli_usage(raw: Dict[str, Any] | None) -> Dict[str, int]:
+    raw = raw or {}
+
+    def _pick(*keys: str) -> int:
+        for key in keys:
+            try:
+                value = int(raw.get(key) or 0)
+            except (TypeError, ValueError):
+                continue
+            if value:
+                return value
+        return 0
+
+    def _int(key: str) -> int:
+        try:
+            return int(raw.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    input_tokens = _pick("input_tokens", "prompt_tokens")
+    # The Claude CLI envelope reports nearly all prompt tokens under the cache
+    # counters — a 3.7k-token scoring prompt comes back as input_tokens=1 with
+    # the rest in cache_creation_input_tokens / cache_read_input_tokens. Dropping
+    # them under-counts input by ~99%, so MAX_LLM_TOKENS_PER_RUN stops bounding
+    # subscription runs.
+    input_tokens += _int("cache_creation_input_tokens") + _int("cache_read_input_tokens")
+    output_tokens = _pick("output_tokens", "completion_tokens")
+    total = max(_pick("total_tokens"), input_tokens + output_tokens)
+    return {"input_tokens": input_tokens, "output_tokens": output_tokens, "total_tokens": total}
+
+
+def _score_batch_cli(runner: str, prompt: str, *, model: str | None, max_tokens: int) -> Dict[str, Any]:
+    import score_batch_subscription as subscription_runner
+
+    env = subscription_runner.sanitized_environment()
+    auth = subscription_runner.preflight_subscription_auth(runner, env=env)
+    if not auth.ok:
+        raise ProviderUnavailable(f"{runner} subscription auth not verified: {auth.detail}")
+
+    env_key = "CODEX_SUBSCRIPTION_SCORING_MODEL" if runner == "codex" else "CLAUDE_SUBSCRIPTION_SCORING_MODEL"
+    selected_model = (os.getenv(env_key) or "").strip()
+    timeout_seconds = max(1, _getenv_int("LLM_CLI_TIMEOUT_SECONDS", DEFAULT_CLI_TIMEOUT_SECONDS))
+    effort = subscription_runner.resolve_runner_effort(runner)
+    print(
+        f"[LLM REQUEST] provider={runner} model={selected_model or 'runner-default'} "
+        f"effort={effort or 'runner-default'} via CLI subscription"
+    )
+    result = subscription_runner.run_runner_attempt(
+        runner,
+        prompt_text=prompt,
+        model=selected_model,
+        timeout_seconds=timeout_seconds,
+        env=env,
+        use_output_schema=(runner == "codex"),
+    )
+    if result.result != "ok":
+        raise ProviderUnavailable(f"{runner} CLI runner result={result.result}: {result.stderr_tail}")
+
+    text = subscription_runner.clean_bundle_text(result.raw_text)
+    bundle = _parse_score_bundle(text)  # InvalidLlmResponse propagates: no fallback on bad output
+    usage = _normalize_cli_usage(result.usage)
+    print(
+        f"[LLM REQUEST OK] provider={runner} "
+        f"input_tokens={usage['input_tokens']} output_tokens={usage['output_tokens']}"
+    )
+    # `model` is what the caller prices the batch with, so it must be the $0
+    # subscription id — billing a sub-served batch at the runner model's API
+    # rate would charge MAX_LLM_USD_PER_RUN for tokens that cost nothing.
+    # The real runner model stays available for logging as `runner_model`.
+    return {
+        "bundle": bundle,
+        "usage": usage,
+        "provider": runner,
+        "model": f"subscription:{runner}",
+        "runner_model": selected_model or "runner-default",
+    }
+
+
+_PROVIDERS: Dict[str, Callable] = {
+    "kimi": _score_batch_kimi,
+    "codex": lambda prompt, *, model, max_tokens: _score_batch_cli("codex", prompt, model=model, max_tokens=max_tokens),
+    "claude": lambda prompt, *, model, max_tokens: _score_batch_cli("claude", prompt, model=model, max_tokens=max_tokens),
+    "anthropic": _anthropic_provider,
+}
+
+
+def _provider_chain() -> List[str]:
+    raw = os.getenv("LLM_SCORING_PROVIDER_CHAIN", "").strip()
+    names = [name.strip().lower() for name in raw.split(",") if name.strip()]
+    if not names:
+        names = list(DEFAULT_PROVIDER_CHAIN)
+    # A name is "recognized" if it's a documented chain member or a currently
+    # registered provider, even if this build hasn't wired its implementation
+    # in yet (e.g. kimi/codex land in later tasks). Only genuinely unknown
+    # names (typos, retired providers) get skipped here.
+    known_names = set(DEFAULT_PROVIDER_CHAIN) | set(_PROVIDERS)
+    chain: List[str] = []
+    for name in names:
+        if name not in known_names:
+            print(f"[WARN] Unknown LLM provider {name!r} in LLM_SCORING_PROVIDER_CHAIN; skipping", file=sys.stderr)
+            continue
+        if name not in chain:
+            chain.append(name)
+    return chain
+
+
+def score_batch(prompt: str, *, model: str | None = None, max_tokens: int) -> Dict[str, Any]:
+    load_dotenv()
+    failures: List[str] = []
+    for index, provider in enumerate(_provider_chain()):
+        # An explicit model belongs to the provider it was chosen for. Handing a
+        # kimi id to a fallback API provider would 400 the rest of the chain, so
+        # every provider after the first resolves its own model from env.
+        requested_model = model if index == 0 else None
+        provider_fn = _PROVIDERS.get(provider)
+        if provider_fn is None:
+            # Recognized chain member (e.g. kimi/codex before their provider
+            # lands) but not registered yet in this build. Treat like any
+            # other unavailability rather than crashing the whole chain.
+            reason = "provider not registered"
+            failures.append(f"{provider}: {reason}")
+            print(f"[LLM FALLBACK] provider={provider} reason={reason}", file=sys.stderr)
+            continue
+        try:
+            result = provider_fn(prompt, model=requested_model, max_tokens=max_tokens)
+        except InvalidLlmResponse:
+            raise
+        except ProviderUnavailable as exc:
+            failures.append(f"{provider}: {exc}")
+            print(f"[LLM FALLBACK] provider={provider} reason={exc}", file=sys.stderr)
+            continue
+        result.setdefault("provider", provider)
+        return result
+    raise RuntimeError("All LLM scoring providers unavailable: " + "; ".join(failures))
+
+
+def provider_chain() -> List[str]:
+    """The resolved fallback chain, in order. Public for cost projection."""
+    load_dotenv()
+    return _provider_chain()
+
+
+def model_for_provider(provider: str) -> str:
+    """Model id a given provider in the chain would use."""
+    if provider == "kimi":
+        return (
+            os.getenv("KIMI_SCORING_MODEL")
+            or os.getenv("LLM_SCORING_MODEL")  # legacy alias
+            or DEFAULT_KIMI_SCORING_MODEL
+        ).strip()
+    if provider in {"codex", "claude"}:
+        return f"subscription:{provider}"
+    return (os.getenv("LLM_SCORING_MODEL") or DEFAULT_LLM_SCORING_MODEL).strip()
+
+
+def resolve_scoring_model() -> str:
+    """Model id the chain's first provider will use — for logging and reporting.
+
+    NOTE: this is the *expected* model, not a spend guard. A pre-spend
+    projection must use the priciest model the chain could reach — see
+    `score_leads.resolve_projection_model` — because a $0 subscription runner
+    first in the chain would otherwise project $0 for a run that falls through
+    to a paid API and spends real money.
+    """
+    load_dotenv()
+    chain = _provider_chain()
+    first = chain[0] if chain else "anthropic"
+    if first == "kimi":
+        return (
+            os.getenv("KIMI_SCORING_MODEL")
+            or os.getenv("LLM_SCORING_MODEL")  # legacy alias
+            or DEFAULT_KIMI_SCORING_MODEL
+        ).strip()
+    if first in {"codex", "claude"}:
+        return f"subscription:{first}"
+    return (os.getenv("LLM_SCORING_MODEL") or DEFAULT_LLM_SCORING_MODEL).strip()
