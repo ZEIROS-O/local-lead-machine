@@ -106,17 +106,25 @@ Key in-flight facts (2026-07-29):
   generalise from them.) Every fetch the crawl declines has to be one that could not have changed
   the answer:
   - `scrape_site` runs two passes — the pages the homepage links, then the
-    `CONTACT_ESTIMATE_PATHS`-style guesses. A group's guesses are skipped only when its linked
-    pages **answered what the group is for**, which for contact means *a form was found*, not
-    merely a 200. A page that loads and offers nothing leaves the question open, and so does a soft
-    404. A HubSpot template emitting an unrendered `/f/contact/$hs_path` matches the contact
-    keywords and 404s; the guess it would have suppressed (`/contact`) was the real form.
-  - Both passes take pages round-robin across keyword groups, so a nav and footer full of contact
-    links cannot drain the budget and leave `weak_services` firing about a page never requested.
-  - `MAX_CANDIDATE_PAGE_FETCHES` (env-tunable) is a backstop against the pathological shape, not a
-    trim on the ladder — it stays above `11 contact guesses + services + about + gallery`. When it
-    does bite, the crawl sets `candidate_page_budget_exhausted` so a truncated crawl is
-    distinguishable from a site that genuinely had nothing, the way the timeout path already is.
+    `CONTACT_ESTIMATE_PATHS`-style guesses. A group's guesses are skipped only once it has
+    **answered what the group is for**. For the contact group that bar is `has_terminal_form`:
+    an estimate form graded *Strong*, the same thing `evidence.strong_estimate_form` stops
+    charging pain for. Anything weaker still scores (+20 no estimate form, +18 weak, +12 basic),
+    so a weaker find does not prove a better page isn't one URL away. **Do not use
+    `forms_found`** — `detect_form_signals` grades any page with a `<button>`, `<input>` or
+    `<iframe>` as Weak rather than None, so a hamburger menu satisfies it and a soft 404 ends the
+    search. (A HubSpot template emitting an unrendered `/f/contact/$hs_path` matches the contact
+    keywords and 404s; the guess it would have suppressed, `/contact`, was the real form.)
+  - Both passes take pages round-robin across keyword groups, and pass 1 reserves a slot per group
+    for pass 2 — otherwise a nav of per-city contact links drains the budget and `weak_services`
+    fires about a page that was never requested.
+  - `MAX_CANDIDATE_PAGE_FETCHES` (env-tunable, floored at the ladder length) is a backstop against
+    the pathological shape, not a trim. When it bites, the crawl sets
+    `candidate_page_budget_exhausted`, and if the contact group never got its terminal answer the
+    form fields are written **`Unknown` rather than `No`** — a search we cut short did not
+    establish absence, and `Unknown` is the one value the pain profile ignores.
+    `tests/test_enrichment_fetch_budget.py` pins the property directly: truncation must never
+    raise `visible_pain_score` above what an unlimited crawl produces.
   - `fetch_url` retries 5xx but not 404 — a 404 is a deterministic answer.
 - **Review velocity needs two observations ≥14 days apart** in `run_state/review_velocity.sqlite3`
   (`REVIEW_SNAPSHOT_DB`). `enrich_row` banks one per lead per run; until a batch has been run twice,

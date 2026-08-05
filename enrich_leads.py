@@ -276,8 +276,42 @@ def getenv_bool(name: str, default: bool = False) -> bool:
     return raw in {"1", "true", "yes", "y", "on"}
 
 
+def candidate_page_budget_floor() -> int:
+    """Below this the fallback ladder cannot run, and pain is manufactured."""
+    return len(CONTACT_ESTIMATE_PATHS) + len(CANDIDATE_PAGE_GROUPS) - 1
+
+
 def resolve_candidate_page_budget() -> int:
-    return max(1, getenv_int("MAX_CANDIDATE_PAGE_FETCHES", MAX_CANDIDATE_PAGE_FETCHES))
+    floor = candidate_page_budget_floor()
+    requested = getenv_int("MAX_CANDIDATE_PAGE_FETCHES", MAX_CANDIDATE_PAGE_FETCHES)
+    if requested < floor:
+        # Not a tuning knob below the ladder: a short budget reports "no form
+        # detected" on sites we simply stopped looking at, and downstream
+        # charges pain for that on every lead in the run.
+        print(
+            f"[WARN] MAX_CANDIDATE_PAGE_FETCHES={requested} is below the fallback ladder; using {floor}",
+            file=sys.stderr,
+        )
+        return floor
+    return requested
+
+
+def has_terminal_form(form_signals: Dict[str, Any]) -> bool:
+    """Has the crawl found what downstream treats as a finished answer?
+
+    `evidence._derive_visible_pain_profile` only stops charging pain at
+    `strong_estimate_form` — estimate form detected *and* Strong. Anything
+    less still scores (+20 for no estimate form, +18 weak, +12 basic), so a
+    weaker find does not mean another page could not improve it.
+
+    `forms_found` is emphatically not this bar: `detect_form_signals` grades
+    any page carrying a `<button>`, `<input>` or `<iframe>` as Weak rather
+    than None, so a hamburger menu would satisfy it.
+    """
+    return (
+        str(form_signals.get("estimate_form_detected") or "").strip().lower() == "yes"
+        and str(form_signals.get("form_strength") or "").strip().lower() == "strong"
+    )
 
 
 def elapsed_seconds(started_at: float) -> float:
@@ -1118,15 +1152,22 @@ def scrape_site(
     fetched_pages = 0
     page_budget = resolve_candidate_page_budget()
 
-    def crawl_targets(targets: List[Tuple[str, str]]) -> Dict[str, bool]:
-        """Fetch each target; report which groups answered their own question."""
+    def crawl_targets(targets: List[Tuple[str, str]], *, reserve: int = 0) -> Dict[str, bool]:
+        """Fetch each target; report which groups came back with a live page.
+
+        `reserve` holds slots back for the pass that follows. Without it a nav
+        of per-city contact links drains the budget in pass 1, and a group
+        with no linked page never gets the one probe that would tell us
+        whether it exists.
+        """
         nonlocal emails, phones, ctas, high_ticket, generic_copy, form_signals
         nonlocal enrichment_timed_out, fetched_pages, budget_exhausted
         group_ok: Dict[str, bool] = {}
+        ceiling = max(1, page_budget - reserve)
 
         for default_page_name, page_url in targets:
-            if fetched_pages >= page_budget:
-                budget_exhausted = True
+            if fetched_pages >= ceiling:
+                budget_exhausted = budget_exhausted or fetched_pages >= page_budget
                 break
             if timed_out():
                 enrichment_timed_out = True
@@ -1202,30 +1243,41 @@ def scrape_site(
                 },
             }
 
-            # Did this page answer what its group is for? For the contact
-            # group that means a form, not merely a 200 — a page that loads
-            # and offers nothing leaves the question open, and a soft 404
-            # loads too.
-            answered = bool(result.get("ok"))
-            if answered and needs_form_by_group.get(default_page_name):
-                answered = bool(page_form_signals.get("forms_found"))
-            group_ok[default_page_name] = group_ok.get(default_page_name, False) or answered
+            group_ok[default_page_name] = group_ok.get(default_page_name, False) or bool(result.get("ok"))
 
         return group_ok
 
-    needs_form_by_group = {name: needs_form for name, _l, _g, needs_form in resolved_groups}
+    def group_answered(name: str, needs_form: bool, linked_ok: Dict[str, bool]) -> bool:
+        """Would fetching this group's guesses still be able to change anything?
 
-    # Pass 1: the pages the homepage actually links. A linked page beats any guess.
-    linked_ok = crawl_targets(interleave([(name, linked) for name, linked, _g, _f in resolved_groups]))
+        For the form-bearing group the question is not "did a page load" — a
+        soft 404 loads, and so does a contact page offering nothing but a
+        phone number. It is answered only by a form downstream treats as
+        final, and that is asked of the crawl's *cumulative* signals, so a
+        strong form found on the homepage ends the search too.
+        """
+        if needs_form:
+            return has_terminal_form(form_signals)
+        return bool(linked_ok.get(name))
 
-    # Pass 2: the blind guesses, for each group whose linked pages did not
-    # answer it. "The HTML linked something" is not enough — a HubSpot
-    # template can emit an unrendered `/f/contact/$hs_path` that matches the
-    # keywords and 404s, and the guess it suppressed was the page actually
-    # serving the form.
+    # Pass 1: the pages the homepage actually links. A linked page beats any
+    # guess. Hold back one slot per group for pass 2.
+    linked_ok = crawl_targets(
+        interleave([(name, linked) for name, linked, _g, _f in resolved_groups]),
+        reserve=len(resolved_groups),
+    )
+
+    # Pass 2: the blind guesses, for each group still unanswered. "The HTML
+    # linked something" is not enough — a HubSpot template can emit an
+    # unrendered `/f/contact/$hs_path` that matches the keywords and 404s, and
+    # the guess it suppressed was the page actually serving the form.
     crawl_targets(
         interleave(
-            [(name, guessed) for name, _linked, guessed, _f in resolved_groups if not linked_ok.get(name)]
+            [
+                (name, guessed)
+                for name, _linked, guessed, needs_form in resolved_groups
+                if not group_answered(name, needs_form, linked_ok)
+            ]
         )
     )
 
@@ -1248,6 +1300,18 @@ def scrape_site(
 
     if budget_exhausted:
         flags.append(CANDIDATE_BUDGET_FLAG)
+
+    # A search we cut short did not establish "this site has no estimate
+    # form" — it established that we stopped looking. Downstream charges +20
+    # for `estimate_form_detected == "no"`, +14 for contact, and +18/+12 for a
+    # weak/basic strength, and that pain is what carries a lead past
+    # `sendability.VISIBLE_PAIN_BLOCKER`. "Unknown" is the honest answer and
+    # the one the pain profile already ignores.
+    truncated_without_answer = budget_exhausted and not has_terminal_form(form_signals)
+    if truncated_without_answer:
+        form_signals = dict(form_signals)
+        for field in ("contact_form_detected", "estimate_form_detected", "form_strength"):
+            form_signals[field] = "Unknown"
 
     if not forms_found:
         flags.append("no_form_detected")

@@ -184,7 +184,8 @@ class PerLeadFetchCeilingTest(unittest.TestCase):
         with patch("enrich_leads.fetch_url", side_effect=_record_fetches(_homepage(links), calls)):
             scrape_site("https://example.com")
 
-        self.assertEqual(len(calls), 1 + enrich_leads.MAX_CANDIDATE_PAGE_FETCHES)
+        self.assertLessEqual(len(calls), 1 + enrich_leads.MAX_CANDIDATE_PAGE_FETCHES)
+        self.assertLess(len(calls), 31)  # the site offered thirty
 
     def test_linked_pages_are_not_crowded_out_by_blind_guesses(self) -> None:
         # No contact link, so the contact group falls back to eleven guesses.
@@ -442,6 +443,82 @@ class PainIsAbsenceTest(unittest.TestCase):
         self.assertTrue((site["pages"].get("services") or {}).get("ok"))
 
 
+CHROME = '<nav><button>Menu</button></nav><input name="q"><iframe src="https://maps.google.com/x"></iframe>'
+
+BASIC_CONTACT_FORM = _homepage(
+    CHROME
+    + """
+    <h1>Contact us</h1>
+    <form>
+      <input name="name"><input type="email" name="email">
+      <textarea name="message"></textarea><button type="submit">Send</button>
+    </form>
+    """
+)
+
+CHROME_ONLY = _homepage(CHROME + "<h1>404 — Page Not Found</h1>")
+
+
+class TerminalFormTest(unittest.TestCase):
+    """Stop looking only when more looking cannot change the answer.
+
+    `evidence._derive_visible_pain_profile` treats `strong_estimate_form`
+    (estimate_form_detected Yes *and* form_strength Strong) as terminal;
+    anything less still scores pain — +20 for no estimate form, +18 weak,
+    +12 basic. So a contact page carrying a basic form, or only nav chrome,
+    leaves the question open and the crawl has to keep going.
+
+    `forms_found` is the wrong bar: `detect_form_signals` returns Weak (never
+    None) for any page with a `<button>`, `<input>` or `<iframe>`, so a
+    hamburger menu satisfies it.
+    """
+
+    def _crawl(self, contact_html: str) -> tuple[list[str], dict]:
+        calls: list[str] = []
+
+        def fake_fetch(url: str, timeout: int = 15) -> dict[str, object]:
+            calls.append(url)
+            if url == "https://example.com":
+                return {
+                    "ok": True,
+                    "status_code": 200,
+                    "final_url": url,
+                    "html": _homepage(CHROME + '<a href="/contact">Contact</a>'),
+                    "error": "",
+                }
+            if url == "https://example.com/contact":
+                return {"ok": True, "status_code": 200, "final_url": url, "html": contact_html, "error": ""}
+            if url == "https://example.com/free-estimate":
+                return {"ok": True, "status_code": 200, "final_url": url, "html": STRONG_FORM, "error": ""}
+            return {"ok": False, "status_code": 404, "final_url": url, "html": "", "error": ""}
+
+        with patch("enrich_leads.fetch_url", side_effect=fake_fetch):
+            site = scrape_site("https://example.com")
+        return calls, site
+
+    def test_nav_chrome_on_a_soft_404_does_not_end_the_search(self) -> None:
+        calls, site = self._crawl(CHROME_ONLY)
+
+        self.assertIn("https://example.com/free-estimate", calls)
+        self.assertEqual(site["estimate_form_detected"], "Yes")
+        self.assertEqual(site["form_strength"], "Strong")
+
+    def test_a_basic_contact_form_does_not_end_the_search(self) -> None:
+        # The ordinary shape: a real contact form that is not an estimate
+        # funnel, with the estimate page one unlinked URL away.
+        calls, site = self._crawl(BASIC_CONTACT_FORM)
+
+        self.assertIn("https://example.com/free-estimate", calls)
+        self.assertEqual(site["estimate_form_detected"], "Yes")
+        self.assertEqual(site["form_strength"], "Strong")
+
+    def test_a_strong_estimate_form_does_end_the_search(self) -> None:
+        # This is terminal — nothing further could improve the answer.
+        calls, _site = self._crawl(STRONG_FORM)
+
+        self.assertNotIn("https://example.com/free-estimate", calls)
+
+
 class TruncationIsVisibleTest(unittest.TestCase):
     """A capped crawl must not read downstream as a complete one.
 
@@ -473,6 +550,63 @@ class TruncationIsVisibleTest(unittest.TestCase):
 
         self.assertNotIn("candidate_page_budget_exhausted", site["site_issue_flags"])
 
+    def test_pass_one_cannot_spend_the_slot_reserved_for_an_unlinked_group(self) -> None:
+        # A per-city nav gives the contact group fifteen linked pages and the
+        # services group none. Pass 1 must leave room for pass 2 to probe
+        # /services, or `weak_services` (+5, and a corroborator worth another
+        # +12) fires about a page that was never requested.
+        nav = "".join(f'<a href="/contact-{city}">Contact</a>' for city in range(15))
+        calls: list[str] = []
+
+        def fake_fetch(url: str, timeout: int = 15) -> dict[str, object]:
+            calls.append(url)
+            if url == "https://example.com":
+                return {"ok": True, "status_code": 200, "final_url": url, "html": _homepage(nav), "error": ""}
+            if url == "https://example.com/services":
+                return {"ok": True, "status_code": 200, "final_url": url, "html": _homepage("<p>Our services.</p>"), "error": ""}
+            return {"ok": True, "status_code": 200, "final_url": url, "html": CHROME_ONLY, "error": ""}
+
+        with patch("enrich_leads.fetch_url", side_effect=fake_fetch):
+            site = scrape_site("https://example.com")
+
+        self.assertIn("https://example.com/services", calls)
+        self.assertTrue((site["pages"].get("services") or {}).get("ok"))
+
+    def test_the_budget_cannot_be_set_below_the_fallback_ladder(self) -> None:
+        # A budget under the ladder silently re-creates the bug this whole
+        # module exists to prevent, across every lead in the run.
+        floor = len(enrich_leads.CONTACT_ESTIMATE_PATHS) + 3
+        with patch.dict(os.environ, {"MAX_CANDIDATE_PAGE_FETCHES": "2"}, clear=False):
+            self.assertGreaterEqual(enrich_leads.resolve_candidate_page_budget(), floor)
+
+    def test_truncation_never_inflates_the_pain_score(self) -> None:
+        # The property that matters, stated directly: whatever the ceiling
+        # does, it must not make a site look worse than crawling it without
+        # one. Pain is what carries a lead past VISIBLE_PAIN_BLOCKER, so an
+        # inflated score on a truncated crawl is a manufactured lead.
+        from lead_machine.evidence import build_evidence_profile
+
+        nav = "".join(f'<a href="/contact-{index}">Contact</a>' for index in range(20))
+
+        def fake_fetch(url: str, timeout: int = 15) -> dict[str, object]:
+            if url == "https://example.com":
+                return {"ok": True, "status_code": 200, "final_url": url, "html": _homepage(nav), "error": ""}
+            if url == "https://example.com/services":
+                return {"ok": True, "status_code": 200, "final_url": url, "html": _homepage("<p>Services.</p>"), "error": ""}
+            return {"ok": True, "status_code": 200, "final_url": url, "html": CHROME_ONLY, "error": ""}
+
+        def pain(budget: int) -> int:
+            with patch("enrich_leads.fetch_url", side_effect=fake_fetch), patch(
+                "enrich_leads.resolve_candidate_page_budget", return_value=budget
+            ):
+                site = scrape_site("https://example.com")
+            profile = build_evidence_profile(
+                {"google": {"business_name": "X", "reviews": 30, "rating": 4.5}, "website": site}
+            )
+            return profile.get("visible_pain_score")
+
+        self.assertLessEqual(pain(enrich_leads.MAX_CANDIDATE_PAGE_FETCHES), pain(500))
+
     def test_the_flag_says_nothing_about_the_site_itself(self) -> None:
         # `_status_from_site` treats ANY flag outside STATIC_FETCH_REVIEW_FLAGS
         # as evidence the site is weak. This flag is a statement about our
@@ -491,9 +625,10 @@ class TruncationIsVisibleTest(unittest.TestCase):
         self.assertEqual(_status_from_site(site), "okay")
 
     def test_the_ceiling_is_operator_tunable(self) -> None:
+        # Above the floor, the operator is in charge.
         # AGENTS.md: every MAX_* cap reads from the environment.
-        with patch.dict(os.environ, {"MAX_CANDIDATE_PAGE_FETCHES": "3"}, clear=False):
-            self.assertEqual(enrich_leads.resolve_candidate_page_budget(), 3)
+        with patch.dict(os.environ, {"MAX_CANDIDATE_PAGE_FETCHES": "24"}, clear=False):
+            self.assertEqual(enrich_leads.resolve_candidate_page_budget(), 24)
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(
                 enrich_leads.resolve_candidate_page_budget(), enrich_leads.MAX_CANDIDATE_PAGE_FETCHES
@@ -518,7 +653,11 @@ class InterPagePauseTest(unittest.TestCase):
             )
             sleep = stack.enter_context(patch("enrich_leads.time.sleep"))
             if ceiling is not None:
-                stack.enter_context(patch("enrich_leads.MAX_CANDIDATE_PAGE_FETCHES", ceiling))
+                # Patch the resolved budget: the raw constant is floored so an
+                # operator cannot set it below the fallback ladder.
+                stack.enter_context(
+                    patch("enrich_leads.resolve_candidate_page_budget", return_value=ceiling)
+                )
             scrape_site("https://example.com")
         return calls, sleep.call_count
 
