@@ -72,6 +72,25 @@ DEFAULT_TIMEOUT = 15
 HOMEPAGE_FETCH_TIMEOUT = 12
 CANDIDATE_PAGE_FETCH_TIMEOUT = 8
 SLOW_ENRICH_SECONDS = 30.0
+# How long a rendered page is given to go quiet, and what it gets when it never
+# does. The old behaviour was an unconditional 1.5s sleep after
+# `domcontentloaded`, paid twice per lead by pages that had already finished
+# loading. The ceiling here is deliberately that same 1.5s: waiting for network
+# idle *up to* the old sleep length is strictly cheaper -- a quiet page returns
+# in a fraction of it, and a site with a chat or ad widget that never idles
+# spends exactly what it used to, not more. (Measured: a 2.5s ceiling plus a
+# fallback made the never-idle tail up to 6s/lead *slower* than the sleep it
+# replaced.) The fallback is for a load state that fails to report at all,
+# which is not the same as one that reports "still busy".
+RENDER_SETTLE_TIMEOUT_MS = 1500
+RENDER_SETTLE_FALLBACK_MS = 500
+# `detect_rendered_form` reads the DOM rather than screenshotting it, and it is
+# only called when the static crawl found no form -- so a shorter look is a
+# look that can report "no form" about a site whose form is injected late, and
+# absence is what `score_online_weakness` charges pain for (+20 no estimate
+# form, +18/+12 weak/basic). That path keeps the full 1.5s window it always
+# had; network idle may not cut it short.
+RENDER_FORM_SETTLE_FLOOR_MS = 1500
 PER_LEAD_ENRICH_TIMEOUT_SECONDS = 45.0
 # A single lead may never stall a run for longer than this, however many
 # workers are running.
@@ -256,6 +275,9 @@ NON_STANDARD_SITE_HINTS = [
 
 DEFAULT_ENRICH_WORKERS = 6
 DEFAULT_BROWSER_ENRICH_WORKERS = 3
+# How long a worker is given to reach the browser-shutdown rendezvous at the
+# end of a run. Only reached when the pool never grew to its full width.
+BROWSER_SHUTDOWN_RENDEZVOUS_SECONDS = 5.0
 
 
 def getenv_int(name: str, default: int) -> int:
@@ -824,6 +846,25 @@ def fetch_session() -> requests.Session:
     return session
 
 
+def reset_fetch_session() -> None:
+    """Hand the pool back at the end of a lead.
+
+    Reuse is worth having across the pages of one site and worth nothing across
+    leads, which are different hosts. What does carry is the cookie jar and the
+    open sockets: a worker thread that enriched forty leads held one jar with
+    forty sites' cookies in it. Cookies are scoped to their domain, so nothing
+    leaks between leads -- but the jar and the connections should end with the
+    crawl that opened them.
+    """
+    session = getattr(_fetch_local, "session", None)
+    _fetch_local.session = None
+    if session is not None:
+        try:
+            session.close()
+        except Exception:
+            pass
+
+
 def fetch_url(url: str, timeout: int = DEFAULT_TIMEOUT, retries: int = 1) -> Dict[str, Any]:
     headers = {"User-Agent": USER_AGENT}
     session = fetch_session()
@@ -1386,6 +1427,122 @@ def scrape_site(
     return apply_visual_audit_scores(result)
 
 
+class BrowserHandle:
+    """A Chromium and the Playwright driver that owns it.
+
+    Both have to be shut down together: closing the browser alone leaves the
+    driver subprocess running, and stopping the driver alone orphans Chromium.
+    """
+
+    def __init__(self, playwright: Any, browser: Any) -> None:
+        self.playwright = playwright
+        self.browser = browser
+
+    def is_alive(self) -> bool:
+        is_connected = getattr(self.browser, "is_connected", None)
+        if is_connected is None:
+            return True
+        try:
+            return bool(is_connected())
+        except Exception:
+            return False
+
+    def close(self) -> None:
+        try:
+            self.browser.close()
+        except Exception:
+            pass
+        try:
+            self.playwright.stop()
+        except Exception:
+            pass
+
+
+_browser_local = threading.local()
+
+
+def _launch_browser() -> BrowserHandle:
+    """The real factory. Tests patch this name to avoid needing the binary."""
+    playwright = sync_playwright().start()
+    return BrowserHandle(playwright, playwright.chromium.launch(headless=True))
+
+
+def thread_browser() -> Any:
+    """One Chromium per worker thread, launched on first use.
+
+    A launch costs roughly a second, and a lead that needed both the rendered
+    site check and the rendered form check paid two of them. Playwright's sync
+    API is bound to the thread that created it, so the browser is thread-local
+    rather than shared -- the same shape as ``fetch_session``.
+    """
+    handle = getattr(_browser_local, "handle", None)
+    if handle is not None and not handle.is_alive():
+        # A crashed Chromium would otherwise poison every remaining lead on
+        # this thread, which costs more than the launch reuse saved.
+        close_thread_browser()
+        handle = None
+    if handle is None:
+        handle = _launch_browser()
+        _browser_local.handle = handle
+    return handle.browser
+
+
+def new_browser_context(**options: Any) -> Any:
+    """Open a per-lead context, discarding the browser if it cannot.
+
+    ``is_alive`` catches a browser that has disconnected, not one that is still
+    connected but out of file descriptors or memory after a long run. That
+    failure surfaces here, and the callers grade it as a *site* problem
+    ("Unknown", no mobile screenshot) -- so a poisoned browser would spend the
+    rest of the thread's leads misreporting them. Dropping it costs one launch.
+    """
+    try:
+        return thread_browser().new_context(**options)
+    except Exception:
+        close_thread_browser()
+        raise
+
+
+def close_thread_browser() -> None:
+    """Shut down this thread's Chromium, if it opened one."""
+    handle = getattr(_browser_local, "handle", None)
+    _browser_local.handle = None
+    if handle is not None:
+        handle.close()
+
+
+def settle_rendered_page(page: Any, timeout_ms: int, *, floor_ms: int = 0) -> None:
+    """Wait for the page to go quiet, and never for less than ``floor_ms``.
+
+    The floor is the safety half of this. Cutting a wait short is not free:
+    whatever the page had not rendered yet is read as absence, and absence is
+    what the pain score charges for. Callers that only screenshot the page can
+    take the early return; callers that read evidence out of the DOM pass the
+    window they used to get unconditionally.
+    """
+    ceiling = max(1, min(RENDER_SETTLE_TIMEOUT_MS, timeout_ms))
+    floor = min(floor_ms, ceiling)
+    started_at = time.monotonic()
+    try:
+        page.wait_for_load_state("networkidle", timeout=ceiling)
+    except PlaywrightTimeoutError:
+        # Sites carrying ad or chat widgets never reach network idle. This wait
+        # has already spent the full ceiling on them -- the same time the old
+        # fixed sleep did -- so there is nothing left to make up.
+        return
+    except Exception:
+        # The load state could not be reported at all, so nothing was waited
+        # out. Give the page at least the short fallback before it is read.
+        floor = max(floor, min(RENDER_SETTLE_FALLBACK_MS, ceiling))
+
+    shortfall = floor - int((time.monotonic() - started_at) * 1000)
+    if shortfall > 0:
+        try:
+            page.wait_for_timeout(shortfall)
+        except Exception:
+            pass
+
+
 def detect_rendered_form(url: str, timeout_ms: int = 20000) -> Dict[str, Any]:
     signals = _empty_form_signals()
     signals["form_detection_method"] = "rendered_browser"
@@ -1393,18 +1550,20 @@ def detect_rendered_form(url: str, timeout_ms: int = 20000) -> Dict[str, Any]:
     if not url:
         return signals
 
+    context = None
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page(viewport={"width": 1366, "height": 1000}, user_agent=USER_AGENT)
-            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-            page.wait_for_timeout(1500)
-            html = page.content()
-            try:
-                text = page.inner_text("body", timeout=3000)
-            except Exception:
-                text = ""
-            browser.close()
+        context = new_browser_context(
+            viewport={"width": 1366, "height": 1000},
+            user_agent=USER_AGENT,
+        )
+        page = context.new_page()
+        page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        settle_rendered_page(page, timeout_ms, floor_ms=RENDER_FORM_SETTLE_FLOOR_MS)
+        html = page.content()
+        try:
+            text = page.inner_text("body", timeout=3000)
+        except Exception:
+            text = ""
         rendered = detect_form_signals(html, page_text=text, page_url=url, method="rendered_browser")
         if rendered.get("form_detection_method") != "embedded_provider":
             rendered["form_detection_method"] = "rendered_browser"
@@ -1413,6 +1572,22 @@ def detect_rendered_form(url: str, timeout_ms: int = 20000) -> Dict[str, Any]:
         return signals
     except Exception:
         return signals
+    finally:
+        close_browser_context(context)
+
+
+def close_browser_context(context: Any) -> None:
+    """Per-lead isolation now that the browser outlives the lead.
+
+    Cookies, storage and service workers live on the context, so one that is
+    left open carries the last lead's site into the next one on this thread.
+    """
+    if context is None:
+        return
+    try:
+        context.close()
+    except Exception:
+        pass
 
 
 def _classify_rendered_exception(exc: Exception) -> Tuple[str, str]:
@@ -1461,57 +1636,60 @@ def check_rendered_site(
     if mobile_path:
         mobile_path.parent.mkdir(parents=True, exist_ok=True)
 
+    desktop_context = None
+    mobile_context = None
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+        # Two contexts, not two pages in one: `is_mobile` is a context option
+        # in Playwright, so a shared context would render the mobile shot as a
+        # narrow desktop and move `mobile_visual_score`. Same options the two
+        # `new_page` calls used to pass, so the render is unchanged -- only the
+        # launch is amortised.
+        desktop_context = new_browser_context(
+            viewport={"width": 1440, "height": 1200},
+            user_agent=USER_AGENT,
+        )
+        page = desktop_context.new_page()
+        response = page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        settle_rendered_page(page, timeout_ms)
+        status_code = response.status if response else 0
+        final_url = page.url
+        if status_code == 404 or status_code >= 500:
+            result["rendered_site_status"] = "Broken"
+            result["rendered_status_reason"] = f"Browser rendered homepage returned HTTP {status_code}."
+            return result
+        if status_code >= 400:
+            result["rendered_site_status"] = "Unknown"
+            result["rendered_status_reason"] = (
+                f"Browser rendered homepage returned HTTP {status_code}; manual review needed before broken-site claims."
+            )
+            return result
+        if desktop_path:
+            page.screenshot(path=str(desktop_path), full_page=True)
+            result["desktop"] = str(desktop_path)
 
-            page = browser.new_page(
-                viewport={"width": 1440, "height": 1200},
+        result["rendered_site_status"] = "Loaded"
+        result["rendered_status_reason"] = (
+            f"Browser rendered homepage successfully"
+            + (f" at {final_url}." if final_url and final_url != url else ".")
+        )
+
+        if mobile_path:
+            mobile_context = new_browser_context(
+                viewport={"width": 390, "height": 1200},
+                is_mobile=True,
                 user_agent=USER_AGENT,
             )
-            response = page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-            page.wait_for_timeout(1500)
-            status_code = response.status if response else 0
-            final_url = page.url
-            if status_code == 404 or status_code >= 500:
-                result["rendered_site_status"] = "Broken"
-                result["rendered_status_reason"] = f"Browser rendered homepage returned HTTP {status_code}."
-                browser.close()
-                return result
-            if status_code >= 400:
-                result["rendered_site_status"] = "Unknown"
-                result["rendered_status_reason"] = (
-                    f"Browser rendered homepage returned HTTP {status_code}; manual review needed before broken-site claims."
-                )
-                browser.close()
-                return result
-            if desktop_path:
-                page.screenshot(path=str(desktop_path), full_page=True)
-                result["desktop"] = str(desktop_path)
+            mobile = mobile_context.new_page()
+            mobile_response = mobile.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            settle_rendered_page(mobile, timeout_ms)
+            mobile_status = mobile_response.status if mobile_response else 0
+            if mobile_status >= 400:
+                result["error"] = f"mobile_http_{mobile_status}"
+            else:
+                mobile.screenshot(path=str(mobile_path), full_page=True)
+                result["mobile"] = str(mobile_path)
 
-            result["rendered_site_status"] = "Loaded"
-            result["rendered_status_reason"] = (
-                f"Browser rendered homepage successfully"
-                + (f" at {final_url}." if final_url and final_url != url else ".")
-            )
-
-            if mobile_path:
-                mobile = browser.new_page(
-                    viewport={"width": 390, "height": 1200},
-                    is_mobile=True,
-                    user_agent=USER_AGENT,
-                )
-                mobile_response = mobile.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-                mobile.wait_for_timeout(1500)
-                mobile_status = mobile_response.status if mobile_response else 0
-                if mobile_status >= 400:
-                    result["error"] = f"mobile_http_{mobile_status}"
-                else:
-                    mobile.screenshot(path=str(mobile_path), full_page=True)
-                    result["mobile"] = str(mobile_path)
-
-            browser.close()
-            return result
+        return result
 
     except Exception as exc:
         status, reason = _classify_rendered_exception(exc)
@@ -1519,6 +1697,9 @@ def check_rendered_site(
         result["rendered_status_reason"] = reason
         result["error"] = reason
         return result
+    finally:
+        close_browser_context(desktop_context)
+        close_browser_context(mobile_context)
 
 
 def screenshot_paths(business_name: str, place_id: str, screenshots_dir: Path) -> Tuple[Path, Path]:
@@ -1615,13 +1796,16 @@ def enrich_row(
         # dropped silently. The dnc_suppressed flag carries the meaning.
         site = empty_site_result("Unknown", [DNC_SUPPRESSED_REASON], url=website_url)
     else:
-        site = scrape_site(
-            website_url,
-            rendered_form_check=rendered_form_check,
-            high_ticket_terms=profile.high_ticket_terms,
-            started_at=started_at,
-            per_lead_timeout=per_lead_timeout,
-        )
+        try:
+            site = scrape_site(
+                website_url,
+                rendered_form_check=rendered_form_check,
+                high_ticket_terms=profile.high_ticket_terms,
+                started_at=started_at,
+                per_lead_timeout=per_lead_timeout,
+            )
+        finally:
+            reset_fetch_session()
 
     screenshots = {"desktop": "", "mobile": "", "error": ""}
     screenshot_url = site.get("final_url") or normalize_url(website_url)
@@ -1885,16 +2069,20 @@ def enrich_rows_concurrently(
     if total == 0:
         return
     if workers <= 1:
-        for index, row in enumerate(rows, start=1):
-            started_at = time.monotonic()
-            try:
-                on_complete(index, row, enrich(row), "", elapsed_seconds(started_at))
-            except Exception as exc:
-                on_complete(index, row, None, str(exc), elapsed_seconds(started_at))
+        try:
+            for index, row in enumerate(rows, start=1):
+                started_at = time.monotonic()
+                try:
+                    on_complete(index, row, enrich(row), "", elapsed_seconds(started_at))
+                except Exception as exc:
+                    on_complete(index, row, None, str(exc), elapsed_seconds(started_at))
+        finally:
+            close_thread_browser()
         return
 
     started_at_by_index: Dict[int, float] = {}
     pool = ThreadPoolExecutor(max_workers=workers)
+    interrupted = False
     try:
         futures = {}
         for index, row in enumerate(rows, start=1):
@@ -1916,10 +2104,48 @@ def enrich_rows_concurrently(
             # started so the interrupt is prompt; the up to `workers` leads
             # already mid-enrichment are left to finish in the `finally`
             # below, since a thread cannot be killed mid-request.
+            interrupted = True
             pool.shutdown(wait=False, cancel_futures=True)
             raise
     finally:
+        if not interrupted:
+            # Skipped on Ctrl-C: the pool is already shutting down there, so a
+            # submit would raise and mask the interrupt. Those browsers die
+            # with the process.
+            close_worker_browsers(pool, workers)
         pool.shutdown(wait=True)
+
+
+def close_worker_browsers(pool: ThreadPoolExecutor, workers: int) -> None:
+    """Close each worker's Chromium on the thread that opened it.
+
+    Playwright's sync API is bound to its creating thread, so the main thread
+    cannot close a worker's browser -- the worker has to do it. A barrier is
+    what makes the hand-out fair: a thread that has taken a closing task waits
+    there instead of coming back for a second one while a peer still holds an
+    open browser. The party count is the pool's *actual* width, not the
+    configured one -- a pool only spawns a thread when no idle one is free, so
+    a short run never grows to `workers` and a barrier that waited for them
+    would spend its whole timeout at the end of every such run. Every task
+    submitted here lands on an existing thread, since they are all idle by now.
+    Closing a thread that has no browser is a no-op.
+    """
+    threads = getattr(pool, "_threads", None)
+    parties = max(1, min(len(threads) if threads else workers, workers))
+    barrier = threading.Barrier(parties)
+
+    def close_one() -> None:
+        try:
+            barrier.wait(timeout=BROWSER_SHUTDOWN_RENDEZVOUS_SECONDS)
+        except threading.BrokenBarrierError:
+            pass
+        close_thread_browser()
+
+    for future in [pool.submit(close_one) for _ in range(parties)]:
+        try:
+            future.result()
+        except Exception:
+            pass
 
 
 def main() -> int:

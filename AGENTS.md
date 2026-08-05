@@ -95,8 +95,34 @@ Key in-flight facts (2026-07-29):
   Only `yes` may count as truthy in a gate — `sendability.required_visible_pain_score` drops the
   mature-band threshold from 40 to 35 on a truthy value. `demand_signal` is deliberately separate.
 - **Enrichment runs concurrently** (`ENRICH_WORKERS`, default 6; 3 when screenshots or rendered
-  checks are on, since each launches its own Chromium) and streams records to disk as they finish.
-  The per-lead ceiling scales with the worker count — it is wall-clock, and contention inflates it.
+  checks are on, since each worker thread holds its own Chromium) and streams records to disk as
+  they finish. The per-lead ceiling scales with the worker count — it is wall-clock, and contention
+  inflates it.
+- **The browser is per worker thread; the context is per lead.** Playwright's sync API is bound to
+  the thread that created it, so `thread_browser()` keeps the Chromium in a `threading.local` and
+  `close_worker_browsers` hands each worker its own closing task at shutdown — the main thread
+  cannot close a worker's browser. Three rules follow, all pinned by
+  `tests/test_browser_pooling.py`:
+  - **Every context is closed on the way out, including the early-return and exception paths.** The
+    browser now outlives the lead, so a leaked context carries one lead's cookies, storage and
+    service workers into the next lead on that thread.
+  - **The mobile pass gets its own context, not a second page.** `is_mobile` is a context option;
+    sharing a context renders the mobile shot as a narrow desktop and moves `mobile_visual_score`.
+  - **A browser that is disconnected — or that can no longer open a context — is discarded, not
+    reused.** One exhausted Chromium would otherwise misreport every remaining lead on that
+    thread as a *site* failure ("Unknown", no mobile screenshot), which costs far more than the
+    launch it saved.
+- **The render settle has a ceiling *and*, where it matters, a floor.** `settle_rendered_page`
+  waits on `wait_for_load_state("networkidle", …)` in place of the unconditional 1.5s sleep each
+  rendered page used to pay. `RENDER_SETTLE_TIMEOUT_MS` is deliberately that same 1.5s, and a
+  settle that times out adds nothing on top — so a site with a chat or ad widget that never idles
+  spends exactly what it used to, and a quiet page returns in a fraction of it. (Measured on 50
+  leads: a 2.5s ceiling plus a fallback made the never-idle tail up to 6s/lead *slower* than the
+  sleep it replaced.) But `detect_rendered_form` passes `RENDER_FORM_SETTLE_FLOOR_MS` and keeps
+  the full window: it reads evidence out of the DOM rather than screenshotting it, and it only
+  runs when the static crawl found no form — so a shorter look reports "no form" about a site
+  whose form is injected late, and that absence is worth +20/+18/+12 of pain. Cutting a wait
+  short is never neutral on the path where something is *read*.
 - **A lead's crawl is budgeted, and a skipped fetch can make a lead *more* sendable.** This is the
   counterintuitive one. `score_leads.score_online_weakness` sells the pain, so **absence adds
   points**: `no_form_detected` is +8 when corroborated, a missing services page is +5 *and* is
@@ -126,6 +152,10 @@ Key in-flight facts (2026-07-29):
     `tests/test_enrichment_fetch_budget.py` pins the property directly: truncation must never
     raise `visible_pain_score` above what an unlimited crawl produces.
   - `fetch_url` retries 5xx but not 404 — a 404 is a deterministic answer.
+  - The pooled `requests.Session` is per worker thread but handed back per lead
+    (`reset_fetch_session`, called from `enrich_row`): reuse is worth having across one site's
+    pages and worth nothing across leads, while the cookie jar and open sockets should end with
+    the crawl that opened them.
 - **Review velocity needs two observations ≥14 days apart** in `run_state/review_velocity.sqlite3`
   (`REVIEW_SNAPSHOT_DB`). `enrich_row` banks one per lead per run; until a batch has been run twice,
   `velocity_band` is legitimately `unknown`.

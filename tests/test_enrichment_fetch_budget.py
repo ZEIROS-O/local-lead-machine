@@ -18,6 +18,7 @@ import os
 import threading
 import unittest
 from contextlib import ExitStack
+from pathlib import Path
 from unittest.mock import patch
 
 import enrich_leads
@@ -672,6 +673,67 @@ class InterPagePauseTest(unittest.TestCase):
 
         self.assertEqual(len(calls), 3)  # homepage + two candidates
         self.assertEqual(pauses, 1)
+
+
+class SessionLifetimeTest(unittest.TestCase):
+    """The pooled session is per-thread, so it outlives the lead that opened it.
+
+    Connection reuse is worth having *within* a lead — several pages off one
+    host — and worth nothing across leads, which are different hosts. What does
+    carry across is the cookie jar and the open sockets: a worker thread that
+    enriched 40 leads held one jar with 40 sites' cookies in it and never
+    closed a single connection. Same-domain cookies will not leak to another
+    domain, but the jar and the pool should end with the crawl that opened
+    them.
+    """
+
+    def tearDown(self) -> None:
+        enrich_leads.reset_fetch_session()
+
+    def test_a_leads_cookies_do_not_ride_along_to_the_next_lead(self) -> None:
+        session = enrich_leads.fetch_session()
+        session.cookies.set("session_id", "lead-one", domain="example.com")
+
+        enrich_leads.reset_fetch_session()
+
+        self.assertEqual(len(enrich_leads.fetch_session().cookies), 0)
+
+    def test_the_pooled_connections_are_released_with_the_lead(self) -> None:
+        session = enrich_leads.fetch_session()
+        with patch.object(session, "close") as close:
+            enrich_leads.reset_fetch_session()
+
+        self.assertEqual(close.call_count, 1)
+
+    def test_resetting_twice_is_harmless(self) -> None:
+        enrich_leads.reset_fetch_session()
+        enrich_leads.reset_fetch_session()
+
+        self.assertIsNotNone(enrich_leads.fetch_session())
+
+    def test_a_crawl_hands_its_session_back(self) -> None:
+        # The reset belongs on the lead boundary, not inside `fetch_url` — a
+        # per-fetch reset would give back exactly the handshake the pool exists
+        # to avoid.
+        calls: list[str] = []
+        sessions: list[int] = []
+
+        def fake_fetch(url: str, timeout: int = 15) -> dict[str, object]:
+            calls.append(url)
+            sessions.append(id(enrich_leads.fetch_session()))
+            return {"ok": True, "status_code": 200, "final_url": url, "html": STRONG_FORM, "error": ""}
+
+        with patch("enrich_leads.fetch_url", side_effect=fake_fetch):
+            with patch("enrich_leads.reset_fetch_session") as reset:
+                enrich_leads.enrich_row(
+                    {"business_name": "Epoxy Pros", "place_id": "place-1", "website_url": "https://example.com"},
+                    Path("unused"),
+                    take_shots=False,
+                )
+
+        self.assertGreater(len(calls), 1)
+        self.assertEqual(len(set(sessions)), 1)  # one session for the whole lead
+        self.assertEqual(reset.call_count, 1)  # handed back once, at the end
 
 
 if __name__ == "__main__":
