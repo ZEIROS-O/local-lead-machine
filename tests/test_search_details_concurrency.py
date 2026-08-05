@@ -20,6 +20,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import make_search_batch
+import places_search
 
 
 def _config(**overrides):
@@ -422,3 +423,48 @@ class SuppressionStillGatesEveryLeadTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PlaceDetailsTransientRetryTest(unittest.TestCase):
+    """A 429 must not permanently drop a lead that a retry would have kept.
+
+    Text Search has retried transient statuses since `_text_search_page` was
+    written; Place Details never did. That asymmetry was survivable while the
+    details loop was serial and paid a 0.15s sleep after every call -- the sleep
+    was pacing the burst even though nothing said so. Concurrency removed the
+    sleep and put six calls in flight, which is a burst well above the old
+    ~6.7/s, so the untried 429 became a lead lost at spend: the budget slot is
+    reserved before the call, so the money is gone either way.
+    """
+
+    def test_place_details_retries_a_transient_status(self) -> None:
+        attempts = []
+
+        def flaky(method, url, *, headers=None, json_body=None):
+            attempts.append(url)
+            if len(attempts) == 1:
+                raise places_search.GoogleApiError("rate limited", status_code=429)
+            return {"id": "place-1", "displayName": {"text": "Patio Pros"}}
+
+        with patch.object(places_search, "request_json", flaky), \
+                patch.object(places_search.time, "sleep", lambda _s: None):
+            result = places_search.place_details("key", "place-1")
+
+        self.assertEqual(len(attempts), 2, "a 429 should be retried, not dropped")
+        self.assertEqual(result["id"], "place-1")
+
+    def test_place_details_does_not_retry_a_permanent_status(self) -> None:
+        attempts = []
+
+        def rejected(method, url, *, headers=None, json_body=None):
+            attempts.append(url)
+            raise places_search.GoogleApiError("bad request", status_code=400)
+
+        with patch.object(places_search, "request_json", rejected), \
+                patch.object(places_search.time, "sleep", lambda _s: None):
+            with self.assertRaises(places_search.GoogleApiError):
+                places_search.place_details("key", "place-1")
+
+        self.assertEqual(
+            len(attempts), 1, "a 400 is deterministic; retrying it just costs latency"
+        )

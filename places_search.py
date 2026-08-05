@@ -332,7 +332,21 @@ def text_search(api_key: str, query: str, max_results: int) -> List[Dict[str, An
     return places
 
 
-def place_details(api_key: str, place_id: str) -> Dict[str, Any]:
+def place_details(
+    api_key: str, place_id: str, *, retries: int = 2, backoff: float = 1.5
+) -> Dict[str, Any]:
+    """Fetch one place's details, retrying only what a retry can fix.
+
+    Same rule as `_text_search_page`, and for the same reason: a 429 or a 5xx
+    clears on its own, while a 400 or a 403 will not, so retrying those three
+    times just adds latency to a failure. Details had no retry at all while the
+    caller was serial and slept 0.15s after every call -- that sleep was pacing
+    the burst even though nothing said so. `collect_raw_rows` now runs several
+    details calls in flight and has dropped the sleep, and a bounded number
+    *in flight* is not a bounded rate. Without this, one 429 loses the lead
+    permanently and still bills for it: the details budget slot is reserved
+    before the call, so the money is spent whether or not a row comes back.
+    """
     headers = {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": api_key,
@@ -340,7 +354,22 @@ def place_details(api_key: str, place_id: str) -> Dict[str, Any]:
     }
 
     url = PLACE_DETAILS_URL.format(place_id=place_id)
-    return request_json("GET", url, headers=headers)
+    last_exc: Optional[Exception] = None
+    for attempt in range(retries + 1):
+        try:
+            return request_json("GET", url, headers=headers)
+        except GoogleApiError as exc:
+            if not exc.is_transient:
+                raise
+            last_exc = exc
+            if attempt < retries:
+                time.sleep(backoff * (attempt + 1))
+        except RuntimeError as exc:
+            # A transport failure with no status attached; worth another try.
+            last_exc = exc
+            if attempt < retries:
+                time.sleep(backoff * (attempt + 1))
+    raise last_exc  # type: ignore[misc]
 
 
 def normalize_place(details: Dict[str, Any], source_query: str) -> Lead:
