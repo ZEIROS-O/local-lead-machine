@@ -275,6 +275,11 @@ NON_STANDARD_SITE_HINTS = [
 
 DEFAULT_ENRICH_WORKERS = 6
 DEFAULT_BROWSER_ENRICH_WORKERS = 5
+# How many of one lead's candidate pages are in flight at once. Distinct from
+# the worker counts above, which are leads-at-a-time: this is the width *inside*
+# a lead. Serial by default, for the measured reason in
+# resolve_page_fetch_workers -- not because the concurrency does not work.
+DEFAULT_PAGE_FETCH_WORKERS = 1
 # How long a worker is given to reach the browser-shutdown rendezvous at the
 # end of a run. Only reached when the pool never grew to its full width.
 BROWSER_SHUTDOWN_RENDEZVOUS_SECONDS = 5.0
@@ -316,6 +321,41 @@ def resolve_candidate_page_budget() -> int:
         )
         return floor
     return requested
+
+
+def resolve_page_fetch_workers() -> int:
+    """How many of one lead's candidate pages to fetch at once.
+
+    The pages a lead crawls have no ordering dependency on each other, so
+    fetching them together is free correctness-wise and was expected to be the
+    next big win: serially a lead's wall clock is the sum of ~7 round trips,
+    each with an 8s ceiling. It does work — and it is still shipped off,
+    because of *where* it runs. Measured on 20-50 real epoxy leads, alternating
+    widths so network drift could not pose as an effect:
+
+        path (leads at once)          width 1        width 5       verdict
+        idle box (1)             67.6/61.1/59.5  44.9/44.9/42.9   1.42x win
+        browser, shipped (5)        90.7/99.3       94.2/94.7     flat
+        network, shipped (6)             inconclusive: noise > effect
+
+    The win is real and the flat result is not a contradiction — both follow
+    from the same thing. Page concurrency can only pay by filling network
+    waits, and both shipped paths already crawl five or six *leads* at once,
+    which fills them already. On an idle box nothing else is competing, so the
+    same change is worth 1.42x. What decides it is total in-flight fetches
+    (leads x pages), and at the shipped defaults that product is already past
+    the knee: the browser path bought 0.5% for ~320 MB more peak PSS, on a box
+    where Phase 3 already measured 3.9 GB.
+
+    So this is a knob, not a default. Turn it up for a run whose lead-level
+    concurrency cannot saturate the box — a handful of leads, a topup, one
+    lead being debugged — where it is worth about 1.4x.
+
+    Fidelity does not depend on the width and was never the question in doubt:
+    every width from 1 to 8 produced the same pages, the same 7.37 fetches per
+    lead and the same graded fields, on both paths.
+    """
+    return max(1, getenv_int("PAGE_FETCH_WORKERS", DEFAULT_PAGE_FETCH_WORKERS))
 
 
 def has_terminal_form(form_signals: Dict[str, Any]) -> bool:
@@ -1192,6 +1232,30 @@ def scrape_site(
     budget_exhausted = False
     fetched_pages = 0
     page_budget = resolve_candidate_page_budget()
+    page_fetch_workers = resolve_page_fetch_workers()
+    fetch_pool: ThreadPoolExecutor | None = None
+
+    def fetch_wave(wave: List[Tuple[str, str]]) -> List[Dict[str, Any]]:
+        """Fetch a wave of candidate pages at once, in submission order.
+
+        The pool is per-lead and lazy, so a site whose crawl never needs two
+        pages at once never starts one and keeps its fetches on the calling
+        thread, where the pooled session is. Results come back as a list
+        indexed by submission — not by completion — because the caller reads
+        them in that order and the page slot names depend on it.
+        """
+        nonlocal fetch_pool
+        if len(wave) == 1:
+            return [fetch_url(wave[0][1], timeout=CANDIDATE_PAGE_FETCH_TIMEOUT)]
+        if fetch_pool is None:
+            fetch_pool = ThreadPoolExecutor(
+                max_workers=page_fetch_workers, thread_name_prefix="page-fetch"
+            )
+        futures = [
+            fetch_pool.submit(fetch_url, page_url, timeout=CANDIDATE_PAGE_FETCH_TIMEOUT)
+            for _name, page_url in wave
+        ]
+        return [future.result() for future in futures]
 
     def crawl_targets(targets: List[Tuple[str, str]], *, reserve: int = 0) -> Dict[str, bool]:
         """Fetch each target; report which groups came back with a live page.
@@ -1200,91 +1264,122 @@ def scrape_site(
         of per-city contact links drains the budget in pass 1, and a group
         with no linked page never gets the one probe that would tell us
         whether it exists.
+
+        Targets are admitted a wave at a time and their results processed
+        serially, in submission order. Only the fetching overlaps: the parsing
+        is BeautifulSoup under one GIL and gains nothing from being parallel,
+        and the page slot names (`estimate`, `estimate_2`, ...) come from
+        insertion order, so naming off completion order would reshuffle the
+        output of every lead with two contactish pages.
+
+        The budget check is per target, exactly as it was. The clock check is
+        per target too, but the whole wave is admitted before any of it is
+        fetched — so a lead that runs out of time mid-wave finishes the pages
+        already dispatched instead of stopping at the next one. That is one
+        wave of slack, bounded by the candidate-page timeout.
         """
         nonlocal emails, phones, ctas, high_ticket, generic_copy, form_signals
         nonlocal enrichment_timed_out, fetched_pages, budget_exhausted
         group_ok: Dict[str, bool] = {}
         ceiling = max(1, page_budget - reserve)
+        index = 0
+        stopped = False
 
-        for default_page_name, page_url in targets:
-            if fetched_pages >= ceiling:
-                budget_exhausted = budget_exhausted or fetched_pages >= page_budget
-                break
-            if timed_out():
-                enrichment_timed_out = True
-                break
-            if not page_url:
+        while index < len(targets) and not stopped:
+            wave: List[Tuple[str, str]] = []
+            while index < len(targets) and len(wave) < page_fetch_workers:
+                default_page_name, page_url = targets[index]
+                if fetched_pages >= ceiling:
+                    budget_exhausted = budget_exhausted or fetched_pages >= page_budget
+                    stopped = True
+                    break
+                if timed_out():
+                    enrichment_timed_out = True
+                    stopped = True
+                    break
+                index += 1
+                if not page_url:
+                    continue
+
+                # Stay on same business domain.
+                if domain_of(page_url) != domain_of(final_url):
+                    continue
+
+                fetched_pages += 1
+                wave.append((default_page_name, page_url))
+
+            if not wave:
                 continue
 
-            # Stay on same business domain.
-            if domain_of(page_url) != domain_of(final_url):
-                continue
-
-            # Pace the crawl between pages, not after the last one — that
-            # trailing sleep bought nothing and every lead paid it.
-            if fetched_pages:
+            # Pace the crawl between waves, not after the last one — that
+            # trailing sleep bought nothing and every lead paid it. Within a
+            # wave there is nothing to pace: those requests are deliberately
+            # concurrent.
+            if fetched_pages > len(wave):
                 time.sleep(0.1)
-            fetched_pages += 1
 
-            result = fetch_url(page_url, timeout=CANDIDATE_PAGE_FETCH_TIMEOUT)
-            page_html = result.get("html") or ""
-            page_text = extract_visible_text(page_html) if result.get("ok") else ""
-            page_title, page_meta = extract_title_meta(page_html) if page_html else ("", "")
+            # strict: a result list shorter than the wave would silently drop
+            # the tail of the crawl, which is quieter than the reshuffle
+            # SubmissionOrderTest catches.
+            for (default_page_name, page_url), result in zip(wave, fetch_wave(wave), strict=True):
+                page_html = result.get("html") or ""
+                page_text = extract_visible_text(page_html) if result.get("ok") else ""
+                page_title, page_meta = extract_title_meta(page_html) if page_html else ("", "")
 
-            page_emails, page_phones = extract_emails_phones(page_text, page_html)
-            emails = clean_emails(emails + page_emails, business_domain=domain_of(final_url))
-            phones = sorted(set(phones + page_phones))
+                page_emails, page_phones = extract_emails_phones(page_text, page_html)
+                emails = clean_emails(emails + page_emails, business_domain=domain_of(final_url))
+                phones = sorted(set(phones + page_phones))
 
-            if page_text:
-                combined_text_parts.append(page_text)
+                if page_text:
+                    combined_text_parts.append(page_text)
 
-            page_form_signals = detect_form_signals(
-                page_html,
-                page_text=page_text,
-                page_url=page_url,
-                method="candidate_page",
-            )
-            form_signals = merge_form_signals(form_signals, page_form_signals)
+                page_form_signals = detect_form_signals(
+                    page_html,
+                    page_text=page_text,
+                    page_url=page_url,
+                    method="candidate_page",
+                )
+                form_signals = merge_form_signals(form_signals, page_form_signals)
 
-            ctas = sorted(set(ctas + detect_terms(page_text, CTA_TERMS)))
-            high_ticket = sorted(set(high_ticket + detect_terms(page_text, high_ticket_terms)))
-            generic_copy = sorted(set(generic_copy + detect_terms(page_text, GENERIC_COPY_TERMS)))
+                ctas = sorted(set(ctas + detect_terms(page_text, CTA_TERMS)))
+                high_ticket = sorted(set(high_ticket + detect_terms(page_text, high_ticket_terms)))
+                generic_copy = sorted(set(generic_copy + detect_terms(page_text, GENERIC_COPY_TERMS)))
 
-            page_name = _candidate_page_name(page_url, pages, default_page_name)
-            page_links = extract_links(result.get("final_url") or page_url, page_html) if page_html else {
-                "internal_links": [], "external_links": [], "social_links": []
-            }
-            page_soup = BeautifulSoup(page_html, "html.parser") if page_html else BeautifulSoup("", "html.parser")
-            pages[page_name] = {
-                "url": page_url,
-                "ok": result.get("ok"),
-                "status_code": result.get("status_code"),
-                "title": page_title,
-                "meta": page_meta,
-                "text": clean_text(page_text, 6000),
-                "contact_form_detected": page_form_signals.get("contact_form_detected", "No"),
-                "estimate_form_detected": page_form_signals.get("estimate_form_detected", "No"),
-                "form_strength": page_form_signals.get("form_strength", "None"),
-                "form_detection_method": page_form_signals.get("form_detection_method", "none"),
-                # Counted here so gallery/portfolio pages can be graded later on how
-                # much work they actually show, not just on the page existing.
-                "image_count": len(page_soup.find_all("img")) + len(page_soup.find_all("picture")),
-                "verification_snapshot": {
-                    "page_role": default_page_name,
-                    "requested_url": page_url,
-                    "final_url": result.get("final_url") or page_url,
-                    "retrieved_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
-                    "response_status": result.get("status_code"),
+                page_name = _candidate_page_name(page_url, pages, default_page_name)
+                page_links = extract_links(result.get("final_url") or page_url, page_html) if page_html else {
+                    "internal_links": [], "external_links": [], "social_links": []
+                }
+                page_soup = BeautifulSoup(page_html, "html.parser") if page_html else BeautifulSoup("", "html.parser")
+                pages[page_name] = {
+                    "url": page_url,
+                    "ok": result.get("ok"),
+                    "status_code": result.get("status_code"),
                     "title": page_title,
-                    "visible_text": clean_text(page_text, 6000),
-                    "visible_links": page_links.get("all_links", []),
-                    "form_count": len(page_soup.find_all("form")),
-                    "control_count": len(page_soup.find_all(["input", "textarea", "select", "button"])),
-                    "render_outcome": "loaded" if result.get("ok") and page_text.strip() else "blank" if result.get("ok") else "connection_error",
-                },
-            }
+                    "meta": page_meta,
+                    "text": clean_text(page_text, 6000),
+                    "contact_form_detected": page_form_signals.get("contact_form_detected", "No"),
+                    "estimate_form_detected": page_form_signals.get("estimate_form_detected", "No"),
+                    "form_strength": page_form_signals.get("form_strength", "None"),
+                    "form_detection_method": page_form_signals.get("form_detection_method", "none"),
+                    # Counted here so gallery/portfolio pages can be graded later on how
+                    # much work they actually show, not just on the page existing.
+                    "image_count": len(page_soup.find_all("img")) + len(page_soup.find_all("picture")),
+                    "verification_snapshot": {
+                        "page_role": default_page_name,
+                        "requested_url": page_url,
+                        "final_url": result.get("final_url") or page_url,
+                        "retrieved_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+                        "response_status": result.get("status_code"),
+                        "title": page_title,
+                        "visible_text": clean_text(page_text, 6000),
+                        "visible_links": page_links.get("all_links", []),
+                        "form_count": len(page_soup.find_all("form")),
+                        "control_count": len(page_soup.find_all(["input", "textarea", "select", "button"])),
+                        "render_outcome": "loaded" if result.get("ok") and page_text.strip() else "blank" if result.get("ok") else "connection_error",
+                    },
+                }
 
-            group_ok[default_page_name] = group_ok.get(default_page_name, False) or bool(result.get("ok"))
+                group_ok[default_page_name] = group_ok.get(default_page_name, False) or bool(result.get("ok"))
 
         return group_ok
 
@@ -1301,26 +1396,42 @@ def scrape_site(
             return has_terminal_form(form_signals)
         return bool(linked_ok.get(name))
 
-    # Pass 1: the pages the homepage actually links. A linked page beats any
-    # guess. Hold back one slot per group for pass 2.
-    linked_ok = crawl_targets(
-        interleave([(name, linked) for name, linked, _g, _f in resolved_groups]),
-        reserve=len(resolved_groups),
-    )
-
-    # Pass 2: the blind guesses, for each group still unanswered. "The HTML
-    # linked something" is not enough — a HubSpot template can emit an
-    # unrendered `/f/contact/$hs_path` that matches the keywords and 404s, and
-    # the guess it suppressed was the page actually serving the form.
-    crawl_targets(
-        interleave(
-            [
-                (name, guessed)
-                for name, _linked, guessed, needs_form in resolved_groups
-                if not group_answered(name, needs_form, linked_ok)
-            ]
+    try:
+        # Pass 1: the pages the homepage actually links. A linked page beats any
+        # guess. Hold back one slot per group for pass 2.
+        linked_ok = crawl_targets(
+            interleave([(name, linked) for name, linked, _g, _f in resolved_groups]),
+            reserve=len(resolved_groups),
         )
-    )
+
+        # Pass 2: the blind guesses, for each group still unanswered. "The HTML
+        # linked something" is not enough — a HubSpot template can emit an
+        # unrendered `/f/contact/$hs_path` that matches the keywords and 404s, and
+        # the guess it suppressed was the page actually serving the form.
+        crawl_targets(
+            interleave(
+                [
+                    (name, guessed)
+                    for name, _linked, guessed, needs_form in resolved_groups
+                    if not group_answered(name, needs_form, linked_ok)
+                ]
+            )
+        )
+    except BaseException:
+        # An interrupt must not sit and wait on in-flight fetches.
+        if fetch_pool is not None:
+            fetch_pool.shutdown(wait=False, cancel_futures=True)
+        raise
+
+    if fetch_pool is not None:
+        # Both passes share the pool, so pass 2 reuses pass 1's threads and the
+        # sessions on them. Nothing is ever left in flight — every wave is
+        # collected before the next is admitted — so this only joins threads
+        # that have already finished. Joining rather than detaching is the
+        # point: a pool thread's session is thread-local, so `reset_fetch_session`
+        # on the lead thread cannot reach it, and it is the thread ending that
+        # ends its cookie jar and its sockets inside the lead that opened them.
+        fetch_pool.shutdown(wait=True)
 
     combined_text = clean_text(" ".join(combined_text_parts), 30000)
     cta_strength = classify_cta_strength(ctas, combined_text)

@@ -156,6 +156,16 @@ Key in-flight facts (2026-07-29):
     `tests/test_enrichment_fetch_budget.py` pins the property directly: truncation must never
     raise `visible_pain_score` above what an unlimited crawl produces.
   - `fetch_url` retries 5xx but not 404 — a 404 is a deterministic answer.
+  - **A lead's candidate pages can be fetched concurrently (`PAGE_FETCH_WORKERS`, default 1 =
+    serial).** The fetches overlap; the parsing and the slot naming stay serial and in
+    *submission* order, because `_candidate_page_name` numbers `estimate`, `estimate_2`, … by
+    insertion into `pages` and naming off completion order would reshuffle every lead with two
+    contactish pages. It ships off on measurement, not on doubt: it is worth 1.42x on an
+    otherwise idle box, but both shipped paths already crawl 5–6 *leads* at once, which fills the
+    network waits it would have filled — measured flat on the browser path for ~320 MB more peak
+    PSS. Turn it up only for a run whose lead-level concurrency cannot saturate the box (a
+    topup, a handful of leads, one lead being debugged). Widths 1–8 produce identical pages and
+    graded fields; `resolve_page_fetch_workers` carries the numbers.
   - The pooled `requests.Session` is per worker thread but handed back per lead
     (`reset_fetch_session`, called from `enrich_row`): reuse is worth having across one site's
     pages and worth nothing across leads, while the cookie jar and open sockets should end with

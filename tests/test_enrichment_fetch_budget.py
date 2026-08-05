@@ -245,14 +245,20 @@ class PerLeadFetchCeilingTest(unittest.TestCase):
         with patch("enrich_leads.fetch_url", side_effect=_record_fetches(_homepage(body), calls)):
             scrape_site("https://example.com")
 
+        # Asserted as a set: at the shipped serial default these do go out in
+        # interleave order, but this test does not pin the width, and under a
+        # raised `PAGE_FETCH_WORKERS` the four candidates share one wave and
+        # which of them the fake records first is then a race. Order is pinned
+        # where the width is pinned — `SerialWidthIsTheOldCrawlTest` for the
+        # crawl, `SubmissionOrderTest` for the assembled output.
+        self.assertEqual(calls[0], "https://example.com")
         self.assertEqual(
-            calls,
+            sorted(calls[1:]),
             [
-                "https://example.com",
-                "https://example.com/contact-us",
-                "https://example.com/services",
                 "https://example.com/about",
+                "https://example.com/contact-us",
                 "https://example.com/gallery",
+                "https://example.com/services",
             ],
         )
 
@@ -636,8 +642,14 @@ class TruncationIsVisibleTest(unittest.TestCase):
             )
 
 
-class InterPagePauseTest(unittest.TestCase):
-    """The pause belongs in the gaps between pages, not after the last one."""
+class InterWavePauseTest(unittest.TestCase):
+    """The pause belongs in the gaps between waves, not after the last one.
+
+    It used to sit between pages, because pages went out one at a time. They
+    go out several at a time now, and pausing *within* a wave would only undo
+    the concurrency it was paced against — so the gap that is left to pace is
+    the one between waves.
+    """
 
     _BODY = (
         '<a href="/contact-us">Contact</a>'
@@ -646,7 +658,7 @@ class InterPagePauseTest(unittest.TestCase):
         '<a href="/gallery">Gallery</a>'
     )
 
-    def _crawl(self, ceiling: int | None = None) -> tuple[list[str], int]:
+    def _crawl(self, ceiling: int | None = None, workers: int | None = None) -> tuple[list[str], int]:
         calls: list[str] = []
         with ExitStack() as stack:
             stack.enter_context(
@@ -659,17 +671,33 @@ class InterPagePauseTest(unittest.TestCase):
                 stack.enter_context(
                     patch("enrich_leads.resolve_candidate_page_budget", return_value=ceiling)
                 )
+            if workers is not None:
+                stack.enter_context(patch.dict(os.environ, {"PAGE_FETCH_WORKERS": str(workers)}))
             scrape_site("https://example.com")
         return calls, sleep.call_count
 
-    def test_four_candidate_pages_are_paced_three_times(self) -> None:
-        calls, pauses = self._crawl()
+    def test_four_candidate_pages_that_fit_one_wave_are_not_paced(self) -> None:
+        calls, pauses = self._crawl(workers=4)
 
         self.assertEqual(len(calls), 5)  # homepage + four candidates
+        self.assertEqual(pauses, 0)
+
+    def test_the_pause_count_tracks_the_wave_count(self) -> None:
+        calls, pauses = self._crawl(workers=2)
+
+        self.assertEqual(len(calls), 5)  # homepage + four candidates
+        self.assertEqual(pauses, 1)  # two waves of two
+
+    def test_a_serial_crawl_still_paces_between_every_page(self) -> None:
+        # The shipped default: every gap between pages is a wave gap, so the
+        # pacing is exactly what it was before the crawl went concurrent.
+        calls, pauses = self._crawl(workers=1)
+
+        self.assertEqual(len(calls), 5)
         self.assertEqual(pauses, 3)
 
-    def test_the_pause_count_tracks_the_page_count(self) -> None:
-        calls, pauses = self._crawl(ceiling=2)
+    def test_the_pause_never_follows_the_last_wave(self) -> None:
+        calls, pauses = self._crawl(ceiling=2, workers=1)
 
         self.assertEqual(len(calls), 3)  # homepage + two candidates
         self.assertEqual(pauses, 1)
@@ -714,16 +742,24 @@ class SessionLifetimeTest(unittest.TestCase):
     def test_a_crawl_hands_its_session_back(self) -> None:
         # The reset belongs on the lead boundary, not inside `fetch_url` — a
         # per-fetch reset would give back exactly the handshake the pool exists
-        # to avoid.
+        # to avoid. A lead spans a small pool of threads now, so the property
+        # is per thread: nobody fetches twice through two different sessions.
         calls: list[str] = []
-        sessions: list[int] = []
+        lock = threading.Lock()
+        sessions_by_thread: dict[int, set[int]] = {}
 
         def fake_fetch(url: str, timeout: int = 15) -> dict[str, object]:
-            calls.append(url)
-            sessions.append(id(enrich_leads.fetch_session()))
+            session = enrich_leads.fetch_session()
+            with lock:
+                calls.append(url)
+                sessions_by_thread.setdefault(threading.get_ident(), set()).add(id(session))
             return {"ok": True, "status_code": 200, "final_url": url, "html": STRONG_FORM, "error": ""}
 
-        with patch("enrich_leads.fetch_url", side_effect=fake_fetch):
+        # Width forced: at the shipped default there is only ever one thread,
+        # so the per-thread property would hold vacuously.
+        with patch.dict(os.environ, {"PAGE_FETCH_WORKERS": "4"}), patch(
+            "enrich_leads.fetch_url", side_effect=fake_fetch
+        ):
             with patch("enrich_leads.reset_fetch_session") as reset:
                 enrich_leads.enrich_row(
                     {"business_name": "Epoxy Pros", "place_id": "place-1", "website_url": "https://example.com"},
@@ -732,8 +768,36 @@ class SessionLifetimeTest(unittest.TestCase):
                 )
 
         self.assertGreater(len(calls), 1)
-        self.assertEqual(len(set(sessions)), 1)  # one session for the whole lead
+        self.assertGreater(len(sessions_by_thread), 1)  # the pool really ran
+        self.assertTrue(all(len(seen) == 1 for seen in sessions_by_thread.values()))
         self.assertEqual(reset.call_count, 1)  # handed back once, at the end
+
+    def test_the_page_fetch_threads_do_not_outlive_the_lead(self) -> None:
+        # `reset_fetch_session` runs on the lead thread and cannot reach a pool
+        # thread's thread-local session. What ends those is the thread ending,
+        # so the pool has to be joined before the crawl returns — otherwise a
+        # run of 150 leads leaks a jar and a socket pool per lead.
+        #
+        # The width is forced because the shipped default is serial: at width 1
+        # every wave is one page, `fetch_wave` stays on the calling thread, and
+        # no pool is ever built — so this test would pass with the join deleted.
+        body = "".join(f'<a href="/contact-{index}">Contact {index}</a>' for index in range(4))
+        calls: list[str] = []
+        live_during_crawl: list[int] = []
+
+        def fake_fetch(url: str, timeout: int = 15) -> dict[str, object]:
+            live_during_crawl.append(
+                len([t for t in threading.enumerate() if t.name.startswith("page-fetch")])
+            )
+            return _record_fetches(_homepage(body), calls)(url, timeout)
+
+        with patch.dict(os.environ, {"PAGE_FETCH_WORKERS": "4"}), patch(
+            "enrich_leads.fetch_url", side_effect=fake_fetch
+        ):
+            scrape_site("https://example.com")
+
+        self.assertGreater(max(live_during_crawl), 0)  # a pool really ran
+        self.assertEqual([t for t in threading.enumerate() if t.name.startswith("page-fetch")], [])
 
 
 if __name__ == "__main__":
