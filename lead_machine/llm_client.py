@@ -21,6 +21,11 @@ DEFAULT_ANTHROPIC_MAX_RETRIES = 2
 DEFAULT_ANTHROPIC_RETRY_BACKOFF_SECONDS = 2
 DEFAULT_KIMI_BASE_URL = "https://api.moonshot.ai/v1"
 DEFAULT_KIMI_SCORING_MODEL = "kimi-k3"
+# kimi-k3 always thinks; reasoning_effort only tunes how much. "low" is the
+# lightest setting Moonshot exposes — the default "max" burns the whole
+# max_tokens budget on reasoning_content before any score JSON is written,
+# which is unnecessary for a fixed-rubric scoring task and starves `content`.
+DEFAULT_KIMI_REASONING_EFFORT = "low"
 TRANSIENT_HTTP_STATUSES = {429, 500, 502, 503, 504}
 
 DEFAULT_PROVIDER_CHAIN = ("kimi", "codex", "claude")
@@ -45,6 +50,10 @@ class InvalidLlmResponse(ValueError):
         # Usage for the failed attempt, so callers can still charge it against
         # per-run token/USD caps even though the response never validated.
         self.usage = usage or {}
+        # Which model burned that usage. The chain can fall past a $0
+        # subscription runner onto a paid API, so the run-level model is the
+        # wrong price for a failed attempt too.
+        self.model = ""
 
 
 def _response_text(data: Dict[str, Any]) -> str:
@@ -263,6 +272,7 @@ def _score_batch_anthropic(prompt: str, *, model: str | None = None, max_tokens:
             # Preserve the paid usage from this attempt so token/USD caps and
             # cost dashboards see it even when the response is unusable.
             exc.usage = usage
+            exc.model = selected_model
             raise
         print(
             f"[LLM REQUEST OK] attempt={attempt} "
@@ -293,6 +303,7 @@ def _score_batch_kimi(prompt: str, *, model: str | None, max_tokens: int) -> Dic
         _getenv_float("KIMI_RETRY_BACKOFF_SECONDS", float(DEFAULT_ANTHROPIC_RETRY_BACKOFF_SECONDS)),
     )
     max_attempts = max_retries + 1
+    reasoning_effort = (os.getenv("KIMI_REASONING_EFFORT") or DEFAULT_KIMI_REASONING_EFFORT).strip()
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
@@ -300,6 +311,7 @@ def _score_batch_kimi(prompt: str, *, model: str | None, max_tokens: int) -> Dic
     body = {
         "model": selected_model,
         "max_tokens": max_tokens,
+        "reasoning_effort": reasoning_effort,
         "messages": [{"role": "user", "content": prompt}],
     }
     url = f"{base_url}/chat/completions"
@@ -308,7 +320,8 @@ def _score_batch_kimi(prompt: str, *, model: str | None, max_tokens: int) -> Dic
     for attempt in range(1, max_attempts + 1):
         print(
             f"[LLM REQUEST] provider=kimi attempt={attempt} model={selected_model} "
-            f"prompt_tokens_est={prompt_tokens_est} max_tokens={max_tokens}"
+            f"prompt_tokens_est={prompt_tokens_est} max_tokens={max_tokens} "
+            f"reasoning_effort={reasoning_effort}"
         )
         try:
             response = requests.post(url, headers=headers, json=body, timeout=(connect_timeout, read_timeout))
@@ -338,6 +351,7 @@ def _score_batch_kimi(prompt: str, *, model: str | None, max_tokens: int) -> Dic
             bundle = _parse_score_bundle(text)
         except InvalidLlmResponse as exc:
             exc.usage = usage
+            exc.model = selected_model
             raise
         print(
             f"[LLM REQUEST OK] provider=kimi attempt={attempt} "
@@ -375,9 +389,21 @@ def _normalize_cli_usage(raw: Dict[str, Any] | None) -> Dict[str, int]:
                 return value
         return 0
 
+    def _int(key: str) -> int:
+        try:
+            return int(raw.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0
+
     input_tokens = _pick("input_tokens", "prompt_tokens")
+    # The Claude CLI envelope reports nearly all prompt tokens under the cache
+    # counters — a 3.7k-token scoring prompt comes back as input_tokens=1 with
+    # the rest in cache_creation_input_tokens / cache_read_input_tokens. Dropping
+    # them under-counts input by ~99%, so MAX_LLM_TOKENS_PER_RUN stops bounding
+    # subscription runs.
+    input_tokens += _int("cache_creation_input_tokens") + _int("cache_read_input_tokens")
     output_tokens = _pick("output_tokens", "completion_tokens")
-    total = _pick("total_tokens") or input_tokens + output_tokens
+    total = max(_pick("total_tokens"), input_tokens + output_tokens)
     return {"input_tokens": input_tokens, "output_tokens": output_tokens, "total_tokens": total}
 
 
@@ -392,7 +418,11 @@ def _score_batch_cli(runner: str, prompt: str, *, model: str | None, max_tokens:
     env_key = "CODEX_SUBSCRIPTION_SCORING_MODEL" if runner == "codex" else "CLAUDE_SUBSCRIPTION_SCORING_MODEL"
     selected_model = (os.getenv(env_key) or "").strip()
     timeout_seconds = max(1, _getenv_int("LLM_CLI_TIMEOUT_SECONDS", DEFAULT_CLI_TIMEOUT_SECONDS))
-    print(f"[LLM REQUEST] provider={runner} model={selected_model or 'runner-default'} via CLI subscription")
+    effort = subscription_runner.resolve_runner_effort(runner)
+    print(
+        f"[LLM REQUEST] provider={runner} model={selected_model or 'runner-default'} "
+        f"effort={effort or 'runner-default'} via CLI subscription"
+    )
     result = subscription_runner.run_runner_attempt(
         runner,
         prompt_text=prompt,
@@ -411,7 +441,17 @@ def _score_batch_cli(runner: str, prompt: str, *, model: str | None, max_tokens:
         f"[LLM REQUEST OK] provider={runner} "
         f"input_tokens={usage['input_tokens']} output_tokens={usage['output_tokens']}"
     )
-    return {"bundle": bundle, "usage": usage, "provider": runner, "model": selected_model or "runner-default"}
+    # `model` is what the caller prices the batch with, so it must be the $0
+    # subscription id — billing a sub-served batch at the runner model's API
+    # rate would charge MAX_LLM_USD_PER_RUN for tokens that cost nothing.
+    # The real runner model stays available for logging as `runner_model`.
+    return {
+        "bundle": bundle,
+        "usage": usage,
+        "provider": runner,
+        "model": f"subscription:{runner}",
+        "runner_model": selected_model or "runner-default",
+    }
 
 
 _PROVIDERS: Dict[str, Callable] = {
@@ -472,14 +512,33 @@ def score_batch(prompt: str, *, model: str | None = None, max_tokens: int) -> Di
     raise RuntimeError("All LLM scoring providers unavailable: " + "; ".join(failures))
 
 
-def resolve_scoring_model() -> str:
-    """Model id the chain's first provider will use — for cost estimation and logging.
+def provider_chain() -> List[str]:
+    """The resolved fallback chain, in order. Public for cost projection."""
+    load_dotenv()
+    return _provider_chain()
 
-    `score_leads.py` needs one model string up front to price the run against
-    `MAX_LLM_USD_PER_RUN`. Reading `LLM_SCORING_MODEL` directly (as it used to)
-    names a provider that may not be in the chain at all. Subscription runners
-    have no per-token price, so they report a `subscription:<runner>` id that the
-    pricing table registers at $0.
+
+def model_for_provider(provider: str) -> str:
+    """Model id a given provider in the chain would use."""
+    if provider == "kimi":
+        return (
+            os.getenv("KIMI_SCORING_MODEL")
+            or os.getenv("LLM_SCORING_MODEL")  # legacy alias
+            or DEFAULT_KIMI_SCORING_MODEL
+        ).strip()
+    if provider in {"codex", "claude"}:
+        return f"subscription:{provider}"
+    return (os.getenv("LLM_SCORING_MODEL") or DEFAULT_LLM_SCORING_MODEL).strip()
+
+
+def resolve_scoring_model() -> str:
+    """Model id the chain's first provider will use — for logging and reporting.
+
+    NOTE: this is the *expected* model, not a spend guard. A pre-spend
+    projection must use the priciest model the chain could reach — see
+    `score_leads.resolve_projection_model` — because a $0 subscription runner
+    first in the chain would otherwise project $0 for a run that falls through
+    to a paid API and spends real money.
     """
     load_dotenv()
     chain = _provider_chain()

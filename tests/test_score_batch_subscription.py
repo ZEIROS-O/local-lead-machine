@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from import_llm_score_bundle import REQUIRED_BUNDLE_SCORE_KEYS
 from lead_machine.manual_scores import validate_manual_score
@@ -20,6 +22,7 @@ from score_batch_subscription import (
     preflight_subscription_auth,
     queue_lock,
     receipt_matches,
+    resolve_runner_effort,
     sanitized_environment,
     validate_bundle_identity,
 )
@@ -225,6 +228,82 @@ class SubscriptionScoringTests(unittest.TestCase):
             self.assertEqual(claude[claude.index("--tools") + 1], "")
             self.assertIn("--no-session-persistence", claude)
             self.assertIn("--strict-mcp-config", claude)
+
+            # No effort configured -> neither CLI gets an effort argument.
+            self.assertNotIn("--effort", claude)
+            self.assertNotIn('model_reasoning_effort="high"', codex)
+
+    def test_reasoning_effort_reaches_each_runner_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp).resolve()
+            codex = build_codex_command(
+                cwd=cwd,
+                last_message_path=cwd / "last.txt",
+                model="gpt-test",
+                use_output_schema=True,
+                reasoning_effort="high",
+            )
+            # codex exec has no --effort flag; effort rides in as a config key.
+            self.assertIn('model_reasoning_effort="high"', codex)
+            self.assertEqual(codex[-1], "-")
+
+            claude = build_claude_command(model="claude-test", reasoning_effort="xhigh")
+            self.assertEqual(claude[claude.index("--effort") + 1], "xhigh")
+
+    def test_cli_usage_counts_cache_tokens_as_input(self) -> None:
+        """Real Claude CLI envelope: 14,873 prompt tokens reported as input_tokens=2.
+
+        Everything else rides in the cache counters. Counting only input_tokens
+        under-reports a subscription run's input by ~99%, which silently unbinds
+        MAX_LLM_TOKENS_PER_RUN.
+        """
+        from lead_machine.llm_client import _normalize_cli_usage
+
+        claude_envelope = {
+            "input_tokens": 2,
+            "cache_creation_input_tokens": 11584,
+            "cache_read_input_tokens": 3289,
+            "output_tokens": 4,
+        }
+        usage = _normalize_cli_usage(claude_envelope)
+        self.assertEqual(usage["input_tokens"], 2 + 11584 + 3289)
+        self.assertEqual(usage["output_tokens"], 4)
+        self.assertEqual(usage["total_tokens"], 2 + 11584 + 3289 + 4)
+
+        # Codex-shaped envelope (no cache counters) is unchanged.
+        codex_envelope = {"input_tokens": 900, "output_tokens": 100, "total_tokens": 1000}
+        self.assertEqual(
+            _normalize_cli_usage(codex_envelope),
+            {"input_tokens": 900, "output_tokens": 100, "total_tokens": 1000},
+        )
+
+        # A reported total that undercounts the parts must not win.
+        self.assertEqual(
+            _normalize_cli_usage({"input_tokens": 5, "cache_read_input_tokens": 500, "output_tokens": 10, "total_tokens": 15})["total_tokens"],
+            515,
+        )
+        self.assertEqual(_normalize_cli_usage(None), {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+
+    def test_runner_effort_resolves_per_runner_and_drops_unknown_levels(self) -> None:
+        env = {
+            "CODEX_REASONING_EFFORT": "HIGH",
+            "CLAUDE_SUBSCRIPTION_EFFORT": "max",
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            self.assertEqual(resolve_runner_effort("codex"), "high")
+            self.assertEqual(resolve_runner_effort("claude"), "max")
+
+        # An unsupported level would make the CLI reject the whole invocation,
+        # silently killing that tier of the provider chain — drop it instead.
+        with mock.patch.dict(os.environ, {"CODEX_REASONING_EFFORT": "ludicrous"}, clear=False):
+            self.assertEqual(resolve_runner_effort("codex"), "")
+        # "minimal" is codex-only; the claude CLI has no such level.
+        with mock.patch.dict(os.environ, {"CLAUDE_SUBSCRIPTION_EFFORT": "minimal"}, clear=False):
+            self.assertEqual(resolve_runner_effort("claude"), "")
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(resolve_runner_effort("codex"), "")
+            self.assertEqual(resolve_runner_effort("claude"), "")
 
     def test_codex_happy_path_writes_receipt_and_rerun_skips(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

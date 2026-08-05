@@ -3087,8 +3087,36 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(kwargs["headers"]["Authorization"], "Bearer kimi-key")
         self.assertEqual(kwargs["json"]["model"], "kimi-k3")
         self.assertEqual(kwargs["json"]["max_tokens"], 4096)
+        self.assertEqual(kwargs["json"]["reasoning_effort"], "low")
         self.assertEqual(kwargs["json"]["messages"][0]["content"], "score this batch")
         self.assertEqual(kwargs["timeout"], (15, 180))
+
+    def test_kimi_provider_reasoning_effort_is_configurable(self) -> None:
+        from lead_machine import llm_client
+
+        bundle = {"batch_id": "batch_001", "scores": [{"score_file": "chij123.json", "score": self._manual_score(total_score=75, grade="B")}]}
+        response = {
+            "choices": [{"message": {"role": "assistant", "content": json.dumps(bundle)}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+
+        class FakeResponse:
+            status_code = 200
+            text = json.dumps(response)
+
+            def json(self) -> dict:
+                return response
+
+        env = {"KIMI_API_KEY": "kimi-key", "LLM_SCORING_PROVIDER_CHAIN": "kimi", "KIMI_REASONING_EFFORT": "high"}
+        with patch.dict(os.environ, env, clear=False):
+            os.environ.pop("KIMI_SCORING_MODEL", None)
+            os.environ.pop("LLM_SCORING_MODEL", None)
+            with patch("lead_machine.llm_client.load_dotenv"):
+                with patch("lead_machine.llm_client.requests.post", return_value=FakeResponse()) as post:
+                    llm_client.score_batch("score this batch", model=None, max_tokens=4096)
+
+        _, kwargs = post.call_args
+        self.assertEqual(kwargs["json"]["reasoning_effort"], "high")
 
     def test_kimi_provider_missing_key_is_unavailable_and_falls_back(self) -> None:
         from lead_machine import llm_client
@@ -3444,6 +3472,122 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual([row["Business Name"] for row in run.manual_run.rows], ["A+ Landscaping LLC"])
         self.assertEqual([missing.lead_name for missing in run.manual_run.missing_scores], ["Second Landscaping"])
 
+    def test_api_llm_spend_is_priced_by_the_provider_that_actually_served_the_batch(self) -> None:
+        """A $0 subscription runner first in the chain must not zero-rate a paid fallback.
+
+        With LLM_SCORING_PROVIDER_CHAIN=codex,kimi,... the run-level model is
+        "subscription:codex" at $0/$0. If codex is quota-blocked and kimi serves
+        the batch, pricing the usage by the run-level model bills real Moonshot
+        tokens at zero and MAX_LLM_USD_PER_RUN never trips.
+        """
+        from score_leads import estimate_llm_usd, score_records_api_run
+
+        enriched = {
+            "google": self._google_fixture(),
+            "evidence": self._evidence_fixture(site_status="weak"),
+        }
+        usage = {"input_tokens": 400_000, "output_tokens": 200_000, "total_tokens": 600_000}
+
+        def kimi_served(prompt: str, *, model: str, max_tokens: int) -> dict:
+            # What llm_client returns after falling past codex onto kimi.
+            return {
+                "bundle": {
+                    "batch_id": "batch_001",
+                    "scores": [{"score_file": "chij123.json", "score": self._manual_score(total_score=75, grade="B")}],
+                },
+                "usage": dict(usage),
+                "provider": "kimi",
+                "model": "kimi-k3",
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("score_leads.llm_client.score_batch", side_effect=kimi_served):
+                run = score_records_api_run(
+                    [enriched],
+                    scores_dir=Path(tmp) / "scores",
+                    fallback_vertical="hardscaping",
+                    batch_size=1,
+                    model="subscription:codex",
+                    max_tokens=20,
+                    max_calls=0,
+                    max_tokens_per_run=0,
+                    max_usd_per_run=0,
+                )
+
+        self.assertEqual(run.usd, estimate_llm_usd(usage, model="kimi-k3"))
+        self.assertGreater(run.usd, 0.0)
+        self.assertNotEqual(run.usd, estimate_llm_usd(usage, model="subscription:codex"))
+
+    def test_spend_projection_uses_the_priciest_reachable_tier_not_the_first(self) -> None:
+        """A $0 runner in front must not zero out the pre-spend projection.
+
+        With codex first, resolve_scoring_model() is "subscription:codex" at
+        $0/$0. Projecting with that makes LLM_SPEND_CONFIRM_USD unreachable, so
+        a run that falls through to a paid tier spends without ever asking.
+        """
+        from score_leads import resolve_projection_model, llm_pricing
+
+        with patch.dict(
+            os.environ,
+            {"LLM_SCORING_PROVIDER_CHAIN": "codex,kimi,claude,anthropic", "KIMI_SCORING_MODEL": "kimi-k3"},
+            clear=False,
+        ):
+            projected = resolve_projection_model()
+
+        self.assertNotEqual(projected, "subscription:codex")
+        self.assertGreater(llm_pricing(projected)[1], 0.0)
+
+        # An all-subscription chain has no paid tier to fall through to.
+        with patch.dict(os.environ, {"LLM_SCORING_PROVIDER_CHAIN": "codex,claude"}, clear=False):
+            self.assertEqual(llm_pricing(resolve_projection_model())[1], 0.0)
+
+    def test_subscription_served_batch_is_billed_at_zero_not_the_runner_model_rate(self) -> None:
+        """The mirror of the test above: a sub-served batch must stay free.
+
+        _score_batch_cli reports model="subscription:<runner>" precisely so the
+        caller prices it at $0. Pricing by the runner's model id instead
+        (claude-sonnet-5) would charge MAX_LLM_USD_PER_RUN API rates for tokens
+        that cost nothing on a subscription.
+        """
+        from score_leads import estimate_llm_usd, score_records_api_run
+
+        enriched = {
+            "google": self._google_fixture(),
+            "evidence": self._evidence_fixture(site_status="weak"),
+        }
+        usage = {"input_tokens": 1, "output_tokens": 1307, "total_tokens": 1308}
+
+        def claude_sub_served(prompt: str, *, model: str, max_tokens: int) -> dict:
+            return {
+                "bundle": {
+                    "batch_id": "batch_001",
+                    "scores": [{"score_file": "chij123.json", "score": self._manual_score(total_score=75, grade="B")}],
+                },
+                "usage": dict(usage),
+                "provider": "claude",
+                "model": "subscription:claude",
+                "runner_model": "claude-sonnet-5",
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("score_leads.llm_client.score_batch", side_effect=claude_sub_served):
+                run = score_records_api_run(
+                    [enriched],
+                    scores_dir=Path(tmp) / "scores",
+                    fallback_vertical="hardscaping",
+                    batch_size=1,
+                    model="subscription:codex",
+                    max_tokens=20,
+                    max_calls=0,
+                    max_tokens_per_run=0,
+                    max_usd_per_run=0,
+                )
+
+        self.assertEqual(run.usd, 0.0)
+        self.assertGreater(estimate_llm_usd(usage, model="claude-sonnet-5"), 0.0)
+        # Tokens still count, so MAX_LLM_TOKENS_PER_RUN keeps bounding sub runs.
+        self.assertEqual(run.tokens, 1308)
+
     def _run_score_leads(self, argv: list[str]) -> tuple[int, str, str]:
         stdout = io.StringIO()
         stderr = io.StringIO()
@@ -3589,7 +3733,11 @@ class LeadMachineContractsTest(unittest.TestCase):
                 "--scores-dir", str(Path(tmp) / "scores"),
                 "--vertical", "hardscaping",
             ]
-            with patch.dict(os.environ, {"LLM_SPEND_CONFIRM_USD": "0.0001"}, clear=False):
+            # Pin the chain: score_leads.main() calls load_dotenv(), so without
+            # this the developer's real .env decides the projection model and a
+            # subscription-first chain would project $0 and skip the refusal.
+            env = {"LLM_SPEND_CONFIRM_USD": "0.0001", "LLM_SCORING_PROVIDER_CHAIN": "anthropic"}
+            with patch.dict(os.environ, env, clear=False):
                 with patch("score_leads.llm_client.score_batch") as score_batch:
                     code, stdout, stderr = self._run_score_leads(argv)
 

@@ -10,6 +10,7 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
@@ -314,12 +315,41 @@ def discover_batches(queue_dir: Path, batch_ids: Sequence[str], scores_dir: Path
     return jobs
 
 
+CODEX_EFFORT_LEVELS = ("minimal", "low", "medium", "high", "xhigh")
+CLAUDE_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
+
+def resolve_runner_effort(runner: str) -> str:
+    """Reasoning effort for a subscription runner, or "" for the runner default.
+
+    An unrecognized level is dropped rather than passed through: both CLIs reject
+    it, and a rejected fallback tier is a silently dead link in the provider
+    chain rather than a loud config error.
+    """
+    if runner == "codex":
+        raw = os.getenv("CODEX_REASONING_EFFORT", "").strip().lower()
+        levels = CODEX_EFFORT_LEVELS
+    else:
+        raw = os.getenv("CLAUDE_SUBSCRIPTION_EFFORT", "").strip().lower()
+        levels = CLAUDE_EFFORT_LEVELS
+    if not raw:
+        return ""
+    if raw not in levels:
+        print(
+            f"[WARN] Ignoring unsupported {runner} effort {raw!r}; expected one of {', '.join(levels)}",
+            file=sys.stderr,
+        )
+        return ""
+    return raw
+
+
 def build_codex_command(
     *,
     cwd: Path,
     last_message_path: Path,
     model: str,
     use_output_schema: bool,
+    reasoning_effort: str = "",
 ) -> list[str]:
     cmd = [
         "codex",
@@ -354,11 +384,15 @@ def build_codex_command(
     cmd.extend(["--output-last-message", str(last_message_path.resolve())])
     if model:
         cmd.extend(["--model", model])
+    if reasoning_effort:
+        # codex exec has no --effort flag; effort is a config key, and
+        # --strict-config above accepts it.
+        cmd.extend(["-c", f'model_reasoning_effort="{reasoning_effort}"'])
     cmd.append("-")
     return cmd
 
 
-def build_claude_command(*, model: str) -> list[str]:
+def build_claude_command(*, model: str, reasoning_effort: str = "") -> list[str]:
     cmd = [
         "claude",
         "-p",
@@ -376,6 +410,8 @@ def build_claude_command(*, model: str) -> list[str]:
     ]
     if model:
         cmd.extend(["--model", model])
+    if reasoning_effort:
+        cmd.extend(["--effort", reasoning_effort])
     return cmd
 
 
@@ -460,15 +496,17 @@ def run_runner_attempt(
     with tempfile.TemporaryDirectory(prefix="subscription-score-runner-") as raw_dir:
         temp_dir = Path(raw_dir)
         last_message_path = temp_dir / "last_message.txt"
+        reasoning_effort = resolve_runner_effort(runner)
         cmd = (
             build_codex_command(
                 cwd=temp_dir,
                 last_message_path=last_message_path,
                 model=model,
                 use_output_schema=use_output_schema,
+                reasoning_effort=reasoning_effort,
             )
             if runner == "codex"
-            else build_claude_command(model=model)
+            else build_claude_command(model=model, reasoning_effort=reasoning_effort)
         )
         try:
             process = process_runner(
