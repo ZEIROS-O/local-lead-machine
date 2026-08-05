@@ -274,7 +274,7 @@ NON_STANDARD_SITE_HINTS = [
 
 
 DEFAULT_ENRICH_WORKERS = 6
-DEFAULT_BROWSER_ENRICH_WORKERS = 3
+DEFAULT_BROWSER_ENRICH_WORKERS = 5
 # How long a worker is given to reach the browser-shutdown rendezvous at the
 # end of a run. Only reached when the pool never grew to its full width.
 BROWSER_SHUTDOWN_RENDEZVOUS_SECONDS = 5.0
@@ -2040,11 +2040,48 @@ def resolve_per_lead_timeout(workers: int) -> float:
 def resolve_enrich_workers(*, browser_work: bool) -> int:
     """How many leads to enrich at once.
 
-    Enrichment is pure I/O with a 45s per-lead timeout, so it ran one lead at a
-    time against a wall of network latency. Browser work is the exception: each
-    rendered check or screenshot launches its own Chromium, so six at once is a
-    memory problem rather than a throughput win. An explicit ENRICH_WORKERS is
-    always honoured — the cap only applies to the default.
+    Enrichment is pure I/O with a per-lead timeout, so it ran one lead at a time
+    against a wall of network latency. Browser work still gets its own default,
+    but no longer for the original reason: the Chromium is per worker thread
+    now, not per lead, so the launch cost is amortised and what is left is
+    contention. Both defaults were measured on 50 real epoxy leads. Two numbers
+    per path, because they disagree and only one of them decides the default:
+
+    *per lead* is worker time summed over the 47 leads that are stable
+    run-to-run, which repeat runs reproduce to within 2%. *batch* is that plus
+    the 222s the three dead hosts spend in connect timeouts (dead on every
+    network run, to the second), divided by the workers — what the run costs.
+
+        workers   browser: per lead / batch    network: per lead / batch
+              3         1.00x /  258s              1.00x /  159s
+              4         1.20x /  222s              1.40x /  145s
+              5         1.39x /  198s              1.91x /  142s
+              6         1.98x /  219s              2.55x /  146s
+             10             -                      4.88x /  147s
+
+    Browser work parallelises because Chromium renders in its own processes:
+    five workers cost 1.39x per lead for 1.67x the threads, and the batch is
+    fastest there. Six is break-even with three, so five is a knee, not a
+    ceiling chosen for headroom.
+
+    The network path does not parallelise. Its BeautifulSoup parsing is
+    in-process Python behind one GIL, and per-lead cost rises slightly *faster*
+    than the worker count, so on leads that actually crawl, fewer workers is
+    better. What flattens its batch column is the dead hosts — they are pure
+    waiting, and more workers genuinely do compress them. Those two effects
+    cancel at this batch's 3-in-50 dead-host rate, which is why measured wall
+    clock is flat from 4 workers to 12 (185-210s). So six is a defensible
+    middle rather than an optimum: raising it to ten gains nothing and doubles
+    per-lead latency, and a batch with a different dead-host rate would move
+    the balance. Do not read the flatness as headroom.
+
+    Neither limit is memory. Peak PSS across the process tree was 3.9 GB at
+    five browser workers, and it is a transient set by which heavy sites happen
+    to render together rather than something that accumulates over a run, so it
+    does not grow with batch length.
+
+    An explicit ENRICH_WORKERS is always honoured; both numbers above are only
+    defaults.
     """
     explicit = os.getenv("ENRICH_WORKERS", "").strip()
     if explicit:

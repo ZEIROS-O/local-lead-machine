@@ -257,10 +257,13 @@ class BrowserReuseTest(_BrowserTestCase):
         # so the pool has to hand each worker its own closing task before it
         # shuts down.
         launcher = _Launcher()
+        # Run at the shipped default rather than a literal, so whatever width
+        # browser runs actually use is the width this path is proven at.
+        workers = enrich_leads.DEFAULT_BROWSER_ENRICH_WORKERS
         # The pool only spawns a thread when no idle one is free, so a fast
         # enrich can run twelve leads on two threads. Hold every worker at once
         # to guarantee the full width is open when shutdown runs.
-        all_workers_busy = threading.Barrier(3, timeout=10)
+        all_workers_busy = threading.Barrier(workers, timeout=10)
         state = threading.local()
 
         def enrich(row):
@@ -272,13 +275,13 @@ class BrowserReuseTest(_BrowserTestCase):
 
         with patch.object(enrich_leads, "_launch_browser", launcher):
             enrich_leads.enrich_rows_concurrently(
-                [{"place_id": f"place-{index}"} for index in range(12)],
-                workers=3,
+                [{"place_id": f"place-{index}"} for index in range(4 * workers)],
+                workers=workers,
                 enrich=enrich,
                 on_complete=lambda *_: None,
             )
 
-        self.assertEqual(launcher.launches, 3)
+        self.assertEqual(launcher.launches, workers)
         for handle in launcher.handles:
             self.assertTrue(handle.browser.closed)
             self.assertTrue(handle.playwright.stopped)

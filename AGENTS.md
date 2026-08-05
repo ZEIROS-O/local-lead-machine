@@ -94,10 +94,14 @@ Key in-flight facts (2026-07-29):
   crawlable site text to read a paid stack from, which is not the same claim as "does not spend".
   Only `yes` may count as truthy in a gate — `sendability.required_visible_pain_score` drops the
   mature-band threshold from 40 to 35 on a truthy value. `demand_signal` is deliberately separate.
-- **Enrichment runs concurrently** (`ENRICH_WORKERS`, default 6; 3 when screenshots or rendered
+- **Enrichment runs concurrently** (`ENRICH_WORKERS`, default 6; 5 when screenshots or rendered
   checks are on, since each worker thread holds its own Chromium) and streams records to disk as
   they finish. The per-lead ceiling scales with the worker count — it is wall-clock, and contention
-  inflates it.
+  inflates it. Both defaults are measured, and the two paths scale in opposite directions: Chromium
+  renders out-of-process so browser work genuinely parallelises, while the network path's parsing is
+  GIL-bound, so 6 there is a defensible middle rather than an optimum — raising it to 10 measured
+  *slower*. The numbers, and what they do and don't license, are in `resolve_enrich_workers`; don't
+  retune either default from first principles.
 - **The browser is per worker thread; the context is per lead.** Playwright's sync API is bound to
   the thread that created it, so `thread_browser()` keeps the Chromium in a `threading.local` and
   `close_worker_browsers` hands each worker its own closing task at shutdown — the main thread

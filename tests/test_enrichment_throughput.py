@@ -26,10 +26,12 @@ import enrich_leads
 from enrich_leads import (
     DEFAULT_BROWSER_ENRICH_WORKERS,
     DEFAULT_ENRICH_WORKERS,
+    MAX_PER_LEAD_ENRICH_TIMEOUT_SECONDS,
     JsonlAppender,
     build_enrichment_error_record,
     enrich_rows_concurrently,
     resolve_enrich_workers,
+    resolve_per_lead_timeout,
 )
 
 
@@ -46,8 +48,12 @@ class WorkerResolutionTest(unittest.TestCase):
             self.assertEqual(resolve_enrich_workers(browser_work=False), DEFAULT_ENRICH_WORKERS)
 
     def test_browser_work_defaults_lower(self) -> None:
-        # Each rendered check or screenshot launches its own Chromium, so the
-        # default that is right for HTTP fetches is a memory problem here.
+        # Browser work gets its own default, but not because a Chromium per
+        # lead makes six a memory problem -- the Chromium is per worker thread
+        # now, and neither default is bounded by memory. The two paths are
+        # measured separately (see resolve_enrich_workers) and their knees
+        # happen to land this way round; if a future measurement inverts them,
+        # this is the assertion to revisit rather than to satisfy.
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(
                 resolve_enrich_workers(browser_work=True), DEFAULT_BROWSER_ENRICH_WORKERS
@@ -61,6 +67,22 @@ class WorkerResolutionTest(unittest.TestCase):
     def test_a_nonsense_setting_does_not_produce_zero_workers(self) -> None:
         with patch.dict(os.environ, {"ENRICH_WORKERS": "0"}, clear=True):
             self.assertGreaterEqual(resolve_enrich_workers(browser_work=False), 1)
+
+    def test_the_browser_default_gets_a_lead_the_full_crawl_budget(self) -> None:
+        # resolve_per_lead_timeout scales 45s by the worker count and caps at
+        # MAX_PER_LEAD_ENRICH_TIMEOUT_SECONDS, so the budget saturates at four
+        # workers. The browser default used to be three, which quietly bought a
+        # lead only 135s of the 180s a slow site can need. Lowering this default
+        # below the saturation point would shrink the crawl again with nothing
+        # in the diff to say so.
+        self.assertEqual(
+            resolve_per_lead_timeout(DEFAULT_BROWSER_ENRICH_WORKERS),
+            MAX_PER_LEAD_ENRICH_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            resolve_per_lead_timeout(DEFAULT_ENRICH_WORKERS),
+            MAX_PER_LEAD_ENRICH_TIMEOUT_SECONDS,
+        )
 
 
 class ConcurrentEnrichmentTest(unittest.TestCase):
