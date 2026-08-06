@@ -317,3 +317,109 @@ class SerialConcurrentEquivalenceTest(unittest.TestCase):
         serial = self._run(concurrency=1)
         concurrent = self._run(concurrency=4)
         self.assertEqual(serial, concurrent)
+
+
+class BatchFailureIsolationTest(unittest.TestCase):
+    """One unparseable batch must not throw away every other batch in the run.
+
+    Real incident, 2026-08-06: a 133-lead run scored 24 of 27 batches, then
+    kimi-k3 returned a `safe_outreach_claims` entry missing its `"claim":` key.
+    That is a JSON *syntax* error, so it raises before schema validation and the
+    repair path never engages; `_looks_truncated_llm_response` is also false for
+    a complete-but-malformed body, so there is no retry either. The resulting
+    ValueError propagated out of the collection loop and aborted the run — 120
+    banked score JSONs on disk, 33 paid calls, and no scored CSV written at all.
+
+    A failed batch is the same class of event as a cap stop: bound the loss to
+    that batch, record it, and let the run finish with what it has.
+    """
+
+    def _records(self, count: int) -> list[dict]:
+        return [
+            {
+                "google": _google_fixture(f"Landscaping {index}", f"ChIJ{index}"),
+                "evidence": _evidence_fixture(),
+            }
+            for index in range(count)
+        ]
+
+    @staticmethod
+    def _fake_score_batch_failing_batch_two(prompt: str, *, model: str, max_tokens: int) -> dict:
+        """Batch 2 of 3 comes back malformed; batches 1 and 3 are fine."""
+        from lead_machine import llm_client
+
+        batch_number = int(_BATCH_ID_RE.search(prompt).group(1))
+        if batch_number == 2:
+            exc = llm_client.InvalidLlmResponse(
+                "Invalid LLM score bundle JSON: Expecting ':' delimiter at line 58 column 65",
+                raw_text='{"batch_id": "batch_002", "scores": [{"The site already offers forms"}]}',
+                usage={"input_tokens": 9, "output_tokens": 4, "total_tokens": 13},
+            )
+            exc.model = model
+            raise exc
+        return {
+            "bundle": {
+                "batch_id": f"batch_{batch_number:03d}",
+                "scores": [
+                    {"score_file": f"chij{batch_number - 1}.json", "score": _manual_score()}
+                ],
+            },
+            "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
+        }
+
+    def _run(self, *, concurrency: int):
+        from score_leads import score_records_api_run
+
+        with tempfile.TemporaryDirectory() as tmp:
+            scores_dir = Path(tmp) / "scores"
+            with patch(
+                "score_leads.llm_client.score_batch",
+                side_effect=self._fake_score_batch_failing_batch_two,
+            ):
+                run = score_records_api_run(
+                    self._records(3),
+                    scores_dir=scores_dir,
+                    fallback_vertical="hardscaping",
+                    batch_size=1,
+                    model="claude-sonnet-5",
+                    max_tokens=20,
+                    max_calls=0,
+                    max_tokens_per_run=0,
+                    max_usd_per_run=0.0,
+                    concurrency=concurrency,
+                )
+            banked = sorted(path.name for path in scores_dir.glob("*.json"))
+        return run, banked
+
+    def _assert_survivors_kept(self, run, banked) -> None:
+        self.assertEqual(
+            banked,
+            ["chij0.json", "chij2.json"],
+            "the batches that succeeded must still be banked",
+        )
+        self.assertEqual(
+            [row["Business Name"] for row in run.manual_run.rows],
+            ["Landscaping 0", "Landscaping 2"],
+            "the scored CSV must carry every lead the run did score",
+        )
+        self.assertEqual(
+            [skip.reason for skip in run.skipped_records],
+            ["batch_failed"],
+            "the failed batch's leads must be reported as skipped, not silently dropped",
+        )
+        self.assertIn(
+            "batch_002",
+            " ".join(run.debug_notes),
+            "the failure must name the batch so the raw response is findable",
+        )
+        # Usage from the failed attempt still counts — it was paid for.
+        self.assertEqual(run.calls, 3)
+        self.assertEqual(run.tokens, 23)
+
+    def test_concurrent_run_survives_one_unparseable_batch(self) -> None:
+        run, banked = self._run(concurrency=4)
+        self._assert_survivors_kept(run, banked)
+
+    def test_serial_run_survives_one_unparseable_batch(self) -> None:
+        run, banked = self._run(concurrency=1)
+        self._assert_survivors_kept(run, banked)

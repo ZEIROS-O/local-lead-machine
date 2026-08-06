@@ -3338,6 +3338,30 @@ def score_records_api_run(
         usd += estimate_llm_usd(usage, model=str(getattr(exc, "model", "") or "").strip() or model)
         _write_partial_usage()
 
+    def _record_batch_failure(
+        exc: BaseException, *, batch_id: str, chunk: List[Dict[str, Any]]
+    ) -> None:
+        """Bound a batch failure to its own batch instead of aborting the run.
+
+        A batch can come back unparseable after both the truncation retry and the
+        validation-repair call have been spent — 2026-08-06 saw kimi-k3 emit a
+        `safe_outreach_claims` entry with no `"claim":` key, a JSON syntax error
+        that raises before schema validation and so reaches neither path. Letting
+        that propagate discarded 24 already-banked batches and wrote no CSV at
+        all. Treat it like a cap stop instead: charge the usage, name the leads in
+        `skipped_records`, and let the run finish with what it did score.
+        """
+        print(f"[LLM BATCH FAILED] batch={batch_id} leads={len(chunk)} error={exc}")
+        debug_notes.append(f"batch {batch_id} failed and its leads were skipped: {exc}")
+        for record in chunk:
+            skipped_records.append(
+                ApiLlmSkip(
+                    lead_name=_lead_name_for_skip(record, fallback_vertical=fallback_vertical),
+                    score_file=score_file_for_record(record, fallback_vertical=fallback_vertical),
+                    reason="batch_failed",
+                )
+            )
+
     if concurrency > 1 and selected:
         # Concurrent path. Batches are composed up front against *reserved*
         # worst-case usage (see _plan_api_llm_batches), submitted to a bounded
@@ -3392,7 +3416,10 @@ def score_records_api_run(
                     result = future.result()
                 except Exception as exc:
                     _bank_failed_batch(exc)
-                    raise
+                    _record_batch_failure(
+                        exc, batch_id=planned_batch.batch_id, chunk=planned_batch.chunk
+                    )
+                    continue
                 _bank_batch(result, batch_id=planned_batch.batch_id, chunk=planned_batch.chunk)
         finally:
             pool.shutdown(wait=False, cancel_futures=True)
@@ -3491,37 +3518,14 @@ def score_records_api_run(
                 max_tokens=max_tokens,
             )
         except Exception as exc:
-            usage = getattr(exc, "usage", None) or {}
-            calls += safe_int(getattr(exc, "call_count", 0))
-            batch_input_tokens = safe_int(usage.get("input_tokens"))
-            batch_output_tokens = safe_int(usage.get("output_tokens"))
-            batch_total_tokens = safe_int(usage.get("total_tokens")) or batch_input_tokens + batch_output_tokens
-            input_tokens += batch_input_tokens
-            output_tokens += batch_output_tokens
-            tokens += batch_total_tokens
-            usd += estimate_llm_usd(usage, model=str(getattr(exc, "model", "") or "").strip() or model)
-            if usage_output_path is not None:
-                _write_llm_usage_payload(
-                    usage_output_path,
-                    _llm_usage_payload(
-                        calls=calls,
-                        input_tokens=input_tokens,
-                        output_tokens=output_tokens,
-                        total_tokens=tokens,
-                        usd=usd,
-                        caps={
-                            "MAX_LLM_CALLS_PER_RUN": max_calls,
-                            "MAX_LLM_TOKENS_PER_RUN": max_tokens_per_run,
-                            "MAX_LLM_USD_PER_RUN": max_usd_per_run,
-                        },
-                        stopped_by_cap=stopped_by_cap,
-                        stop_reason=stop_reason,
-                        skipped_records=skipped_records,
-                        debug_notes=debug_notes,
-                        partial=True,
-                    ),
-                )
-            raise
+            # Same containment as the concurrent path: charge what the failed
+            # attempt burned, record the leads it cost us, and move to the next
+            # batch rather than discarding every batch already banked.
+            _bank_failed_batch(exc)
+            _record_batch_failure(exc, batch_id=batch_id, chunk=chunk)
+            index += len(chunk)
+            batch_index += 1
+            continue
         # Price by the model that actually served the batch, not the run-level
         # one. With a subscription runner first in the chain, `model` is
         # "subscription:<runner>" at $0/$0 — so a fallback to a paid API would

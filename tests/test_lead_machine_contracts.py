@@ -4759,7 +4759,15 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(len(run.skipped_records or []), 1)
         self.assertEqual((run.skipped_records or [])[0].reason, "single_record_exceeds_token_cap")
 
-    def test_api_llm_invalid_json_writes_raw_debug_output_before_raising(self) -> None:
+    def test_api_llm_invalid_json_writes_raw_debug_output_and_skips_the_batch(self) -> None:
+        """The raw body must land on disk and the batch must be skipped, not fatal.
+
+        This used to assert the run raised. It no longer does: a batch that stays
+        unparseable after its retry and repair paths is contained to that batch
+        (see BatchFailureIsolationTest), so the debug artifact and the reason
+        reach the caller via `debug_notes`/`skipped_records` instead of a
+        traceback. The artifact contract itself is unchanged.
+        """
         from lead_machine.llm_client import InvalidLlmResponse
         from score_leads import score_records_api_run
 
@@ -4771,23 +4779,23 @@ class LeadMachineContractsTest(unittest.TestCase):
                 "score_leads.llm_client.score_batch",
                 side_effect=InvalidLlmResponse("Invalid LLM score bundle JSON: Unterminated string", raw_text=raw_text),
             ):
-                with self.assertRaises(ValueError) as caught:
-                    score_records_api_run(
-                        [self._huge_detailing_record()],
-                        scores_dir=scores_dir,
-                        fallback_vertical="detailing",
-                        batch_size=1,
-                        model="claude-sonnet-5",
-                        max_tokens=8192,
-                        max_calls=0,
-                        max_tokens_per_run=100_000,
-                        max_usd_per_run=0.0,
-                    )
+                run = score_records_api_run(
+                    [self._huge_detailing_record()],
+                    scores_dir=scores_dir,
+                    fallback_vertical="detailing",
+                    batch_size=1,
+                    model="claude-sonnet-5",
+                    max_tokens=8192,
+                    max_calls=0,
+                    max_tokens_per_run=100_000,
+                    max_usd_per_run=0.0,
+                )
 
             debug_path = scores_dir / "_api_bundles" / "batch_001_invalid_response_attempt_1.txt"
             self.assertTrue(debug_path.exists())
             self.assertEqual(debug_path.read_text(encoding="utf-8"), raw_text)
-            self.assertIn(str(debug_path), str(caught.exception))
+            self.assertIn(str(debug_path), " ".join(run.debug_notes))
+            self.assertEqual([skip.reason for skip in run.skipped_records], ["batch_failed"])
 
     def test_api_llm_terminal_failure_writes_partial_usage_output(self) -> None:
         from lead_machine.llm_client import InvalidLlmResponse
@@ -4806,26 +4814,28 @@ class LeadMachineContractsTest(unittest.TestCase):
                     usage=usage,
                 ),
             ):
-                with self.assertRaises(ValueError):
-                    score_records_api_run(
-                        [self._huge_detailing_record()],
-                        scores_dir=scores_dir,
-                        fallback_vertical="detailing",
-                        batch_size=1,
-                        model="claude-sonnet-5",
-                        max_tokens=4096,
-                        max_calls=0,
-                        max_tokens_per_run=100_000,
-                        max_usd_per_run=0.0,
-                        usage_output_path=usage_path,
-                    )
+                run = score_records_api_run(
+                    [self._huge_detailing_record()],
+                    scores_dir=scores_dir,
+                    fallback_vertical="detailing",
+                    batch_size=1,
+                    model="claude-sonnet-5",
+                    max_tokens=4096,
+                    max_calls=0,
+                    max_tokens_per_run=100_000,
+                    max_usd_per_run=0.0,
+                    usage_output_path=usage_path,
+                )
 
+            # A failed attempt is still a paid attempt: it must be charged against
+            # the run's caps whether or not the run goes on to finish.
             payload = json.loads(usage_path.read_text(encoding="utf-8"))
             self.assertEqual(payload["calls"], 1)
             self.assertEqual(payload["input_tokens"], 1000)
             self.assertEqual(payload["output_tokens"], 200)
             self.assertEqual(payload["total_tokens"], 1200)
             self.assertTrue(payload["partial"])
+            self.assertEqual([skip.reason for skip in run.skipped_records], ["batch_failed"])
 
     def test_api_llm_no_text_response_retries_with_larger_token_cap(self) -> None:
         from lead_machine.llm_client import InvalidLlmResponse
@@ -4956,26 +4966,28 @@ class LeadMachineContractsTest(unittest.TestCase):
                     ),
                 ],
             ):
-                with self.assertRaises(RuntimeError) as caught:
-                    score_records_api_run(
-                        [self._huge_detailing_record()],
-                        scores_dir=scores_dir,
-                        fallback_vertical="detailing",
-                        batch_size=1,
-                        model="claude-sonnet-5",
-                        max_tokens=4096,
-                        max_calls=0,
-                        max_tokens_per_run=100_000,
-                        max_usd_per_run=0.0,
-                    )
+                run = score_records_api_run(
+                    [self._huge_detailing_record()],
+                    scores_dir=scores_dir,
+                    fallback_vertical="detailing",
+                    batch_size=1,
+                    model="claude-sonnet-5",
+                    max_tokens=4096,
+                    max_calls=0,
+                    max_tokens_per_run=100_000,
+                    max_usd_per_run=0.0,
+                )
 
             debug_path = scores_dir / "_api_bundles" / "batch_001_validation_failed_attempt_1.json"
             self.assertTrue(debug_path.exists())
             self.assertEqual(debug_path.read_text(encoding="utf-8"), raw_text)
-            message = str(caught.exception)
+            # Same diagnostic content as when this was a raised RuntimeError —
+            # it now reaches the operator through the run's debug notes.
+            message = " ".join(run.debug_notes)
             self.assertIn("batch_001", message)
             self.assertIn("confidence must be low, medium, or high", message)
             self.assertIn(str(debug_path), message)
+            self.assertEqual([skip.reason for skip in run.skipped_records], ["batch_failed"])
 
     def test_api_llm_preserves_successful_first_batch_when_second_batch_validation_fails(self) -> None:
         from lead_machine.llm_client import InvalidLlmResponse
@@ -5010,22 +5022,25 @@ class LeadMachineContractsTest(unittest.TestCase):
                     ),
                 ],
             ):
-                with self.assertRaises(RuntimeError):
-                    score_records_api_run(
-                        [first, second],
-                        scores_dir=scores_dir,
-                        fallback_vertical="detailing",
-                        batch_size=1,
-                        model="claude-sonnet-5",
-                        max_tokens=4096,
-                        max_calls=0,
-                        max_tokens_per_run=100_000,
-                        max_usd_per_run=0.0,
-                    )
+                run = score_records_api_run(
+                    [first, second],
+                    scores_dir=scores_dir,
+                    fallback_vertical="detailing",
+                    batch_size=1,
+                    model="claude-sonnet-5",
+                    max_tokens=4096,
+                    max_calls=0,
+                    max_tokens_per_run=100_000,
+                    max_usd_per_run=0.0,
+                )
 
             self.assertTrue((scores_dir / "_api_bundles" / "batch_001_response.json").exists())
             self.assertTrue((scores_dir / "chij123.json").exists())
             self.assertTrue((scores_dir / "_api_bundles" / "batch_002_validation_failed_attempt_1.json").exists())
+            # The preservation this test is named for now reaches the output too:
+            # the good batch becomes a scored row instead of dying with the run.
+            self.assertEqual([row["Business Name"] for row in run.manual_run.rows], ["First Detail"])
+            self.assertEqual([skip.lead_name for skip in run.skipped_records], ["Second Detail"])
 
     def test_manual_score_loader_accepts_new_schema_and_normalizes_mismatched_total(self) -> None:
         raw_score = self._manual_score(total_score=1, grade="Skip")
