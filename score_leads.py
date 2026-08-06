@@ -26,6 +26,7 @@ import os
 import re
 import shutil
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -3100,6 +3101,124 @@ def clear_scores_dir(scores_dir: Path) -> None:
         shutil.rmtree(bundle_dir)
 
 
+DEFAULT_LLM_SCORING_CONCURRENCY = 4
+
+
+def resolve_llm_scoring_concurrency() -> int:
+    """Batches in flight at once during API-LLM scoring.
+
+    The safe ceiling is provider-specific and is NOT one number: the CLI runners
+    (`codex`, `claude`) are bounded by local CPU/memory per subprocess, while
+    `kimi` and `anthropic` are bounded by per-org tokens-per-minute limits. 4 is
+    conservative for all four. Raise it only against a provider whose rate limit
+    you have actually checked.
+    """
+    return max(1, getenv_int("LLM_SCORING_CONCURRENCY", DEFAULT_LLM_SCORING_CONCURRENCY))
+
+
+@dataclass(frozen=True)
+class _PlannedBatch:
+    """One batch composed before any API call, so it can be submitted concurrently."""
+
+    batch_id: str
+    chunk: List[Dict[str, Any]]
+    compact_records: List[Dict[str, Any]]
+    prompt: str
+    reserved_tokens: int
+    reserved_usd: float
+
+
+def _plan_api_llm_batches(
+    selected: List[Dict[str, Any]],
+    *,
+    fallback_vertical: str,
+    batch_size: int,
+    model: str,
+    max_tokens: int,
+    max_tokens_per_run: int,
+    max_usd_per_run: float,
+) -> Tuple[List[_PlannedBatch], List[ApiLlmSkip], str]:
+    """Compose every batch up front, reserving worst-case tokens/spend per batch.
+
+    The serial loop decides whether the *next* batch fits by adding its projection
+    to the *actual* usage banked so far. With calls in flight there is no actual
+    usage to read, so planning reserves `estimated_prompt_tokens + max_tokens` —
+    always >= what the call really costs. The cap therefore binds earlier than it
+    would serially, never later: a concurrent run can stop short of a batch the
+    serial run would have made, but it can never overshoot the cap.
+    """
+    planned: List[_PlannedBatch] = []
+    skipped: List[ApiLlmSkip] = []
+    stop_reason = ""
+    index = 0
+    batch_index = 1
+    reserved_tokens = 0
+    reserved_usd = 0.0
+    configured_batch_size = max(1, batch_size)
+
+    while index < len(selected):
+        current_batch_size = min(configured_batch_size, len(selected) - index)
+        batch_id = f"batch_{batch_index:03d}"
+        while current_batch_size > 0:
+            chunk = selected[index : index + current_batch_size]
+            compact_records = [
+                build_llm_scoring_record(record, fallback_vertical=fallback_vertical)
+                for record in chunk
+            ]
+            prompt = build_api_llm_scoring_prompt(compact_records, batch_id=batch_id)
+            estimated_prompt_tokens = estimate_prompt_tokens(prompt)
+            projected_total_tokens = estimated_prompt_tokens + max(0, max_tokens)
+            projected_usd = _projected_usd_for_prompt(estimated_prompt_tokens, max_tokens, model=model)
+
+            chunk_exceeds_run_cap = max_tokens_per_run > 0 and projected_total_tokens > max_tokens_per_run
+            remaining_exceeds_run_cap = (
+                max_tokens_per_run > 0 and reserved_tokens + projected_total_tokens > max_tokens_per_run
+            )
+            remaining_exceeds_usd_cap = (
+                max_usd_per_run > 0 and reserved_usd + projected_usd > max_usd_per_run
+            )
+
+            if (
+                chunk_exceeds_run_cap or remaining_exceeds_run_cap or remaining_exceeds_usd_cap
+            ) and current_batch_size > 1:
+                current_batch_size = max(1, current_batch_size // 2)
+                continue
+
+            if chunk_exceeds_run_cap:
+                skipped_record = ApiLlmSkip(
+                    lead_name=_lead_name_for_skip(chunk[0], fallback_vertical=fallback_vertical),
+                    score_file=score_file_for_record(chunk[0], fallback_vertical=fallback_vertical),
+                    reason="single_record_exceeds_token_cap",
+                )
+                skipped.append(skipped_record)
+                print(f"[LLM SKIP] {skipped_record.score_file}: {skipped_record.reason}")
+                index += 1
+                break
+
+            if remaining_exceeds_run_cap:
+                return planned, skipped, "MAX_LLM_TOKENS_PER_RUN"
+            if remaining_exceeds_usd_cap:
+                return planned, skipped, "MAX_LLM_USD_PER_RUN"
+
+            planned.append(
+                _PlannedBatch(
+                    batch_id=batch_id,
+                    chunk=chunk,
+                    compact_records=compact_records,
+                    prompt=prompt,
+                    reserved_tokens=projected_total_tokens,
+                    reserved_usd=projected_usd,
+                )
+            )
+            reserved_tokens += projected_total_tokens
+            reserved_usd += projected_usd
+            index += len(chunk)
+            batch_index += 1
+            break
+
+    return planned, skipped, stop_reason
+
+
 def score_records_api_run(
     records: List[Dict[str, Any]],
     *,
@@ -3113,6 +3232,7 @@ def score_records_api_run(
     max_usd_per_run: float = DEFAULT_MAX_LLM_USD_PER_RUN,
     resume_scored_keys: set[str] | None = None,
     usage_output_path: Path | None = None,
+    concurrency: int = 1,
 ) -> ApiLlmRun:
     unscored_records, skipped_already_scored = filter_unscored_records(
         records,
@@ -3135,7 +3255,137 @@ def score_records_api_run(
     batch_index = 1
     configured_batch_size = max(1, batch_size)
 
-    while index < len(selected):
+    def _write_partial_usage() -> None:
+        if usage_output_path is None:
+            return
+        _write_llm_usage_payload(
+            usage_output_path,
+            _llm_usage_payload(
+                calls=calls,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=tokens,
+                usd=usd,
+                caps={
+                    "MAX_LLM_CALLS_PER_RUN": max_calls,
+                    "MAX_LLM_TOKENS_PER_RUN": max_tokens_per_run,
+                    "MAX_LLM_USD_PER_RUN": max_usd_per_run,
+                },
+                stopped_by_cap=stopped_by_cap,
+                stop_reason=stop_reason,
+                skipped_records=skipped_records,
+                debug_notes=debug_notes,
+                partial=True,
+            ),
+        )
+
+    def _bank_batch(result: Dict[str, Any], *, batch_id: str, chunk: List[Dict[str, Any]]) -> None:
+        """Merge one completed batch. Called on the calling thread, in submit order."""
+        nonlocal calls, input_tokens, output_tokens, tokens, usd
+        served_model = resolve_served_model(result, model)
+        runner_model = result.get("runner_model")
+        runner_model = runner_model.strip() if isinstance(runner_model, str) else ""
+        print(
+            f"[LLM PROVIDER] batch={batch_id} provider={result.get('provider', 'unknown')} "
+            f"model={served_model}" + (f" runner_model={runner_model}" if runner_model else "")
+        )
+        bundle = result["bundle"]
+        usage = result.get("usage") or {}
+        calls += safe_int(result.get("call_count")) or 1
+        debug_notes.extend(str(note) for note in result.get("debug_notes") or [] if str(note))
+        batch_input_tokens = safe_int(usage.get("input_tokens"))
+        batch_output_tokens = safe_int(usage.get("output_tokens"))
+        batch_total_tokens = (
+            safe_int(usage.get("total_tokens")) or batch_input_tokens + batch_output_tokens
+        )
+        input_tokens += batch_input_tokens
+        output_tokens += batch_output_tokens
+        tokens += batch_total_tokens
+        usd += estimate_llm_usd(usage, model=served_model)
+
+        bundle_dir.mkdir(parents=True, exist_ok=True)
+        bundle_path = bundle_dir / f"{batch_id}_response.json"
+        bundle_path.write_text(json.dumps(bundle, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        import_score_bundle(bundle_path, scores_dir)
+        _write_partial_usage()
+
+    def _bank_failed_batch(exc: BaseException) -> None:
+        nonlocal calls, input_tokens, output_tokens, tokens, usd
+        usage = getattr(exc, "usage", None) or {}
+        calls += safe_int(getattr(exc, "call_count", 0))
+        batch_input_tokens = safe_int(usage.get("input_tokens"))
+        batch_output_tokens = safe_int(usage.get("output_tokens"))
+        batch_total_tokens = (
+            safe_int(usage.get("total_tokens")) or batch_input_tokens + batch_output_tokens
+        )
+        input_tokens += batch_input_tokens
+        output_tokens += batch_output_tokens
+        tokens += batch_total_tokens
+        usd += estimate_llm_usd(usage, model=str(getattr(exc, "model", "") or "").strip() or model)
+        _write_partial_usage()
+
+    if concurrency > 1 and selected:
+        # Concurrent path. Batches are composed up front against *reserved*
+        # worst-case usage (see _plan_api_llm_batches), submitted to a bounded
+        # pool, and merged strictly in submit order — completion order would
+        # change which bundle wins a score_file collision and would renumber
+        # batch ids relative to a serial run.
+        planned, planned_skips, plan_stop_reason = _plan_api_llm_batches(
+            selected,
+            fallback_vertical=fallback_vertical,
+            batch_size=configured_batch_size,
+            model=model,
+            max_tokens=max_tokens,
+            max_tokens_per_run=max_tokens_per_run,
+            max_usd_per_run=max_usd_per_run,
+        )
+        skipped_records.extend(planned_skips)
+        if plan_stop_reason:
+            stopped_by_cap = True
+            stop_reason = plan_stop_reason
+            print(f"[STOP] Hit {stop_reason}")
+
+        for planned_batch in planned:
+            for record, compact in zip(planned_batch.chunk, planned_batch.compact_records):
+                lead_id = lead_id_for_record(record, fallback_vertical=fallback_vertical)
+                api_evidence_ref_ids_by_lead_id[lead_id] = compact_evidence_ref_ids(compact)
+
+        pool = ThreadPoolExecutor(max_workers=concurrency)
+        submitted: List[Tuple[_PlannedBatch, Any]] = []
+        try:
+            for position, planned_batch in enumerate(planned):
+                if max_calls > 0 and position >= max_calls:
+                    stopped_by_cap = True
+                    stop_reason = "MAX_LLM_CALLS_PER_RUN"
+                    print(f"[STOP] Hit {stop_reason}")
+                    break
+                submitted.append(
+                    (
+                        planned_batch,
+                        pool.submit(
+                            _score_batch_with_debug,
+                            planned_batch.prompt,
+                            batch_id=planned_batch.batch_id,
+                            bundle_dir=bundle_dir,
+                            compact_records=planned_batch.compact_records,
+                            model=model,
+                            max_tokens=max_tokens,
+                        ),
+                    )
+                )
+            for planned_batch, future in submitted:
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    _bank_failed_batch(exc)
+                    raise
+                _bank_batch(result, batch_id=planned_batch.batch_id, chunk=planned_batch.chunk)
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+    # Serial path — unchanged, and still the default (`concurrency` == 1) so every
+    # existing caller keeps byte-identical batch composition and cap semantics.
+    while concurrency <= 1 and index < len(selected):
         stop_reason = _hit_llm_cap(
             calls=calls,
             tokens=tokens,
@@ -3631,6 +3881,7 @@ def main() -> int:
             max_tokens_per_run=max_tokens_per_run,
             max_usd_per_run=max_usd_per_run,
             usage_output_path=Path(args.llm_usage_output) if args.llm_usage_output else None,
+            concurrency=resolve_llm_scoring_concurrency(),
         )
         scored = api_run.manual_run.rows
         print(f"[LLM] Calls: {api_run.calls}")

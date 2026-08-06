@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import time
 from typing import Any, Callable, Dict, List
 
@@ -186,8 +187,35 @@ def _transient_request_reason(exc: requests.RequestException) -> str:
     return exc.__class__.__name__
 
 
+_dotenv_lock = threading.Lock()
+_dotenv_loaded = False
+
+
+def _ensure_dotenv_loaded() -> None:
+    """Load .env exactly once per process.
+
+    `load_dotenv()` mutates os.environ. Calling it per request was harmless while
+    scoring was serial; with batches in flight concurrently it is N threads
+    writing a shared dict. Double-checked locking keeps the fast path lock-free.
+    """
+    global _dotenv_loaded
+    if _dotenv_loaded:
+        return
+    with _dotenv_lock:
+        if _dotenv_loaded:
+            return
+        load_dotenv()
+        _dotenv_loaded = True
+
+
+def _reset_dotenv_loaded_for_tests() -> None:
+    global _dotenv_loaded
+    with _dotenv_lock:
+        _dotenv_loaded = False
+
+
 def _score_batch_anthropic(prompt: str, *, model: str | None = None, max_tokens: int) -> Dict[str, Any]:
-    load_dotenv()
+    _ensure_dotenv_loaded()
     api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     if not api_key:
         raise ProviderUnavailable("Missing ANTHROPIC_API_KEY in .env")
@@ -483,7 +511,7 @@ def _provider_chain() -> List[str]:
 
 
 def score_batch(prompt: str, *, model: str | None = None, max_tokens: int) -> Dict[str, Any]:
-    load_dotenv()
+    _ensure_dotenv_loaded()
     failures: List[str] = []
     for index, provider in enumerate(_provider_chain()):
         # An explicit model belongs to the provider it was chosen for. Handing a
@@ -514,7 +542,7 @@ def score_batch(prompt: str, *, model: str | None = None, max_tokens: int) -> Di
 
 def provider_chain() -> List[str]:
     """The resolved fallback chain, in order. Public for cost projection."""
-    load_dotenv()
+    _ensure_dotenv_loaded()
     return _provider_chain()
 
 
@@ -540,7 +568,7 @@ def resolve_scoring_model() -> str:
     first in the chain would otherwise project $0 for a run that falls through
     to a paid API and spends real money.
     """
-    load_dotenv()
+    _ensure_dotenv_loaded()
     chain = _provider_chain()
     first = chain[0] if chain else "anthropic"
     if first == "kimi":
