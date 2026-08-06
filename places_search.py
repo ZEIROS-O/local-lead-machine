@@ -483,9 +483,14 @@ def main() -> int:
         print("[ERROR] Missing GOOGLE_PLACES_API_KEY in .env", file=sys.stderr)
         return 1
 
-    max_search_calls = getenv_int("MAX_SEARCH_CALLS_PER_RUN", 3)
-    max_details_calls = getenv_int("MAX_DETAILS_CALLS_PER_RUN", 50)
-    max_total_places = getenv_int("MAX_TOTAL_PLACES_PER_RUN", 50)
+    # Legacy-CLI budgets: this entry point is not the one `run_agent_pipeline.py`
+    # drives — `make_search_batch.py` reads none of these and bounds its own spend
+    # by `limit_per_query` x searches and `--max-details`. Raised 2026-08-05 off
+    # the same 2026-06-20 build-time defaults as the LLM caps; 3 search calls
+    # could not complete a single metro's search config.
+    max_search_calls = getenv_int("MAX_SEARCH_CALLS_PER_RUN", 30)
+    max_details_calls = getenv_int("MAX_DETAILS_CALLS_PER_RUN", 400)
+    max_total_places = getenv_int("MAX_TOTAL_PLACES_PER_RUN", 400)
 
     searches_path = Path(args.searches)
     output_path = Path(args.output)

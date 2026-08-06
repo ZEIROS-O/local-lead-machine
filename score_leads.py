@@ -272,10 +272,24 @@ class LlmCostEstimate:
 
 DEFAULT_LLM_SCORING_MODEL = "claude-sonnet-5"
 DEFAULT_LLM_MAX_TOKENS = 4096
-DEFAULT_MAX_LLM_CALLS_PER_RUN = 5
-DEFAULT_MAX_LLM_TOKENS_PER_RUN = 100_000
-DEFAULT_MAX_LLM_USD_PER_RUN = 5.0
-DEFAULT_LLM_SPEND_CONFIRM_USD = 0.50
+# Sized against a real batch, 2026-08-05. The originals (5 calls / 100k tokens)
+# came from the first LLM-scoring commit on 2026-06-20, when a "batch" was a
+# handful of test leads; they were never revisited and had become the binding
+# throughput limit — a 133-lead batch is 27 calls, so a 5-call ceiling scored 25
+# leads and stopped, making concurrency worth ~1.25x instead of 4x.
+#
+# Reference point: 133 leads at --llm-batch-size 5 = 27 batches, 370,862
+# projected tokens, $2.44 projected / ~$2.20 actual on kimi-k3. These leave
+# roughly 2x headroom on that, because the halving path at _plan_api_llm_batches
+# can split a batch and push the call count above the naive ceil(leads / size).
+#
+# MAX_LLM_USD_PER_RUN is the real backstop — it is denominated in the thing that
+# actually hurts. The calls and tokens ceilings are blunt proxies kept as a
+# second line of defence against a pricing bug making USD read low.
+DEFAULT_MAX_LLM_CALLS_PER_RUN = 60
+DEFAULT_MAX_LLM_TOKENS_PER_RUN = 800_000
+DEFAULT_MAX_LLM_USD_PER_RUN = 10.0
+DEFAULT_LLM_SPEND_CONFIRM_USD = 3.00
 # Per-model list prices in USD per million tokens, as (input, output).
 #
 # Cost was previously computed from two constants named for Sonnet 4.6 while

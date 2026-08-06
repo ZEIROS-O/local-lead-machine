@@ -2339,7 +2339,12 @@ def main() -> int:
         print(f"[ERROR] Missing input file: {input_path}", file=sys.stderr)
         return 1
 
-    max_websites = getenv_int("MAX_WEBSITES_PER_RUN", 40)
+    # Raised 40 -> 200 on 2026-08-05. Unlike the LLM caps this one *discards
+    # leads* rather than stopping short, so an undersized value is a silent
+    # yield loss: a 133-lead batch under the old 40 threw away 93 already-paid-
+    # for Places results. 200 clears a full metro batch with headroom.
+    # NOTE: .env sets MAX_WEBSITES_PER_RUN=90, which still binds ahead of this.
+    max_websites = getenv_int("MAX_WEBSITES_PER_RUN", 200)
 
     rows = read_csv(input_path)
 
