@@ -71,3 +71,6 @@ data/*
 !tests/fixtures/
 !tests/fixtures/**
 !.gitkeep
+
+# Sales collateral / one-off documents
+.outputs/
