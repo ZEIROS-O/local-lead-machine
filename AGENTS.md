@@ -220,9 +220,16 @@ non-zero exit means the base has fallen behind and a write path is about to 422:
   `AIRTABLE_DEALS_TABLE` (default `Deals`), `AIRTABLE_RECEIPTS_PATH`, `ANTHROPIC_API_KEY`,
   `LPM_SETTER_ROSTER` (ordered comma-separated active setters; assignment is stable for new leads
   and never overwrites an existing assignee),
-  `LLM_SCORING_MODEL`, the `MAX_LLM_*` caps, the Places caps (`MAX_SEARCH_CALLS_PER_RUN` 3,
-  `MAX_DETAILS_CALLS_PER_RUN` 50, `MAX_TOTAL_PLACES_PER_RUN` 50, `MAX_WEBSITES_PER_RUN` 40),
-  `ENRICH_WORKERS`, `PLACES_DETAILS_WORKERS` (6, max 8),
+  `LLM_SCORING_MODEL`, the `MAX_LLM_*` caps (`MAX_LLM_CALLS_PER_RUN` 60, `MAX_LLM_TOKENS_PER_RUN`
+  800k, `MAX_LLM_USD_PER_RUN` $10, `LLM_SPEND_CONFIRM_USD` $3 — all resized 2026-08-05 off the
+  2026-06-20 build-time values, which had become the binding throughput limit at 5 calls/run;
+  **`MAX_LLM_USD_PER_RUN` is the real backstop**, the calls/tokens ceilings are blunt proxies),
+  `LLM_SCORING_CONCURRENCY` (4; the safe value is provider-specific — CLI runners are bounded by
+  local CPU/memory, `kimi`/`anthropic` by per-org tokens-per-minute), the Places caps
+  (`MAX_SEARCH_CALLS_PER_RUN` 30, `MAX_DETAILS_CALLS_PER_RUN` 400, `MAX_TOTAL_PLACES_PER_RUN` 400 —
+  legacy-CLI only, `make_search_batch.py` reads none of them), `MAX_WEBSITES_PER_RUN` (200; this one
+  **discards leads** past the ceiling rather than stopping short, so undersizing it is a silent yield
+  loss), `ENRICH_WORKERS`, `PLACES_DETAILS_WORKERS` (6, max 8),
   `BUYER_INTENT_ADS_CHECK` (off), `FOLLOW_UP_CADENCE_DAYS` (4), and
   `REVIEW_SNAPSHOT_DB`.
   **Compliance requires `SUPPRESSION_SOURCE` (or `LPM_OUTCOMES_JSONL`) to be set** or search,
