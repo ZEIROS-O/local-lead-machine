@@ -14,7 +14,14 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+# Agent worktrees — a checkout inside the repo returns false hits on every
+# repo-wide grep, which has already misled one review. Never commit one.
 .worktrees/
+.claude/worktrees/
+
+# Machine-local Claude Code settings (the shared ones in settings.json ARE tracked)
+.claude/settings.local.json
 
 # Dashboard frontend build/install output
 dashboard-ui/node_modules/
