@@ -26,10 +26,11 @@ import os
 import re
 import shutil
 import sys
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Deque, Dict, List, Tuple
 
 from dotenv import load_dotenv
 
@@ -289,6 +290,14 @@ DEFAULT_LLM_MAX_TOKENS = 4096
 DEFAULT_MAX_LLM_CALLS_PER_RUN = 60
 DEFAULT_MAX_LLM_TOKENS_PER_RUN = 800_000
 DEFAULT_MAX_LLM_USD_PER_RUN = 10.0
+# Worst-case billed calls one batch can spend inside `_score_batch_with_debug`:
+# the initial call, a truncation retry, and a validation-repair call. A batch in
+# flight has banked nothing yet, so the concurrent cap gate has to charge it at
+# this worst case — otherwise `MAX_LLM_CALLS_PER_RUN` counts batches rather than
+# calls and a cap of 60 admits ~180 billed calls. It is the same multiplier for
+# tokens and USD: a retried batch re-sends its prompt and doubles its output
+# allowance, so it lands at 2-3x the single-call reservation the planner made.
+MAX_LLM_CALLS_PER_BATCH = 3
 DEFAULT_LLM_SPEND_CONFIRM_USD = 3.00
 # Per-model list prices in USD per million tokens, as (input, output).
 #
@@ -3147,7 +3156,7 @@ def _plan_api_llm_batches(
     *,
     fallback_vertical: str,
     batch_size: int,
-    model: str,
+    projection_model: str,
     max_tokens: int,
     max_tokens_per_run: int,
     max_usd_per_run: float,
@@ -3155,11 +3164,21 @@ def _plan_api_llm_batches(
     """Compose every batch up front, reserving worst-case tokens/spend per batch.
 
     The serial loop decides whether the *next* batch fits by adding its projection
-    to the *actual* usage banked so far. With calls in flight there is no actual
-    usage to read, so planning reserves `estimated_prompt_tokens + max_tokens` —
-    always >= what the call really costs. The cap therefore binds earlier than it
-    would serially, never later: a concurrent run can stop short of a batch the
-    serial run would have made, but it can never overshoot the cap.
+    to the *actual* usage banked so far. Planning happens before any call, so it
+    reserves `estimated_prompt_tokens + max_tokens` instead — the cost of exactly
+    one call. That is a *ceiling on the first call*, not on the batch: a truncation
+    retry re-sends the prompt with a doubled output allowance and a validation
+    repair sends a larger prompt, so a batch can land at 2-3x its reservation.
+    Planning is therefore the first line of defence only; the submission loop in
+    `score_records_api_run` reconciles against banked actuals so a cap can still
+    stop the run after planning is done.
+
+    `projection_model` prices the reservation and must be
+    `resolve_projection_model()` — the priciest model the chain could reach — not
+    the caller's `model`. A `subscription:*` entry at the head of the chain is
+    priced (0.0, 0.0), so pricing with the caller's model zeroes every reservation
+    and `MAX_LLM_USD_PER_RUN` stops binding at all, while a fall-through to Kimi or
+    the Claude API spends real money.
     """
     planned: List[_PlannedBatch] = []
     skipped: List[ApiLlmSkip] = []
@@ -3182,7 +3201,9 @@ def _plan_api_llm_batches(
             prompt = build_api_llm_scoring_prompt(compact_records, batch_id=batch_id)
             estimated_prompt_tokens = estimate_prompt_tokens(prompt)
             projected_total_tokens = estimated_prompt_tokens + max(0, max_tokens)
-            projected_usd = _projected_usd_for_prompt(estimated_prompt_tokens, max_tokens, model=model)
+            projected_usd = _projected_usd_for_prompt(
+                estimated_prompt_tokens, max_tokens, model=projection_model
+            )
 
             chunk_exceeds_run_cap = max_tokens_per_run > 0 and projected_total_tokens > max_tokens_per_run
             remaining_exceeds_run_cap = (
@@ -3240,6 +3261,7 @@ def score_records_api_run(
     fallback_vertical: str,
     batch_size: int = 5,
     model: str = DEFAULT_LLM_SCORING_MODEL,
+    projection_model: str = "",
     max_tokens: int = DEFAULT_LLM_MAX_TOKENS,
     max_calls: int = DEFAULT_MAX_LLM_CALLS_PER_RUN,
     max_tokens_per_run: int = DEFAULT_MAX_LLM_TOKENS_PER_RUN,
@@ -3248,11 +3270,20 @@ def score_records_api_run(
     usage_output_path: Path | None = None,
     concurrency: int = 1,
 ) -> ApiLlmRun:
+    """Score `records` through the API-LLM chain, bounded by the per-run caps.
+
+    `projection_model` is the model the *reservations* are priced with — pass
+    `resolve_projection_model()`, the priciest model the chain could reach. It
+    defaults to `model` only so existing callers keep working; a caller running a
+    `subscription:*`-first chain that leaves it unset gets a $0 reservation and no
+    working `MAX_LLM_USD_PER_RUN`.
+    """
     unscored_records, skipped_already_scored = filter_unscored_records(
         records,
         existing_keys=resume_scored_keys or set(),
         fallback_vertical=fallback_vertical,
     )
+    reservation_model = str(projection_model or "").strip() or model
     selected = [ensure_evidence(record) for record in unscored_records]
     bundle_dir = scores_dir / "_api_bundles"
     calls = 0
@@ -3364,15 +3395,13 @@ def score_records_api_run(
 
     if concurrency > 1 and selected:
         # Concurrent path. Batches are composed up front against *reserved*
-        # worst-case usage (see _plan_api_llm_batches), submitted to a bounded
-        # pool, and merged strictly in submit order — completion order would
-        # change which bundle wins a score_file collision and would renumber
-        # batch ids relative to a serial run.
+        # worst-case usage (see _plan_api_llm_batches), then fed to a bounded pool
+        # through the sliding window below.
         planned, planned_skips, plan_stop_reason = _plan_api_llm_batches(
             selected,
             fallback_vertical=fallback_vertical,
             batch_size=configured_batch_size,
-            model=model,
+            projection_model=reservation_model,
             max_tokens=max_tokens,
             max_tokens_per_run=max_tokens_per_run,
             max_usd_per_run=max_usd_per_run,
@@ -3388,30 +3417,84 @@ def score_records_api_run(
                 lead_id = lead_id_for_record(record, fallback_vertical=fallback_vertical)
                 api_evidence_ref_ids_by_lead_id[lead_id] = compact_evidence_ref_ids(compact)
 
+        # Submission and collection interleave through a sliding window rather
+        # than "submit everything, then collect everything". Submitting the whole
+        # plan up front left no point at which a cap could still stop the run: the
+        # only gate was the planned-batch *index* against `max_calls`, which
+        # counts batches while the bill is in calls, and the reservations behind
+        # it cover a single call per batch while a batch can spend three.
+        #
+        # The window keeps at most `concurrency` batches in flight and re-checks
+        # `_hit_llm_cap` against banked actuals before every submission, charging
+        # each in-flight batch at its worst case (MAX_LLM_CALLS_PER_BATCH x its
+        # reservation) because it has banked nothing yet. With nothing in flight
+        # that reduces to exactly the serial check, so the two paths stop at the
+        # same batch whenever the cap trips on a drained window.
+        #
+        # Residual, and it is inherent to running calls in parallel: batches
+        # already in flight when the cap trips are paid for and are still banked,
+        # so a token/USD cap can be overshot by their actual usage. Serial can
+        # overshoot by one batch; concurrent by up to `concurrency`.
         pool = ThreadPoolExecutor(max_workers=concurrency)
-        submitted: List[Tuple[_PlannedBatch, Any]] = []
+        in_flight: Deque[Tuple[_PlannedBatch, Any]] = deque()
+        in_flight_tokens = 0
+        in_flight_usd = 0.0
+        next_position = 0
+        submission_stopped = False
         try:
-            for position, planned_batch in enumerate(planned):
-                if max_calls > 0 and position >= max_calls:
-                    stopped_by_cap = True
-                    stop_reason = "MAX_LLM_CALLS_PER_RUN"
-                    print(f"[STOP] Hit {stop_reason}")
-                    break
-                submitted.append(
-                    (
-                        planned_batch,
-                        pool.submit(
-                            _score_batch_with_debug,
-                            planned_batch.prompt,
-                            batch_id=planned_batch.batch_id,
-                            bundle_dir=bundle_dir,
-                            compact_records=planned_batch.compact_records,
-                            model=model,
-                            max_tokens=max_tokens,
-                        ),
+            while True:
+                while (
+                    not submission_stopped
+                    and next_position < len(planned)
+                    and len(in_flight) < concurrency
+                ):
+                    cap_reason = _hit_llm_cap(
+                        calls=calls + MAX_LLM_CALLS_PER_BATCH * len(in_flight),
+                        tokens=tokens + MAX_LLM_CALLS_PER_BATCH * in_flight_tokens,
+                        usd=usd + MAX_LLM_CALLS_PER_BATCH * in_flight_usd,
+                        max_calls=max_calls,
+                        max_tokens_per_run=max_tokens_per_run,
+                        max_usd_per_run=max_usd_per_run,
                     )
-                )
-            for planned_batch, future in submitted:
+                    if cap_reason:
+                        # With work still in flight this is a throttle, not a
+                        # verdict — the reservations being charged may turn out to
+                        # cost far less. Drain first and re-decide on real numbers.
+                        if in_flight:
+                            break
+                        submission_stopped = True
+                        stopped_by_cap = True
+                        stop_reason = cap_reason
+                        print(f"[STOP] Hit {stop_reason}")
+                        break
+                    planned_batch = planned[next_position]
+                    next_position += 1
+                    in_flight_tokens += planned_batch.reserved_tokens
+                    in_flight_usd += planned_batch.reserved_usd
+                    in_flight.append(
+                        (
+                            planned_batch,
+                            pool.submit(
+                                _score_batch_with_debug,
+                                planned_batch.prompt,
+                                batch_id=planned_batch.batch_id,
+                                bundle_dir=bundle_dir,
+                                compact_records=planned_batch.compact_records,
+                                model=model,
+                                max_tokens=max_tokens,
+                            ),
+                        )
+                    )
+
+                if not in_flight:
+                    break
+
+                # Merged strictly in submit order — completion order would change
+                # which bundle wins a score_file collision and would renumber batch
+                # ids relative to a serial run.
+                planned_batch, future = in_flight.popleft()
+                in_flight_tokens -= planned_batch.reserved_tokens
+                in_flight_usd -= planned_batch.reserved_usd
                 try:
                     result = future.result()
                 except Exception as exc:
@@ -3894,6 +3977,9 @@ def main() -> int:
             fallback_vertical=args.vertical,
             batch_size=args.llm_batch_size,
             model=llm_model,
+            # Reservations price against the priciest tier the chain can fall
+            # through to, for the same reason the estimate above does.
+            projection_model=projection_model,
             max_tokens=args.llm_max_tokens,
             max_calls=max_calls,
             max_tokens_per_run=max_tokens_per_run,
