@@ -99,6 +99,13 @@ def lead_packet_for_record(record: Dict[str, Any], *, fallback_vertical: str) ->
     website = record.get("website", {}) or {}
     lead = normalize_lead(google, fallback_vertical=fallback_vertical, source_batch=google.get("source_query", ""))
     lane_result = classify_icp_lane(record)
+    prompt_evidence = dict(evidence)
+    # Raw crawl snapshots can contain megabytes of repeated navigation text
+    # and links. Scoring uses the stable evidence_items below plus the bounded
+    # website_text field, so carrying the raw snapshots adds no claimable
+    # evidence and can exceed subscription-runner input limits.
+    prompt_evidence.pop("verification_snapshot", None)
+    prompt_evidence.pop("verification_snapshots", None)
 
     return {
         "score_file": score_file_for_record(record, fallback_vertical=fallback_vertical),
@@ -109,7 +116,7 @@ def lead_packet_for_record(record: Dict[str, Any], *, fallback_vertical: str) ->
         "icp_lane_blockers": lane_result.blockers,
         "lead": lead.to_dict(),
         "screenshots": (evidence.get("screenshots") or website.get("screenshots") or record.get("screenshots") or {}),
-        "evidence": evidence,
+        "evidence": prompt_evidence,
         "buyer_intent": record.get("buyer_intent") or {},
         "buyer_intent_summary": buyer_intent_summary(record),
         "website_text": str(website.get("combined_text") or "")[:WEBSITE_TEXT_LIMIT],

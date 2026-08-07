@@ -2556,6 +2556,36 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertIn('"send_trigger": ""', prompt)
         self.assertEqual(expected_files, ["chij123.json", "chij456.json"])
 
+    def test_llm_batch_omits_raw_verification_snapshots_but_keeps_evidence_items(self) -> None:
+        evidence = self._evidence_fixture(site_status="weak")
+        evidence["verification_snapshot"] = {
+            "visible_text": "RAW-SNAPSHOT-TEXT" * 100,
+            "visible_links": ["https://example.com/raw-snapshot-link"],
+        }
+        evidence["verification_snapshots"] = [
+            {"visible_text": "RAW-SNAPSHOTS-TEXT" * 100}
+        ]
+        enriched = {
+            "google": self._google_fixture(),
+            "evidence": evidence,
+            "website": {"combined_text": "Bounded website text."},
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            batch_paths = write_llm_batches(
+                [enriched],
+                Path(tmp),
+                fallback_vertical="hardscaping",
+                batch_size=1,
+            )
+            prompt = batch_paths[0].prompt_path.read_text(encoding="utf-8")
+
+        self.assertNotIn("RAW-SNAPSHOT-TEXT", prompt)
+        self.assertNotIn("RAW-SNAPSHOTS-TEXT", prompt)
+        self.assertNotIn("raw-snapshot-link", prompt)
+        self.assertIn('"evidence_items"', prompt)
+        self.assertIn('"website_text": "Bounded website text."', prompt)
+
     def test_llm_batch_only_candidates_ranks_visible_pain_before_high_review_decent_site(self) -> None:
         high_review_decent = {
             "google": {
