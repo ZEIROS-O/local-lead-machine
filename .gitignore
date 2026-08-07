@@ -23,6 +23,11 @@ __pycache__/
 # Machine-local Claude Code settings (the shared ones in settings.json ARE tracked)
 .claude/settings.local.json
 
+# Packaging build output — `pip install -e .` (how both CI workflows install) writes these
+*.egg-info/
+build/
+dist/
+
 # Dashboard frontend build/install output
 dashboard-ui/node_modules/
 dashboard-ui/dist/

@@ -24,7 +24,7 @@ jobs:
       - name: Install test dependencies
         run: |
           python -m venv .venv
-          .venv/bin/pip install -r requirements-dashboard.txt beautifulsoup4 lxml playwright python-dotenv PyYAML tldextract
+          .venv/bin/pip install -e ".[runtime,dashboard,browser,test]"
 
       - name: Run tests
         run: .venv/bin/python -m unittest discover -s tests

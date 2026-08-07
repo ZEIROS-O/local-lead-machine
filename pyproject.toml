@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "local-lead-machine"
+version = "0.1.0"
+description = "Local-service lead discovery, enrichment, scoring, and outreach preparation"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+runtime = [
+  "requests>=2.32,<3",
+  "python-dotenv",
+  "PyYAML",
+  "tldextract",
+]
+dashboard = [
+  "fastapi>=0.115,<1",
+  "httpx>=0.28,<1",
+  "requests>=2.32,<3",
+  "uvicorn[standard]>=0.34,<1",
+]
+browser = [
+  "playwright",
+]
+test = [
+  "beautifulsoup4",
+  "lxml",
+]
+
+[tool.setuptools.packages.find]
+include = ["lead_machine*"]
