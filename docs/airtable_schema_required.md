@@ -60,7 +60,7 @@ Also observed 2026-07-29: the base has five tables (`Prospects`, `Sales Activiti
 | Skip Reason | Single line text | ? |  |
 | Place Key | Single line text | ? | Used as upsert key; must be unique per business |
 | Assigned Setter | Single select | ? | One exact choice per name in `LPM_SETTER_ROSTER`. Upload seeds a stable assignment only on create; it never PATCHes an existing assignment |
-| Status | Single select | partially verified (2026-07-30) | Canonical code vocabulary: New, Mockup Needed, Manual Review, Not Fit, Sent, Follow-Up, Won, Lost, **Do Not Contact**, **Booked**. The first eight were live on 2026-07-30; the two MVP additions require manual creation and have not been verified live. `Not Fit` and `Do Not Contact` are applied by hand |
+| Status | Single select | operator-reported live (2026-08-03) | Canonical code vocabulary: **New, Manual Review, Not Fit, Follow-Up, Won, Lost, Booked**. Lou manually consolidated `Mockup Needed` into `New`, `Sent` into `Follow-Up`, and `Do Not Contact` into `Not Fit` in the live base. Run `airtable_required_choices.py check` before writes; `Booked` has not been independently verified live |
 | Outreach Channel | Single select | yes (2026-07-29) | Live choices match exactly: Email, Phone, Instagram DM, SMS. This is why `mark_sent.py` is safe without `typecast` and `mark_outcome.py` is not — see below |
 | Consent Posture | Single line text | ? | Required and documented before any SMS draft can pass |
 | Last Contacted | Date | ? |  |
@@ -85,7 +85,7 @@ the automated pipeline creates rows here.
 > (typecast removal) until the eight missing select choices were created by hand — six in
 > `Sales Activities`, plus `Won` and `Lost` on `Prospects.Status`. All eight now exist and the
 > module became operational. The MVP now additionally requires `Sales Activities.Outcome = Held`,
-> `Prospects.Status = Do Not Contact / Booked`, the `Assigned Setter` field and choices, and
+> `Prospects.Status = Booked`, the `Assigned Setter` field and choices, and
 > `Deals.Cash Collected`. These additions are code-declared/documented but not verified live.
 >
 > **If a write starts 422-ing, run this first:**
@@ -101,7 +101,7 @@ the automated pipeline creates rows here.
 ### `Sales Activities` (`AIRTABLE_SALES_ACTIVITIES_TABLE`, default `Sales Activities`)
 
 One immutable row per observed funnel event — the activity ledger. This is the authoritative
-in-CRM record of what happened on a lead after `Status=Sent`.
+in-CRM record of what happened after contact moves a lead to `Status=Follow-Up`.
 
 | Field | Airtable Type | Notes |
 |-------|--------------|-------|
@@ -129,7 +129,7 @@ until the eight were added by hand on 2026-07-30:
 |-------|--------------------------|---------------------|
 | `Sales Activities.Activity Type` | **Reply**, **Close** | Call, Email, Meeting, Follow Up, Demo, Note, Other, Reply, Close |
 | `Sales Activities.Outcome` | **Replied**, **Meeting Booked**, **Won**, **Lost** | Completed, Scheduled, Rescheduled, Cancelled, No Show, Outcome Pending, Replied, Meeting Booked, Won, Lost. Add **Held** for the MVP closer workflow |
-| `Prospects.Status` | **Won**, **Lost** (and `Closed` removed) | New, Mockup Needed, Manual Review, Not Fit, Sent, Follow-Up, Won, Lost. Add **Do Not Contact** and **Booked** for the MVP |
+| `Prospects.Status` | **Won**, **Lost** (and `Closed` removed) | Current canonical vocabulary after the 2026-08-03 consolidation: New, Manual Review, Not Fit, Follow-Up, Won, Lost, Booked |
 
 The same obligation applies to any value added later: it is a hard prerequisite, not cleanup, and
 restoring `typecast` is not the fix — it is the drift channel the removal closed.
@@ -232,7 +232,7 @@ the UI steps. Field creation and non-select types (`Deals.Cash Collected`) remai
 
 1. Create `Prospects.Assigned Setter` as single select and add every exact name from
    `LPM_SETTER_ROSTER`.
-2. Add `Do Not Contact` and `Booked` to `Prospects.Status`.
+2. Confirm `Booked` exists in `Prospects.Status`.
 3. Add `Held` to `Sales Activities.Outcome`.
 4. Create `Deals.Cash Collected` as currency.
 5. Run `.venv/bin/python airtable_required_choices.py check`; it must exit 0.

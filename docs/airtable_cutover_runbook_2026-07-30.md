@@ -10,6 +10,17 @@ approved it, the code shipped as `6390d64`, and the base was brought into line
 the same day — the API doing what it could, Lou doing by hand the four things no
 API call can perform.
 
+## Status consolidation postscript — 2026-08-03
+
+Lou subsequently removed three redundant `Prospects.Status` choices in Airtable:
+`Do Not Contact` converged into `Not Fit`, `Sent` into `Follow-Up`, and
+`Mockup Needed` into `New`. The current canonical vocabulary is `New`,
+`Manual Review`, `Not Fit`, `Follow-Up`, `Won`, `Lost`, `Booked`.
+
+Current views must use `Status = New` for the call queue and `Status = Follow-Up`
+for due follow-ups. Historical observations below retain the choices and counts
+that were true during the 2026-07-30 cutover.
+
 ## What happened
 
 | Step | State | Note |
@@ -193,7 +204,7 @@ Re-count `Status=Closed`.
 - If records exist, classify each as Won or Lost from evidence. If the outcome is
   ambiguous, stop; never guess just to complete the migration.
 
-The final Status vocabulary must be exactly:
+The final Status vocabulary for the 2026-07-30 cutover was:
 
 `New`, `Mockup Needed`, `Manual Review`, `Not Fit`, `Sent`, `Follow-Up`, `Won`,
 `Lost`.
@@ -313,16 +324,16 @@ rep-facing views:
    - Filter: Packet Tier = Sendable Packet
    - Commercial Fit State = commercially-sendable
    - Contact Eligibility = contact-now
-   - Status is New or Mockup Needed
+   - Status is New
    - Sort: Lead Priority ascending, then Opportunity Score descending, then
      Score Total descending
    - Group: Vertical
 2. **📅 Follow-Ups Due**
    - Next Follow-Up is on or before today
-   - Status is Sent or Follow-Up
+   - Status is Follow-Up
    - Sort: Next Follow-Up ascending
 3. **📊 Pipeline**
-   - Kanban grouped by the canonical eight-value Status
+   - Kanban grouped by the canonical seven-value Status
 4. **🧪 Manual Review**
    - Packet Tier = Manual Review Packet
    - Sort: Opportunity Score descending, then Score Total descending
@@ -400,7 +411,7 @@ Then verify read-only:
 - Prospects count exactly matches the deletion-ready snapshot.
 - All 23 retired fields are absent.
 - Both new fields exist with the exact types above.
-- Status has the canonical eight choices and no Closed.
+- Status has the canonical seven choices and no Closed.
 - Required Sales Activities choices exist.
 - Deposit Pending still exists.
 - The nine junk choices are absent.

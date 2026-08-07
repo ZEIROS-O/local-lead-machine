@@ -47,7 +47,7 @@ class TestApplyMarkOutcome(unittest.TestCase):
     def _session(
         self,
         *,
-        current_status="Sent",
+        current_status="Follow-Up",
         patch_status=None,
         patch_follow_up="2026-07-31",
         post_payloads=None,
@@ -74,12 +74,12 @@ class TestApplyMarkOutcome(unittest.TestCase):
         session.get.assert_not_called()
 
     def test_source_status_gate(self):
-        for allowed in ("Sent", "Follow-Up", "  sent  "):
+        for allowed in ("Follow-Up", "  follow-up  "):
             with self.subTest(status=allowed):
                 session = self._session(current_status=allowed, patch_status="Follow-Up")
                 receipt = mark_outcome.apply_mark_outcome(event="replied", session=session, **self.ARGS)
                 self.assertEqual(receipt["result"], "applied")
-        for refused in ("New", "Mockup Needed", "Manual Review", "Won", "Lost", ""):
+        for refused in ("New", "Mockup Needed", "Manual Review", "Sent", "Won", "Lost", ""):
             with self.subTest(status=refused):
                 session = self._session(current_status=refused)
                 with self.assertRaisesRegex(mark_outcome.MarkOutcomeError, "not eligible"):
@@ -489,7 +489,7 @@ class TestMain(unittest.TestCase):
             self.assertEqual(mark_outcome.main(), 1)
 
     def test_happy_path_replied(self):
-        get_resp = _response(200, {"id": "rec42", "fields": {"Status": "Sent", "Business Name": "Acme"}})
+        get_resp = _response(200, {"id": "rec42", "fields": {"Status": "Follow-Up", "Business Name": "Acme"}})
         patch_resp = _response(
             200, {"id": "rec42", "fields": {"Status": "Follow-Up", "Next Follow-Up": "2026-07-31"}}
         )

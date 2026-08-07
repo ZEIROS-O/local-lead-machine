@@ -276,7 +276,7 @@ class UploadSetterAssignmentTest(unittest.TestCase):
     def test_operational_ownership_is_idempotent_for_the_csv_door(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             card = upload_airtable.csv_row_to_record(
-                {"Business Name": "Dialled Co", "Place Key": "ChIJ123", "Status": "Sent"},
+                {"Business Name": "Dialled Co", "Place Key": "ChIJ123", "Status": "Follow-Up"},
                 Path(tmp),
             )
         before = list(card["defaulted_airtable_fields"])

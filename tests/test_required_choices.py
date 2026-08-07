@@ -55,7 +55,7 @@ def live_tables(
     outcome: list[dict] | None = None,
     deal_status: list[dict] | None = None,
 ) -> list[dict]:
-    """The base as the Meta API returns it, defaulting to the 2026-07-30 state."""
+    """An incomplete base, already using the consolidated Status vocabulary."""
     prospect_fields = [
         select_field(
             "fldStatus",
@@ -64,12 +64,9 @@ def live_tables(
             if status is not None
             else [
                 choice("sel1", "New"),
-                choice("sel2", "Mockup Needed"),
-                choice("sel3", "Manual Review"),
-                choice("sel4", "Not Fit"),
-                choice("sel5", "Sent"),
-                choice("sel6", "Follow-Up"),
-                choice("sel7", "Closed"),
+                choice("sel2", "Manual Review"),
+                choice("sel3", "Not Fit"),
+                choice("sel4", "Follow-Up"),
             ],
         )
     ]
@@ -179,10 +176,12 @@ class RequiredVocabularyIsDerivedTest(unittest.TestCase):
                     f"{table}.{field} lost declared choices",
                 )
 
-    def test_mvp_operator_choices_are_required_even_when_not_code_written(self):
+    def test_operator_choices_are_required_even_when_not_code_written(self):
         required = required_choices()
-        self.assertIn("Do Not Contact", required["Prospects"]["Status"])
         self.assertIn("Booked", required["Prospects"]["Status"])
+        self.assertNotIn("Do Not Contact", required["Prospects"]["Status"])
+        self.assertNotIn("Sent", required["Prospects"]["Status"])
+        self.assertNotIn("Mockup Needed", required["Prospects"]["Status"])
         self.assertIn("Held", required["Sales Activities"]["Outcome"])
         self.assertIn("Held", OPERATOR_REQUIRED_SELECT_CHOICES["Sales Activities"]["Outcome"])
         self.assertNotIn("Held", REQUIRED_SELECT_CHOICES["Sales Activities"]["Outcome"])
@@ -285,7 +284,7 @@ class AuditChoicesTest(unittest.TestCase):
         statuses = statuses_for(live_tables())
         self.assertEqual(
             status_named(statuses, "Status").missing,
-            ("Booked", "Do Not Contact", "Lost", "Won"),
+            ("Booked", "Lost", "Won"),
         )
         self.assertEqual(
             status_named(statuses, "Activity Type").missing, ("Close", "Reply")
@@ -365,7 +364,13 @@ class AuditChoicesTest(unittest.TestCase):
 
     def test_a_retired_choice_is_never_reported_as_a_problem(self):
         """`Closed` is retired, but removing it is a hand step, not this check's call."""
-        status = status_named(statuses_for(live_tables()), "Status")
+        tables = live_tables(
+            status=[
+                choice(f"sel{i}", name)
+                for i, name in enumerate((*PROSPECT_STATUS_CHOICES, "Closed"))
+            ]
+        )
+        status = status_named(statuses_for(tables), "Status")
         self.assertIn("Closed", status.live)
         self.assertNotIn("Closed", status.missing)
 

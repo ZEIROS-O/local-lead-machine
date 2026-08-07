@@ -25,6 +25,8 @@ class QueueStatusClause:
 
     @property
     def airtable_condition(self) -> str:
+        if len(self.allowed) == 1:
+            return f"{{{self.field}}}='{self.allowed[0]}'"
         return "OR(" + ",".join(f"{{{self.field}}}='{value}'" for value in self.allowed) + ")"
 
 
@@ -78,21 +80,17 @@ READINESS_CROSS_CHECKS = (
 #
 # `Closed` was split into `Won`/`Lost` (2026-07-29). One closed state cannot say
 # which, so a won deal and a dead lead landed in the same cell and no conversion
-# rate was recoverable from the base. `Do Not Contact` is the terminal
-# compliance state a setter applies after an opt-out, while `Booked`
-# distinguishes an appointment from a generic follow-up. Code leads, the
-# Airtable runbook follows: either new value 422s until a human pre-creates it,
-# because no write path may use typecast.
+# rate was recoverable from the base. On 2026-08-03 the live base consolidated
+# Mockup Needed into New, Sent into Follow-Up, and Do Not Contact into Not Fit.
+# Opt-out suppression remains independent ledger state; a visible Not Fit value
+# is not a substitute for a suppression entry.
 PROSPECT_STATUS_CHOICES = (
     "New",
-    "Mockup Needed",
     "Manual Review",
     "Not Fit",
-    "Sent",
     "Follow-Up",
     "Won",
     "Lost",
-    "Do Not Contact",
     "Booked",
 )
 PROSPECT_STATUS_CHOICE_SET = frozenset(PROSPECT_STATUS_CHOICES)
@@ -103,37 +101,26 @@ PROSPECT_STATUS_CHOICE_SET = frozenset(PROSPECT_STATUS_CHOICES)
 # that consumes it; a gate carrying its own copy would keep answering for a
 # Status set that had moved underneath it.
 #
-# Accepted means "taken into outreach", not "won". A lead that was sent and lost
-# was still accepted — the machine's job is to propose leads worth contacting,
-# and conversion is a separate question with a separate metric. `Booked` joins
-# them: an appointment is unambiguously a lead taken into outreach.
-#
-# `Do Not Contact` is rejected, not accepted, and the asymmetry is deliberate.
-# It is hand-applied and reachable straight from `New`, so a rep who declines a
-# lead because it is a competitor or a known DNC number would otherwise score as
-# an approval of the machine's proposal — while a rep who writes `Not Fit` for
-# the same reason scores against it. Every other accepted status is downstream
-# of mark_sent, which is what made the bucket evidence rather than assertion.
-# Bucketing it here can only depress the rate, never inflate it, and inflation
-# is the one direction that makes a losing loop read as passing. Distinguishing
-# "opted out after we called" from "rep refused to call it" needs evidence of
-# contact — `Last Contacted` — which the eval does not read yet.
-ACCEPTED_STATUSES = frozenset({"Sent", "Follow-Up", "Won", "Lost", "Booked"})
-REJECTED_STATUSES = frozenset({"Not Fit", "Do Not Contact"})
-UNDECIDED_STATUSES = frozenset({"New", "Mockup Needed", "Manual Review"})
+# Accepted means "taken into outreach", not "won". Contact logging moves a lead
+# directly from New to Follow-Up, so Follow-Up is the first durable acceptance
+# signal. A lead that later loses was still accepted; conversion remains a
+# separate metric.
+ACCEPTED_STATUSES = frozenset({"Follow-Up", "Won", "Lost", "Booked"})
+REJECTED_STATUSES = frozenset({"Not Fit"})
+UNDECIDED_STATUSES = frozenset({"New", "Manual Review"})
 # Pinned as a partition by tests/test_queue_state_formula.py: a new Status must
 # be classified as accept, reject or undecided, because the alternative is a KPI
 # that silently stops counting the cases it cannot place.
 
-# An allowlist, never a "not in {Sent, Closed}" denylist: a denylist silently
+# An allowlist, never a "not in terminal statuses" denylist: a denylist silently
 # widens the morning queue the moment a status is added, and the Won/Lost split
 # is exactly such an addition. Pinned against PROSPECT_STATUS_CHOICES by
 # tests/test_queue_state_formula.py so a vocabulary edit that renames or drops a
 # queued status fails there rather than quietly emptying "Ready to Dial".
 QUEUE_STATUS_CLAUSE = QueueStatusClause(
     "Status",
-    ("New", "Mockup Needed"),
-    "Status must be New or Mockup Needed",
+    ("New",),
+    "Status must be New",
 )
 
 READINESS_FILTER_CLAUSES = ",".join(

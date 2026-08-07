@@ -589,7 +589,7 @@ def csv_row_to_record(row: Dict[str, str], packet_dir: Path) -> Dict[str, Any]:
 
     if row_is_sendable:
         if not clean_cell(fields.get("Status")):
-            fields["Status"] = "Mockup Needed"
+            fields["Status"] = "New"
             mark_defaulted("Status")
     elif clean_cell(fields.get("Packet Tier")) == _TIER_MANUAL:
         fields["Status"] = "Manual Review"
@@ -696,7 +696,7 @@ def enforce_operational_field_ownership(
     are the other front door and never got the same treatment: `lead_card`
     copies the scorer's `Status: "New"` into `airtable_fields` and returns no
     `defaulted_airtable_fields` at all, so a JSONL re-upload of a lead a human
-    had moved to `Do Not Contact` PATCHed the opt-out away and put the row back
+    had moved to `Not Fit` PATCHed the terminal state away and put the row back
     in `QUEUE_FILTER_FORMULA`. Idempotent, so the CSV path is unaffected.
     """
     normalized: List[Dict[str, Any]] = []

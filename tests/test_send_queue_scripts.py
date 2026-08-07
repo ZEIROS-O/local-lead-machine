@@ -48,7 +48,7 @@ class TestBuildFormula(unittest.TestCase):
         formula = qrs.build_formula("")
         self.assertEqual(
             formula,
-            "AND({Verdict}='send',OR({Status}='New',{Status}='Mockup Needed'))",
+            "AND({Verdict}='send',{Status}='New')",
         )
 
     def test_vertical_clause_added_and_quotes_escaped(self):
@@ -197,7 +197,7 @@ class TestMarkSent(unittest.TestCase):
         session.get.return_value = _response(200, {"id": "rec42", "fields": fields})
         confirmed = patch_fields or {
             **fields,
-            "Status": "Sent",
+            "Status": "Follow-Up",
             "Last Contacted": "2026-07-10",
             "Outreach Channel": channel,
             "Next Follow-Up": "2026-07-14",
@@ -256,14 +256,14 @@ class TestMarkSent(unittest.TestCase):
             session.get.assert_not_called()
             session.patch.assert_not_called()
 
-    def test_only_new_and_mockup_needed_may_transition_to_sent(self):
+    def test_only_new_may_transition_to_follow_up(self):
         with tempfile.TemporaryDirectory() as tmp:
             suppression = self._suppression(tmp)
-            for allowed in ("New", "Mockup Needed", "  new  "):
+            for allowed in ("New", "  new  "):
                 receipt, session = self._apply(suppression, {**READY_FIELDS, "Status": allowed}, channel="Email")
                 self.assertEqual(receipt["result"], "applied")
                 session.patch.assert_called_once()
-            for refused in ("", "Manual Review", "Follow-Up", "Contacted", "Won", "Lost", "Unknown"):
+            for refused in ("", "Mockup Needed", "Manual Review", "Sent", "Contacted", "Won", "Lost", "Unknown"):
                 with self.subTest(status=refused):
                     session = MagicMock()
                     session.get.return_value = _response(
@@ -295,19 +295,19 @@ class TestMarkSent(unittest.TestCase):
             with self.assertRaisesRegex(mark_sent.MarkSentError, "suppressed or opted out"):
                 self._apply(str(opted_out), dict(READY_FIELDS))
 
-    def test_conflicting_sent_refused_and_exact_sent_is_idempotent(self):
+    def test_conflicting_follow_up_refused_and_exact_follow_up_is_idempotent(self):
         with tempfile.TemporaryDirectory() as tmp:
             suppression = self._suppression(tmp)
             with self.assertRaisesRegex(mark_sent.MarkSentError, "conflicting"):
                 self._apply(
                     suppression,
-                    {**READY_FIELDS, "Status": "Sent", "Last Contacted": "2026-07-09", "Outreach Channel": "SMS"},
+                    {**READY_FIELDS, "Status": "Follow-Up", "Last Contacted": "2026-07-09", "Outreach Channel": "SMS"},
                 )
             receipt, session = self._apply(
                 suppression,
                 {
                     **READY_FIELDS,
-                    "Status": "Sent",
+                    "Status": "Follow-Up",
                     "Last Contacted": "2026-07-10",
                     "Outreach Channel": "SMS",
                     "Next Follow-Up": "2026-07-14",
@@ -323,7 +323,7 @@ class TestMarkSent(unittest.TestCase):
                 self._apply(
                     suppression,
                     dict(READY_FIELDS),
-                    patch_fields={**READY_FIELDS, "Status": "Sent", "Last Contacted": "2026-07-09", "Outreach Channel": "SMS"},
+                    patch_fields={**READY_FIELDS, "Status": "Follow-Up", "Last Contacted": "2026-07-09", "Outreach Channel": "SMS"},
                 )
 
     def test_patches_status_channel_and_date_without_typecast(self):
@@ -336,7 +336,7 @@ class TestMarkSent(unittest.TestCase):
                     "id": "rec42",
                     "fields": {
                         **READY_FIELDS,
-                        "Status": "Sent",
+                        "Status": "Follow-Up",
                         "Last Contacted": "2026-07-10",
                         "Outreach Channel": "SMS",
                         "Next Follow-Up": "2026-07-14",
@@ -359,7 +359,7 @@ class TestMarkSent(unittest.TestCase):
         self.assertEqual(
             payload["fields"],
             {
-                "Status": "Sent",
+                "Status": "Follow-Up",
                 "Last Contacted": "2026-07-10",
                 "Next Follow-Up": "2026-07-14",
                 "Outreach Channel": "SMS",
@@ -372,7 +372,7 @@ class TestMarkSent(unittest.TestCase):
             with patch.object(mark_sent, "load_dotenv", lambda: False), \
                  patch.dict(os.environ, self.ENV, clear=True), \
                  patch("requests.get", return_value=_response(200, {"id": "rec42", "fields": dict(READY_FIELDS)})), \
-                 patch("requests.patch", return_value=_response(200, {"id": "rec42", "fields": {**READY_FIELDS, "Status": "Sent", "Last Contacted": "2026-07-10", "Next Follow-Up": "2026-07-14"}})) as mock_patch, \
+                 patch("requests.patch", return_value=_response(200, {"id": "rec42", "fields": {**READY_FIELDS, "Status": "Follow-Up", "Last Contacted": "2026-07-10", "Next Follow-Up": "2026-07-14"}})) as mock_patch, \
                  patch("sys.argv", ["mark_sent.py", "--record-id", "rec42", "--date", "2026-07-10", "--suppression-source", suppression]), \
                  patch("sys.stdout", io.StringIO()):
                 self.assertEqual(mark_sent.main(), 0)
@@ -418,7 +418,7 @@ class TestMarkSent(unittest.TestCase):
                     channel="Email",
                     patch_fields={
                         **READY_FIELDS,
-                        "Status": "Sent",
+                        "Status": "Follow-Up",
                         "Last Contacted": "2026-07-10",
                         "Outreach Channel": "Email",
                         "Next Follow-Up": "2026-07-17",

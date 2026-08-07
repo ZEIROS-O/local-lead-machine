@@ -503,7 +503,7 @@ def ok_proc() -> subprocess.CompletedProcess[str]:
     return subprocess.CompletedProcess(
         args=[],
         returncode=0,
-        stdout=json.dumps({"result": "applied", "record_id": "rec", "status": "Sent"}),
+        stdout=json.dumps({"result": "applied", "record_id": "rec", "status": "Follow-Up"}),
         stderr="",
     )
 
@@ -783,7 +783,7 @@ class MarkSentTest(unittest.TestCase):
             item["status"] = "Manual Review"
             path = write_queue_file(root, items=[item])
             with patch.object(hq, "_run_capture") as run, self.assertRaisesRegex(
-                CommandError, "New or Mockup Needed"
+                CommandError, "New"
             ):
                 hq.cmd_mark_sent(["1"], dry_run=True, execute=True, root=root, **queue_identity(path))
             run.assert_not_called()
@@ -918,6 +918,7 @@ class MarkSentTest(unittest.TestCase):
                 res = hq.cmd_mark_sent(["1"], dry_run=True, execute=True, root=root, **queue_identity(path))
             run.assert_not_called()
             self.assertIn("[DRY-RUN]", res.message)
+            self.assertIn("Status=Follow-Up", res.message)
             self.assertEqual(path.read_text(encoding="utf-8"), before)
             self.assertEqual((root / "outcomes.jsonl").read_text(encoding="utf-8"), "")
 

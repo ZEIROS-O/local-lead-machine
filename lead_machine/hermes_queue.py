@@ -1085,7 +1085,7 @@ def _require_queue_status_eligible(matched: list[dict[str, Any]]) -> None:
     ]
     if invalid:
         raise CommandError(
-            "Refusing mark-sent: selected queue item is not in New or Mockup Needed status: "
+            "Refusing mark-sent: selected queue item is not in New status: "
             + ", ".join(invalid)
         )
 
@@ -1193,7 +1193,7 @@ def cmd_mark_sent(
         return CommandResult(
             f"repo_root: {root_path}\n"
             f"preview /mark-sent: map {' '.join(tokens)} against an immutable queue run, PATCH Airtable "
-            f"Status=Sent via {MARK_SENT_SCRIPT} with Outreach Channel={channel_label} and "
+            f"Status=Follow-Up via {MARK_SENT_SCRIPT} with Outreach Channel={channel_label} and "
             f"Last Contacted={send_date}, update separate "
             f"write-back state, and append one idempotent operator-agent outcomes row."
         )
@@ -1237,7 +1237,7 @@ def cmd_mark_sent(
         )
         lines = [
             f"[DRY-RUN] {item.get('n') or 'record'}. {item.get('business') or item.get('record_id')} "
-            f"({item.get('record_id')}) -> Sent via {channel_label}"
+            f"({item.get('record_id')}) -> Sent via {channel_label}; Airtable Status=Follow-Up"
             for item in matched
         ]
         lines.append(f"approval_id: {approval['approval_id']}")

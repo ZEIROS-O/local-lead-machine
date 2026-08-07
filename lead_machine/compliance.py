@@ -17,7 +17,7 @@ ACCEPTABLE_SMS_CONSENT_POSTURES = frozenset(
 SUPPRESSION_EVENTS = frozenset(
     {"opt_out", "opted_out", "unsubscribe", "unsubscribed", "suppressed", "stop"}
 )
-MARK_SENT_ALLOWED_SOURCE_STATUSES = frozenset({"new", "mockup needed"})
+MARK_SENT_ALLOWED_SOURCE_STATUSES = frozenset({"new"})
 
 
 class ComplianceError(ValueError):

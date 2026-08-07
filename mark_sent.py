@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mark one Airtable prospect record as sent.
+"""Record one completed contact and move the Airtable prospect to Follow-Up.
 
 Write-back half of the `send-queue` skill's Airtable loop. Only ever called
 after Lou has already sent the message himself and reports it via
@@ -50,6 +50,7 @@ class MarkSentError(RuntimeError):
 
 
 OUTREACH_CHANNEL_CHOICES = frozenset({"Email", "Phone", "Instagram DM", "SMS"})
+TARGET_STATUS = "Follow-Up"
 
 
 def _request_json(response: requests.Response, operation: str) -> dict:
@@ -67,7 +68,7 @@ def _request_json(response: requests.Response, operation: str) -> dict:
 def _exact_requested_state(
     fields: dict, *, channel: str, last_contacted: str, next_follow_up: str
 ) -> bool:
-    if str(fields.get("Status") or "").strip().casefold() != "sent":
+    if str(fields.get("Status") or "").strip().casefold() != TARGET_STATUS.casefold():
         return False
     if str(fields.get("Last Contacted") or "").strip() != last_contacted:
         return False
@@ -118,18 +119,20 @@ def apply_mark_sent(
         return {
             "result": "already_applied",
             "record_id": record_id,
-            "status": "Sent",
+            "status": TARGET_STATUS,
             "channel": channel,
             "date": last_contacted,
             "next_follow_up": next_follow_up,
         }
 
     status = str(fields.get("Status") or "").strip().casefold()
-    if status == "sent":
-        raise MarkSentError("record is already Sent with conflicting channel or date")
+    if status == TARGET_STATUS.casefold():
+        raise MarkSentError(
+            f"record is already {TARGET_STATUS} with conflicting channel or date"
+        )
     if not is_mark_sent_source_status(fields.get("Status")):
         raise MarkSentError(
-            "current Airtable Status is not eligible for mark-sent; expected New or Mockup Needed"
+            "current Airtable Status is not eligible for mark-sent; expected New"
         )
 
     readiness = contact_readiness_failures(fields)
@@ -145,7 +148,7 @@ def apply_mark_sent(
         raise MarkSentError("current Airtable Consent Posture does not permit SMS")
 
     requested_fields = {
-        "Status": "Sent",
+        "Status": TARGET_STATUS,
         "Last Contacted": last_contacted,
         "Next Follow-Up": next_follow_up,
     }
@@ -171,7 +174,7 @@ def apply_mark_sent(
         "result": "applied",
         "next_follow_up": next_follow_up,
         "record_id": record_id,
-        "status": "Sent",
+        "status": TARGET_STATUS,
         "channel": channel,
         "date": last_contacted,
     }

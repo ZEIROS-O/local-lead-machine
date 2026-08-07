@@ -39,7 +39,7 @@ def base_record(
 
 
 def decided(accepted: int, rejected: int) -> list[dict[str, object]]:
-    records = [base_record(f"acc-{index}", "Sent") for index in range(accepted)]
+    records = [base_record(f"acc-{index}", "Follow-Up") for index in range(accepted)]
     records += [base_record(f"rej-{index}", "Not Fit") for index in range(rejected)]
     return records
 
@@ -62,7 +62,7 @@ class AcceptRateEvalTests(unittest.TestCase):
 
         report = self.evaluate(
             [
-                base_record("sendable", "Sent"),
+                base_record("sendable", "Follow-Up"),
                 base_record("watchlist", "Not Fit", verdict=verdict_module.VERDICT_WATCH),
                 base_record("none", "Not Fit", verdict=verdict_module.VERDICT_REJECT),
             ],
@@ -77,14 +77,13 @@ class AcceptRateEvalTests(unittest.TestCase):
         report = self.evaluate(
             [
                 base_record("new", "New"),
-                base_record("mockup", "Mockup Needed"),
                 base_record("manual", "Manual Review"),
-                base_record("sent", "Sent"),
+                base_record("contacted", "Follow-Up"),
             ],
             minimum_decided=1,
         )
 
-        self.assertEqual(report["counts"]["undecided"], 3)
+        self.assertEqual(report["counts"]["undecided"], 2)
         self.assertEqual(report["counts"]["decided"], 1)
         self.assertEqual(report["accept_rate"], 1.0)
 

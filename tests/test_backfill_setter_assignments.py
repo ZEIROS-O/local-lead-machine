@@ -327,7 +327,7 @@ class BackfillCommandSafetyTest(unittest.TestCase):
             patch.dict(os.environ, {"LPM_SETTER_ROSTER": "Michael"}, clear=False),
             patch(
                 "backfill_setter_assignments.assert_required_choices_ready",
-                side_effect=ValueError("missing Do Not Contact"),
+                side_effect=ValueError("missing Booked"),
             ),
             patch("backfill_setter_assignments.fetch_prospects") as fetch,
             patch("backfill_setter_assignments.apply_blank_assignment_backfill") as send,
@@ -347,7 +347,7 @@ class BackfillCommandSafetyTest(unittest.TestCase):
             )
 
         self.assertEqual(code, 1)
-        self.assertIn("missing Do Not Contact", stderr.getvalue())
+        self.assertIn("missing Booked", stderr.getvalue())
         fetch.assert_not_called()
         send.assert_not_called()
 

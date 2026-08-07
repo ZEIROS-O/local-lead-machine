@@ -34,15 +34,15 @@ class TestQueueStateFormula(unittest.TestCase):
     def test_filter_formula_is_the_canonical_static_queue_expression(self):
         self.assertEqual(
             getattr(queue_state, "QUEUE_FILTER_FORMULA", None),
-            "AND({Verdict}='send',OR({Status}='New',{Status}='Mockup Needed'))",
+            "AND({Verdict}='send',{Status}='New')",
         )
 
     def test_generated_formula_reports_the_first_failed_clause(self):
         self.assertEqual(
             queue_state.queue_state_formula(),
             "IF({Verdict}='send',"
-            "IF(OR({Status}='New',{Status}='Mockup Needed'),\"Ready to Dial\","
-            "\"Blocked: Status must be New or Mockup Needed\"),"
+            "IF({Status}='New',\"Ready to Dial\","
+            "\"Blocked: Status must be New\"),"
             "\"Blocked: Verdict must be send\")",
         )
 
@@ -94,14 +94,11 @@ class TestQueueStateFormula(unittest.TestCase):
             getattr(queue_state, "PROSPECT_STATUS_CHOICES", None),
             (
                 "New",
-                "Mockup Needed",
                 "Manual Review",
                 "Not Fit",
-                "Sent",
                 "Follow-Up",
                 "Won",
                 "Lost",
-                "Do Not Contact",
                 "Booked",
             ),
         )
@@ -142,19 +139,10 @@ class TestQueueStateFormula(unittest.TestCase):
                 with self.subTest(pair=(first, second)):
                     self.assertEqual(buckets[first] & buckets[second], frozenset())
 
-    def test_dnc_and_booked_are_terminal_and_leave_the_dial_queue(self):
-        for status in ("Do Not Contact", "Booked"):
-            with self.subTest(status=status):
-                self.assertNotIn(status, queue_state.QUEUE_STATUS_CLAUSE.allowed)
-
-    def test_booked_is_accepted_and_dnc_is_not(self):
-        # Asymmetric on purpose. `Booked` is only reachable after contact;
-        # `Do Not Contact` is hand-applied and reachable straight from `New`,
-        # so counting it as an approval would let a rep who declines to dial a
-        # lead inflate the KPI that says whether the loop is working.
+    def test_booked_is_accepted_and_not_fit_is_rejected(self):
         self.assertIn("Booked", queue_state.ACCEPTED_STATUSES)
-        self.assertIn("Do Not Contact", queue_state.REJECTED_STATUSES)
-        self.assertNotIn("Do Not Contact", queue_state.ACCEPTED_STATUSES)
+        self.assertIn("Not Fit", queue_state.REJECTED_STATUSES)
+        self.assertNotIn("Not Fit", queue_state.ACCEPTED_STATUSES)
 
     def test_undecided_statuses_contain_the_whole_dial_queue(self):
         # A queued lead has not been judged yet. If one ever counted as accepted,
@@ -163,11 +151,8 @@ class TestQueueStateFormula(unittest.TestCase):
             with self.subTest(status=status):
                 self.assertIn(status, queue_state.UNDECIDED_STATUSES)
 
-    def test_queue_gate_is_unchanged_by_the_won_lost_split(self):
-        # Evidence that splitting Closed did not move "Ready to Dial": the two
-        # queued statuses are untouched, and neither new value joins them —
-        # a closed lead, won or lost, is never dialled again.
-        self.assertEqual(queue_state.QUEUE_STATUS_CLAUSE.allowed, ("New", "Mockup Needed"))
+    def test_queue_gate_only_accepts_new(self):
+        self.assertEqual(queue_state.QUEUE_STATUS_CLAUSE.allowed, ("New",))
         for closed in ("Won", "Lost"):
             with self.subTest(status=closed):
                 self.assertNotIn(closed, queue_state.QUEUE_STATUS_CLAUSE.allowed)
@@ -178,7 +163,7 @@ class TestQueueStateFormula(unittest.TestCase):
                             "Status": closed,
                         }
                     ),
-                    "Blocked: Status must be New or Mockup Needed",
+                    "Blocked: Status must be New",
                 )
 
     def test_queue_status_clause_is_canonical(self):
@@ -189,9 +174,9 @@ class TestQueueStateFormula(unittest.TestCase):
             (clause.field, clause.allowed, clause.failure, clause.airtable_condition),
             (
                 "Status",
-                ("New", "Mockup Needed"),
-                "Status must be New or Mockup Needed",
-                "OR({Status}='New',{Status}='Mockup Needed')",
+                ("New",),
+                "Status must be New",
+                "{Status}='New'",
             ),
         )
 
@@ -226,9 +211,9 @@ class TestQueueStateFormula(unittest.TestCase):
             ),
             (
                 "status",
-                {"Status": "Sent"},
+                {"Status": "Follow-Up"},
                 [],
-                "Blocked: Status must be New or Mockup Needed",
+                "Blocked: Status must be New",
             ),
             ("all pass", {}, [], "Ready to Dial"),
         )

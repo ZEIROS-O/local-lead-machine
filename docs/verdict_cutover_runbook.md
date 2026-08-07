@@ -153,7 +153,7 @@ all are, views are not. Steps 1 and 2 were automatable; this is not.
 `READINESS_CLAUSES` is now one clause, so the queue filter is:
 
 ```
-AND({Verdict}='send',OR({Status}='New',{Status}='Mockup Needed'))
+AND({Verdict}='send',{Status}='New')
 ```
 
 The two clauses this drops — `Commercial Fit State` and `Contact Eligibility` —
@@ -175,7 +175,7 @@ needs touching.
 | `Packet Tier` is `Sendable Packet` | **`Verdict` is `send`** |
 | `Commercial Fit State` is `commercially-sendable` | *delete this condition* |
 | `Contact Eligibility` is `contact-now` | *delete this condition* |
-| `Status` is any of `New`, `Mockup Needed` | unchanged |
+| `Status` is `New` | **keep `New`; remove `Mockup Needed` if still present** |
 
 Sort (`Lead Priority` asc → `Opportunity Score` desc → `Score Total` desc) and
 grouping (`Vertical`) are unchanged.

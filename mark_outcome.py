@@ -2,7 +2,7 @@
 """Record a post-send funnel outcome for one Airtable prospect record.
 
 The pipeline's only write-back after outreach used to be mark_sent.py, which
-stops at Status=Sent. Nothing recorded what happened after that: a reply, a
+stops at Status=Follow-Up. Nothing recorded what happened after that: a reply, a
 booked call, a closed-won deal, a closed-lost. This script is the write-back
 for those four events — it never sends anything, only logs what a human
 already observed, mirroring mark_sent.py's guarded-PATCH conventions.
@@ -73,7 +73,7 @@ except ModuleNotFoundError:
         return False
 
 
-OUTCOME_SOURCE_STATUSES = frozenset({"sent", "follow-up"})
+OUTCOME_SOURCE_STATUSES = frozenset({"follow-up"})
 
 # Won and Lost, not a shared Closed: the two closing events are the only place
 # the pipeline ever learns whether the work converted, and collapsing them threw
@@ -279,7 +279,7 @@ def apply_mark_outcome(
 
     if normalize_airtable_status(fields.get("Status")) not in OUTCOME_SOURCE_STATUSES:
         raise MarkOutcomeError(
-            f"current Airtable Status is not eligible for {event}; expected Sent or Follow-Up"
+            f"current Airtable Status is not eligible for {event}; expected Follow-Up"
         )
 
     target_status = TARGET_STATUS[event]

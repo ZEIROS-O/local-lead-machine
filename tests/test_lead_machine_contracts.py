@@ -198,7 +198,7 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(planned[0]["upsert_key"], "place:ChIJ123")
         fields = planned[0]["payload"]["fields"]  # type: ignore[index]
         self.assertEqual(fields["Business Name"], "A+ Landscaping LLC")
-        self.assertEqual(fields["Status"], "Mockup Needed")
+        self.assertEqual(fields["Status"], "New")
         self.assertEqual(fields["Outreach Channel"], "Phone")
         # Both were dropped from the schema: Best Service Angle duplicated
         # Offer Fit, Next Action restated Status.
@@ -605,7 +605,7 @@ class LeadMachineContractsTest(unittest.TestCase):
 
         `score_leads` writes `Status: "New"` on every scored row, so the CSV
         always supplies a non-blank Status. Copying it into a PATCH overwrote
-        whatever the human set: a lead that was dialled and marked `Sent` went
+        whatever the human set: a lead that was dialled and moved to `Follow-Up` went
         back to `New`, which is exactly `queue_state.QUEUE_FILTER_FORMULA`, so
         the morning queue served it again and the prospect was contacted twice.
         The same PATCH reverted `Won` / `Lost` / `Not Fit`.

@@ -2,7 +2,7 @@
 """Read-only Airtable query for records ready to send.
 
 Built for the ZEIROS `send-queue` skill: pulls LPM prospects that pass the
-four-field readiness contract and are currently New or Mockup Needed,
+canonical readiness contract and are currently New,
 so the daily send queue can draft against real pipeline state instead of
 stale exports. Never writes anything (see mark_sent.py for the write-back
 half of this loop).

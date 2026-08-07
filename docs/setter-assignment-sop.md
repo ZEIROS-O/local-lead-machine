@@ -7,7 +7,7 @@ not send or dial anything.
 
 1. In Airtable, add `Prospects.Assigned Setter` as a single select with one exact choice per active
    rep.
-2. Add `Do Not Contact` and `Booked` to `Prospects.Status`, add `Held` to
+2. Confirm `Booked` exists in `Prospects.Status`, add `Held` to
    `Sales Activities.Outcome`, and add `Deals.Cash Collected` as a currency field.
 3. Set the ordered roster in `.env`, for example:
 
@@ -61,12 +61,12 @@ Create one filtered grid view per rep:
 
 - `Verdict = send`
 - `Assigned Setter = <rep>`
-- `Status` **is** `New` or `Mockup Needed`
+- `Status` **is** `New`
 
 That last clause is an allowlist, and it has to stay one. `lead_machine/queue_state.py` names the
-same two values in `QUEUE_STATUS_CLAUSE.allowed` and says why: a denylist such as "Status is not
-`Do Not Contact` / `Not Fit` / `Won` / `Lost`" silently widens the queue the moment a status is
-added, and it already admits `Sent` and `Follow-Up` — so a lead `mark_sent.py` recorded as contacted
+same value in `QUEUE_STATUS_CLAUSE.allowed` and says why: a denylist such as "Status is not
+`Not Fit` / `Won` / `Lost`" silently widens the queue the moment a status is added, and it admits
+`Follow-Up` — so a lead `mark_sent.py` recorded as contacted
 stays on the rep's screen and gets dialled a second time. Mirror `QUEUE_STATUS_CLAUSE.allowed`; if
 that tuple ever changes, change these views with it.
 

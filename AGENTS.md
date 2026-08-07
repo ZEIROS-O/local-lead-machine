@@ -81,9 +81,11 @@ Key in-flight facts (2026-07-29):
   `mark_outcome.REQUIRED_SELECT_CHOICES`, `mark_outcome.OPERATOR_REQUIRED_SELECT_CHOICES`,
   `queue_state.PROSPECT_STATUS_CHOICES`, or `LPM_SETTER_ROSTER` is half a change**: the base has to
   be edited by hand too, or that write path 422s. `airtable_required_choices.py check` catches it —
-  exit 2 names the missing choice and prints the UI steps. The pre-MVP vocabulary was brought level
-  on 2026-07-30; the MVP additions (`Do Not Contact`, `Booked`, `Held`, and the setter roster) are
-  code-declared but not verified live, so do not claim the checker currently exits 0. Background in
+  exit 2 names the missing choice and prints the UI steps. On 2026-08-03 Lou manually consolidated
+  `Do Not Contact` → `Not Fit`, `Sent` → `Follow-Up`, and `Mockup Needed` → `New` in the live base;
+  code's canonical vocabulary is now `New`, `Manual Review`, `Not Fit`, `Follow-Up`, `Won`, `Lost`,
+  `Booked`. The remaining MVP additions (`Booked`, `Held`, and the setter roster) are code-declared
+  but not verified live, so do not claim the checker currently exits 0. Background in
   [`docs/airtable_schema_required.md`](docs/airtable_schema_required.md); full record in
   [`docs/airtable_cutover_runbook_2026-07-30.md`](docs/airtable_cutover_runbook_2026-07-30.md).
 - **Scoring runs through a provider chain** in `lead_machine/llm_client.py`: kimi (Moonshot API,
@@ -191,10 +193,11 @@ Key in-flight facts (2026-07-29):
 The pipeline ends at Airtable; three small scripts move a lead through the funnel afterwards, and
 every one of them logs something a human already did. **None of them send anything.**
 
-- `query_ready_to_send.py` — read-only queue of leads passing the readiness contract.
-- `mark_sent.py` — `Status=Sent`, `Last Contacted`, `Outreach Channel`, and arms `Next Follow-Up`
-  one cadence step out.
-- `mark_outcome.py` — everything after that: `replied` / `meeting_booked` → `Follow-Up` (re-arms the
+- `query_ready_to_send.py` — read-only queue of `Status=New` leads passing the readiness contract.
+- `mark_sent.py` — records the completed contact, moves `Status=New` → `Follow-Up`, writes
+  `Last Contacted` and `Outreach Channel`, and arms `Next Follow-Up` one cadence step out.
+- `mark_outcome.py` — everything after that, starting from `Follow-Up`: `replied` /
+  `meeting_booked` stay `Follow-Up` (and re-arm the
   cadence), `closed_won` → `Won`, `closed_lost` → `Lost` (both clear it), plus a
   `Sales Activities` row and, on a win, a `Deals` row.
 
