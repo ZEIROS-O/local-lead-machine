@@ -249,6 +249,7 @@ WATER_RESTORATION_FRANCHISE_DENYLIST = (
 
 GARAGE_DOOR_TERMS = (
     "garage door repair",
+    "garage door replacement",
     "garage door installation",
     "garage door service",
     "overhead door repair",

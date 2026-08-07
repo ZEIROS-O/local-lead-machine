@@ -181,6 +181,55 @@ class GenerateSearchConfigTest(unittest.TestCase):
             self.assertIn("garage floor epoxy", cfg["exclude_terms"])
             self.assertIn("home depot", cfg["exclude_terms"])
 
+    def test_generate_garage_doors_cincinnati_full_uses_curated_intent_and_network_exclusions(self) -> None:
+        path = self._generate(vertical="garage_doors", market="cincinnati", size="full")
+        cfg = self._load(path)
+
+        self.assertEqual(
+            cfg["queries"],
+            [
+                "garage door repair Cincinnati OH",
+                "garage door replacement Cincinnati OH",
+                "garage door installation Cincinnati OH",
+                "garage door opener repair Cincinnati OH",
+                "garage door spring repair Cincinnati OH",
+                "emergency garage door repair Cincinnati OH",
+                "overhead door repair Cincinnati OH",
+                "commercial overhead door Cincinnati OH",
+            ],
+        )
+        self.assertEqual(
+            cfg["geo_slices"],
+            [
+                "Cincinnati OH",
+                "Cincinnati east side OH",
+                "Cincinnati west side OH",
+                "Norwood OH",
+                "Blue Ash OH",
+                "Mason OH",
+                "West Chester OH",
+                "Loveland OH",
+                "Milford OH",
+                "Fairfield OH",
+                "Hamilton OH",
+                "Lebanon OH",
+                "Florence KY",
+                "Covington KY",
+                "Newport KY",
+            ],
+        )
+        self.assertEqual(cfg["min_rating"], 4.3)
+        self.assertEqual(cfg["min_reviews"], 8)
+        self.assertIn("garage door replacement", cfg["boost_terms"])
+        for network in (
+            "precision garage door",
+            "precision door",
+            "a1 garage door service",
+            "overhead door company",
+            "wayne dalton",
+        ):
+            self.assertIn(network, cfg["exclude_terms"])
+
     def test_generate_plumbing_cleveland_medium(self) -> None:
         path = self._generate(vertical="plumbing", market="cleveland", size="medium")
         self.assertEqual(path.name, "plumbing_cleveland_medium_001.json")

@@ -4,18 +4,15 @@
   "airtable_vertical": "Garage Doors",
   "search_terms": [
     "garage door repair",
+    "garage door replacement",
     "garage door installation",
-    "garage door service",
-    "overhead door repair",
     "garage door opener repair",
     "garage door spring repair",
-    "emergency garage door repair",
-    "commercial overhead door"
+    "emergency garage door repair"
   ],
   "high_intent_terms": [
-    "garage door opener installation",
-    "broken garage door spring",
-    "rolling steel door"
+    "overhead door repair",
+    "commercial overhead door"
   ],
   "exclude_terms": [
     "garage floor epoxy",
@@ -33,6 +30,11 @@
     "lowes",
     "menards",
     "ace hardware",
+    "precision garage door",
+    "precision door",
+    "a1 garage door service",
+    "overhead door company",
+    "wayne dalton",
     "wayne dalton dealer"
   ],
   "min_rating": 4.3,
