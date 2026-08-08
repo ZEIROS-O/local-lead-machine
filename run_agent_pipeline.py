@@ -114,6 +114,66 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def check_airtable_lock_compatibility(airtable: str, lock_file: str) -> None:
+    """Refuse an Airtable sync that runs behind a batch-private lock.
+
+    `--lock-file` and `--airtable` are individually safe and jointly are not.
+    Every output this wrapper writes is keyed by batch name, so a private lock
+    correctly lets distinct batches run search, enrich and score in parallel.
+    The Airtable base is the one piece of shared state with no batch-keyed
+    path, and `upload_airtable`'s fetch_existing_records -> plan_airtable_sync
+    -> send_airtable_plan is an unlocked read-then-write that is the only
+    cross-batch dedupe there is. Two syncs behind two private locks each read a
+    base without the other's rows and both POST, so one business lands twice,
+    both rows `Status: New`, both matching QUEUE_FILTER_FORMULA. `mark_sent`
+    flips one and the twin is served to a rep again -- the 2026-07-31
+    double-contact, by a route no downstream gate can close:
+    MARK_SENT_ALLOWED_SOURCE_STATUSES cannot reject the twin, because the twin
+    legitimately *is* new.
+
+    So the pair is checked here, once, before the run takes a lock or spends
+    anything. Compared by resolved path, not by string: a lock spelled
+    absolutely, or with a `..` in it, that lands on the default file still
+    serialises and is still allowed.
+
+    SCOPE -- this narrows the route, it does not close it. Two known gaps:
+
+    * `DEFAULT_LOCK_FILE` is CWD-relative (`output/.agent_pipeline.lock`), so
+      both sides of the comparison resolve against the working directory. Two
+      runs started in different directories each pass this check, take
+      *different* lockfiles, and sync to the same base. Today only the fact
+      that `.env` lives in one checkout stops that, which is config placement,
+      not a control.
+    * Every other live-upload path is unlocked: `hermes_commands.cmd_sync_live`
+      (documented as the only command that builds `upload_airtable.py --live`),
+      `run_pipeline.py --airtable-live`, `make airtable-live`, and
+      `upload_airtable.py --live` by hand. None consults this lock.
+
+    The invariant this enforces is "which lock this wrapper was told to hold";
+    the invariant actually wanted is "one writer per Airtable base at a time",
+    which belongs in `upload_airtable.py` keyed on base+table. Until that
+    exists, treat this as one door bolted on a building with five others.
+    """
+    if airtable == "skip":
+        return
+    if Path(lock_file).resolve() == DEFAULT_LOCK_FILE.resolve():
+        return
+    raise PipelineRefusal(
+        f"--airtable {airtable} requires the default lock file "
+        f"({DEFAULT_LOCK_FILE}), but --lock-file is {lock_file}. A private "
+        "lock lets another pipeline run at the same time, and the Airtable "
+        "sync is an unlocked read-then-write against a base that is shared by "
+        "every batch: two concurrent syncs each read the base without the "
+        "other's records and both POST, creating two Status=New records for "
+        "one business and double-contacting it. Drop --lock-file so runs "
+        "serialise on the shared lock and let this run do the sync. If you "
+        "must keep the private lock, pass --airtable skip -- but note that "
+        "syncing later by hand (/sync-live, make airtable-live, "
+        "run_pipeline.py --airtable-live) takes no lock at all, so do it only "
+        "when no other pipeline is running."
+    )
+
+
 def acquire_lock(path: Path, batch: str) -> bool:
     """Atomically create the lockfile. Returns False if a live run holds it."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -641,7 +701,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
             "review_queue_<batch>/, data/raw/<batch>.csv, reports/search_<batch>.md, ...), so "
             "giving each batch its own lock file (e.g. output/.agent_pipeline.<batch>.lock) lets "
             "distinct batches run in parallel through search, enrich and score. NOT through the "
-            "Airtable sync: use --mode search-only or --airtable skip. The base is shared state no "
+            "Airtable sync, which is refused outright when this is not the default lock: use "
+            "--mode search-only or --airtable skip. The base is shared state no "
             "batch-keyed path names, and upload_airtable's fetch_existing_records -> "
             "plan_airtable_sync -> send_airtable_plan is an unlocked read-then-write that is the "
             "only cross-batch dedupe there is -- two parallel syncs both read a base without the "
@@ -784,6 +845,14 @@ def _run_pipeline(args: argparse.Namespace) -> int:
 def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
     lock_path = Path(args.lock_file)
+
+    # Before the lock, not after: a refusal must leave no lockfile behind, and
+    # nothing may run ahead of it.
+    try:
+        check_airtable_lock_compatibility(args.airtable, args.lock_file)
+    except PipelineRefusal as exc:
+        status("REFUSE", str(exc))
+        return 2
 
     try:
         batch_preview = args.batch or f"{args.vertical}_{args.market}_{args.size}"
