@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -174,6 +174,96 @@ class DetailsBudgetTest(unittest.TestCase):
         self.assertTrue(budget.exhausted)
         self.assertFalse(budget.reserve())
         self.assertEqual(budget.count, 2)
+
+
+class DetailsBudgetDefaultTest(unittest.TestCase):
+    """A run that names no cap still gets one.
+
+    `DetailsBudget` was always a correct ceiling; the hole was that nobody
+    handed it a number. `run_agent_pipeline.py` never passes `--max-details`,
+    so `max_details=None` flowed all the way down and the budget was
+    unlimited -- and since the per-call pacing sleep is gone and details are
+    fetched six-wide, unbounded billed spend now runs about six times faster
+    than the code these defaults were written against. The absence of a flag
+    must not mean the absence of a brake.
+    """
+
+    def test_no_explicit_cap_resolves_to_a_bounded_default(self) -> None:
+        with patch.dict(os.environ, {"MAX_DETAILS_CALLS_PER_RUN": ""}):
+            resolved = make_search_batch.resolve_max_details(None)
+        self.assertIsNotNone(resolved, "an unspecified cap must not mean unlimited")
+        self.assertEqual(resolved, make_search_batch.DEFAULT_MAX_DETAILS_CALLS_PER_RUN)
+
+    def test_env_var_overrides_the_default(self) -> None:
+        with patch.dict(os.environ, {"MAX_DETAILS_CALLS_PER_RUN": "25"}):
+            self.assertEqual(make_search_batch.resolve_max_details(None), 25)
+
+    def test_explicit_argument_wins_over_the_env(self) -> None:
+        with patch.dict(os.environ, {"MAX_DETAILS_CALLS_PER_RUN": "25"}):
+            self.assertEqual(make_search_batch.resolve_max_details(5), 5)
+            # Including an explicit 0: "spend nothing" is a real instruction,
+            # not a missing value.
+            self.assertEqual(make_search_batch.resolve_max_details(0), 0)
+
+    def test_a_negative_env_value_is_the_documented_way_back_to_unlimited(self) -> None:
+        # The escape hatch has to be the env var and not `--max-details`,
+        # because `_validate_optional_cap` rejects a negative flag and 0
+        # already means "no details calls at all".
+        with patch.dict(os.environ, {"MAX_DETAILS_CALLS_PER_RUN": "-1"}):
+            self.assertIsNone(make_search_batch.resolve_max_details(None))
+
+    def test_an_unparseable_env_value_falls_back_to_the_bounded_default(self) -> None:
+        warned = io.StringIO()
+        with patch.dict(os.environ, {"MAX_DETAILS_CALLS_PER_RUN": "lots"}):
+            with redirect_stderr(warned):
+                resolved = make_search_batch.resolve_max_details(None)
+        self.assertEqual(resolved, make_search_batch.DEFAULT_MAX_DETAILS_CALLS_PER_RUN)
+        self.assertIn("MAX_DETAILS_CALLS_PER_RUN", warned.getvalue())
+
+    def test_collect_raw_rows_enforces_the_env_default_with_no_flag(self) -> None:
+        # The regression that matters: the resolved default has to reach the
+        # budget object, not merely exist as a constant.
+        def fake_details(api_key, place_id):
+            return _details(place_id, int(place_id.rsplit("-", 1)[1]))
+
+        with patch.dict(os.environ, {"MAX_DETAILS_CALLS_PER_RUN": "4"}):
+            raw_rows, warnings, errors = _collect(
+                _config(), details_fn=fake_details, search_fn=_search_returning(20)
+            )
+
+        self.assertEqual(len(raw_rows), 4, "billed past the env cap with no --max-details")
+        self.assertEqual(errors, [])
+        self.assertTrue(any("max-details=4" in w for w in warnings), warnings)
+
+    def test_collect_raw_rows_is_bounded_even_with_no_env_at_all(self) -> None:
+        def fake_details(api_key, place_id):
+            return _details(place_id, int(place_id.rsplit("-", 1)[1]))
+
+        with patch.dict(os.environ, {"MAX_DETAILS_CALLS_PER_RUN": ""}), patch.object(
+            make_search_batch, "DEFAULT_MAX_DETAILS_CALLS_PER_RUN", 3
+        ):
+            raw_rows, warnings, _ = _collect(
+                _config(), details_fn=fake_details, search_fn=_search_returning(20)
+            )
+
+        self.assertEqual(len(raw_rows), 3)
+        self.assertTrue(any("max-details=3" in w for w in warnings), warnings)
+
+    def test_the_shipped_default_clears_a_normal_metro_batch(self) -> None:
+        # Observed unique places per medium metro config across the 32 batches
+        # in data/raw peak at 251; the default has to sit clear of that or it
+        # would silently truncate ordinary runs.
+        self.assertGreaterEqual(make_search_batch.DEFAULT_MAX_DETAILS_CALLS_PER_RUN, 300)
+        # And it has to stay a real brake, not a formality.
+        self.assertLessEqual(make_search_batch.DEFAULT_MAX_DETAILS_CALLS_PER_RUN, 1000)
+
+    def test_the_default_matches_the_legacy_cli_cap_of_the_same_name(self) -> None:
+        # `MAX_DETAILS_CALLS_PER_RUN` already bounds the legacy places_search
+        # CLI. One env var must not mean two different numbers depending on
+        # which entry point read it.
+        with patch.dict(os.environ, {"MAX_DETAILS_CALLS_PER_RUN": ""}):
+            legacy_default = places_search.getenv_int("MAX_DETAILS_CALLS_PER_RUN", 400)
+        self.assertEqual(make_search_batch.DEFAULT_MAX_DETAILS_CALLS_PER_RUN, legacy_default)
 
 
 class DetailsWorkerResolutionTest(unittest.TestCase):

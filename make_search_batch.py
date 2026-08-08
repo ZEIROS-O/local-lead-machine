@@ -46,6 +46,11 @@ DEFAULT_REVIEW_SNAPSHOT_DB = "run_state/review_velocity.sqlite3"
 DEFAULT_DETAILS_WORKERS = 6
 MAX_DETAILS_WORKERS = 8
 
+# Default ceiling on billed Place Details calls per run (MAX_DETAILS_CALLS_PER_RUN).
+# See resolve_max_details. Same name and same number as the cap the legacy
+# places_search CLI already reads, so the knob means one thing repo-wide.
+DEFAULT_MAX_DETAILS_CALLS_PER_RUN = 400
+
 REQUIRED_CONFIG_FIELDS = ["batch", "vertical", "location", "limit_per_query", "queries"]
 
 REQUIRED_FINAL_FIELDS = [
@@ -656,6 +661,36 @@ class DetailsBudget:
             return True
 
 
+def resolve_max_details(max_details: Optional[int]) -> Optional[int]:
+    """The effective ceiling on billed Place Details calls for one run.
+
+    `DetailsBudget` was always a correct ceiling; what was missing was a
+    number to give it. `--max-details` is optional and `run_agent_pipeline.py`
+    never passes it, so `None` reached `DetailsBudget` and meant unlimited --
+    on the paid path, with the per-call pacing sleep removed and six calls in
+    flight, so an unattended run could bill without a brake roughly six times
+    faster than the code this default replaces. An unspecified cap now means
+    the configured default, never unlimited.
+
+    Precedence, strictest source first:
+
+    * an explicit `max_details` wins outright, including an explicit ``0``
+      ("spend nothing" is an instruction, not a missing value);
+    * otherwise `MAX_DETAILS_CALLS_PER_RUN`;
+    * otherwise `DEFAULT_MAX_DETAILS_CALLS_PER_RUN`.
+
+    Unlimited is still reachable, but only deliberately and only through the
+    env: a negative `MAX_DETAILS_CALLS_PER_RUN` (e.g. ``-1``) restores the old
+    behaviour. It cannot be a `--max-details` value, because
+    `_validate_optional_cap` rejects a negative flag and ``0`` is already
+    taken.
+    """
+    if max_details is not None:
+        return max_details
+    configured = getenv_int("MAX_DETAILS_CALLS_PER_RUN", DEFAULT_MAX_DETAILS_CALLS_PER_RUN)
+    return None if configured < 0 else configured
+
+
 def resolve_details_workers() -> int:
     """How many Place Details calls to keep in flight.
 
@@ -683,6 +718,7 @@ def collect_raw_rows(
     queries_run: List[str] = []
     duplicate_reason_counts: Counter[str] = Counter()
     seen_place_ids: set[str] = set()
+    max_details = resolve_max_details(max_details)
     details_budget = DetailsBudget(max_details)
     details_cap_reported = False
     collected = 0
@@ -753,7 +789,14 @@ def collect_raw_rows(
                     # happening to be single-threaded.
                     if not details_budget.reserve():
                         if not details_cap_reported:
-                            warnings.append(f"Hit --max-details={max_details}; skipped remaining Place Details calls")
+                            # The cap may have come from --max-details or from
+                            # MAX_DETAILS_CALLS_PER_RUN, so name both escapes
+                            # rather than the flag the operator may not have
+                            # passed.
+                            warnings.append(
+                                f"Hit max-details={max_details}; skipped remaining Place Details "
+                                "calls. Raise --max-details or MAX_DETAILS_CALLS_PER_RUN to go further."
+                            )
                             _progress(f"[DETAILS] hit max-details={max_details}; skipping remaining Place Details calls")
                             details_cap_reported = True
                         continue
@@ -1107,7 +1150,9 @@ def main() -> int:
     parser.add_argument(
         "--max-details", type=int, default=None,
         help="Hard cap on billed Place Details calls. Reserved atomically, so the concurrent "
-             "fetch cannot exceed it.",
+             "fetch cannot exceed it. Omitting this does not mean unlimited: it falls back to "
+             f"MAX_DETAILS_CALLS_PER_RUN (default {DEFAULT_MAX_DETAILS_CALLS_PER_RUN}). Set that "
+             "env var negative for genuinely unlimited.",
     )
     parser.add_argument("--max-enrich", type=int, default=None, help="Optional cap on enrichment rows")
     parser.add_argument(
