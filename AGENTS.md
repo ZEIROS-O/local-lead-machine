@@ -124,6 +124,14 @@ Key in-flight facts (2026-07-29):
   to reach on this path** — the §4.3 "14 of 25 grades moved with no code change" defect stays open
   for exactly the runs routed through `codex`, and that includes the Phase 3 backlog. This is a
   known, accepted limitation to decide at the Phase 3 gate, not a bug to fix in `llm_client`.
+- **Scoring is the only path that sends prospect data off this machine**, and the payload is built
+  in exactly one place — `build_llm_scoring_record` (`score_leads.py:2711`). It carries business
+  name, **street address**, **phone**, URLs, and up to 8 raw 300-char windows of the prospect's own
+  page text selected by `LLM_SCORING_SNIPPET_TERMS` — a list that includes `contact`, `review` and
+  `testimonial`, so the windows routinely contain an owner's name and email or a customer's name.
+  The default chain is **kimi-first**, so an unmodified run sends all of that to Moonshot. Full
+  breakdown and the open decisions in [`docs/pii-boundary.md`](docs/pii-boundary.md); read it before
+  changing the default chain or adding a snippet term.
 - **Two Anthropic payload features are deliberately NOT wired, and both are traps.** They read like
   free wins, so the reasoning is recorded here to stop a future pass from "finishing" them.
   *`thinking: {"type": "disabled"}`* — not a universal opt-out. It is a hard 400 on `fable-5` and
