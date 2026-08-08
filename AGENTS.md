@@ -242,9 +242,17 @@ and must be owner-readable only.
   `BUYER_INTENT_ADS_CHECK` (off), `FOLLOW_UP_CADENCE_DAYS` (4), and
   `REVIEW_SNAPSHOT_DB`.
   **Compliance requires `SUPPRESSION_SOURCE` (or `LPM_OUTCOMES_JSONL`) to be set** or search,
-  enrichment and scoring all fail closed with `[ERROR]` and exit 1. `ALLOW_MISSING_SUPPRESSION_INDEX=1`
-  bypasses it loudly; there is deliberately no silent empty-index fallback, because an empty index
-  disables every opt-out.
+  enrichment, scoring **and `query_ready_to_send.py`** all fail closed with `[ERROR]` and exit 1.
+  `ALLOW_MISSING_SUPPRESSION_INDEX=1` bypasses it loudly; there is deliberately no silent
+  empty-index fallback, because an empty index disables every opt-out.
+  The ledger is also the *only* record of an opt-out: `mark_outcome.py --event opt_out`
+  (alias `unsubscribed`) appends to it via `compliance.append_suppression_event` and sets
+  `Status = Not Fit`, with no source-status gate — a rep hears "take me off your list" on the
+  first dial, at `Status = New`. `Do Not Contact` is deliberately not a Status; the ledger is
+  where every stage already reads. Suppression matches on **contact channels**, not Place Key,
+  so an opt-out on a record with no `Phone` and no `Email` records `suppression_scope:
+  "record_only"`, warns, and will *not* survive re-discovery under a new record — pass
+  `--phone`/`--email` to make it stick.
 - HTTP via `requests` (see `places_search.request_json`). No new heavy deps without reason.
 - Tests are stdlib `unittest` in `tests/`. Run `.venv/bin/python -m unittest discover -s tests`
   (bare `python -m unittest` discovers 0 tests here, and the system interpreter has none of the
