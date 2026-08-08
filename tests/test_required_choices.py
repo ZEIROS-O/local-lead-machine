@@ -135,6 +135,8 @@ def complete_tables() -> list[dict]:
             choice("selA", "Call"),
             choice("selB", "Reply"),
             choice("selC", "Close"),
+            # The opt-out verb logs its activity row as a Note.
+            choice("selI", "Note"),
         ],
         outcome=[
             choice("selD", "Replied"),
@@ -142,6 +144,8 @@ def complete_tables() -> list[dict]:
             choice("selF", "Won"),
             choice("selG", "Lost"),
             choice("selH", "Held"),
+            # ...carrying its compliance meaning here.
+            choice("selJ", "Opted Out"),
         ],
     )
 
@@ -287,11 +291,11 @@ class AuditChoicesTest(unittest.TestCase):
             ("Booked", "Lost", "Won"),
         )
         self.assertEqual(
-            status_named(statuses, "Activity Type").missing, ("Close", "Reply")
+            status_named(statuses, "Activity Type").missing, ("Close", "Note", "Reply")
         )
         self.assertEqual(
             status_named(statuses, "Outcome").missing,
-            ("Held", "Lost", "Meeting Booked", "Replied", "Won"),
+            ("Held", "Lost", "Meeting Booked", "Opted Out", "Replied", "Won"),
         )
 
     def test_an_absent_field_is_reported_rather_than_raised(self):

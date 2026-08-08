@@ -195,6 +195,132 @@ def load_suppression_index(value: Path | str) -> set[str]:
     return suppressed
 
 
+# --- Writing the suppression ledger --------------------------------------
+# This module was read-only until 2026-08-07: it could load an index and match
+# against it, but nothing in the repo could *create* a suppression row. The only
+# ledger appender was hermes_queue's, whose sole call site writes
+# `{"event": "sent"}`. Every `opt_out` literal lived in a test fixture, so a rep
+# who heard "take me off your list" had nowhere to put it — the one gap in the
+# pipeline that created liability rather than delay.
+#
+# The writer lives here, beside the reader, because the two have to agree on the
+# row shape exactly: a row `load_suppression_index` skips is a suppression that
+# silently applies to nobody.
+
+DEFAULT_SUPPRESSION_EVENT = "opt_out"
+
+
+def normalize_suppression_event(value: Any) -> str:
+    """Fold an event name the way `load_suppression_index` folds it on read."""
+    return str(value or "").strip().casefold().replace("-", "_").replace(" ", "_")
+
+
+def configured_suppression_source() -> str:
+    """The ledger path the environment names, unresolved and unvalidated.
+
+    Shared by the reader below and by every write path, so a run cannot end up
+    reading one file and appending to another.
+    """
+    return (
+        os.getenv("SUPPRESSION_SOURCE", "").strip()
+        or os.getenv("LPM_OUTCOMES_JSONL", "").strip()
+    )
+
+
+def append_suppression_event(
+    ledger: Path | str,
+    *,
+    event: str = DEFAULT_SUPPRESSION_EVENT,
+    record_id: Any = "",
+    phone: Any = "",
+    email: Any = "",
+    occurred_at: str = "",
+    source: str = "",
+    notes: str = "",
+) -> dict[str, Any]:
+    """Append one suppression row: append-only, fsynced, idempotent on repeat.
+
+    Fails closed in four directions, each of which would otherwise produce a
+    suppression that suppresses nobody:
+
+    * an `event` outside `SUPPRESSION_EVENTS` — the reader skips those rows;
+    * a row with no identifier — the reader *raises* on those, so writing one
+      would brick every later run that loads this file;
+    * a ledger path that does not exist — creating it would record the opt-out
+      into a file nothing reads, while the rep believes they are covered;
+    * a ledger that does not parse — a good row added to a broken file is still
+      a file every reader rejects wholesale.
+
+    Idempotency is defined on identifiers, not on the row: repeating the same
+    opt-out appends nothing, but adding a channel the ledger has never seen
+    (a second phone, a late-discovered email) still appends. A rule keyed on
+    exact-row equality would silently drop the new channel.
+
+    Contact values are written as given, not normalised: `suppression_identifier`
+    normalises on read, and the raw string is what a human can recognise in the
+    ledger later.
+
+    Returns `{"result": "appended"|"already_present", "path", "identifiers"}`.
+    """
+    normalized_event = normalize_suppression_event(event)
+    if normalized_event not in SUPPRESSION_EVENTS:
+        raise ComplianceError(
+            f"{event!r} is not a suppression event, so load_suppression_index would "
+            f"skip the row it produces. Expected one of {sorted(SUPPRESSION_EVENTS)}"
+        )
+
+    path = suppression_source_path(ledger)
+
+    identifiers = {
+        identifier
+        for kind, value in (("record_id", record_id), ("phone", phone), ("email", email))
+        if (identifier := suppression_identifier(kind, value))
+    }
+    if not identifiers:
+        raise ComplianceError(
+            "a suppression event needs at least one identifier (record_id, phone or email); "
+            "load_suppression_index rejects a row without one"
+        )
+
+    row: dict[str, Any] = {"event": normalized_event}
+    for key, value in (
+        ("record_id", record_id),
+        ("phone", phone),
+        ("email", email),
+        ("occurred_at", occurred_at),
+        ("source", source),
+        ("notes", notes),
+    ):
+        cleaned = str(value or "").strip()
+        if cleaned:
+            row[key] = cleaned
+
+    existing = load_suppression_index(path)
+    if identifiers <= existing:
+        return {
+            "result": "already_present",
+            "path": str(path),
+            "identifiers": sorted(identifiers),
+        }
+
+    line = json.dumps(row, sort_keys=True)
+    try:
+        # A ledger whose last line has no terminator would otherwise be
+        # concatenated with this row into one unparseable line, taking down
+        # every reader of the file.
+        existing_text = path.read_text(encoding="utf-8")
+        prefix = "\n" if existing_text and not existing_text.endswith("\n") else ""
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(prefix + line + "\n")
+            handle.flush()
+            # An opt-out that only reached the page cache is not recorded.
+            os.fsync(handle.fileno())
+    except OSError as exc:
+        raise ComplianceError(f"suppression ledger {path} is not writable: {exc}") from exc
+
+    return {"result": "appended", "path": str(path), "identifiers": sorted(identifiers)}
+
+
 def matching_suppression_identifiers(
     record: Mapping[str, Any], suppression: Iterable[str]
 ) -> set[str]:
@@ -228,10 +354,7 @@ def load_configured_suppression_index() -> set[str]:
     index every opt-out silently stops applying. Callers must opt out loudly via
     ALLOW_MISSING_SUPPRESSION_INDEX rather than getting an empty set by default.
     """
-    suppression_source = (
-        os.getenv("SUPPRESSION_SOURCE", "").strip()
-        or os.getenv("LPM_OUTCOMES_JSONL", "").strip()
-    )
+    suppression_source = configured_suppression_source()
 
     if not suppression_source:
         if _env_flag("ALLOW_MISSING_SUPPRESSION_INDEX", False):
