@@ -244,6 +244,29 @@ class ApiLlmSkip:
     reason: str
 
 
+#: Skip reasons that mean "the run stopped short on budget", as opposed to "this
+#: batch failed". Membership is deliberately an allow-list: an unclassified reason
+#: reports as a failure, because reporting a failure as a benign cap stop is the
+#: error that costs an operator a run, not the reverse.
+LLM_CAP_SKIP_REASONS = frozenset({"single_record_exceeds_token_cap"})
+
+
+def partition_api_llm_skips(
+    skipped_records: List["ApiLlmSkip"] | None,
+) -> Tuple[List["ApiLlmSkip"], List["ApiLlmSkip"]]:
+    """Split cap stops from batch failures for reporting.
+
+    Both land in `skipped_records`, and both used to print under the single
+    heading "Records skipped by LLM caps". They call for opposite responses: a
+    cap stop means raise the cap or split the run and the leads re-score
+    untouched; a `batch_failed` lead means the model could not produce a valid
+    bundle for it and re-running unchanged will most likely fail again.
+    """
+    cap_skips = [s for s in skipped_records or [] if s.reason in LLM_CAP_SKIP_REASONS]
+    failures = [s for s in skipped_records or [] if s.reason not in LLM_CAP_SKIP_REASONS]
+    return cap_skips, failures
+
+
 @dataclass(frozen=True)
 class ApiLlmRun:
     manual_run: ManualScoreRun
@@ -2262,24 +2285,36 @@ def resolve_projection_model() -> str:
     except Exception:  # never let projection break a run
         return expected
     priced: List[Tuple[float, str]] = []
-    for candidate in {c for c in candidates if c} | {expected}:
+    for candidate in sorted({c for c in candidates if c} | {expected}):
         try:
             _, output_price = llm_pricing(candidate)
         except UnknownLlmModelError:
-            continue
+            # Documented in AGENTS.md as an abort, and it has to be one: skipping
+            # an unpriced candidate projects as though that tier did not exist, so
+            # falling through to it spends money the pre-spend gate never saw.
+            # Nothing has been called yet, so aborting here is free.
+            raise UnknownLlmModelError(
+                f"LLM chain can reach {candidate!r}, which has no price in "
+                f"LLM_PRICING_USD_PER_MILLION_TOKENS. Add it, or drop that provider "
+                f"from LLM_SCORING_PROVIDER_CHAIN — spend caps cannot bind on a "
+                f"model with no price."
+            ) from None
         priced.append((output_price, candidate))
     if not priced:
         return expected
     return max(priced)[1]
 
 
-def resolve_served_model(result: Dict[str, Any], fallback: str) -> str:
+def resolve_served_model(result: Dict[str, Any], fallback: str, *, worst_case: str = "") -> str:
     """Model id to price a served batch with, falling back to the run-level one.
 
     The chain reports which provider served the batch so spend lands on the
     right price row. But a provider is free-form about what it reports, and an
     id with no pricing entry must not kill a run mid-flight — the call is
-    already paid for. Unknown ids fall back to the run-level model loudly;
+    already paid for. Unknown ids are charged loudly at `worst_case` (the
+    priciest tier the chain could reach) rather than at the run-level model,
+    because the run-level model is routinely a $0 subscription runner and
+    charging an unknown paid model at $0.00 is how the USD cap stops binding.
     MAX_LLM_TOKENS_PER_RUN still bounds the run either way.
     """
     candidate = result.get("model")
@@ -2289,13 +2324,19 @@ def resolve_served_model(result: Dict[str, Any], fallback: str) -> str:
     try:
         llm_pricing(candidate)
     except UnknownLlmModelError:
+        charge_at = fallback
+        try:
+            if worst_case and llm_pricing(worst_case)[1] > llm_pricing(fallback)[1]:
+                charge_at = worst_case
+        except UnknownLlmModelError:
+            charge_at = fallback
         print(
             f"[WARN] Provider reported unpriced model {candidate!r}; "
-            f"charging this batch at {fallback!r} instead. Add it to "
+            f"charging this batch at {charge_at!r} instead. Add it to "
             f"LLM_PRICING_USD_PER_MILLION_TOKENS so spend caps stay accurate.",
             file=sys.stderr,
         )
-        return fallback
+        return charge_at
     return candidate
 
 
@@ -3100,6 +3141,11 @@ def _score_batch_with_debug(
     # subscription runner onto a paid API, so `model` is the wrong price here.
     failed_model = ""
     calls_made = 0
+    # Retries that the run has to own up to. The validation-repair path already
+    # writes itself into debug_notes; the truncation retry only ever printed to
+    # stdout and dropped a file in the bundle dir, so its spend showed up in the
+    # bill and the call count and nowhere in the run's own reporting.
+    retry_notes: List[str] = []
     while True:
         try:
             calls_made += 1
@@ -3128,6 +3174,7 @@ def _score_batch_with_debug(
                     repaired = llm_client.score_batch(repair_prompt, model=model, max_tokens=current_max_tokens)
                     repaired["usage"] = _accumulate_usage(failed_usage, repaired.get("usage"))
                     repaired["call_count"] = calls_made
+                    repaired.setdefault("debug_notes", []).extend(retry_notes)
                     repaired.setdefault("debug_notes", []).append(
                         f"validation repair succeeded for {batch_id}; raw response saved to {validation_debug_path}"
                     )
@@ -3153,6 +3200,7 @@ def _score_batch_with_debug(
                     err.usage = failed_usage
                     err.model = failed_model
                     err.call_count = calls_made
+                    err.debug_notes = list(retry_notes)
                     raise err from repair_exc
 
             debug_path = _write_invalid_llm_response(
@@ -3165,16 +3213,23 @@ def _score_batch_with_debug(
                 attempt += 1
                 current_max_tokens = max(8192, current_max_tokens * 2)
                 print(f"[LLM RETRY] Invalid/truncated JSON; raw response saved to {debug_path}; retrying with max_tokens={current_max_tokens}")
+                retry_notes.append(
+                    f"truncation retry for {batch_id}: first attempt came back truncated "
+                    f"(saved to {debug_path}); retried at max_tokens={current_max_tokens}"
+                )
                 continue
             err = ValueError(f"{exc}; raw LLM response saved to {debug_path}")
             err.usage = failed_usage
             err.model = failed_model
             err.call_count = calls_made
+            err.debug_notes = list(retry_notes)
             raise err from exc
         else:
             if failed_usage:
                 result["usage"] = _accumulate_usage(failed_usage, result.get("usage"))
             result["call_count"] = calls_made
+            if retry_notes:
+                result.setdefault("debug_notes", []).extend(retry_notes)
             return result
 
 
@@ -3453,7 +3508,7 @@ def score_records_api_run(
     def _bank_batch(result: Dict[str, Any], *, batch_id: str, chunk: List[Dict[str, Any]]) -> None:
         """Merge one completed batch. Called on the calling thread, in submit order."""
         nonlocal calls, input_tokens, output_tokens, tokens, usd
-        served_model = resolve_served_model(result, model)
+        served_model = resolve_served_model(result, model, worst_case=reservation_model)
         runner_model = result.get("runner_model")
         runner_model = runner_model.strip() if isinstance(runner_model, str) else ""
         print(
@@ -3509,6 +3564,9 @@ def score_records_api_run(
         `skipped_records`, and let the run finish with what it did score.
         """
         print(f"[LLM BATCH FAILED] batch={batch_id} leads={len(chunk)} error={exc}")
+        # Retries the batch spent before giving up ride on the exception; bank them
+        # first so the run reports the spend even though the batch produced nothing.
+        debug_notes.extend(str(note) for note in getattr(exc, "debug_notes", None) or [] if str(note))
         debug_notes.append(f"batch {batch_id} failed and its leads were skipped: {exc}")
         for record in chunk:
             skipped_records.append(
@@ -3747,7 +3805,7 @@ def score_records_api_run(
         # one. With a subscription runner first in the chain, `model` is
         # "subscription:<runner>" at $0/$0 — so a fallback to a paid API would
         # bill every token at zero and MAX_LLM_USD_PER_RUN would never trip.
-        served_model = resolve_served_model(result, model)
+        served_model = resolve_served_model(result, model, worst_case=reservation_model)
         runner_model = result.get("runner_model")
         runner_model = runner_model.strip() if isinstance(runner_model, str) else ""
         print(
@@ -4139,9 +4197,13 @@ def main() -> int:
         print(f"[LLM] Tokens: {api_run.tokens}")
         print(f"[LLM] Estimated USD: {api_run.usd:.4f}")
         print(f"[LLM] Missing scores skipped: {len(api_run.manual_run.missing_scores)}")
-        print(f"[LLM] Records skipped by LLM caps: {len(api_run.skipped_records or [])}")
-        for skipped in api_run.skipped_records or []:
+        cap_skips, batch_failures = partition_api_llm_skips(api_run.skipped_records)
+        print(f"[LLM] Records skipped by LLM caps: {len(cap_skips)}")
+        for skipped in cap_skips:
             print(f"[LLM] - {skipped.score_file}: {skipped.reason}")
+        print(f"[LLM] Records skipped by batch failure: {len(batch_failures)}")
+        for skipped in batch_failures:
+            print(f"[LLM] - {skipped.score_file}: {skipped.reason}", file=sys.stderr)
         if api_run.stopped_by_cap:
             print(f"[LLM] Stopped by cap: {api_run.stop_reason}")
         if args.llm_usage_output:

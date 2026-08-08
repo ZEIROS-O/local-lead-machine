@@ -93,8 +93,14 @@ Key in-flight facts (2026-07-29):
   claude CLI (subscription). Order via `LLM_SCORING_PROVIDER_CHAIN`; `anthropic` (Messages API,
   `ANTHROPIC_API_KEY`) remains an optional provider. Fallback happens only on provider
   unavailability — invalid output stays with the repair flow in `score_leads.py`. Every model the
-  chain can resolve must have a price in `score_leads.LLM_PRICING_USD_PER_MILLION_TOKENS` or the
-  run aborts at cost estimation; `[LLM PROVIDER]` in the run log says who actually served.
+  chain can resolve must have a price in `score_leads.LLM_PRICING_USD_PER_MILLION_TOKENS` or
+  `resolve_projection_model()` aborts at cost estimation, before any call is made. A model the
+  *provider reports having served* is different: the call is already paid for, so an unpriced
+  served id never aborts — `resolve_served_model()` charges it at the priciest tier the chain
+  could have reached and warns. It is charged there rather than at the run-level model because
+  the run-level model is routinely a $0 subscription runner, and charging unknown paid spend at
+  $0.00 is exactly how `MAX_LLM_USD_PER_RUN` stops binding.
+  `[LLM PROVIDER]` in the run log says who actually served.
 - **Determinism is pinned only where the model accepts it, and the default config is not pinned.**
   `llm_client` sends `temperature: 0` on the kimi and anthropic payloads, but omits it for model
   families that fix sampling server-side (`SAMPLING_FIXED_MODEL_PREFIXES`): `kimi-k3` (Moonshot

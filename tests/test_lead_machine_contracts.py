@@ -3571,6 +3571,55 @@ class LeadMachineContractsTest(unittest.TestCase):
         with patch.dict(os.environ, {"LLM_SCORING_PROVIDER_CHAIN": "codex,claude"}, clear=False):
             self.assertEqual(llm_pricing(resolve_projection_model())[1], 0.0)
 
+    def test_projection_aborts_when_a_reachable_chain_model_has_no_price(self) -> None:
+        """AGENTS.md promises this abort; the code used to `continue` past it.
+
+        An unpriced chain member is invisible to the projection, so it projects as
+        if that tier did not exist. Fall through to it and the run spends real
+        money the pre-spend gate never saw. Aborting costs nothing here — this
+        runs before any call.
+        """
+        from score_leads import resolve_projection_model, UnknownLlmModelError
+
+        with patch.dict(
+            os.environ,
+            {"LLM_SCORING_PROVIDER_CHAIN": "codex,kimi",
+             "KIMI_SCORING_MODEL": "kimi-not-in-the-pricing-table"},
+            clear=False,
+        ):
+            with self.assertRaises(UnknownLlmModelError) as caught:
+                resolve_projection_model()
+
+        self.assertIn("kimi-not-in-the-pricing-table", str(caught.exception))
+        self.assertIn("LLM_PRICING_USD_PER_MILLION_TOKENS", str(caught.exception))
+
+    def test_unpriced_served_model_banks_at_worst_case_not_at_a_free_runner(self) -> None:
+        """Mid-flight the call is already paid for, so this must not abort — but
+        charging an unknown served model at a $0 subscription run-level model
+        banks real spend as $0.00 and the USD cap stops binding. Charge it at the
+        priciest tier the chain could have reached instead.
+        """
+        from score_leads import resolve_served_model, llm_pricing
+
+        charged = resolve_served_model(
+            {"model": "some-model-nobody-registered"},
+            "subscription:codex",
+            worst_case="claude-opus-5",
+        )
+
+        self.assertEqual(charged, "claude-opus-5")
+        self.assertGreater(llm_pricing(charged)[1], 0.0)
+
+    def test_unpriced_served_model_never_aborts_when_worst_case_is_also_unknown(self) -> None:
+        # The call is already paid for; an unknown id must not kill the run.
+        from score_leads import resolve_served_model
+
+        self.assertEqual(
+            resolve_served_model({"model": "mystery"}, "kimi-k3", worst_case="also-mystery"),
+            "kimi-k3",
+        )
+        self.assertEqual(resolve_served_model({"model": "mystery"}, "kimi-k3"), "kimi-k3")
+
     def test_subscription_served_batch_is_billed_at_zero_not_the_runner_model_rate(self) -> None:
         """The mirror of the test above: a sub-served batch must stay free.
 
@@ -4455,6 +4504,121 @@ class LeadMachineContractsTest(unittest.TestCase):
             {"input_tokens": 1700, "output_tokens": 300, "total_tokens": 2000},
         )
         self.assertEqual(caught.exception.call_count, 2)
+
+    def test_api_llm_skips_partition_cap_stops_from_batch_failures(self) -> None:
+        # One list carries two unrelated causes. Reported under the single heading
+        # "Records skipped by LLM caps", a `batch_failed` lead reads as a budget
+        # stop — so an operator judging batch completeness concludes the run ran
+        # out of money and the leads are fine to re-score, when in fact the model
+        # failed on them and the run still exited 0.
+        import score_leads
+
+        skips = [
+            score_leads.ApiLlmSkip(lead_name="A", score_file="a.json",
+                                   reason="single_record_exceeds_token_cap"),
+            score_leads.ApiLlmSkip(lead_name="B", score_file="b.json", reason="batch_failed"),
+            score_leads.ApiLlmSkip(lead_name="C", score_file="c.json", reason="batch_failed"),
+        ]
+
+        cap_skips, failures = score_leads.partition_api_llm_skips(skips)
+
+        self.assertEqual([s.score_file for s in cap_skips], ["a.json"])
+        self.assertEqual([s.score_file for s in failures], ["b.json", "c.json"])
+        self.assertEqual(score_leads.partition_api_llm_skips(None), ([], []))
+
+    def test_api_llm_skips_partition_treats_unknown_reasons_as_failures(self) -> None:
+        # A reason nobody has classified yet must not be reported as a cap stop.
+        # Cap stops are the benign half; defaulting an unknown cause into the
+        # benign bucket is how the mislabelling happened in the first place.
+        import score_leads
+
+        skips = [score_leads.ApiLlmSkip(lead_name="Z", score_file="z.json",
+                                        reason="something_new_and_unclassified")]
+
+        cap_skips, failures = score_leads.partition_api_llm_skips(skips)
+
+        self.assertEqual(cap_skips, [])
+        self.assertEqual([s.score_file for s in failures], ["z.json"])
+
+    def test_score_batch_with_debug_reports_truncation_retry_in_debug_notes(self) -> None:
+        # The truncation retry is a second billed call. It printed to stdout and
+        # dropped an `invalid_response_attempt_1.txt` into _api_bundles/, but it
+        # never entered the run's own debug_notes — so the run reported the repair
+        # retries and stayed silent about these, leaving a quarter of retry spend
+        # invisible in the artifact an operator actually reviews.
+        import score_leads
+        from lead_machine import llm_client
+
+        compact_records = [{"score_file": "phone-123.json", "lead": {"business_name": "X"},
+                            "evidence_ref_options": [{"id": "google_profile", "label": "Google profile"}]}]
+        truncated = llm_client.InvalidLlmResponse(
+            "Unterminated string starting at line 4",
+            raw_text='{"scores": [',
+            parsed_json=None,
+            usage={"input_tokens": 900, "output_tokens": 4096, "total_tokens": 4996},
+        )
+        good = {"bundle": {"batch_id": "b", "scores": []},
+                "usage": {"input_tokens": 900, "output_tokens": 300, "total_tokens": 1200}}
+
+        calls = {"n": 0}
+
+        def fake_score_batch(prompt, *, model, max_tokens):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise truncated
+            return dict(good)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(score_leads.llm_client, "score_batch", side_effect=fake_score_batch):
+                result = score_leads._score_batch_with_debug(
+                    "prompt", batch_id="batch_010", bundle_dir=Path(tmp),
+                    compact_records=compact_records, model="m", max_tokens=4096,
+                )
+
+        self.assertEqual(result["call_count"], 2)
+        notes = result.get("debug_notes") or []
+        self.assertTrue(
+            any("batch_010" in note and "truncat" in note.lower() for note in notes),
+            f"truncation retry must be named in debug_notes; got {notes!r}",
+        )
+
+    def test_score_batch_with_debug_carries_retry_notes_onto_the_failure(self) -> None:
+        # A batch that retried and *then* failed is the worst reporting case: the
+        # retry was billed and the batch produced nothing. The note has to ride the
+        # exception so `_record_batch_failure` can bank it into the run's notes.
+        import score_leads
+        from lead_machine import llm_client
+
+        compact_records = [{"score_file": "phone-123.json", "lead": {"business_name": "X"},
+                            "evidence_ref_options": [{"id": "google_profile", "label": "Google profile"}]}]
+        truncated = llm_client.InvalidLlmResponse(
+            "Unterminated string starting at line 4", raw_text='{"scores": [', parsed_json=None,
+            usage={"input_tokens": 900, "output_tokens": 4096, "total_tokens": 4996},
+        )
+        still_bad = llm_client.InvalidLlmResponse(
+            "not json at all", raw_text="???", parsed_json=None,
+            usage={"input_tokens": 900, "output_tokens": 50, "total_tokens": 950},
+        )
+
+        calls = {"n": 0}
+
+        def fake_score_batch(prompt, *, model, max_tokens):
+            calls["n"] += 1
+            raise truncated if calls["n"] == 1 else still_bad
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(score_leads.llm_client, "score_batch", side_effect=fake_score_batch):
+                with self.assertRaises(ValueError) as caught:
+                    score_leads._score_batch_with_debug(
+                        "prompt", batch_id="batch_015", bundle_dir=Path(tmp),
+                        compact_records=compact_records, model="m", max_tokens=4096,
+                    )
+
+        notes = getattr(caught.exception, "debug_notes", None) or []
+        self.assertTrue(
+            any("batch_015" in note and "truncat" in note.lower() for note in notes),
+            f"retry note must ride the failure; got {notes!r}",
+        )
 
     def test_api_llm_prompt_requires_non_empty_evidence_refs_from_options(self) -> None:
         from score_leads import build_api_llm_scoring_prompt, build_llm_scoring_record
