@@ -383,6 +383,21 @@ def flatten_safe_outreach_claims(value: Any) -> str:
 
 
 def normalize_unsafe_claims(value: Any) -> List[str]:
+    """Unsafe claims keep the raw `;` split, deliberately — with a caveat.
+
+    They carry no citations, so the misattribution that forced escaping on the
+    safe side cannot happen here: a split yields two warnings rather than one,
+    and never moves evidence between assertions.
+
+    But the reason it is harmless is narrower than it looks, and it is *not*
+    "both fragments still block". No blocker reads unsafe claims at all — they
+    are display-only. The safety rests on them sitting outside the gate
+    entirely. Wire them into `evaluate_sendability` and this unescaped split
+    becomes live; escape it then, the way `_escape_claim_text` does.
+
+    Known, accepted loss: a claim of only `;` or whitespace round-trips to
+    nothing, dropping a "do not say this" warning from the rep's card.
+    """
     if isinstance(value, dict):
         for key in ("unsafe_claims", "Unsafe Claims"):
             if key in value:

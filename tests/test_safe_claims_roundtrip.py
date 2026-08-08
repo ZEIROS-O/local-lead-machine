@@ -169,6 +169,33 @@ class LegacySafeClaimParsingTests(unittest.TestCase):
             [{"claim": r"Photos live at C:\gallery", "evidence_refs": ["ev_1"]}],
         )
 
+    def test_a_legacy_row_that_already_held_an_escape_sequence_reads_as_escaped(self) -> None:
+        r"""The two shapes where legacy parsing genuinely changed, pinned as chosen.
+
+        Backward compatibility is exact for a raw `;`, which is the shape the
+        audit found in real data. It is *not* exact for a stored `\;` or `\\`,
+        because the new reader cannot tell "written by the new escaping writer"
+        from "a backslash that happened to precede a semicolon". It resolves
+        both as escapes.
+
+        That is the correct resolution rather than merely the convenient one:
+        under the old flattener a claim boundary is always the literal `] ; `,
+        so a stored `\;` can only ever have come from inside a claim's own text.
+        Merging it back reconstructs what the model actually said. The effect is
+        a relaxation — the old parser split this into two claims, one of them
+        uncited and therefore blocking — so it is recorded here rather than left
+        to be discovered as drift.
+        """
+        self.assertEqual(
+            normalize_safe_outreach_claims(r"Load 8s\; rivals 2s [ev_1]"),
+            [{"claim": "Load 8s; rivals 2s", "evidence_refs": ["ev_1"]}],
+        )
+        # And a legacy doubled backslash collapses to one, same cause.
+        self.assertEqual(
+            normalize_safe_outreach_claims(r"Photos live at C:\\gallery [ev_1]"),
+            [{"claim": r"Photos live at C:\gallery", "evidence_refs": ["ev_1"]}],
+        )
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
