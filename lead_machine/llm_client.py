@@ -31,6 +31,34 @@ TRANSIENT_HTTP_STATUSES = {429, 500, 502, 503, 504}
 
 DEFAULT_PROVIDER_CHAIN = ("kimi", "codex", "claude")
 
+# §4.3 — grades have to be reproducible. Re-scoring 25 overlapping leads with no
+# scoring code changed moved 14 grades (three A→B, nine Skip→C, scores swinging
+# ±7) because the payload pinned no sampling at all. 0 is the pin.
+PINNED_TEMPERATURE = 0
+
+# ...but the pin only applies where the model will take it. Both API providers'
+# *current* default models fix sampling server-side, and sending the key anyway
+# is not a no-op:
+#   * kimi-k3 — Moonshot fixes temperature=1.0 / top_p=0.95 and documents that
+#     they must be omitted from requests. Thinking is always on.
+#   * claude-sonnet-5 / opus-5 / opus-4-8 / opus-4-7 / fable-5 / mythos-5 —
+#     temperature, top_p and top_k were removed from the Messages API and now
+#     return a hard 400. Older ids (sonnet-4-5, sonnet-4-6, opus-4-6, haiku-4-5)
+#     still accept them.
+# A 400 kills the batch mid-run; a missing pin only costs determinism, so an id
+# in this set omits the key rather than gambling the run on it. Matching is by
+# family prefix so dated variants (claude-sonnet-5-20260214) are covered too.
+SAMPLING_FIXED_MODEL_PREFIXES = (
+    "kimi-k3",
+    "claude-fable-5",
+    "claude-mythos-5",
+    "claude-mythos-preview",
+    "claude-opus-5",
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-sonnet-5",
+)
+
 
 class ProviderUnavailable(RuntimeError):
     """A scoring provider cannot serve this call (missing key, auth, quota, transport)."""
@@ -145,6 +173,41 @@ def _getenv_float(name: str, default: float) -> float:
         return default
 
 
+def _getenv_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
+def model_accepts_temperature(model: str) -> bool:
+    """Whether `model` will take an explicit `temperature` in its request payload.
+
+    False for the families in `SAMPLING_FIXED_MODEL_PREFIXES`, and for an empty
+    id — an unresolved model is not something to gamble a billed batch on.
+    """
+    normalized = (model or "").strip().lower()
+    if not normalized:
+        return False
+    return not normalized.startswith(SAMPLING_FIXED_MODEL_PREFIXES)
+
+
+def temperature_for_model(model: str) -> int | None:
+    """`PINNED_TEMPERATURE` when the model supports it, else None (omit the key).
+
+    `LLM_PIN_TEMPERATURE=0` omits it everywhere — the escape hatch for a model
+    that rejects sampling but is not yet in `SAMPLING_FIXED_MODEL_PREFIXES`, so
+    a run can be unblocked from `.env` instead of a code change mid-backlog.
+    """
+    if not _getenv_bool("LLM_PIN_TEMPERATURE", True):
+        return None
+    return PINNED_TEMPERATURE if model_accepts_temperature(model) else None
+
+
+def _temperature_for_log(temperature: int | None) -> str:
+    return "unset(model-fixed)" if temperature is None else str(temperature)
+
+
 def _estimate_prompt_tokens(prompt: str) -> int:
     if not prompt:
         return 0
@@ -239,12 +302,16 @@ def _score_batch_anthropic(prompt: str, *, model: str | None = None, max_tokens:
         "max_tokens": max_tokens,
         "messages": [{"role": "user", "content": prompt}],
     }
+    temperature = temperature_for_model(selected_model)
+    if temperature is not None:
+        body["temperature"] = temperature
     prompt_tokens_est = _estimate_prompt_tokens(prompt)
 
     for attempt in range(1, max_attempts + 1):
         print(
             f"[LLM REQUEST] attempt={attempt} model={selected_model} "
-            f"prompt_tokens_est={prompt_tokens_est} max_tokens={max_tokens}"
+            f"prompt_tokens_est={prompt_tokens_est} max_tokens={max_tokens} "
+            f"temperature={_temperature_for_log(temperature)}"
         )
         try:
             response = requests.post(
@@ -342,6 +409,9 @@ def _score_batch_kimi(prompt: str, *, model: str | None, max_tokens: int) -> Dic
         "reasoning_effort": reasoning_effort,
         "messages": [{"role": "user", "content": prompt}],
     }
+    temperature = temperature_for_model(selected_model)
+    if temperature is not None:
+        body["temperature"] = temperature
     url = f"{base_url}/chat/completions"
     prompt_tokens_est = _estimate_prompt_tokens(prompt)
 
@@ -349,7 +419,8 @@ def _score_batch_kimi(prompt: str, *, model: str | None, max_tokens: int) -> Dic
         print(
             f"[LLM REQUEST] provider=kimi attempt={attempt} model={selected_model} "
             f"prompt_tokens_est={prompt_tokens_est} max_tokens={max_tokens} "
-            f"reasoning_effort={reasoning_effort}"
+            f"reasoning_effort={reasoning_effort} "
+            f"temperature={_temperature_for_log(temperature)}"
         )
         try:
             response = requests.post(url, headers=headers, json=body, timeout=(connect_timeout, read_timeout))
