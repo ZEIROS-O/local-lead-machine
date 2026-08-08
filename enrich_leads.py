@@ -1459,15 +1459,29 @@ def scrape_site(
     # weak/basic strength, and that pain is what carries a lead past
     # `sendability.VISIBLE_PAIN_BLOCKER`. "Unknown" is the honest answer and
     # the one the pain profile already ignores.
+    #
+    # `cta_strength` moves with them. `evidence._derive_visible_pain_profile`
+    # charges its +14 on `cta_strength in {none, weak}` *or* the flag, so
+    # leaving the graded field at "None" keeps the charge standing no matter
+    # what the flags say.
     truncated_without_answer = budget_exhausted and not has_terminal_form(form_signals)
     if truncated_without_answer:
         form_signals = dict(form_signals)
         for field in ("contact_form_detected", "estimate_form_detected", "form_strength"):
             form_signals[field] = "Unknown"
+        cta_strength = "Unknown"
 
-    if not forms_found:
+    # The other half of the same sentence. Rewriting the fields to "Unknown"
+    # while still appending the absence flags says both things at once, and
+    # the flags win: `score_leads.score_online_weakness` charges +8 for
+    # `no_form_detected` and +8 for `no_clear_cta_detected` inside
+    # `not strong_estimate_form`, a branch the "Unknown" rewrite *guarantees*
+    # is entered. A site whose only form sits past the ceiling would grade as
+    # a site with no form — our own crawl budget sold as the prospect's
+    # weakness. We did not look; we do not get to report.
+    if not forms_found and not truncated_without_answer:
         flags.append("no_form_detected")
-    if not ctas:
+    if not ctas and not truncated_without_answer:
         flags.append("no_clear_cta_detected")
     if not emails:
         flags.append("no_email_detected")
