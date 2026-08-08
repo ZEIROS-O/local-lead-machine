@@ -132,10 +132,27 @@ def check_airtable_lock_compatibility(airtable: str, lock_file: str) -> None:
     legitimately *is* new.
 
     So the pair is checked here, once, before the run takes a lock or spends
-    anything. Only the default lock serialises runs globally, so only the
-    default lock may sync. Compared by resolved path, not by string: a lock
-    spelled absolutely, or with a `..` in it, that lands on the default file
-    still serialises and is still allowed.
+    anything. Compared by resolved path, not by string: a lock spelled
+    absolutely, or with a `..` in it, that lands on the default file still
+    serialises and is still allowed.
+
+    SCOPE -- this narrows the route, it does not close it. Two known gaps:
+
+    * `DEFAULT_LOCK_FILE` is CWD-relative (`output/.agent_pipeline.lock`), so
+      both sides of the comparison resolve against the working directory. Two
+      runs started in different directories each pass this check, take
+      *different* lockfiles, and sync to the same base. Today only the fact
+      that `.env` lives in one checkout stops that, which is config placement,
+      not a control.
+    * Every other live-upload path is unlocked: `hermes_commands.cmd_sync_live`
+      (documented as the only command that builds `upload_airtable.py --live`),
+      `run_pipeline.py --airtable-live`, `make airtable-live`, and
+      `upload_airtable.py --live` by hand. None consults this lock.
+
+    The invariant this enforces is "which lock this wrapper was told to hold";
+    the invariant actually wanted is "one writer per Airtable base at a time",
+    which belongs in `upload_airtable.py` keyed on base+table. Until that
+    exists, treat this as one door bolted on a building with five others.
     """
     if airtable == "skip":
         return
@@ -148,9 +165,12 @@ def check_airtable_lock_compatibility(airtable: str, lock_file: str) -> None:
         "sync is an unlocked read-then-write against a base that is shared by "
         "every batch: two concurrent syncs each read the base without the "
         "other's records and both POST, creating two Status=New records for "
-        "one business and double-contacting it. Either drop --lock-file so "
-        "runs serialise on the global lock, or pass --airtable skip and sync "
-        "once the parallel runs have all finished."
+        "one business and double-contacting it. Drop --lock-file so runs "
+        "serialise on the shared lock and let this run do the sync. If you "
+        "must keep the private lock, pass --airtable skip -- but note that "
+        "syncing later by hand (/sync-live, make airtable-live, "
+        "run_pipeline.py --airtable-live) takes no lock at all, so do it only "
+        "when no other pipeline is running."
     )
 
 
