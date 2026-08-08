@@ -396,8 +396,14 @@ class SerialConcurrentEquivalenceTest(unittest.TestCase):
         where this scenario's cap trips. It is *not* a general guarantee: see
         `ConcurrentCapEnforcementTest.test_actual_usage_over_reservation_still_stops_the_run`,
         where the concurrent run gets one batch further than the serial one because
-        batches already in flight are paid for. The general invariant those two
-        share is the prefix property asserted below.
+        batches already in flight are paid for.
+
+        There is deliberately no general parity claim here. Under a binding
+        `MAX_LLM_TOKENS_PER_RUN` the two paths score *different lead sets*: serial
+        charges the next batch's projection against banked actuals, while planning
+        charges it against cumulative reservations that no actual ever reconciles
+        downward. That divergence predates this cap work and is not pinned
+        anywhere — see the submission-gate comment in `score_leads.py`.
         """
         serial = self._capped_run(concurrency=1)
         concurrent = self._capped_run(concurrency=4)
@@ -545,6 +551,86 @@ class ConcurrentCapEnforcementTest(unittest.TestCase):
         )
         self.assertEqual(run.stop_reason, "MAX_LLM_USD_PER_RUN")
         self.assertLess(run.calls, 6, "the cap must stop submission, not merely be reported")
+
+    def test_a_full_window_throttles_rather_than_ending_the_run(self) -> None:
+        """A worst-case charge that trips on a *full* window must drain, not stop.
+
+        The submission gate charges every in-flight batch at three times its
+        reservation, because a batch that has banked nothing could still spend
+        that much. With the window full that charge can trip the cap on money no
+        batch will actually cost — here reservations are $0.0612 apiece while the
+        served batches cost $0.00018, a 340x gap. Treating that as a verdict ends
+        the run two batches in and silently under-scores the input; the run must
+        instead drain the window and re-decide on banked actuals.
+
+        This pins the `if in_flight: break` throttle. Without it every assertion
+        below fails: the run stops two batches in with `stopped_by_cap=True`,
+        having spent well under 1% of the cap.
+
+        The cap has to sit between two layers, which is the only window where the
+        throttle is observable at all, so it is derived from the real reservation
+        rather than hard-coded: above the planner's cumulative `5 x R` (so all
+        five batches get planned) and below the submission gate's worst-case
+        charge on a full window, `MAX_LLM_CALLS_PER_BATCH x 2 x R`. Hard-coding it
+        would silently stop testing the throttle the moment prompt size moved and
+        the planner started binding first — which is exactly what happened while
+        this test was being written.
+        """
+        import score_leads
+        from score_leads import MAX_LLM_CALLS_PER_BATCH, score_records_api_run
+
+        tiny_usage = {"input_tokens": 10, "output_tokens": 10, "total_tokens": 20}
+        records = self._records(5)
+
+        def fake_score_batch(prompt: str, *, model: str, max_tokens: int) -> dict:
+            batch_number = int(_BATCH_ID_RE.search(prompt).group(1))
+            return _valid_batch_result(batch_number, usage=tiny_usage)
+
+        planned, _, _ = score_leads._plan_api_llm_batches(
+            [score_leads.ensure_evidence(record) for record in records],
+            fallback_vertical="hardscaping",
+            batch_size=1,
+            projection_model="claude-sonnet-5",
+            max_tokens=4000,
+            max_tokens_per_run=0,
+            max_usd_per_run=0.0,
+        )
+        self.assertEqual(len(planned), 5)
+        reservation = planned[0].reserved_usd
+        planner_ceiling = len(planned) * reservation
+        gate_charge = MAX_LLM_CALLS_PER_BATCH * 2 * reservation
+        self.assertLess(
+            planner_ceiling,
+            gate_charge,
+            "no cap can distinguish the two layers; the scenario is unbuildable",
+        )
+        cap = (planner_ceiling + gate_charge) / 2
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("score_leads.llm_client.score_batch", side_effect=fake_score_batch):
+                run = score_records_api_run(
+                    records,
+                    scores_dir=Path(tmp) / "scores",
+                    fallback_vertical="hardscaping",
+                    batch_size=1,
+                    model="claude-sonnet-5",
+                    max_tokens=4000,
+                    max_calls=0,
+                    max_tokens_per_run=0,
+                    max_usd_per_run=cap,
+                    concurrency=3,
+                )
+
+        self.assertFalse(
+            run.stopped_by_cap,
+            f"the run stopped on reserved money it never spent (${run.usd:.5f} of ${cap:.5f})",
+        )
+        self.assertEqual(run.stop_reason, "")
+        self.assertEqual(run.calls, 5, "every batch should still have been submitted")
+        self.assertEqual(
+            len(run.manual_run.rows), 5, "throttling must not drop leads from the output"
+        )
+        self.assertLess(run.usd, cap)
 
 
 class BatchFailureIsolationTest(unittest.TestCase):

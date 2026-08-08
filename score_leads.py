@@ -3428,8 +3428,16 @@ def score_records_api_run(
         # `_hit_llm_cap` against banked actuals before every submission, charging
         # each in-flight batch at its worst case (MAX_LLM_CALLS_PER_BATCH x its
         # reservation) because it has banked nothing yet. With nothing in flight
-        # that reduces to exactly the serial check, so the two paths stop at the
-        # same batch whenever the cap trips on a drained window.
+        # that reduces to exactly serial's `_hit_llm_cap` layer.
+        #
+        # It does *not* reduce to serial as a whole. Serial has a second layer
+        # (`remaining_exceeds_run_cap` / `remaining_exceeds_usd_cap` below) that
+        # charges the next batch's projection against banked actuals; planning's
+        # counterpart in `_plan_api_llm_batches` charges it against cumulative
+        # reservations, which no actual ever reconciles downward. Under a binding
+        # MAX_LLM_TOKENS_PER_RUN the two paths therefore score different lead sets
+        # — measured, pre-dating this gate, and not pinned by any test. Do not
+        # read the sentence above as a parity guarantee.
         #
         # Residual, and it is inherent to running calls in parallel: batches
         # already in flight when the cap trips are paid for and are still banked,
