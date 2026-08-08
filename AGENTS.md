@@ -95,6 +95,21 @@ Key in-flight facts (2026-07-29):
   unavailability — invalid output stays with the repair flow in `score_leads.py`. Every model the
   chain can resolve must have a price in `score_leads.LLM_PRICING_USD_PER_MILLION_TOKENS` or the
   run aborts at cost estimation; `[LLM PROVIDER]` in the run log says who actually served.
+- **Determinism is pinned only where the model accepts it, and the default config is not pinned.**
+  `llm_client` sends `temperature: 0` on the kimi and anthropic payloads, but omits it for model
+  families that fix sampling server-side (`SAMPLING_FIXED_MODEL_PREFIXES`): `kimi-k3` (Moonshot
+  fixes `temperature=1.0`/`top_p=0.95` and documents that they must be omitted) and
+  `claude-sonnet-5` / `opus-5` / `opus-4-8` / `opus-4-7` / `fable-5` / `mythos-5` (sampling params
+  removed from the Messages API — sending one is a 400). **Both current defaults are in that set**,
+  so out of the box nothing is pinned; older ids (`kimi-k2`, `claude-sonnet-4-5`, `claude-sonnet-4-6`,
+  `claude-opus-4-6`, `claude-haiku-4-5`) do get the pin. `LLM_DISABLE_TEMPERATURE_PIN=1` omits it
+  everywhere, for a new model that rejects sampling before it is listed. The failure direction is
+  deliberate: a 400 kills a batch mid-run, a missing pin only costs determinism.
+- **The `codex` and `claude` subscription runners have no temperature knob at all.** They are CLI
+  subprocesses driven by model + `reasoning_effort`, so no payload-level pin can reach them. Grades
+  from a `subscription:*` provider are **not reproducible run-to-run** and re-scoring the same leads
+  can move them across the A/B/C/Skip boundary. Do not treat a subscription-scored grade as stable;
+  re-verify with `verify-batch` rather than assuming a re-run reproduces it.
 - **`buyer_intent.money_signal` is tri-state** (`yes`/`no`/`unknown`). "unknown" means there was no
   crawlable site text to read a paid stack from, which is not the same claim as "does not spend".
   Only `yes` may count as truthy in a gate — `sendability.required_visible_pain_score` drops the
@@ -236,7 +251,14 @@ and must be owner-readable only.
   `LLM_SCORING_CONCURRENCY` (4; the safe value is provider-specific — CLI runners are bounded by
   local CPU/memory, `kimi`/`anthropic` by per-org tokens-per-minute), the Places caps
   (`MAX_SEARCH_CALLS_PER_RUN` 30, `MAX_DETAILS_CALLS_PER_RUN` 400, `MAX_TOTAL_PLACES_PER_RUN` 400 —
-  legacy-CLI only, `make_search_batch.py` reads none of them), `MAX_WEBSITES_PER_RUN` (200; this one
+  the search and total-places caps are legacy-CLI only, but **`make_search_batch.py` now reads
+  `MAX_DETAILS_CALLS_PER_RUN`**: `collect_raw_rows` used to build `DetailsBudget(None)`, i.e. no
+  ceiling at all on billed Place Details, and the perf range removed the per-call sleep and added
+  6-way concurrency, so an unattended run could bill ~6× faster with no brake. Unspecified now means
+  400, never unlimited; an explicit `--max-details` still wins, and a *negative* env value restores
+  unlimited. Note 400 truncates the two big `_full` configs — `cleveland_hardscaping_full_001`
+  (~2,300 places) and `garage_doors_cincinnati_full_001` — to a warning plus skip-remaining, so
+  raise it deliberately for those), `MAX_WEBSITES_PER_RUN` (200; this one
   **discards leads** past the ceiling rather than stopping short, so undersizing it is a silent yield
   loss), `ENRICH_WORKERS`, `PLACES_DETAILS_WORKERS` (6, max 8),
   `BUYER_INTENT_ADS_CHECK` (off), `FOLLOW_UP_CADENCE_DAYS` (4), and

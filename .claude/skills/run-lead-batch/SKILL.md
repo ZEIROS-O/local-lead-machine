@@ -127,8 +127,16 @@ re-spent.
 - Sanity-check the batch with the **`verify-batch`** skill — never trust grades
   blind. That skill is the *checker*; this one is the *maker*. Keep them
   separate; do not have the same pass both score and bless a batch.
-- `make airtable-dry` before `make airtable-live`, and confirm the diff does not
-  touch `Status` on human-decided rows.
+- Dry-run the upload before ever going live, and confirm the diff does not
+  touch `Status` on human-decided rows:
+  ```
+  .venv/bin/python upload_airtable.py --dry-run --input <scored.csv> --packet-dir <packets_dir>
+  ```
+  Upload the **total** scope — pass no row-filtering flags. The dry-run's job
+  is to show every row the live run would touch, so a narrowed preview blesses
+  a plan that is not the one that executes. `make airtable-dry` /
+  `make airtable-live` wrap the same command with the Makefile's batch
+  variables.
 
 ## Summarize (the run's telemetry)
 
