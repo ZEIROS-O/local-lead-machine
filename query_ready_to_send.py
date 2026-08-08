@@ -6,6 +6,15 @@ canonical readiness contract and are currently New,
 so the daily send queue can draft against real pipeline state instead of
 stale exports. Never writes anything (see mark_sent.py for the write-back
 half of this loop).
+
+Suppression is applied here as well as at send time. The pipeline's three
+fail-closed gates (search, enrichment, scoring) stop a *re-discovered*
+opted-out lead before it ever reaches the base, but they cannot touch a record
+already in Airtable when the opt-out is logged — a duplicate of the same
+business under a different record id is exactly what `dedupe_places.py` exists
+because of. mark_sent refuses such a record, but only after the rep has been
+handed it and dialled it by hand, which is the call the ledger was supposed to
+prevent.
 """
 from __future__ import annotations
 
@@ -14,7 +23,7 @@ import json
 import os
 import re
 import sys
-from typing import Any, Dict, List
+from typing import AbstractSet, Any, Dict, List
 from urllib.parse import quote
 
 import requests
@@ -26,7 +35,12 @@ except ModuleNotFoundError:
         return False
 
 from lead_machine.airtable_sync import resolve_vertical_label
-from lead_machine.compliance import is_mark_sent_source_status
+from lead_machine.compliance import (
+    ComplianceError,
+    is_mark_sent_source_status,
+    is_suppressed,
+    load_configured_suppression_index,
+)
 from lead_machine import queue_state
 from lead_machine.sendability import is_contact_ready
 
@@ -70,13 +84,22 @@ DISPLAY_FIELDS = [
 ]
 
 _PRIORITY_RANK = {"A": 0, "B": 1, "C": 2}
-# The fields the read-back guard must actually receive to mean anything. It is
-# two now because the base answers the send question in one column: asking for
-# `Commercial Fit State` after the cutover would request a field that no longer
-# exists, and a guard whose evidence never arrives is one that cannot fail.
+# The fields the read-back guard must actually receive to mean anything: a guard
+# whose evidence never arrives is one that cannot fail. `Verdict` and `Status`
+# answer the send question after the cutover collapsed it into one column.
+#
+# `Phone` and `Email` joined them when suppression started being applied here.
+# They are what `record_matches_suppression` matches on, so letting the schema
+# probe drop them degrades the opt-out check to a record-id-only comparison,
+# which by construction misses a suppressed business re-discovered under a new
+# record — the case the ledger exists for. That must not happen behind a warning
+# that reads as cosmetic; if they are absent the query fails rather than serving
+# a queue it cannot screen.
 REQUIRED_READINESS_FIELDS = {
     "Verdict",
     "Status",
+    "Phone",
+    "Email",
 }
 
 
@@ -96,7 +119,21 @@ def build_formula(vertical: str) -> str:
 _UNKNOWN_FIELD_RE = re.compile(r'Unknown field name: \\?"(.+?)\\?"')
 
 
-def fetch_ready_records(base_id: str, table: str, token: str, *, vertical: str = "") -> List[Dict[str, Any]]:
+def fetch_ready_records(
+    base_id: str,
+    table: str,
+    token: str,
+    *,
+    suppression: AbstractSet[str],
+    vertical: str = "",
+) -> List[Dict[str, Any]]:
+    """Fetch the send queue. `suppression` is required, never defaulted.
+
+    A default would make "no index" indistinguishable from "checked and clear"
+    at every call site — the same fail-open this module's other guards are
+    written against. `main()` resolves the real index and fails closed if the
+    environment names none.
+    """
     url = airtable_base_url(base_id, table)
     headers = {"Authorization": f"Bearer {token}"}
 
@@ -163,6 +200,13 @@ def fetch_ready_records(base_id: str, table: str, token: str, *, vertical: str =
                     file=sys.stderr,
                 )
                 continue
+            if suppression and is_suppressed(row, suppression):
+                print(
+                    f"[SKIP] Airtable record {row['record_id'] or '<missing-id>'} is "
+                    "suppressed (opt-out); excluded from the send queue",
+                    file=sys.stderr,
+                )
+                continue
             records.append(row)
         offset = data.get("offset")
         if not offset:
@@ -201,8 +245,19 @@ def main() -> int:
 
     vertical = resolve_vertical_label(args.vertical)
 
+    # Fails closed, exactly as search, enrichment and scoring do: an unresolved
+    # index is an unsafe state, not an empty one. ALLOW_MISSING_SUPPRESSION_INDEX
+    # is the loud bypass.
     try:
-        records = fetch_ready_records(args.base_id, args.table, args.token, vertical=vertical)
+        suppression = load_configured_suppression_index()
+    except ComplianceError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        records = fetch_ready_records(
+            args.base_id, args.table, args.token, suppression=suppression, vertical=vertical
+        )
     except RuntimeError as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         return 1

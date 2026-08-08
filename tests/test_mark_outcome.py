@@ -12,6 +12,7 @@ import ast
 import io
 import json
 import os
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -19,6 +20,7 @@ from urllib.parse import unquote
 
 import mark_outcome
 from lead_machine import queue_state
+from lead_machine.compliance import load_suppression_index, record_matches_suppression
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -32,8 +34,10 @@ def _response(status_code=200, payload=None, text=""):
     return resp
 
 
-class TestApplyMarkOutcome(unittest.TestCase):
-    ARGS = dict(
+class MarkOutcomeHarness(unittest.TestCase):
+    """Shared session/ledger scaffolding. Carries no tests of its own."""
+
+    BASE_ARGS = dict(
         record_id="rec42",
         notes="they called back",
         occurred_at="2026-07-27T12:00:00+00:00",
@@ -44,6 +48,23 @@ class TestApplyMarkOutcome(unittest.TestCase):
         token="tok",
     )
 
+    def setUp(self):
+        # Every event now travels with a suppression ledger: `opt_out` is the
+        # only one that writes to it, but the shared harness has to supply one
+        # for the loops below that run every shipped event.
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.ledger = Path(self._tmp.name) / "outcomes.jsonl"
+        self.ledger.write_text("", encoding="utf-8")
+        self.ARGS = {**self.BASE_ARGS, "suppression_source": str(self.ledger)}
+
+    def _ledger_rows(self):
+        return [
+            json.loads(line)
+            for line in self.ledger.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
     def _session(
         self,
         *,
@@ -51,10 +72,19 @@ class TestApplyMarkOutcome(unittest.TestCase):
         patch_status=None,
         patch_follow_up="2026-07-31",
         post_payloads=None,
+        extra_fields=None,
     ):
         session = MagicMock()
         session.get.return_value = _response(
-            200, {"id": "rec42", "fields": {"Status": current_status, "Business Name": "Acme Epoxy"}}
+            200,
+            {
+                "id": "rec42",
+                "fields": {
+                    "Status": current_status,
+                    "Business Name": "Acme Epoxy",
+                    **(extra_fields or {}),
+                },
+            },
         )
         patched = {"Status": patch_status}
         # Airtable omits a date field entirely once it is cleared.
@@ -67,6 +97,8 @@ class TestApplyMarkOutcome(unittest.TestCase):
         ]
         return session
 
+
+class TestApplyMarkOutcome(MarkOutcomeHarness):
     def test_unknown_event_rejected_before_any_network_call(self):
         session = self._session()
         with self.assertRaisesRegex(mark_outcome.MarkOutcomeError, "unknown event"):
@@ -126,7 +158,9 @@ class TestApplyMarkOutcome(unittest.TestCase):
         # dead lead the same cell, so nothing downstream — a rollup, a view, a
         # conversion rate — could ever tell them apart after the fact.
         applied = {}
-        for event in sorted(mark_outcome.CLOSING_EVENTS):
+        # The two *funnel* closes. opt_out closes the cadence too, but it is a
+        # compliance record with its own terminal status and its own tests.
+        for event in sorted(mark_outcome.CLOSING_EVENTS - mark_outcome.SUPPRESSION_WRITING_EVENTS):
             with self.subTest(event=event):
                 target = mark_outcome.TARGET_STATUS[event]
                 session = self._session(patch_status=target, patch_follow_up=None)
@@ -260,14 +294,14 @@ class TestApplyMarkOutcome(unittest.TestCase):
         session.post.assert_not_called()
 
     def test_preflight_blocks_a_new_event_whose_choices_are_undeclared(self):
-        # A fifth event wired into the three maps, with choices nobody created:
-        # "Follow-Up" is already declared, "Note" is not, and the first
+        # A new event wired into the three maps, with choices nobody created:
+        # "Follow-Up" is already declared, "Voicemail" is not, and the first
         # undeclared one is what has to be named.
         with patch.dict(mark_outcome.TARGET_STATUS, {"ghosted": "Follow-Up"}), \
-             patch.dict(mark_outcome.ACTIVITY_TYPE, {"ghosted": "Note"}), \
+             patch.dict(mark_outcome.ACTIVITY_TYPE, {"ghosted": "Voicemail"}), \
              patch.dict(mark_outcome.ACTIVITY_OUTCOME, {"ghosted": "No Reply"}):
             with self.assertRaisesRegex(
-                mark_outcome.MarkOutcomeError, r"Sales Activities\.Activity Type choice 'Note'"
+                mark_outcome.MarkOutcomeError, r"Sales Activities\.Activity Type choice 'Voicemail'"
             ):
                 mark_outcome.preflight_select_values("ghosted")
 
@@ -281,11 +315,15 @@ class TestApplyMarkOutcome(unittest.TestCase):
     def test_written_select_vocabulary_is_closed(self):
         # Without typecast these strings must already exist as choices in the
         # base or the write 422s. Changing one is a schema change, not a rename.
-        self.assertEqual(set(mark_outcome.TARGET_STATUS.values()), {"Follow-Up", "Won", "Lost"})
-        self.assertEqual(set(mark_outcome.ACTIVITY_TYPE.values()), {"Reply", "Call", "Close"})
+        self.assertEqual(
+            set(mark_outcome.TARGET_STATUS.values()), {"Follow-Up", "Won", "Lost", "Not Fit"}
+        )
+        self.assertEqual(
+            set(mark_outcome.ACTIVITY_TYPE.values()), {"Reply", "Call", "Close", "Note"}
+        )
         self.assertEqual(
             set(mark_outcome.ACTIVITY_OUTCOME.values()),
-            {"Replied", "Meeting Booked", "Won", "Lost"},
+            {"Replied", "Meeting Booked", "Won", "Lost", "Opted Out"},
         )
         self.assertEqual(mark_outcome.CLOSED_WON_DEAL_STATUS, "Deposit Pending")
 
@@ -389,6 +427,226 @@ class TestApplyMarkOutcome(unittest.TestCase):
                 with self.assertRaises(mark_outcome.MarkOutcomeError) as caught:
                     mark_outcome.apply_mark_outcome(event="closed_won", session=session, **self.ARGS)
                 self.assertNotIn(mark_outcome.RUNBOOK_DOC, str(caught.exception))
+
+
+class TestOptOutVerb(MarkOutcomeHarness):
+    """The verb that turns "take me off your list" into durable suppression.
+
+    Before this, `mark_outcome` accepted four events and `compliance` had no
+    writer, so a rep had neither a status nor a command — the one gap in the
+    pipeline that creates liability rather than delay.
+    """
+
+    CONTACTS = {"Phone": "(216) 555-0100", "Email": "Owner@Example.com"}
+
+    def _opt_out(self, *, event="opt_out", current_status="New", **kwargs):
+        session = self._session(
+            current_status=current_status,
+            patch_status="Not Fit",
+            patch_follow_up=None,
+            extra_fields=self.CONTACTS,
+            **kwargs,
+        )
+        receipt = mark_outcome.apply_mark_outcome(event=event, session=session, **self.ARGS)
+        return receipt, session
+
+    def test_both_spellings_are_shipped_events(self):
+        self.assertIn("opt_out", mark_outcome.OUTCOME_EVENTS)
+        self.assertIn("unsubscribed", mark_outcome.OUTCOME_EVENTS)
+        self.assertEqual(mark_outcome.TARGET_STATUS["opt_out"], "Not Fit")
+        self.assertEqual(mark_outcome.TARGET_STATUS["unsubscribed"], "Not Fit")
+
+    def test_opt_out_writes_a_ledger_row_the_index_reads_back(self):
+        receipt, _ = self._opt_out()
+        self.assertEqual(receipt["result"], "applied")
+        self.assertEqual(receipt["status"], "Not Fit")
+        self.assertEqual(receipt["suppression"], "appended")
+
+        index = load_suppression_index(self.ledger)
+        self.assertIn("record_id:rec42", index)
+        self.assertIn("phone:2165550100", index)
+        self.assertIn("email:owner@example.com", index)
+
+    def test_the_ledger_row_captures_phone_and_email_not_only_the_record_id(self):
+        # record_matches_suppression matches on contact channels, so a
+        # record-id-only row would let the same business back in under a new
+        # Airtable record after re-discovery.
+        self._opt_out()
+        row = self._ledger_rows()[0]
+        self.assertEqual(row["event"], "opt_out")
+        self.assertEqual(row["record_id"], "rec42")
+        self.assertEqual(row["phone"], "(216) 555-0100")
+        self.assertEqual(row["email"], "Owner@Example.com")
+
+    def test_it_works_from_status_new(self):
+        # The defining difference from the other four verbs: a rep hears "take
+        # me off your list" on the first dial, when Status is still New.
+        for status in ("New", "Manual Review", "Follow-Up", "Won", "Lost", "Booked", ""):
+            with self.subTest(status=status):
+                self.ledger.write_text("", encoding="utf-8")
+                receipt, session = self._opt_out(current_status=status)
+                self.assertEqual(receipt["status"], "Not Fit")
+                self.assertTrue(session.patch.called)
+
+    def test_the_source_status_gate_still_binds_the_other_verbs(self):
+        session = self._session(current_status="New")
+        with self.assertRaisesRegex(mark_outcome.MarkOutcomeError, "not eligible"):
+            mark_outcome.apply_mark_outcome(event="replied", session=session, **self.ARGS)
+
+    def test_unsubscribed_is_an_alias_that_lands_the_same_way(self):
+        receipt, session = self._opt_out(event="unsubscribed")
+        self.assertEqual(receipt["status"], "Not Fit")
+        self.assertEqual(self._ledger_rows()[0]["event"], "unsubscribed")
+        self.assertIn("phone:2165550100", load_suppression_index(self.ledger))
+
+    def test_it_clears_next_follow_up(self):
+        _, session = self._opt_out()
+        fields = session.patch.call_args.kwargs["json"]["fields"]
+        self.assertEqual(fields, {"Status": "Not Fit", "Next Follow-Up": None})
+        self.assertIn("opt_out", mark_outcome.CLOSING_EVENTS)
+
+    def test_repeating_the_verb_is_idempotent(self):
+        first, _ = self._opt_out()
+        self.assertEqual(first["result"], "applied")
+        second, session = self._opt_out(current_status="Not Fit")
+        self.assertEqual(second["result"], "already_applied")
+        self.assertEqual(second["suppression"], "already_present")
+        self.assertEqual(len(self._ledger_rows()), 1)
+        session.patch.assert_not_called()
+        session.post.assert_not_called()
+
+    def test_the_ledger_is_written_before_airtable_is_touched(self):
+        """Ordering is the compliance decision, not an implementation detail.
+
+        A suppression row with no status change is over-suppression, which is
+        safe. A status change with no suppression row is the liability. Every
+        Airtable write here can still 422 until the runbook creates the choices
+        this module needs, so the row has to land first.
+        """
+        session = self._session(
+            current_status="New",
+            patch_status="Not Fit",
+            patch_follow_up=None,
+            extra_fields=self.CONTACTS,
+        )
+        session.patch.return_value = _response(422, text="INVALID_MULTIPLE_CHOICE_OPTIONS")
+        with self.assertRaises(mark_outcome.MarkOutcomeError) as caught:
+            mark_outcome.apply_mark_outcome(event="opt_out", session=session, **self.ARGS)
+        self.assertIn("suppression was recorded", str(caught.exception))
+        self.assertIn("phone:2165550100", load_suppression_index(self.ledger))
+
+    def test_extra_contacts_can_be_suppressed_alongside_the_record(self):
+        session = self._session(
+            current_status="New",
+            patch_status="Not Fit",
+            patch_follow_up=None,
+            extra_fields=self.CONTACTS,
+        )
+        mark_outcome.apply_mark_outcome(
+            event="opt_out",
+            session=session,
+            extra_phones=["216.555.9999"],
+            extra_emails=["alias@example.com"],
+            **self.ARGS,
+        )
+        index = load_suppression_index(self.ledger)
+        self.assertIn("phone:2165550100", index)
+        self.assertIn("phone:2165559999", index)
+        self.assertIn("email:alias@example.com", index)
+
+    def test_a_missing_suppression_source_stops_the_verb_before_any_network_call(self):
+        args = {**self.ARGS, "suppression_source": ""}
+        session = self._session(current_status="New")
+        with self.assertRaisesRegex(mark_outcome.MarkOutcomeError, "suppression"):
+            mark_outcome.apply_mark_outcome(event="opt_out", session=session, **args)
+        session.get.assert_not_called()
+        session.patch.assert_not_called()
+
+    def test_the_other_verbs_do_not_require_a_suppression_source(self):
+        args = {**self.ARGS, "suppression_source": ""}
+        session = self._session(patch_status="Follow-Up")
+        receipt = mark_outcome.apply_mark_outcome(event="replied", session=session, **args)
+        self.assertEqual(receipt["result"], "applied")
+
+    def test_the_activity_row_records_the_opt_out(self):
+        _, session = self._opt_out()
+        fields = session.post.call_args_list[0].kwargs["json"]["records"][0]["fields"]
+        self.assertEqual(fields["Activity Type"], "Note")
+        self.assertEqual(fields["Outcome"], "Opted Out")
+        self.assertEqual(fields["Linked Prospect"], ["rec42"])
+
+    def test_not_fit_is_in_the_canonical_status_vocabulary(self):
+        self.assertIn("Not Fit", queue_state.PROSPECT_STATUS_CHOICES)
+        # And it is terminal for the queue: the send queue only serves New.
+        self.assertNotIn("Not Fit", queue_state.QUEUE_STATUS_CLAUSE.allowed)
+
+    def test_a_contactless_record_is_reported_as_a_partial_opt_out(self):
+        """record_id alone is a suppression that does not survive re-discovery.
+
+        `append_suppression_event` accepts a record id as a sufficient
+        identifier, but `record_matches_suppression` matches on contact
+        channels. A record with no Phone and no Email therefore produces a row
+        that suppresses this Airtable record and nothing else — and because
+        `opt_out` has no source-status gate it reaches records that never passed
+        `is_contact_ready`, which is exactly where those fields are empty.
+
+        The row is still written: it does suppress the record in hand, and
+        refusing outright would leave that record dialable. But it must never
+        read back as a completed opt-out.
+        """
+        session = self._session(
+            current_status="New",
+            patch_status="Not Fit",
+            patch_follow_up=None,
+            extra_fields={},
+        )
+        receipt = mark_outcome.apply_mark_outcome(
+            event="opt_out", session=session, **self.ARGS
+        )
+
+        self.assertEqual(receipt["suppression"], "appended")
+        self.assertEqual(receipt["suppression_scope"], "record_only")
+        self.assertEqual(receipt["suppression_channels"], [])
+
+        index = load_suppression_index(self.ledger)
+        self.assertIn("record_id:rec42", index)
+        self.assertFalse(
+            record_matches_suppression(
+                {"record_id": "recREDISCOVERED", "Phone": "(216) 555-0100"}, index
+            ),
+            "a record-id-only row cannot match a re-discovered record; the "
+            "receipt is the only thing that can warn the rep",
+        )
+
+    def test_a_contacted_record_reports_the_channels_it_suppressed(self):
+        receipt, _ = self._opt_out()
+        self.assertEqual(receipt["suppression_scope"], "contact")
+        self.assertEqual(
+            sorted(receipt["suppression_channels"]),
+            ["email:owner@example.com", "phone:2165550100"],
+        )
+
+    def test_extra_channels_upgrade_a_contactless_record_to_a_full_opt_out(self):
+        session = self._session(
+            current_status="New",
+            patch_status="Not Fit",
+            patch_follow_up=None,
+            extra_fields={},
+        )
+        receipt = mark_outcome.apply_mark_outcome(
+            event="opt_out",
+            session=session,
+            extra_phones=["216.555.0100"],
+            **self.ARGS,
+        )
+        self.assertEqual(receipt["suppression_scope"], "contact")
+        self.assertIn("phone:2165550100", receipt["suppression_channels"])
+        self.assertTrue(
+            record_matches_suppression(
+                {"record_id": "recREDISCOVERED", "Phone": "(216) 555-0100"},
+                load_suppression_index(self.ledger),
+            )
+        )
 
 
 class TestNoAirtableWritePathTypecasts(unittest.TestCase):
@@ -508,6 +766,51 @@ class TestMain(unittest.TestCase):
         receipt = json.loads(out.getvalue())
         self.assertEqual(receipt["result"], "applied")
         self.assertEqual(receipt["status"], "Follow-Up")
+
+    def test_opt_out_is_a_cli_choice_and_resolves_the_ledger_from_the_environment(self):
+        get_resp = _response(
+            200,
+            {
+                "id": "rec42",
+                "fields": {
+                    "Status": "New",
+                    "Business Name": "Acme",
+                    "Phone": "(216) 555-0100",
+                    "Email": "owner@example.com",
+                },
+            },
+        )
+        patch_resp = _response(200, {"id": "rec42", "fields": {"Status": "Not Fit"}})
+        post_resp = _response(200, {"records": [{"id": "recAct1"}]})
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "outcomes.jsonl"
+            ledger.write_text("", encoding="utf-8")
+            env = {**self.ENV, "SUPPRESSION_SOURCE": str(ledger)}
+            with patch.object(mark_outcome, "load_dotenv", lambda: False), \
+                 patch.dict(os.environ, env, clear=True), \
+                 patch("requests.get", return_value=get_resp), \
+                 patch("requests.patch", return_value=patch_resp), \
+                 patch("requests.post", return_value=post_resp), \
+                 patch(
+                     "sys.argv",
+                     ["mark_outcome.py", "--record-id", "rec42", "--event", "opt_out",
+                      "--date", "2026-08-07"],
+                 ), \
+                 patch("sys.stdout", io.StringIO()) as out:
+                self.assertEqual(mark_outcome.main(), 0)
+            receipt = json.loads(out.getvalue())
+            self.assertEqual(receipt["status"], "Not Fit")
+            self.assertIn("phone:2165550100", load_suppression_index(ledger))
+
+    def test_opt_out_without_a_configured_ledger_fails_before_the_network(self):
+        with patch.object(mark_outcome, "load_dotenv", lambda: False), \
+             patch.dict(os.environ, self.ENV, clear=True), \
+             patch("requests.get") as mock_get, \
+             patch("sys.argv", ["mark_outcome.py", "--record-id", "rec42", "--event", "opt_out"]), \
+             patch("sys.stderr", io.StringIO()) as err:
+            self.assertEqual(mark_outcome.main(), 1)
+        self.assertFalse(mock_get.called)
+        self.assertIn("suppression", err.getvalue())
 
 
 if __name__ == "__main__":

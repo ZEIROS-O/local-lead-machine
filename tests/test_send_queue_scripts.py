@@ -90,7 +90,7 @@ class TestFetchReadyRecords(unittest.TestCase):
         }
         probe = _response(200, {"records": []})
         with patch("requests.get", side_effect=[probe, _response(200, page1), _response(200, page2)]) as mock_get:
-            records = qrs.fetch_ready_records("app123", "Prospects", "tok")
+            records = qrs.fetch_ready_records("app123", "Prospects", "tok", suppression=set())
 
         self.assertEqual([r["record_id"] for r in records], ["recA9", "recA5", "recB"])
         # Missing display fields degrade to empty strings, not KeyErrors.
@@ -104,7 +104,7 @@ class TestFetchReadyRecords(unittest.TestCase):
         captured = io.StringIO()
         with patch("requests.get", side_effect=[bad_probe, good_probe, page]) as mock_get, \
              patch("sys.stderr", captured):
-            records = qrs.fetch_ready_records("app123", "Prospects", "tok")
+            records = qrs.fetch_ready_records("app123", "Prospects", "tok", suppression=set())
 
         self.assertEqual(records, [])
         self.assertIn("Safe Outreach Claims", captured.getvalue())
@@ -115,7 +115,7 @@ class TestFetchReadyRecords(unittest.TestCase):
     def test_non_field_error_raises(self):
         with patch("requests.get", return_value=_response(401, text="unauthorized")):
             with self.assertRaises(RuntimeError):
-                qrs.fetch_ready_records("app123", "Prospects", "tok")
+                qrs.fetch_ready_records("app123", "Prospects", "tok", suppression=set())
 
     def test_missing_required_commercial_field_fails_closed(self):
         response = _response(
@@ -124,7 +124,7 @@ class TestFetchReadyRecords(unittest.TestCase):
         )
         with patch("requests.get", return_value=response) as mock_get:
             with self.assertRaises(RuntimeError):
-                qrs.fetch_ready_records("app123", "Prospects", "tok")
+                qrs.fetch_ready_records("app123", "Prospects", "tok", suppression=set())
         self.assertEqual(mock_get.call_count, 1)
 
     def test_missing_queue_status_field_fails_closed(self):
@@ -134,7 +134,7 @@ class TestFetchReadyRecords(unittest.TestCase):
         )
         with patch("requests.get", return_value=response) as mock_get:
             with self.assertRaises(RuntimeError):
-                qrs.fetch_ready_records("app123", "Prospects", "tok")
+                qrs.fetch_ready_records("app123", "Prospects", "tok", suppression=set())
         self.assertEqual(mock_get.call_count, 1)
 
     def test_defensive_post_fetch_check_rejects_non_ready_rows(self):
@@ -154,7 +154,7 @@ class TestFetchReadyRecords(unittest.TestCase):
             ]
         }
         with patch("requests.get", side_effect=[_response(200, {"records": []}), _response(200, page)]):
-            records = qrs.fetch_ready_records("app123", "Prospects", "tok")
+            records = qrs.fetch_ready_records("app123", "Prospects", "tok", suppression=set())
         self.assertEqual([record["record_id"] for record in records], ["recReady"])
 
     def test_defensive_post_fetch_check_rejects_unsafe_status(self):
@@ -165,8 +165,78 @@ class TestFetchReadyRecords(unittest.TestCase):
             ]
         }
         with patch("requests.get", side_effect=[_response(200, {"records": []}), _response(200, page)]):
-            records = qrs.fetch_ready_records("app123", "Prospects", "tok")
+            records = qrs.fetch_ready_records("app123", "Prospects", "tok", suppression=set())
         self.assertEqual([record["record_id"] for record in records], ["recReady"])
+
+
+class TestQueryRespectsSuppression(unittest.TestCase):
+    """The queue must not offer a rep a business that has opted out.
+
+    The pipeline's three fail-closed gates (search, enrichment, scoring) stop a
+    re-discovered opted-out lead before it reaches the base. What they cannot
+    stop is a *duplicate* record already in the base under a different record id
+    when the opt-out is logged — deduping is why `dedupe_places.py` exists, so
+    duplicates are a fact. mark_sent refuses such a record, but only after the
+    rep has already been handed it and dialled it by hand.
+    """
+
+    def _page(self):
+        return {
+            "records": [
+                {"id": "recClear", "fields": {**READY_FIELDS, "Phone": "216-555-0001"}},
+                {"id": "recDupe", "fields": {**READY_FIELDS, "Phone": "(216) 555-0100"}},
+            ]
+        }
+
+    def test_a_rediscovered_lead_with_the_same_phone_is_excluded(self):
+        index = {"phone:2165550100"}
+        with patch("requests.get", side_effect=[_response(200, {"records": []}), _response(200, self._page())]), \
+             patch("sys.stderr", io.StringIO()) as err:
+            records = qrs.fetch_ready_records("app123", "Prospects", "tok", suppression=index)
+        self.assertEqual([r["record_id"] for r in records], ["recClear"])
+        self.assertIn("recDupe", err.getvalue())
+        self.assertIn("suppressed", err.getvalue())
+
+    def test_the_opted_out_record_itself_is_excluded_by_its_record_id(self):
+        # Identifiers are casefolded on both sides, which is what makes an
+        # Airtable id written into the ledger by hand still match.
+        index = {"record_id:recdupe"}
+        with patch("requests.get", side_effect=[_response(200, {"records": []}), _response(200, self._page())]), \
+             patch("sys.stderr", io.StringIO()):
+            records = qrs.fetch_ready_records("app123", "Prospects", "tok", suppression=index)
+        self.assertEqual([r["record_id"] for r in records], ["recClear"])
+
+    def test_main_loads_the_configured_index_and_fails_closed_without_one(self):
+        env = {"AIRTABLE_BASE_ID": "app", "AIRTABLE_PROSPECTS_TABLE": "Prospects", "AIRTABLE_PAT": "tok"}
+        with patch.object(qrs, "load_dotenv", lambda: False), \
+             patch.dict(os.environ, env, clear=True), \
+             patch("requests.get") as mock_get, \
+             patch("sys.argv", ["query_ready_to_send.py"]), \
+             patch("sys.stderr", io.StringIO()) as err:
+            self.assertEqual(qrs.main(), 1)
+        self.assertFalse(mock_get.called)
+        self.assertIn("suppression source", err.getvalue())
+
+    def test_main_passes_the_configured_index_through(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "outcomes.jsonl"
+            ledger.write_text(
+                json.dumps({"event": "opt_out", "phone": "(216) 555-0100"}) + "\n", encoding="utf-8"
+            )
+            env = {
+                "AIRTABLE_BASE_ID": "app",
+                "AIRTABLE_PROSPECTS_TABLE": "Prospects",
+                "AIRTABLE_PAT": "tok",
+                "SUPPRESSION_SOURCE": str(ledger),
+            }
+            with patch.object(qrs, "load_dotenv", lambda: False), \
+                 patch.dict(os.environ, env, clear=True), \
+                 patch("requests.get", side_effect=[_response(200, {"records": []}), _response(200, self._page())]), \
+                 patch("sys.argv", ["query_ready_to_send.py"]), \
+                 patch("sys.stderr", io.StringIO()), \
+                 patch("sys.stdout", io.StringIO()) as out:
+                self.assertEqual(qrs.main(), 0)
+            self.assertEqual([row["record_id"] for row in json.loads(out.getvalue())], ["recClear"])
 
 
 class TestQueryMain(unittest.TestCase):
