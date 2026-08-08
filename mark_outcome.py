@@ -354,6 +354,7 @@ def apply_mark_outcome(
     target_status = TARGET_STATUS[event]
 
     suppression_result = ""
+    suppression_channels: list[str] = []
     if suppressing:
         # Before every Airtable write. A suppression row with no status change is
         # over-suppression, which is safe; a status change with no suppression row
@@ -371,6 +372,11 @@ def apply_mark_outcome(
                 notes=notes,
             )
             suppression_result = str(suppression_receipt.get("result") or "")
+            suppression_channels = [
+                identifier
+                for identifier in suppression_receipt.get("identifiers") or []
+                if str(identifier).startswith(("phone:", "email:"))
+            ]
             # Contacts the base does not carry — a second line, a personal
             # address the rep was given on the call. Suppression matches on
             # channels, so every channel we know has to land in the ledger.
@@ -378,7 +384,7 @@ def apply_mark_outcome(
                 for value in values:
                     if not str(value or "").strip():
                         continue
-                    append_suppression_event(
+                    extra_receipt = append_suppression_event(
                         suppression_source,
                         event=event,
                         record_id=record_id,
@@ -387,8 +393,36 @@ def apply_mark_outcome(
                         source="mark_outcome",
                         notes=notes,
                     )
+                    suppression_channels.extend(
+                        identifier
+                        for identifier in extra_receipt.get("identifiers") or []
+                        if str(identifier).startswith(("phone:", "email:"))
+                        and identifier not in suppression_channels
+                    )
         except ComplianceError as exc:
-            raise MarkOutcomeError(f"could not record the opt-out: {exc}") from exc
+            # The primary row may already be fsynced when a later extra channel
+            # fails, so this cannot claim nothing was recorded. Re-running is
+            # idempotent, which is the actual instruction.
+            raise MarkOutcomeError(
+                f"the opt-out was not fully recorded: {exc}. Re-run the same command "
+                "once the ledger is writable — appending is idempotent."
+            ) from exc
+
+        if not suppression_channels:
+            # `record_id` alone satisfies append_suppression_event, but
+            # `record_matches_suppression` matches on contact channels. A business
+            # re-discovered under a new Airtable record has a new record id and
+            # the same phone, so a record-id-only row suppresses this row and
+            # nothing else — the exact case this verb exists to prevent. The row
+            # is kept (it does suppress the record in hand) but must never read as
+            # a completed opt-out.
+            print(
+                f"[WARN] {record_id} has no Phone and no Email, so the opt-out is "
+                "recorded against the record id only. It will NOT survive "
+                "re-discovery under a new record. Re-run with --phone/--email to "
+                "suppress the contact channels.",
+                file=sys.stderr,
+            )
 
         if suppression_result == "already_present" and current_status == normalize_airtable_status(
             target_status
@@ -402,6 +436,8 @@ def apply_mark_outcome(
                 "status": target_status,
                 "next_follow_up": None,
                 "suppression": suppression_result,
+                "suppression_channels": suppression_channels,
+                "suppression_scope": "contact" if suppression_channels else "record_only",
             }
 
     # A closed lead must leave the follow-up queue: Airtable clears a date on an
@@ -469,6 +505,11 @@ def apply_mark_outcome(
         }
         if suppressing:
             result["suppression"] = suppression_result
+            result["suppression_channels"] = suppression_channels
+            # "record_only" is a partial opt-out: it does not survive
+            # re-discovery. Callers must be able to tell the two apart without
+            # parsing stderr.
+            result["suppression_scope"] = "contact" if suppression_channels else "record_only"
 
         if event == "closed_won":
             # Package is the Deals primary field: leaving it empty makes the deal

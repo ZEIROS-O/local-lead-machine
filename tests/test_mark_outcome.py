@@ -20,7 +20,7 @@ from urllib.parse import unquote
 
 import mark_outcome
 from lead_machine import queue_state
-from lead_machine.compliance import load_suppression_index
+from lead_machine.compliance import load_suppression_index, record_matches_suppression
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -579,6 +579,74 @@ class TestOptOutVerb(MarkOutcomeHarness):
         self.assertIn("Not Fit", queue_state.PROSPECT_STATUS_CHOICES)
         # And it is terminal for the queue: the send queue only serves New.
         self.assertNotIn("Not Fit", queue_state.QUEUE_STATUS_CLAUSE.allowed)
+
+    def test_a_contactless_record_is_reported_as_a_partial_opt_out(self):
+        """record_id alone is a suppression that does not survive re-discovery.
+
+        `append_suppression_event` accepts a record id as a sufficient
+        identifier, but `record_matches_suppression` matches on contact
+        channels. A record with no Phone and no Email therefore produces a row
+        that suppresses this Airtable record and nothing else — and because
+        `opt_out` has no source-status gate it reaches records that never passed
+        `is_contact_ready`, which is exactly where those fields are empty.
+
+        The row is still written: it does suppress the record in hand, and
+        refusing outright would leave that record dialable. But it must never
+        read back as a completed opt-out.
+        """
+        session = self._session(
+            current_status="New",
+            patch_status="Not Fit",
+            patch_follow_up=None,
+            extra_fields={},
+        )
+        receipt = mark_outcome.apply_mark_outcome(
+            event="opt_out", session=session, **self.ARGS
+        )
+
+        self.assertEqual(receipt["suppression"], "appended")
+        self.assertEqual(receipt["suppression_scope"], "record_only")
+        self.assertEqual(receipt["suppression_channels"], [])
+
+        index = load_suppression_index(self.ledger)
+        self.assertIn("record_id:rec42", index)
+        self.assertFalse(
+            record_matches_suppression(
+                {"record_id": "recREDISCOVERED", "Phone": "(216) 555-0100"}, index
+            ),
+            "a record-id-only row cannot match a re-discovered record; the "
+            "receipt is the only thing that can warn the rep",
+        )
+
+    def test_a_contacted_record_reports_the_channels_it_suppressed(self):
+        receipt, _ = self._opt_out()
+        self.assertEqual(receipt["suppression_scope"], "contact")
+        self.assertEqual(
+            sorted(receipt["suppression_channels"]),
+            ["email:owner@example.com", "phone:2165550100"],
+        )
+
+    def test_extra_channels_upgrade_a_contactless_record_to_a_full_opt_out(self):
+        session = self._session(
+            current_status="New",
+            patch_status="Not Fit",
+            patch_follow_up=None,
+            extra_fields={},
+        )
+        receipt = mark_outcome.apply_mark_outcome(
+            event="opt_out",
+            session=session,
+            extra_phones=["216.555.0100"],
+            **self.ARGS,
+        )
+        self.assertEqual(receipt["suppression_scope"], "contact")
+        self.assertIn("phone:2165550100", receipt["suppression_channels"])
+        self.assertTrue(
+            record_matches_suppression(
+                {"record_id": "recREDISCOVERED", "Phone": "(216) 555-0100"},
+                load_suppression_index(self.ledger),
+            )
+        )
 
 
 class TestNoAirtableWritePathTypecasts(unittest.TestCase):

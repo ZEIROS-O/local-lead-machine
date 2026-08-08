@@ -84,13 +84,22 @@ DISPLAY_FIELDS = [
 ]
 
 _PRIORITY_RANK = {"A": 0, "B": 1, "C": 2}
-# The fields the read-back guard must actually receive to mean anything. It is
-# two now because the base answers the send question in one column: asking for
-# `Commercial Fit State` after the cutover would request a field that no longer
-# exists, and a guard whose evidence never arrives is one that cannot fail.
+# The fields the read-back guard must actually receive to mean anything: a guard
+# whose evidence never arrives is one that cannot fail. `Verdict` and `Status`
+# answer the send question after the cutover collapsed it into one column.
+#
+# `Phone` and `Email` joined them when suppression started being applied here.
+# They are what `record_matches_suppression` matches on, so letting the schema
+# probe drop them degrades the opt-out check to a record-id-only comparison,
+# which by construction misses a suppressed business re-discovered under a new
+# record — the case the ledger exists for. That must not happen behind a warning
+# that reads as cosmetic; if they are absent the query fails rather than serving
+# a queue it cannot screen.
 REQUIRED_READINESS_FIELDS = {
     "Verdict",
     "Status",
+    "Phone",
+    "Email",
 }
 
 
