@@ -31,7 +31,7 @@ test:
 	$(PY) -m unittest discover -s tests
 
 compile:
-	$(PY) -m py_compile enrich_leads.py score_leads.py make_llm_queue.py make_llm_batch.py import_llm_score_bundle.py score_batch_subscription.py make_packets.py run_pipeline.py upload_airtable.py feedback_report.py make_search_batch.py make_icp_lane_report.py make_grade_disagreement_report.py backfill_packet_tier.py collect_review_signals.py collect_external_signals.py scoring_calibration.py lead_machine/icp_lanes.py lead_machine/signals.py lead_machine/review_velocity.py lead_machine/review_pain_verifier.py lead_machine/scoring_profiles.py lead_machine/scoring_v3.py lead_machine/scoring_calibration.py lead_machine/external_signals.py lead_machine/llm_client.py lead_machine/sendability.py
+	$(PY) -m py_compile enrich_leads.py score_leads.py make_llm_queue.py make_llm_batch.py import_llm_score_bundle.py score_batch_subscription.py make_packets.py run_pipeline.py run_agent_pipeline.py upload_airtable.py feedback_report.py make_search_batch.py make_icp_lane_report.py make_grade_disagreement_report.py backfill_packet_tier.py collect_review_signals.py collect_external_signals.py scoring_calibration.py lead_machine/icp_lanes.py lead_machine/signals.py lead_machine/review_velocity.py lead_machine/review_pain_verifier.py lead_machine/scoring_profiles.py lead_machine/scoring_v3.py lead_machine/scoring_calibration.py lead_machine/external_signals.py lead_machine/llm_client.py lead_machine/sendability.py
 
 dashboard: dashboard-build
 	$(PY) -m lead_machine.dashboard

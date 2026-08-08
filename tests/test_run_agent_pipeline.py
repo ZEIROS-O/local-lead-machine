@@ -203,6 +203,56 @@ class AgentPipelineTest(unittest.TestCase):
         self.assertEqual(summary["counts"]["manual_review_packet"], 1)
         self.assertEqual(summary["counts"]["watchlist"], 1)
 
+    # ---- per-stage timing and a summary that keeps up -------------------- #
+    #
+    # The perf plan's own verification step was "record wall clock per stage so
+    # the win is measured, not asserted", and nothing in the wrapper ever timed
+    # anything -- every performance number in this project was measured by hand
+    # and cannot be reproduced from artifacts. The summary had the mirror defect:
+    # written once at the very end, so output/agent_run_summary_*.json kept
+    # reporting a previous run's shape. One on disk said `scored: 0,
+    # mode: search-only` from 2026-08-04 while a 133-lead scored CSV from
+    # 2026-08-06 sat beside it. Same mechanism fixes both: time each stage, and
+    # rewrite the summary as each one closes.
+
+    def test_summary_records_wall_clock_per_stage(self) -> None:
+        self._write_config()
+        self._write_scored("detailing_cleveland_medium_001")
+        commands: list[list[str]] = []
+        with patch.object(rap, "run", side_effect=self._fake_run(commands)), redirect_stdout(io.StringIO()):
+            rap.main(self._argv("packets-only"))
+        summary = json.loads(
+            (self.root / "output" / "agent_run_summary_detailing_cleveland_medium_001.json").read_text()
+        )
+        stages = {entry["stage"]: entry for entry in summary["stages"]}
+        self.assertIn("packets", stages)
+        for entry in summary["stages"]:
+            self.assertIsInstance(entry["seconds"], float)
+            self.assertGreaterEqual(entry["seconds"], 0.0)
+            self.assertIn(entry["status"], {"ok", "skipped", "failed"})
+        self.assertIsInstance(summary["elapsed_seconds"], float)
+
+    def test_summary_is_rewritten_as_each_stage_closes_not_only_at_the_end(self) -> None:
+        # A run that refuses partway used to leave the previous run's summary
+        # sitting on disk, so the artifact an operator reads described a run that
+        # was days old. Reality-so-far beats a stale lie.
+        self._write_config()
+        stale = self.root / "output" / "agent_run_summary_detailing_cleveland_medium_001.json"
+        stale.write_text(
+            json.dumps({"batch": "detailing_cleveland_medium_001", "mode": "search-only",
+                        "counts": {"scored": 0}, "stages": []}),
+            encoding="utf-8",
+        )
+        commands: list[list[str]] = []
+        with patch.object(rap, "run", side_effect=self._fake_run(commands)), redirect_stdout(io.StringIO()):
+            code = rap.main(self._argv("packets-only"))
+
+        self.assertEqual(code, 2)  # no scored CSV -> PipelineRefusal at packets
+        summary = json.loads(stale.read_text())
+        self.assertEqual(summary["mode"], "packets-only")
+        stages = {entry["stage"]: entry for entry in summary["stages"]}
+        self.assertEqual(stages["packets"]["status"], "failed")
+
     # ---- the parallel-run guard ----------------------------------------- #
     #
     # `--lock-file` exists so distinct batches can run search/enrich/score in
