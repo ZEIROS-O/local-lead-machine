@@ -3149,7 +3149,9 @@ def _score_batch_with_debug(
     while True:
         try:
             calls_made += 1
-            result = llm_client.score_batch(prompt, model=model, max_tokens=current_max_tokens)
+            result = llm_client.score_batch(
+                prompt, model=model, max_tokens=current_max_tokens, batch_id=batch_id
+            )
         except llm_client.InvalidLlmResponse as exc:
             failed_usage = _accumulate_usage(failed_usage, getattr(exc, "usage", None))
             failed_model = str(getattr(exc, "model", "") or "").strip() or failed_model
@@ -3171,7 +3173,9 @@ def _score_batch_with_debug(
                 )
                 try:
                     calls_made += 1
-                    repaired = llm_client.score_batch(repair_prompt, model=model, max_tokens=current_max_tokens)
+                    repaired = llm_client.score_batch(
+                        repair_prompt, model=model, max_tokens=current_max_tokens, batch_id=batch_id
+                    )
                     repaired["usage"] = _accumulate_usage(failed_usage, repaired.get("usage"))
                     repaired["call_count"] = calls_made
                     repaired.setdefault("debug_notes", []).extend(retry_notes)

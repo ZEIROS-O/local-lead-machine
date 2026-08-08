@@ -2827,7 +2827,7 @@ class LeadMachineContractsTest(unittest.TestCase):
                 return response
 
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key", "LLM_SCORING_PROVIDER_CHAIN": "anthropic"}, clear=False):
-            with patch("lead_machine.llm_client.requests.post", return_value=FakeResponse()) as post:
+            with patch("lead_machine.llm_client._post", return_value=FakeResponse()) as post:
                 result = score_batch("score this batch", model="claude-sonnet-5", max_tokens=4096)
 
         self.assertEqual(result["bundle"]["batch_id"], "batch_001")
@@ -2865,7 +2865,7 @@ class LeadMachineContractsTest(unittest.TestCase):
             "LLM_SCORING_PROVIDER_CHAIN": "anthropic",
         }
         with patch.dict(os.environ, env, clear=False):
-            with patch("lead_machine.llm_client.requests.post", return_value=FakeResponse()) as post:
+            with patch("lead_machine.llm_client._post", return_value=FakeResponse()) as post:
                 score_batch("score this batch", model="claude-sonnet-5", max_tokens=4096)
 
         _, kwargs = post.call_args
@@ -2896,7 +2896,7 @@ class LeadMachineContractsTest(unittest.TestCase):
         }
         with patch.dict(os.environ, env, clear=False):
             with patch(
-                "lead_machine.llm_client.requests.post",
+                "lead_machine.llm_client._post",
                 side_effect=[requests.exceptions.ReadTimeout("read timed out"), requests.exceptions.Timeout("timed out"), FakeResponse()],
             ) as post:
                 with patch("time.sleep") as sleep:
@@ -2932,7 +2932,7 @@ class LeadMachineContractsTest(unittest.TestCase):
         }
         with patch.dict(os.environ, env, clear=False):
             with patch(
-                "lead_machine.llm_client.requests.post",
+                "lead_machine.llm_client._post",
                 side_effect=[FakeResponse(500), FakeResponse(503), FakeResponse(200, success)],
             ) as post:
                 with patch("time.sleep") as sleep:
@@ -2954,7 +2954,7 @@ class LeadMachineContractsTest(unittest.TestCase):
             {"ANTHROPIC_API_KEY": "test-key", "ANTHROPIC_MAX_RETRIES": "2", "LLM_SCORING_PROVIDER_CHAIN": "anthropic"},
             clear=False,
         ):
-            with patch("lead_machine.llm_client.requests.post", return_value=FakeResponse()) as post:
+            with patch("lead_machine.llm_client._post", return_value=FakeResponse()) as post:
                 with patch("time.sleep") as sleep:
                     with self.assertRaises(RuntimeError) as caught:
                         score_batch("score this batch", model="claude-sonnet-5", max_tokens=4096)
@@ -2977,7 +2977,7 @@ class LeadMachineContractsTest(unittest.TestCase):
         }
         with patch.dict(os.environ, env, clear=False):
             with patch(
-                "lead_machine.llm_client.requests.post",
+                "lead_machine.llm_client._post",
                 side_effect=requests.exceptions.ReadTimeout("read timed out"),
             ) as post:
                 with patch("time.sleep"):
@@ -3014,10 +3014,10 @@ class LeadMachineContractsTest(unittest.TestCase):
 
         bundle = {"batch_id": "batch_001", "scores": [{"score_file": "chij123.json", "score": self._manual_score(total_score=75, grade="B")}]}
 
-        def fake_down(prompt, *, model, max_tokens):
+        def fake_down(prompt, *, model, max_tokens, **_):
             raise llm_client.ProviderUnavailable("no api key")
 
-        def fake_up(prompt, *, model, max_tokens):
+        def fake_up(prompt, *, model, max_tokens, **_):
             return {"bundle": bundle, "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}, "model": "m"}
 
         providers = {"kimi": fake_down, "codex": fake_up, "claude": fake_down}
@@ -3034,11 +3034,11 @@ class LeadMachineContractsTest(unittest.TestCase):
         bundle = {"batch_id": "batch_001", "scores": [{"score_file": "chij123.json", "score": self._manual_score(total_score=75, grade="B")}]}
         seen: list = []
 
-        def fake_down(prompt, *, model, max_tokens):
+        def fake_down(prompt, *, model, max_tokens, **_):
             seen.append(model)
             raise llm_client.ProviderUnavailable("down")
 
-        def fake_up(prompt, *, model, max_tokens):
+        def fake_up(prompt, *, model, max_tokens, **_):
             seen.append(model)
             return {"bundle": bundle, "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}, "model": "m"}
 
@@ -3054,10 +3054,10 @@ class LeadMachineContractsTest(unittest.TestCase):
     def test_llm_client_does_not_fall_back_on_invalid_llm_response(self) -> None:
         from lead_machine import llm_client
 
-        def fake_bad_json(prompt, *, model, max_tokens):
+        def fake_bad_json(prompt, *, model, max_tokens, **_):
             raise llm_client.InvalidLlmResponse("bad json", raw_text="{nope")
 
-        def fake_up(prompt, *, model, max_tokens):
+        def fake_up(prompt, *, model, max_tokens, **_):
             raise AssertionError("next provider must not be tried")
 
         providers = {"kimi": fake_bad_json, "codex": fake_up}
@@ -3070,7 +3070,7 @@ class LeadMachineContractsTest(unittest.TestCase):
         from lead_machine import llm_client
 
         def fake_down(reason):
-            def _fn(prompt, *, model, max_tokens):
+            def _fn(prompt, *, model, max_tokens, **_):
                 raise llm_client.ProviderUnavailable(reason)
             return _fn
 
@@ -3106,7 +3106,7 @@ class LeadMachineContractsTest(unittest.TestCase):
             os.environ.pop("KIMI_SCORING_MODEL", None)
             os.environ.pop("LLM_SCORING_MODEL", None)
             with patch("lead_machine.llm_client.load_dotenv"):
-                with patch("lead_machine.llm_client.requests.post", return_value=FakeResponse()) as post:
+                with patch("lead_machine.llm_client._post", return_value=FakeResponse()) as post:
                     result = llm_client.score_batch("score this batch", model=None, max_tokens=4096)
 
         self.assertEqual(result["provider"], "kimi")
@@ -3142,7 +3142,7 @@ class LeadMachineContractsTest(unittest.TestCase):
             os.environ.pop("KIMI_SCORING_MODEL", None)
             os.environ.pop("LLM_SCORING_MODEL", None)
             with patch("lead_machine.llm_client.load_dotenv"):
-                with patch("lead_machine.llm_client.requests.post", return_value=FakeResponse()) as post:
+                with patch("lead_machine.llm_client._post", return_value=FakeResponse()) as post:
                     llm_client.score_batch("score this batch", model=None, max_tokens=4096)
 
         _, kwargs = post.call_args
@@ -3153,7 +3153,7 @@ class LeadMachineContractsTest(unittest.TestCase):
 
         bundle = {"batch_id": "batch_001", "scores": [{"score_file": "chij123.json", "score": self._manual_score(total_score=75, grade="B")}]}
 
-        def fake_up(prompt, *, model, max_tokens):
+        def fake_up(prompt, *, model, max_tokens, **_):
             return {"bundle": bundle, "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}, "model": "m"}
 
         env = {"LLM_SCORING_PROVIDER_CHAIN": "kimi,codex"}
@@ -3190,7 +3190,7 @@ class LeadMachineContractsTest(unittest.TestCase):
             os.environ.pop("KIMI_SCORING_MODEL", None)
             os.environ.pop("LLM_SCORING_MODEL", None)
             with patch("lead_machine.llm_client.load_dotenv"):
-                with patch("lead_machine.llm_client.requests.post", side_effect=[FakeResponse(429), FakeResponse(200, success)]) as post:
+                with patch("lead_machine.llm_client._post", side_effect=[FakeResponse(429), FakeResponse(200, success)]) as post:
                     with patch("time.sleep") as sleep:
                         result = llm_client.score_batch("score this batch", model=None, max_tokens=4096)
 
@@ -3210,7 +3210,7 @@ class LeadMachineContractsTest(unittest.TestCase):
 
         bundle = {"batch_id": "batch_001", "scores": [{"score_file": "chij123.json", "score": self._manual_score(total_score=75, grade="B")}]}
 
-        def fake_up(prompt, *, model, max_tokens):
+        def fake_up(prompt, *, model, max_tokens, **_):
             return {"bundle": bundle, "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}, "model": "m"}
 
         env = {"KIMI_API_KEY": "kimi-key", "LLM_SCORING_PROVIDER_CHAIN": "kimi,codex", "KIMI_MAX_RETRIES": "1"}
@@ -3218,7 +3218,7 @@ class LeadMachineContractsTest(unittest.TestCase):
             os.environ.pop("KIMI_SCORING_MODEL", None)
             os.environ.pop("LLM_SCORING_MODEL", None)
             with patch("lead_machine.llm_client.load_dotenv"):
-                with patch("lead_machine.llm_client.requests.post", return_value=FakeResponse()) as post:
+                with patch("lead_machine.llm_client._post", return_value=FakeResponse()) as post:
                     with patch("time.sleep"):
                         with patch.dict(llm_client._PROVIDERS, {"codex": fake_up}, clear=False):
                             result = llm_client.score_batch("score this batch", model=None, max_tokens=4096)
@@ -3246,7 +3246,7 @@ class LeadMachineContractsTest(unittest.TestCase):
         with patch.dict(os.environ, env, clear=False):
             os.environ.pop("KIMI_SCORING_MODEL", None)
             with patch("lead_machine.llm_client.load_dotenv"):
-                with patch("lead_machine.llm_client.requests.post", return_value=FakeResponse()) as post:
+                with patch("lead_machine.llm_client._post", return_value=FakeResponse()) as post:
                     result = llm_client.score_batch("score this batch", model=None, max_tokens=4096)
 
         self.assertEqual(result["model"], "kimi-k2.6")
@@ -3371,7 +3371,7 @@ class LeadMachineContractsTest(unittest.TestCase):
             "evidence": self._evidence_fixture(site_status="weak"),
         }
 
-        def fake_score_batch(prompt: str, *, model: str, max_tokens: int) -> dict:
+        def fake_score_batch(prompt: str, *, model: str, max_tokens: int, **_: object) -> dict:
             return {
                 "bundle": {"batch_id": "batch_001", "scores": [{"score_file": "chij123.json", "score": first_score}]},
                 "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
@@ -3415,7 +3415,7 @@ class LeadMachineContractsTest(unittest.TestCase):
             "evidence": self._evidence_fixture(site_status="weak"),
         }
 
-        def fake_score_batch(prompt: str, *, model: str, max_tokens: int) -> dict:
+        def fake_score_batch(prompt: str, *, model: str, max_tokens: int, **_: object) -> dict:
             return {
                 "bundle": {"batch_id": "batch_001", "scores": [{"score_file": "chij123.json", "score": first_score}]},
                 "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
@@ -3466,7 +3466,7 @@ class LeadMachineContractsTest(unittest.TestCase):
             "evidence": self._evidence_fixture(site_status="weak"),
         }
 
-        def fake_score_batch(prompt: str, *, model: str, max_tokens: int) -> dict:
+        def fake_score_batch(prompt: str, *, model: str, max_tokens: int, **_: object) -> dict:
             return {
                 "bundle": {"batch_id": "batch_001", "scores": [{"score_file": "chij123.json", "score": first_score}]},
                 "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
@@ -3518,7 +3518,7 @@ class LeadMachineContractsTest(unittest.TestCase):
         }
         usage = {"input_tokens": 400_000, "output_tokens": 200_000, "total_tokens": 600_000}
 
-        def kimi_served(prompt: str, *, model: str, max_tokens: int) -> dict:
+        def kimi_served(prompt: str, *, model: str, max_tokens: int, **_: object) -> dict:
             # What llm_client returns after falling past codex onto kimi.
             return {
                 "bundle": {
@@ -3636,7 +3636,7 @@ class LeadMachineContractsTest(unittest.TestCase):
         }
         usage = {"input_tokens": 1, "output_tokens": 1307, "total_tokens": 1308}
 
-        def claude_sub_served(prompt: str, *, model: str, max_tokens: int) -> dict:
+        def claude_sub_served(prompt: str, *, model: str, max_tokens: int, **_: object) -> dict:
             return {
                 "bundle": {
                     "batch_id": "batch_001",
@@ -3684,7 +3684,7 @@ class LeadMachineContractsTest(unittest.TestCase):
     def _fake_score_batch_factory(self):
         score = self._manual_score(total_score=75, grade="B")
 
-        def fake_score_batch(prompt: str, *, model: str, max_tokens: int) -> dict:
+        def fake_score_batch(prompt: str, *, model: str, max_tokens: int, **_: object) -> dict:
             return {
                 "bundle": {
                     "batch_id": "batch_001",
@@ -4043,7 +4043,7 @@ class LeadMachineContractsTest(unittest.TestCase):
         for index, record in enumerate(records, start=1):
             record["google"]["google_maps_url"] = f"https://maps.google.com/?cid={index}"
 
-        def fake_score_batch(prompt: str, *, model: str, max_tokens: int) -> dict:
+        def fake_score_batch(prompt: str, *, model: str, max_tokens: int, **_: object) -> dict:
             score_files = sorted(set(re.findall(r'"score_file": "([^"]+\.json)"', prompt)))
             return {
                 "bundle": {
@@ -4123,7 +4123,7 @@ class LeadMachineContractsTest(unittest.TestCase):
         for index, record in enumerate(records, start=1):
             record["google"]["google_maps_url"] = f"https://maps.google.com/?cid={index}"
 
-        def fake_score_batch(prompt: str, *, model: str, max_tokens: int) -> dict:
+        def fake_score_batch(prompt: str, *, model: str, max_tokens: int, **_: object) -> dict:
             score_files = sorted(set(re.findall(r'"score_file": "([^"]+\.json)"', prompt)))
             return {
                 "bundle": {
@@ -4442,7 +4442,7 @@ class LeadMachineContractsTest(unittest.TestCase):
 
         calls = {"n": 0}
 
-        def fake_score_batch(prompt, *, model, max_tokens):
+        def fake_score_batch(prompt, *, model, max_tokens, **_):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise failed
@@ -4485,7 +4485,7 @@ class LeadMachineContractsTest(unittest.TestCase):
 
         calls = {"n": 0}
 
-        def fake_score_batch(prompt, *, model, max_tokens):
+        def fake_score_batch(prompt, *, model, max_tokens, **_):
             calls["n"] += 1
             raise failed if calls["n"] == 1 else repair_failed
 
@@ -4504,6 +4504,49 @@ class LeadMachineContractsTest(unittest.TestCase):
             {"input_tokens": 1700, "output_tokens": 300, "total_tokens": 2000},
         )
         self.assertEqual(caught.exception.call_count, 2)
+
+    def test_llm_client_has_exactly_one_outbound_http_seam(self) -> None:
+        """Every provider must POST through `_post`, never `requests.post`.
+
+        This is a test-integrity invariant, not a style rule. The suite patches
+        `lead_machine.llm_client._post` to keep scoring tests offline. When the
+        pooled session first landed and the providers stopped calling
+        `requests.post`, nine tests that patched the old name kept passing their
+        patch to nothing and made *live* Anthropic and Moonshot calls instead —
+        billed, non-deterministic, and green. A second seam re-opens that hole
+        silently, so pin that only one exists.
+        """
+        import ast
+
+        source = Path("lead_machine/llm_client.py").read_text(encoding="utf-8")
+        offenders = []
+        for node in ast.walk(ast.parse(source)):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not isinstance(func, ast.Attribute):
+                continue
+            rendered = ast.unparse(func)
+            # Anything reached through the `requests` module, plus any `.post(`
+            # on some other receiver (a Session held elsewhere, say). Bare
+            # `.get(` is excluded deliberately — it is dict access here, not HTTP.
+            is_http = rendered.startswith("requests.") or func.attr == "post"
+            if not is_http:
+                continue
+            # Constructing the pooled Session is not an outbound call.
+            if rendered == "requests.Session":
+                continue
+            # `_session().post(...)` inside the `_post` wrapper is the one seam.
+            if isinstance(func.value, ast.Call) and getattr(func.value.func, "id", "") == "_session":
+                continue
+            offenders.append(f"line {node.lineno}: {rendered}")
+
+        self.assertEqual(
+            offenders,
+            [],
+            "llm_client must make outbound HTTP only via _post(); found "
+            + "; ".join(offenders),
+        )
 
     def test_api_llm_skips_partition_cap_stops_from_batch_failures(self) -> None:
         # One list carries two unrelated causes. Reported under the single heading
@@ -4562,7 +4605,7 @@ class LeadMachineContractsTest(unittest.TestCase):
 
         calls = {"n": 0}
 
-        def fake_score_batch(prompt, *, model, max_tokens):
+        def fake_score_batch(prompt, *, model, max_tokens, **_):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise truncated
@@ -4602,7 +4645,7 @@ class LeadMachineContractsTest(unittest.TestCase):
 
         calls = {"n": 0}
 
-        def fake_score_batch(prompt, *, model, max_tokens):
+        def fake_score_batch(prompt, *, model, max_tokens, **_):
             calls["n"] += 1
             raise truncated if calls["n"] == 1 else still_bad
 
@@ -4855,7 +4898,7 @@ class LeadMachineContractsTest(unittest.TestCase):
             for index in range(10)
         ]
 
-        def fake_score_batch(prompt: str, *, model: str, max_tokens: int) -> dict:
+        def fake_score_batch(prompt: str, *, model: str, max_tokens: int, **_: object) -> dict:
             score_files = sorted(set(re.findall(r'"score_file": "([^"]+\.json)"', prompt)))
             return {
                 "bundle": {
@@ -4904,7 +4947,7 @@ class LeadMachineContractsTest(unittest.TestCase):
         run_cap = estimate_prompt_tokens(single_prompt) + 20 + 50
         self.assertLess(run_cap, estimate_prompt_tokens(double_prompt) + 20)
 
-        def fake_score_batch(prompt: str, *, model: str, max_tokens: int) -> dict:
+        def fake_score_batch(prompt: str, *, model: str, max_tokens: int, **_: object) -> dict:
             score_files = sorted(set(re.findall(r'"score_file": "([^"]+\.json)"', prompt)))
             return {
                 "bundle": {
@@ -5042,7 +5085,7 @@ class LeadMachineContractsTest(unittest.TestCase):
 
         calls = 0
 
-        def fake_score_batch(prompt: str, *, model: str, max_tokens: int) -> dict:
+        def fake_score_batch(prompt: str, *, model: str, max_tokens: int, **_: object) -> dict:
             nonlocal calls
             calls += 1
             if calls == 1:

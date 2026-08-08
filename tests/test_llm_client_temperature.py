@@ -148,7 +148,7 @@ class AnthropicPayloadTemperatureTest(_PayloadTestCase):
             os.environ.pop("LLM_DISABLE_TEMPERATURE_PIN", None)
             with patch("lead_machine.llm_client.load_dotenv"):
                 with patch(
-                    "lead_machine.llm_client.requests.post", return_value=_anthropic_response()
+                    "lead_machine.llm_client._post", return_value=_anthropic_response()
                 ) as post:
                     llm_client.score_batch(
                         "score this batch", model="claude-sonnet-4-5", max_tokens=4096
@@ -169,7 +169,7 @@ class AnthropicPayloadTemperatureTest(_PayloadTestCase):
             os.environ.pop("LLM_DISABLE_TEMPERATURE_PIN", None)
             with patch("lead_machine.llm_client.load_dotenv"):
                 with patch(
-                    "lead_machine.llm_client.requests.post", return_value=_anthropic_response()
+                    "lead_machine.llm_client._post", return_value=_anthropic_response()
                 ) as post:
                     llm_client.score_batch("score this batch", model=None, max_tokens=4096)
 
@@ -189,7 +189,7 @@ class KimiPayloadTemperatureTest(_PayloadTestCase):
             os.environ.pop("LLM_DISABLE_TEMPERATURE_PIN", None)
             with patch("lead_machine.llm_client.load_dotenv"):
                 with patch(
-                    "lead_machine.llm_client.requests.post", return_value=_kimi_response()
+                    "lead_machine.llm_client._post", return_value=_kimi_response()
                 ) as post:
                     llm_client.score_batch("score this batch", model=None, max_tokens=4096)
 
@@ -208,7 +208,7 @@ class KimiPayloadTemperatureTest(_PayloadTestCase):
             os.environ.pop("LLM_DISABLE_TEMPERATURE_PIN", None)
             with patch("lead_machine.llm_client.load_dotenv"):
                 with patch(
-                    "lead_machine.llm_client.requests.post", return_value=_kimi_response()
+                    "lead_machine.llm_client._post", return_value=_kimi_response()
                 ) as post:
                     llm_client.score_batch("score this batch", model=None, max_tokens=4096)
 

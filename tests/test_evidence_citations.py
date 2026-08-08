@@ -94,7 +94,7 @@ class UncitedScoresAreNeverBackfilledTest(unittest.TestCase):
     def _run_batch(self, *, first: Exception, second: Exception) -> object:
         calls = {"n": 0}
 
-        def fake_score_batch(prompt, *, model, max_tokens):  # noqa: ANN001
+        def fake_score_batch(prompt, *, model, max_tokens, **_):  # noqa: ANN001
             calls["n"] += 1
             raise first if calls["n"] == 1 else second
 

@@ -211,6 +211,41 @@ def _temperature_for_log(temperature: int | None) -> str:
     return "unset(model-fixed)" if temperature is None else str(temperature)
 
 
+def _batch_for_log(batch_id: str) -> str:
+    """`batch=<id> ` prefix for a log line, or empty when the caller gave none."""
+    cleaned = str(batch_id or "").strip()
+    return f"batch={cleaned} " if cleaned else ""
+
+
+# One pooled HTTP session per thread. The concurrent scoring path runs
+# LLM_SCORING_CONCURRENCY workers against one host, and a bare requests.post
+# opens and tears down a fresh TCP+TLS connection per call — the handshake is
+# paid on every batch. requests.Session is not documented thread-safe, so the
+# pool is thread-local rather than shared: each worker reuses its own keep-alive
+# connection across its batches, and no two threads touch one session.
+_SESSIONS = threading.local()
+
+
+def _session() -> "requests.Session":
+    existing = getattr(_SESSIONS, "session", None)
+    if existing is None:
+        existing = requests.Session()
+        _SESSIONS.session = existing
+    return existing
+
+
+def _post(url: str, **kwargs: Any) -> "requests.Response":
+    """The single outbound HTTP seam for this module.
+
+    Every provider POSTs through here rather than calling `requests.post` or a
+    session directly. One seam means one thing for tests to patch — when the
+    pooled session landed, the suite was still patching `requests.post`, so nine
+    "mocked" tests silently made live API calls instead of failing. A contract
+    test pins that no other outbound call exists.
+    """
+    return _session().post(url, **kwargs)
+
+
 def _estimate_prompt_tokens(prompt: str) -> int:
     if not prompt:
         return 0
@@ -280,7 +315,9 @@ def _reset_dotenv_loaded_for_tests() -> None:
         _dotenv_loaded = False
 
 
-def _score_batch_anthropic(prompt: str, *, model: str | None = None, max_tokens: int) -> Dict[str, Any]:
+def _score_batch_anthropic(
+    prompt: str, *, model: str | None = None, max_tokens: int, batch_id: str = ""
+) -> Dict[str, Any]:
     _ensure_dotenv_loaded()
     api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     if not api_key:
@@ -312,12 +349,12 @@ def _score_batch_anthropic(prompt: str, *, model: str | None = None, max_tokens:
 
     for attempt in range(1, max_attempts + 1):
         print(
-            f"[LLM REQUEST] attempt={attempt} model={selected_model} "
+            f"[LLM REQUEST] {_batch_for_log(batch_id)}attempt={attempt} model={selected_model} "
             f"prompt_tokens_est={prompt_tokens_est} max_tokens={max_tokens} "
             f"temperature={_temperature_for_log(temperature)}"
         )
         try:
-            response = requests.post(
+            response = _post(
                 ANTHROPIC_MESSAGES_URL,
                 headers=headers,
                 json=body,
@@ -381,7 +418,9 @@ def _score_batch_anthropic(prompt: str, *, model: str | None = None, max_tokens:
     raise RuntimeError("Anthropic API request failed without making an attempt")
 
 
-def _score_batch_kimi(prompt: str, *, model: str | None, max_tokens: int) -> Dict[str, Any]:
+def _score_batch_kimi(
+    prompt: str, *, model: str | None, max_tokens: int, batch_id: str = ""
+) -> Dict[str, Any]:
     api_key = (os.getenv("KIMI_API_KEY") or os.getenv("MOONSHOT_API_KEY") or "").strip()
     if not api_key:
         raise ProviderUnavailable("Missing KIMI_API_KEY (or MOONSHOT_API_KEY) in .env")
@@ -420,13 +459,13 @@ def _score_batch_kimi(prompt: str, *, model: str | None, max_tokens: int) -> Dic
 
     for attempt in range(1, max_attempts + 1):
         print(
-            f"[LLM REQUEST] provider=kimi attempt={attempt} model={selected_model} "
+            f"[LLM REQUEST] {_batch_for_log(batch_id)}provider=kimi attempt={attempt} model={selected_model} "
             f"prompt_tokens_est={prompt_tokens_est} max_tokens={max_tokens} "
             f"reasoning_effort={reasoning_effort} "
             f"temperature={_temperature_for_log(temperature)}"
         )
         try:
-            response = requests.post(url, headers=headers, json=body, timeout=(connect_timeout, read_timeout))
+            response = _post(url, headers=headers, json=body, timeout=(connect_timeout, read_timeout))
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
             if attempt >= max_attempts:
                 raise ProviderUnavailable(f"kimi request failed after {attempt} attempts: {exc}") from exc
@@ -464,9 +503,13 @@ def _score_batch_kimi(prompt: str, *, model: str | None, max_tokens: int) -> Dic
     raise ProviderUnavailable("kimi request failed without making an attempt")
 
 
-def _anthropic_provider(prompt: str, *, model: str | None, max_tokens: int) -> Dict[str, Any]:
+def _anthropic_provider(
+    prompt: str, *, model: str | None, max_tokens: int, batch_id: str = ""
+) -> Dict[str, Any]:
     try:
-        return _score_batch_anthropic(prompt, model=model, max_tokens=max_tokens)
+        return _score_batch_anthropic(
+            prompt, model=model, max_tokens=max_tokens, batch_id=batch_id
+        )
     except ProviderUnavailable:
         raise
     except InvalidLlmResponse:
@@ -509,7 +552,9 @@ def _normalize_cli_usage(raw: Dict[str, Any] | None) -> Dict[str, int]:
     return {"input_tokens": input_tokens, "output_tokens": output_tokens, "total_tokens": total}
 
 
-def _score_batch_cli(runner: str, prompt: str, *, model: str | None, max_tokens: int) -> Dict[str, Any]:
+def _score_batch_cli(
+    runner: str, prompt: str, *, model: str | None, max_tokens: int, batch_id: str = ""
+) -> Dict[str, Any]:
     import score_batch_subscription as subscription_runner
 
     env = subscription_runner.sanitized_environment()
@@ -522,7 +567,7 @@ def _score_batch_cli(runner: str, prompt: str, *, model: str | None, max_tokens:
     timeout_seconds = max(1, _getenv_int("LLM_CLI_TIMEOUT_SECONDS", DEFAULT_CLI_TIMEOUT_SECONDS))
     effort = subscription_runner.resolve_runner_effort(runner)
     print(
-        f"[LLM REQUEST] provider={runner} model={selected_model or 'runner-default'} "
+        f"[LLM REQUEST] {_batch_for_log(batch_id)}provider={runner} model={selected_model or 'runner-default'} "
         f"effort={effort or 'runner-default'} via CLI subscription"
     )
     result = subscription_runner.run_runner_attempt(
@@ -558,8 +603,12 @@ def _score_batch_cli(runner: str, prompt: str, *, model: str | None, max_tokens:
 
 _PROVIDERS: Dict[str, Callable] = {
     "kimi": _score_batch_kimi,
-    "codex": lambda prompt, *, model, max_tokens: _score_batch_cli("codex", prompt, model=model, max_tokens=max_tokens),
-    "claude": lambda prompt, *, model, max_tokens: _score_batch_cli("claude", prompt, model=model, max_tokens=max_tokens),
+    "codex": lambda prompt, *, model, max_tokens, batch_id="": _score_batch_cli(
+        "codex", prompt, model=model, max_tokens=max_tokens, batch_id=batch_id
+    ),
+    "claude": lambda prompt, *, model, max_tokens, batch_id="": _score_batch_cli(
+        "claude", prompt, model=model, max_tokens=max_tokens, batch_id=batch_id
+    ),
     "anthropic": _anthropic_provider,
 }
 
@@ -584,7 +633,16 @@ def _provider_chain() -> List[str]:
     return chain
 
 
-def score_batch(prompt: str, *, model: str | None = None, max_tokens: int) -> Dict[str, Any]:
+def score_batch(
+    prompt: str, *, model: str | None = None, max_tokens: int, batch_id: str = ""
+) -> Dict[str, Any]:
+    """Score one batch through the provider chain.
+
+    `batch_id` is logging-only. At LLM_SCORING_CONCURRENCY>1 several batches are
+    in flight at once and their `[LLM REQUEST]` lines interleave on one stdout,
+    so without it a retry or a fallback cannot be attributed to the batch that
+    caused it — which is the line an operator reads when reconciling spend.
+    """
     _ensure_dotenv_loaded()
     failures: List[str] = []
     for index, provider in enumerate(_provider_chain()):
@@ -599,15 +657,23 @@ def score_batch(prompt: str, *, model: str | None = None, max_tokens: int) -> Di
             # other unavailability rather than crashing the whole chain.
             reason = "provider not registered"
             failures.append(f"{provider}: {reason}")
-            print(f"[LLM FALLBACK] provider={provider} reason={reason}", file=sys.stderr)
+            print(
+                f"[LLM FALLBACK] {_batch_for_log(batch_id)}provider={provider} reason={reason}",
+                file=sys.stderr,
+            )
             continue
         try:
-            result = provider_fn(prompt, model=requested_model, max_tokens=max_tokens)
+            result = provider_fn(
+                prompt, model=requested_model, max_tokens=max_tokens, batch_id=batch_id
+            )
         except InvalidLlmResponse:
             raise
         except ProviderUnavailable as exc:
             failures.append(f"{provider}: {exc}")
-            print(f"[LLM FALLBACK] provider={provider} reason={exc}", file=sys.stderr)
+            print(
+                f"[LLM FALLBACK] {_batch_for_log(batch_id)}provider={provider} reason={exc}",
+                file=sys.stderr,
+            )
             continue
         result.setdefault("provider", provider)
         return result
