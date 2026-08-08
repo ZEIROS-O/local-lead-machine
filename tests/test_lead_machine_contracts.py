@@ -4415,7 +4415,11 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(result["call_count"], 2)
 
     def test_score_batch_with_debug_counts_usage_when_repair_also_fails(self) -> None:
-        # Fallback path previously reported usage={} - hiding two real paid calls.
+        # Both attempts are real paid calls, so the caps must see them even
+        # though the batch produced nothing. This used to be asserted on the
+        # evidence_refs backfill's return value; that backfill minted citations
+        # the model declined to make and was removed, so the same property is
+        # now pinned on the error the failed batch raises.
         import score_leads
         from lead_machine import llm_client
 
@@ -4439,19 +4443,18 @@ class LeadMachineContractsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(score_leads.llm_client, "score_batch", side_effect=fake_score_batch), \
                  patch.object(score_leads, "build_validation_repair_prompt", return_value="repair"), \
-                 patch.object(score_leads, "_write_validation_failed_llm_response", return_value=Path(tmp) / "dbg.json"), \
-                 patch.object(score_leads, "_fallback_fill_empty_evidence_refs",
-                              return_value=({"batch_id": "b", "scores": []}, "filled")):
-                result = score_leads._score_batch_with_debug(
-                    "prompt", batch_id="b", bundle_dir=Path(tmp),
-                    compact_records=compact_records, model="m", max_tokens=4096,
-                )
+                 patch.object(score_leads, "_write_validation_failed_llm_response", return_value=Path(tmp) / "dbg.json"):
+                with self.assertRaises(RuntimeError) as caught:
+                    score_leads._score_batch_with_debug(
+                        "prompt", batch_id="b", bundle_dir=Path(tmp),
+                        compact_records=compact_records, model="m", max_tokens=4096,
+                    )
 
         self.assertEqual(
-            result["usage"],
+            caught.exception.usage,
             {"input_tokens": 1700, "output_tokens": 300, "total_tokens": 2000},
         )
-        self.assertEqual(result["call_count"], 2)
+        self.assertEqual(caught.exception.call_count, 2)
 
     def test_api_llm_prompt_requires_non_empty_evidence_refs_from_options(self) -> None:
         from score_leads import build_api_llm_scoring_prompt, build_llm_scoring_record

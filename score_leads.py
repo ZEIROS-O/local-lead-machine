@@ -34,7 +34,7 @@ from typing import Any, Deque, Dict, List, Tuple
 
 from dotenv import load_dotenv
 
-from import_llm_score_bundle import import_score_bundle, validate_bundle_scores
+from import_llm_score_bundle import import_score_bundle
 from lead_machine.buyer_signals import (
     buyer_intent_summary,
     demand_signal_state,
@@ -1744,6 +1744,177 @@ def read_csv_rows(path: Path) -> List[Dict[str, str]]:
         return list(csv.DictReader(f))
 
 
+# ---------------------------------------------------------------------------
+# Evidence sidecar
+#
+# `Raw Evidence` and `Evidence Snapshot` are ~96% of a scored CSV's bytes
+# (51 MB of 53 MB on the 133-lead garage-doors batch), which makes the file the
+# operator is supposed to review unopenable in a spreadsheet. They can be split
+# into a JSONL sidecar keyed by Place Key and rehydrated on read.
+#
+# The inline layout stays the DEFAULT. Several readers outside this module —
+# `evals/reproducibility.py`, `evals/gate_liveness.py`, `upload_airtable.py`,
+# `make_packets.py`, `collect_review_signals.py` — open the scored corpus with a
+# bare `csv.DictReader`, and `sendability`/`buyer_signals` fall back to
+# `Raw Evidence` for the evidence profile and the review demand band. Handing
+# any of them a slim CSV would silently change recomputed verdicts and turn the
+# daily gates red. Flipping the default to `sidecar` requires migrating those
+# readers onto `read_scored_csv_rows` (or an equivalent) first.
+# ---------------------------------------------------------------------------
+
+EVIDENCE_SIDECAR_COLUMNS: Tuple[str, ...] = ("Raw Evidence", "Evidence Snapshot")
+EVIDENCE_SIDECAR_SUFFIX = ".evidence.jsonl"
+SCORED_CSV_EVIDENCE_ENV = "LPM_SCORED_CSV_EVIDENCE"
+
+
+def evidence_sidecar_path(csv_path: Path) -> Path:
+    """The sidecar that belongs to *csv_path*: ``scored_x.csv`` -> ``scored_x.evidence.jsonl``."""
+    csv_path = Path(csv_path)
+    return csv_path.with_name(csv_path.stem + EVIDENCE_SIDECAR_SUFFIX)
+
+
+def scored_csv_evidence_is_inline() -> bool:
+    """True when the scored CSV keeps the evidence columns inline (the default)."""
+    return str(os.getenv(SCORED_CSV_EVIDENCE_ENV) or "").strip().lower() != "sidecar"
+
+
+def _csv_text(value: Any) -> str:
+    """The string ``csv.DictWriter`` would write for *value*."""
+    return "" if value is None else str(value)
+
+
+def write_evidence_sidecar(path: Path, rows: List[Dict[str, Any]]) -> None:
+    """Write one JSONL record per row that carries evidence, keyed by Place Key.
+
+    ``row_index`` rides along so rows with a missing or duplicated Place Key
+    still resolve to exactly their own evidence on read.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines: List[str] = []
+    for index, row in enumerate(rows):
+        present = [column for column in EVIDENCE_SIDECAR_COLUMNS if column in row]
+        if not present:
+            continue
+        entry: Dict[str, Any] = {
+            "row_index": index,
+            "place_key": _csv_text(row.get("Place Key") or row.get("place_key")).strip(),
+        }
+        for column in present:
+            entry[column] = _csv_text(row.get(column))
+        lines.append(json.dumps(entry, ensure_ascii=False))
+
+    if not lines:
+        path.unlink(missing_ok=True)
+        return
+
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def read_evidence_sidecar(path: Path) -> List[Dict[str, Any]]:
+    if not path.exists() or path.stat().st_size == 0:
+        return []
+    entries: List[Dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(entry, dict):
+            entries.append(entry)
+    return entries
+
+
+def write_scored_csv(
+    path: Path,
+    rows: List[Dict[str, Any]],
+    *,
+    inline_evidence: bool | None = None,
+) -> Path:
+    """Write the scored CSV, splitting the evidence columns out when asked.
+
+    ``inline_evidence`` defaults to the layout selected by
+    ``LPM_SCORED_CSV_EVIDENCE`` (inline unless it is set to ``sidecar``). Inline
+    is the default and writes no sidecar — the evidence would be a byte-for-byte
+    duplicate of the CSV's own columns, and on a real batch that is another
+    52 MB on disk for no reader. Any sidecar left by an earlier sidecar-layout
+    run is removed so it cannot go stale beside an inline CSV.
+
+    Returns the sidecar path (which exists only in the sidecar layout).
+    """
+    path = Path(path)
+    if inline_evidence is None:
+        inline_evidence = scored_csv_evidence_is_inline()
+
+    sidecar_path = evidence_sidecar_path(path)
+    if inline_evidence:
+        sidecar_path.unlink(missing_ok=True)
+        write_csv(path, rows)
+    else:
+        write_evidence_sidecar(sidecar_path, rows)
+        write_csv(
+            path,
+            [
+                {key: value for key, value in row.items() if key not in EVIDENCE_SIDECAR_COLUMNS}
+                for row in rows
+            ],
+        )
+    return sidecar_path
+
+
+def read_scored_csv_rows(path: Path) -> List[Dict[str, str]]:
+    """Read a scored CSV, restoring any evidence column that lives in the sidecar.
+
+    Handles both layouts. A CSV that carries the columns inline — every scored
+    CSV written before the split, and the current default — passes straight
+    through, and an inline value always wins over the sidecar so a stale
+    sidecar can never overwrite real data.
+    """
+    path = Path(path)
+    rows = read_csv_rows(path)
+    if not rows:
+        return rows
+
+    entries = read_evidence_sidecar(evidence_sidecar_path(path))
+    if not entries:
+        return rows
+
+    by_index: Dict[int, Dict[str, Any]] = {}
+    by_place_key: Dict[str, Dict[str, Any]] = {}
+    ambiguous_keys: set[str] = set()
+    for entry in entries:
+        index = entry.get("row_index")
+        if isinstance(index, int):
+            by_index[index] = entry
+        place_key = str(entry.get("place_key") or "").strip()
+        if not place_key:
+            continue
+        if place_key in by_place_key:
+            ambiguous_keys.add(place_key)
+            continue
+        by_place_key[place_key] = entry
+
+    for index, row in enumerate(rows):
+        missing = [column for column in EVIDENCE_SIDECAR_COLUMNS if not row.get(column)]
+        if not missing:
+            continue
+        place_key = str(row.get("Place Key") or row.get("place_key") or "").strip()
+        entry = by_index.get(index)
+        if entry is not None and place_key and str(entry.get("place_key") or "").strip() != place_key:
+            # Rows were reordered relative to the sidecar; trust the key.
+            entry = None
+        if entry is None and place_key and place_key not in ambiguous_keys:
+            entry = by_place_key.get(place_key)
+        if entry is None:
+            continue
+        for column in missing:
+            if column in entry:
+                row[column] = _csv_text(entry.get(column))
+
+    return rows
+
+
 def _stable_key_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip()).lower()
 
@@ -2876,46 +3047,12 @@ Original invalid JSON:
 """
 
 
-def _fallback_fill_empty_evidence_refs(
-    bundle: Dict[str, Any],
-    compact_records: List[Dict[str, Any]],
-) -> Tuple[Dict[str, Any] | None, str]:
-    fixed = copy.deepcopy(bundle)
-    compact_by_file = {
-        _score_file_for_compact(compact): compact
-        for compact in compact_records
-        if _score_file_for_compact(compact)
-    }
-    filled_files: List[str] = []
-
-    for index, item in enumerate(fixed.get("scores") or []):
-        if not isinstance(item, dict):
-            return None, ""
-        score = item.get("score")
-        if not isinstance(score, dict):
-            return None, ""
-        if score.get("evidence_refs"):
-            continue
-        score_file = str(item.get("score_file") or "").strip()
-        compact = compact_by_file.get(score_file)
-        if compact is None and index < len(compact_records):
-            compact = compact_records[index]
-        options = (compact or {}).get("evidence_ref_options") or []
-        fallback_refs = [str(option.get("id")) for option in options if option.get("id")][:3]
-        if not fallback_refs:
-            return None, ""
-        score["evidence_refs"] = fallback_refs
-        filled_files.append(score_file or f"scores[{index}]")
-
-    if not filled_files:
-        return None, ""
-
-    try:
-        validate_bundle_scores(fixed)
-    except ValueError:
-        return None, ""
-
-    return fixed, f"deterministic evidence_refs fallback filled {', '.join(filled_files)}"
+# There is deliberately no deterministic backfill for empty `evidence_refs`.
+# A model that declines to cite is telling us it found nothing citable, and
+# `EVIDENCE_COUNT_BLOCKER` exists to catch exactly that lead. Copying the first
+# three `evidence_ref_options` ids into the score would manufacture the gate's
+# own input, so an uncited batch fails here like any other validation failure
+# and its leads stay unscored and re-runnable.
 
 
 def _validation_failure_runtime_error(
@@ -3007,17 +3144,6 @@ def _score_batch_with_debug(
                             attempt=2,
                             raw_text=repair_exc.raw_text,
                         )
-                    fallback_bundle, fallback_note = _fallback_fill_empty_evidence_refs(parsed_json, compact_records)
-                    if fallback_bundle is not None:
-                        return {
-                            "bundle": fallback_bundle,
-                            "usage": failed_usage,
-                            "model": failed_model,
-                            "call_count": calls_made,
-                            "debug_notes": [
-                                f"{fallback_note}; raw response saved to {validation_debug_path}; repair failed"
-                            ],
-                        }
                     err = _validation_failure_runtime_error(
                         batch_id=batch_id,
                         validation_failures=f"{validation_failures}\nRepair failures:\n{repair_exc}",
@@ -3797,6 +3923,17 @@ def main() -> int:
     parser.add_argument("--scores-dir", default="", help="Manual/API LLM score JSON directory")
     parser.add_argument("--cards-output", default="", help="Optional lead cards JSONL output")
     parser.add_argument(
+        "--evidence-layout",
+        choices=["inline", "sidecar"],
+        default=None,
+        help=(
+            "Where the heavy Raw Evidence / Evidence Snapshot columns go. 'inline' (default) keeps "
+            "them in the scored CSV; 'sidecar' writes them only to <output>.evidence.jsonl, which "
+            "readers that do not go through read_scored_csv_rows() cannot see. Defaults to "
+            f"${SCORED_CSV_EVIDENCE_ENV}."
+        ),
+    )
+    parser.add_argument(
         "--only-scored",
         action="store_true",
         help="Manual LLM mode: skip enriched records without a matching score JSON",
@@ -3897,7 +4034,9 @@ def main() -> int:
         existing_scored_keys: set[str] = set()
         skipped_already_scored = 0
         if resume_scored and output_path.exists():
-            existing_scored_rows = read_csv_rows(output_path)
+            # Resume re-writes these rows into the new CSV, so they must come
+            # back with their evidence attached whichever layout wrote them.
+            existing_scored_rows = read_scored_csv_rows(output_path)
             existing_scored_keys = stable_lead_keys_from_rows(existing_scored_rows)
             records, skipped_already_scored = filter_unscored_records(
                 records,
@@ -4017,7 +4156,8 @@ def main() -> int:
     if append_existing_scored_rows:
         scored = [*existing_scored_rows, *scored]
 
-    write_csv(output_path, scored)
+    inline_evidence = None if args.evidence_layout is None else args.evidence_layout == "inline"
+    sidecar_path = write_scored_csv(output_path, scored, inline_evidence=inline_evidence)
 
     if args.cards_output:
         cards = [build_lead_card(row) for row in scored]
@@ -4034,6 +4174,8 @@ def main() -> int:
 
     print(f"[DONE] Read: {input_path}")
     print(f"[DONE] Wrote: {output_path}")
+    if sidecar_path.exists():
+        print(f"[DONE] Evidence sidecar: {sidecar_path}")
     if args.cards_output:
         print(f"[DONE] Lead cards: {args.cards_output}")
     print(f"[DONE] Rows: {len(scored)}")
