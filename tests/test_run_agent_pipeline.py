@@ -203,6 +203,98 @@ class AgentPipelineTest(unittest.TestCase):
         self.assertEqual(summary["counts"]["manual_review_packet"], 1)
         self.assertEqual(summary["counts"]["watchlist"], 1)
 
+    # ---- the parallel-run guard ----------------------------------------- #
+    #
+    # `--lock-file` exists so distinct batches can run search/enrich/score in
+    # parallel; the wrapper keys every output by batch name, so those stages
+    # do not collide. The Airtable base is the one piece of shared state that
+    # is *not* batch-keyed, and upload_airtable's fetch_existing_records ->
+    # plan_airtable_sync -> send_airtable_plan is an unlocked read-then-write
+    # that is the only cross-batch dedupe there is. Two syncs behind two
+    # private locks each read a base without the other's rows and both POST,
+    # landing two Status=New records for one business -- both pass
+    # QUEUE_FILTER_FORMULA, mark_sent flips one, and the twin is served to a
+    # rep again. MARK_SENT_ALLOWED_SOURCE_STATUSES cannot catch that: the
+    # second record legitimately *is* new. So the two flags have to be read
+    # together, once, before anything runs.
+
+    def test_airtable_live_refuses_under_a_custom_lock_file(self) -> None:
+        self._write_config()
+        self._write_scored("detailing_cleveland_medium_001")
+        custom = self.root / "output" / ".agent_pipeline.detailing_cleveland_medium_001.lock"
+        commands: list[list[str]] = []
+        out = io.StringIO()
+        with patch.object(rap, "run", side_effect=self._fake_run(commands)), redirect_stdout(out):
+            code = rap.main(self._argv("packets-only", airtable="live", lock_file=str(custom)))
+        self.assertEqual(code, 2)
+        self.assertIn("[REFUSE]", out.getvalue())
+        self.assertEqual(commands, [])
+        # Fail closed: the refusal lands before the lock is even taken, so a
+        # refused run leaves no lockfile behind for the next run to reap.
+        self.assertFalse(custom.exists())
+
+    def test_airtable_dry_run_also_refuses_under_a_custom_lock_file(self) -> None:
+        # dry-run still calls upload_airtable.py, which still performs the
+        # unlocked fetch_existing_records read. Refusing only `live` would
+        # leave the operator one flag away from the real thing.
+        self._write_config()
+        self._write_scored("detailing_cleveland_medium_001")
+        custom = self.root / "output" / "batch.lock"
+        commands: list[list[str]] = []
+        out = io.StringIO()
+        with patch.object(rap, "run", side_effect=self._fake_run(commands)), redirect_stdout(out):
+            code = rap.main(self._argv("packets-only", airtable="dry-run", lock_file=str(custom)))
+        self.assertEqual(code, 2)
+        self.assertIn("[REFUSE]", out.getvalue())
+        self.assertEqual(commands, [])
+
+    def test_refusal_names_both_escapes(self) -> None:
+        self._write_config()
+        self._write_scored("detailing_cleveland_medium_001")
+        custom = self.root / "output" / "batch.lock"
+        commands: list[list[str]] = []
+        out = io.StringIO()
+        with patch.object(rap, "run", side_effect=self._fake_run(commands)), redirect_stdout(out):
+            rap.main(self._argv("packets-only", airtable="live", lock_file=str(custom)))
+        message = out.getvalue()
+        self.assertIn("--lock-file", message)
+        self.assertIn("--airtable skip", message)
+
+    def test_custom_lock_file_is_allowed_with_airtable_skip(self) -> None:
+        # The whole point of --lock-file: parallel batches through
+        # search/enrich/score, which touch nothing shared.
+        self._write_config()
+        self._write_scored("detailing_cleveland_medium_001")
+        custom = self.root / "output" / "batch.lock"
+        commands: list[list[str]] = []
+        with patch.object(rap, "run", side_effect=self._fake_run(commands)), redirect_stdout(io.StringIO()):
+            code = rap.main(self._argv("packets-only", airtable="skip", lock_file=str(custom)))
+        self.assertEqual(code, 0)
+        self.assertFalse(any("upload_airtable.py" in cmd for cmd in commands))
+
+    def test_default_lock_file_is_allowed_with_live_airtable(self) -> None:
+        # The global lock serialises runs, so one sync at a time. Allowed.
+        self._write_config()
+        self._write_scored("detailing_cleveland_medium_001")
+        commands: list[list[str]] = []
+        with patch.object(rap, "run", side_effect=self._fake_run(commands)), redirect_stdout(io.StringIO()):
+            code = rap.main(self._argv("packets-only", airtable="live"))
+        self.assertEqual(code, 0)
+        self.assertTrue(any("upload_airtable.py" in cmd for cmd in commands))
+
+    def test_lock_file_spelled_differently_but_resolving_to_the_default_is_allowed(self) -> None:
+        # The guard is about which lock is held, not about which string was
+        # typed. An absolute path, or one with a `..` in it, that lands on the
+        # default lock still serialises against every other run.
+        self._write_config()
+        self._write_scored("detailing_cleveland_medium_001")
+        spelled = self.root / "output" / "packets" / ".." / ".." / "output" / ".agent_pipeline.lock"
+        commands: list[list[str]] = []
+        with patch.object(rap, "run", side_effect=self._fake_run(commands)), redirect_stdout(io.StringIO()):
+            code = rap.main(self._argv("packets-only", airtable="live", lock_file=str(spelled)))
+        self.assertEqual(code, 0)
+        self.assertTrue(any("upload_airtable.py" in cmd for cmd in commands))
+
     def test_search_mode_forks_batch_when_outputs_exist(self) -> None:
         self._write_config()
         # Existing outputs for _001 should trigger a fork to _002.
