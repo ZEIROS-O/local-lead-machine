@@ -378,11 +378,26 @@ def flatten_safe_outreach_claims(value: Any) -> str:
     parts: List[str] = []
     for claim in normalize_safe_outreach_claims(value):
         refs = ",".join(claim.get("evidence_refs") or [])
-        parts.append(f"{claim.get('claim', '')} [{refs}]")
+        parts.append(f"{_escape_claim_text(str(claim.get('claim', '')))} [{refs}]")
     return "; ".join(parts)
 
 
 def normalize_unsafe_claims(value: Any) -> List[str]:
+    """Unsafe claims keep the raw `;` split, deliberately — with a caveat.
+
+    They carry no citations, so the misattribution that forced escaping on the
+    safe side cannot happen here: a split yields two warnings rather than one,
+    and never moves evidence between assertions.
+
+    But the reason it is harmless is narrower than it looks, and it is *not*
+    "both fragments still block". No blocker reads unsafe claims at all — they
+    are display-only. The safety rests on them sitting outside the gate
+    entirely. Wire them into `evaluate_sendability` and this unescaped split
+    becomes live; escape it then, the way `_escape_claim_text` does.
+
+    Known, accepted loss: a claim of only `;` or whitespace round-trips to
+    nothing, dropping a "do not say this" warning from the rep's card.
+    """
     if isinstance(value, dict):
         for key in ("unsafe_claims", "Unsafe Claims"):
             if key in value:
@@ -1369,9 +1384,50 @@ def _split_refs(value: Any) -> List[str]:
     return [str(value).strip()]
 
 
+def _escape_claim_text(text: str) -> str:
+    """Make a claim safe to sit inside the `"; "`-joined flat string.
+
+    The flat form is what a rep reads in Airtable, so it stays flat rather than
+    becoming JSON. Escaping the backslash first is what keeps the two
+    substitutions from colliding: a claim already containing `\\;` must survive
+    the round trip as `\\;`, not turn into a delimiter.
+    """
+    return text.replace("\\", "\\\\").replace(";", "\\;")
+
+
+def _split_escaped_claims(value: str) -> List[str]:
+    """Split on unescaped `;` and unescape each fragment, in one left-to-right pass.
+
+    Splitting and unescaping have to share a scan: doing them separately makes
+    the answer depend on how many backslashes precede a delimiter. Only `\\\\`
+    and `\\;` are treated as escapes — a lone backslash in a legacy row (a
+    Windows path, say) is left exactly as written, and a legacy raw `;` splits
+    precisely as it always has.
+    """
+    parts: List[str] = []
+    buffer: List[str] = []
+    index = 0
+    length = len(value)
+    while index < length:
+        char = value[index]
+        if char == "\\" and index + 1 < length and value[index + 1] in ("\\", ";"):
+            buffer.append(value[index + 1])
+            index += 2
+            continue
+        if char == ";":
+            parts.append("".join(buffer))
+            buffer = []
+            index += 1
+            continue
+        buffer.append(char)
+        index += 1
+    parts.append("".join(buffer))
+    return parts
+
+
 def _parse_flattened_safe_claims(value: str) -> List[Dict[str, Any]]:
     claims: List[Dict[str, Any]] = []
-    for part in value.split(";"):
+    for part in _split_escaped_claims(value):
         cleaned = part.strip()
         if not cleaned:
             continue
