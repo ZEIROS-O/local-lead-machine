@@ -195,11 +195,14 @@ def model_accepts_temperature(model: str) -> bool:
 def temperature_for_model(model: str) -> int | None:
     """`PINNED_TEMPERATURE` when the model supports it, else None (omit the key).
 
-    `LLM_PIN_TEMPERATURE=0` omits it everywhere — the escape hatch for a model
-    that rejects sampling but is not yet in `SAMPLING_FIXED_MODEL_PREFIXES`, so
-    a run can be unblocked from `.env` instead of a code change mid-backlog.
+    `LLM_DISABLE_TEMPERATURE_PIN=1` omits it everywhere — the escape hatch for a
+    model that rejects sampling but is not yet in `SAMPLING_FIXED_MODEL_PREFIXES`,
+    so a run can be unblocked from `.env` instead of a code change mid-backlog.
+    Named for the disable rather than the pin on purpose: the pinned value *is*
+    zero, so a `LLM_PIN_TEMPERATURE=0` would read equally as "pin it to 0" and
+    "do not pin", and those are opposite outcomes.
     """
-    if not _getenv_bool("LLM_PIN_TEMPERATURE", True):
+    if _getenv_bool("LLM_DISABLE_TEMPERATURE_PIN", False):
         return None
     return PINNED_TEMPERATURE if model_accepts_temperature(model) else None
 

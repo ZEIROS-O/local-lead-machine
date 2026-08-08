@@ -118,14 +118,14 @@ class ModelTemperatureSupportTest(unittest.TestCase):
 
     def test_temperature_for_model_returns_the_pin_or_none(self) -> None:
         with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("LLM_PIN_TEMPERATURE", None)
+            os.environ.pop("LLM_DISABLE_TEMPERATURE_PIN", None)
             self.assertEqual(llm_client.temperature_for_model("claude-sonnet-4-5"), 0)
             self.assertIsNone(llm_client.temperature_for_model("claude-sonnet-5"))
 
     def test_kill_switch_omits_temperature_even_on_a_supporting_model(self) -> None:
         # Escape hatch for a new model that also rejects sampling: unblock the
         # run from .env instead of shipping a code change mid-backlog.
-        with patch.dict(os.environ, {"LLM_PIN_TEMPERATURE": "0"}, clear=False):
+        with patch.dict(os.environ, {"LLM_DISABLE_TEMPERATURE_PIN": "1"}, clear=False):
             self.assertIsNone(llm_client.temperature_for_model("claude-sonnet-4-5"))
 
 
@@ -145,7 +145,7 @@ class AnthropicPayloadTemperatureTest(_PayloadTestCase):
             "LLM_SCORING_PROVIDER_CHAIN": "anthropic",
         }
         with patch.dict(os.environ, env, clear=False):
-            os.environ.pop("LLM_PIN_TEMPERATURE", None)
+            os.environ.pop("LLM_DISABLE_TEMPERATURE_PIN", None)
             with patch("lead_machine.llm_client.load_dotenv"):
                 with patch(
                     "lead_machine.llm_client.requests.post", return_value=_anthropic_response()
@@ -166,7 +166,7 @@ class AnthropicPayloadTemperatureTest(_PayloadTestCase):
         }
         with patch.dict(os.environ, env, clear=False):
             os.environ.pop("LLM_SCORING_MODEL", None)
-            os.environ.pop("LLM_PIN_TEMPERATURE", None)
+            os.environ.pop("LLM_DISABLE_TEMPERATURE_PIN", None)
             with patch("lead_machine.llm_client.load_dotenv"):
                 with patch(
                     "lead_machine.llm_client.requests.post", return_value=_anthropic_response()
@@ -186,7 +186,7 @@ class KimiPayloadTemperatureTest(_PayloadTestCase):
             "KIMI_SCORING_MODEL": "kimi-k2-0905-preview",
         }
         with patch.dict(os.environ, env, clear=False):
-            os.environ.pop("LLM_PIN_TEMPERATURE", None)
+            os.environ.pop("LLM_DISABLE_TEMPERATURE_PIN", None)
             with patch("lead_machine.llm_client.load_dotenv"):
                 with patch(
                     "lead_machine.llm_client.requests.post", return_value=_kimi_response()
@@ -205,7 +205,7 @@ class KimiPayloadTemperatureTest(_PayloadTestCase):
         with patch.dict(os.environ, env, clear=False):
             os.environ.pop("KIMI_SCORING_MODEL", None)
             os.environ.pop("LLM_SCORING_MODEL", None)
-            os.environ.pop("LLM_PIN_TEMPERATURE", None)
+            os.environ.pop("LLM_DISABLE_TEMPERATURE_PIN", None)
             with patch("lead_machine.llm_client.load_dotenv"):
                 with patch(
                     "lead_machine.llm_client.requests.post", return_value=_kimi_response()
