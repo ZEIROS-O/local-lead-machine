@@ -34,7 +34,7 @@ from typing import Any, Deque, Dict, List, Tuple
 
 from dotenv import load_dotenv
 
-from import_llm_score_bundle import import_score_bundle, validate_bundle_scores
+from import_llm_score_bundle import import_score_bundle
 from lead_machine.buyer_signals import (
     buyer_intent_summary,
     demand_signal_state,
@@ -2876,46 +2876,12 @@ Original invalid JSON:
 """
 
 
-def _fallback_fill_empty_evidence_refs(
-    bundle: Dict[str, Any],
-    compact_records: List[Dict[str, Any]],
-) -> Tuple[Dict[str, Any] | None, str]:
-    fixed = copy.deepcopy(bundle)
-    compact_by_file = {
-        _score_file_for_compact(compact): compact
-        for compact in compact_records
-        if _score_file_for_compact(compact)
-    }
-    filled_files: List[str] = []
-
-    for index, item in enumerate(fixed.get("scores") or []):
-        if not isinstance(item, dict):
-            return None, ""
-        score = item.get("score")
-        if not isinstance(score, dict):
-            return None, ""
-        if score.get("evidence_refs"):
-            continue
-        score_file = str(item.get("score_file") or "").strip()
-        compact = compact_by_file.get(score_file)
-        if compact is None and index < len(compact_records):
-            compact = compact_records[index]
-        options = (compact or {}).get("evidence_ref_options") or []
-        fallback_refs = [str(option.get("id")) for option in options if option.get("id")][:3]
-        if not fallback_refs:
-            return None, ""
-        score["evidence_refs"] = fallback_refs
-        filled_files.append(score_file or f"scores[{index}]")
-
-    if not filled_files:
-        return None, ""
-
-    try:
-        validate_bundle_scores(fixed)
-    except ValueError:
-        return None, ""
-
-    return fixed, f"deterministic evidence_refs fallback filled {', '.join(filled_files)}"
+# There is deliberately no deterministic backfill for empty `evidence_refs`.
+# A model that declines to cite is telling us it found nothing citable, and
+# `EVIDENCE_COUNT_BLOCKER` exists to catch exactly that lead. Copying the first
+# three `evidence_ref_options` ids into the score would manufacture the gate's
+# own input, so an uncited batch fails here like any other validation failure
+# and its leads stay unscored and re-runnable.
 
 
 def _validation_failure_runtime_error(
@@ -3007,17 +2973,6 @@ def _score_batch_with_debug(
                             attempt=2,
                             raw_text=repair_exc.raw_text,
                         )
-                    fallback_bundle, fallback_note = _fallback_fill_empty_evidence_refs(parsed_json, compact_records)
-                    if fallback_bundle is not None:
-                        return {
-                            "bundle": fallback_bundle,
-                            "usage": failed_usage,
-                            "model": failed_model,
-                            "call_count": calls_made,
-                            "debug_notes": [
-                                f"{fallback_note}; raw response saved to {validation_debug_path}; repair failed"
-                            ],
-                        }
                     err = _validation_failure_runtime_error(
                         batch_id=batch_id,
                         validation_failures=f"{validation_failures}\nRepair failures:\n{repair_exc}",
