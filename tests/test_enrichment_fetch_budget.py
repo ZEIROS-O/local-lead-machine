@@ -642,6 +642,113 @@ class TruncationIsVisibleTest(unittest.TestCase):
             )
 
 
+class TruncatedAbsenceIsNotEvidenceTest(unittest.TestCase):
+    """A form we stopped short of is not a form the site does not have.
+
+    `TruncationIsVisibleTest.test_truncation_never_inflates_the_pain_score`
+    states the property but cannot catch this: its fixture has no form at any
+    budget, so the absence flags fire identically on both sides of the
+    comparison and the delta is zero either way. The fixture here is the one
+    that separates them — the site's only estimate form sits on the 20th
+    linked contact page, well past the 16-fetch ceiling. Crawled whole, it is
+    a healthy site. Crawled to the ceiling, every absence we report is a
+    statement about our own budget.
+
+    The `"Unknown"` rewrite already handles the graded fields. The flags are
+    the other half of the same sentence: `score_leads.score_online_weakness`
+    charges +8 for `no_form_detected` and +8 for `no_clear_cta_detected`, and
+    `evidence._derive_visible_pain_profile` adds +14 for the CTA — all inside
+    branches that the rewrite to `"Unknown"` *guarantees* are entered, because
+    `has_strong_estimate_form` can no longer be true. Left ungated, the
+    rewrite lowers the pain by one route and the flags put it straight back.
+    """
+
+    # Zero-padded because the candidate URLs are crawled in sorted order, and
+    # `/contact-19` unpadded sorts tenth. The form has to be on the page that
+    # sorts last, or the ceiling reaches it and there is nothing to test.
+    _NAV = "".join(f'<a href="/contact-{index:02d}">Contact {index}</a>' for index in range(20))
+
+    # No <form>, no <input>, no <button>, no <iframe> — `detect_form_signals`
+    # grades any of those as Weak, which would satisfy `forms_found` and stop
+    # `no_form_detected` firing for the wrong reason. And no CTA_TERMS phrase,
+    # so `no_clear_cta_detected` is genuinely reachable.
+    _FORMLESS = _homepage("<h2>Our work</h2><p>Serving Northeast Ohio since 1998.</p>")
+
+    def _fake_fetch(self, url: str, timeout: int = 15) -> dict[str, object]:
+        if url == "https://example.com":
+            html = _homepage(self._NAV)
+        elif url == "https://example.com/contact-19":  # the 20th, past the ceiling
+            html = STRONG_FORM
+        else:
+            html = self._FORMLESS
+        return {"ok": True, "status_code": 200, "final_url": url, "html": html, "error": ""}
+
+    def _crawl(self, budget: int) -> dict[str, object]:
+        with patch("enrich_leads.fetch_url", side_effect=self._fake_fetch), patch(
+            "enrich_leads.resolve_candidate_page_budget", return_value=budget
+        ):
+            return scrape_site("https://example.com")
+
+    def _record(self, site: dict[str, object]) -> dict[str, object]:
+        return {
+            "google": {"business_name": "X", "reviews": 30, "rating": 4.5},
+            "website": site,
+            "derived": {},
+        }
+
+    def test_the_whole_site_has_a_strong_estimate_form(self) -> None:
+        # The control. Without this the ceiling case proves nothing: it would
+        # be a site that really has no form.
+        site = self._crawl(500)
+
+        self.assertEqual(site["estimate_form_detected"], "Yes")
+        self.assertEqual(site["form_strength"], "Strong")
+        self.assertNotIn("no_form_detected", site["site_issue_flags"])
+        self.assertNotIn("no_clear_cta_detected", site["site_issue_flags"])
+        self.assertNotIn(enrich_leads.CANDIDATE_BUDGET_FLAG, site["site_issue_flags"])
+
+    def test_the_ceiling_does_not_assert_the_form_is_missing(self) -> None:
+        site = self._crawl(enrich_leads.MAX_CANDIDATE_PAGE_FETCHES)
+
+        # Precondition: we really did stop early, and really did not find it.
+        self.assertIn(enrich_leads.CANDIDATE_BUDGET_FLAG, site["site_issue_flags"])
+        self.assertFalse(site["forms_found"])
+
+        self.assertNotIn("no_form_detected", site["site_issue_flags"])
+        self.assertNotIn("no_clear_cta_detected", site["site_issue_flags"])
+
+    def test_the_ceiling_leaves_the_lead_unknown_not_healthy(self) -> None:
+        # Dropping the flags must not read as "we looked and it was fine".
+        # Every field the flags spoke for has to say Unknown, which is what
+        # the graded fields already do and what downstream already ignores.
+        site = self._crawl(enrich_leads.MAX_CANDIDATE_PAGE_FETCHES)
+
+        self.assertEqual(site["contact_form_detected"], "Unknown")
+        self.assertEqual(site["estimate_form_detected"], "Unknown")
+        self.assertEqual(site["form_strength"], "Unknown")
+        self.assertEqual(site["cta_strength"], "Unknown")
+
+    def test_the_ceiling_cannot_score_worse_than_the_whole_site(self) -> None:
+        # The downstream half, read-only: both scorers that charge for these
+        # flags must come out no higher on the truncated crawl than on the
+        # complete one. Pain is what carries a lead past
+        # `sendability.VISIBLE_PAIN_BLOCKER`, so a truncated crawl scoring
+        # higher is a lead manufactured out of our own budget.
+        from lead_machine.evidence import build_evidence_profile
+        from score_leads import score_online_weakness
+
+        truncated = self._record(self._crawl(enrich_leads.MAX_CANDIDATE_PAGE_FETCHES))
+        whole = self._record(self._crawl(500))
+
+        self.assertLessEqual(
+            score_online_weakness(truncated)[0], score_online_weakness(whole)[0]
+        )
+        self.assertLessEqual(
+            build_evidence_profile(truncated)["visible_pain_score"],
+            build_evidence_profile(whole)["visible_pain_score"],
+        )
+
+
 class InterWavePauseTest(unittest.TestCase):
     """The pause belongs in the gaps between waves, not after the last one.
 
