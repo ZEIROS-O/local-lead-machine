@@ -98,6 +98,48 @@ def _manual_score() -> dict:
 _BATCH_ID_RE = re.compile(r"batch_(\d+)")
 
 
+def _valid_batch_result(batch_number: int, *, usage: dict | None = None, model: str = "") -> dict:
+    result = {
+        "bundle": {
+            "batch_id": f"batch_{batch_number:03d}",
+            "scores": [{"score_file": f"chij{batch_number - 1}.json", "score": _manual_score()}],
+        },
+        "usage": usage or {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
+    }
+    if model:
+        result["model"] = model
+    return result
+
+
+def _two_call_provider(usage: dict | None = None):
+    """A provider where every batch bills exactly two calls.
+
+    The first attempt comes back truncated, which `_score_batch_with_debug`
+    retries with a larger `max_tokens` — one of the three call sites a single
+    batch can spend (initial, truncation retry, validation repair). Returns the
+    fake and the per-batch attempt counter so a test can assert on real calls
+    made, not just on the number the run banked.
+    """
+    attempts: dict[int, int] = {}
+    lock = threading.Lock()
+
+    def fake_score_batch(prompt: str, *, model: str = "", max_tokens: int = 0) -> dict:
+        from lead_machine import llm_client
+
+        batch_number = int(_BATCH_ID_RE.search(prompt).group(1))
+        with lock:
+            attempts[batch_number] = attempts.get(batch_number, 0) + 1
+            first_attempt = attempts[batch_number] == 1
+        if first_attempt:
+            raise llm_client.InvalidLlmResponse(
+                "Invalid LLM score bundle JSON: Unterminated string starting at line 4 column 12",
+                raw_text='{"batch_id": "batch_%03d", "scores": [{"score_file": "chij' % batch_number,
+            )
+        return _valid_batch_result(batch_number, usage=usage)
+
+    return fake_score_batch, attempts
+
+
 class ConcurrentApiLlmScoringTest(unittest.TestCase):
     def _records(self, count: int) -> list[dict]:
         return [
@@ -317,6 +359,278 @@ class SerialConcurrentEquivalenceTest(unittest.TestCase):
         serial = self._run(concurrency=1)
         concurrent = self._run(concurrency=4)
         self.assertEqual(serial, concurrent)
+
+    def _capped_run(self, *, concurrency: int) -> tuple[list[str], int, int, float, bool, str]:
+        """Same run as `_run`, but with MAX_LLM_CALLS_PER_RUN actually binding."""
+        from score_leads import score_records_api_run
+
+        provider, _ = _two_call_provider()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("score_leads.llm_client.score_batch", side_effect=provider):
+                run = score_records_api_run(
+                    self._records(6),
+                    scores_dir=Path(tmp) / "scores",
+                    fallback_vertical="hardscaping",
+                    batch_size=1,
+                    model="claude-sonnet-5",
+                    max_tokens=20,
+                    max_calls=4,
+                    max_tokens_per_run=0,
+                    max_usd_per_run=0.0,
+                    concurrency=concurrency,
+                )
+        return (
+            [row["Business Name"] for row in run.manual_run.rows],
+            run.calls,
+            run.tokens,
+            run.usd,
+            run.stopped_by_cap,
+            run.stop_reason,
+        )
+
+    def test_concurrent_run_matches_serial_run_with_a_binding_calls_cap(self) -> None:
+        """The uncapped parity test says nothing about cap behaviour — pin that too.
+
+        Exact parity holds here because the concurrent gate reduces to the serial
+        `_hit_llm_cap(banked usage)` check whenever nothing is in flight, which is
+        where this scenario's cap trips. It is *not* a general guarantee: see
+        `ConcurrentCapEnforcementTest.test_actual_usage_over_reservation_still_stops_the_run`,
+        where the concurrent run gets one batch further than the serial one because
+        batches already in flight are paid for.
+
+        There is deliberately no general parity claim here. Under a binding
+        `MAX_LLM_TOKENS_PER_RUN` the two paths score *different lead sets*: serial
+        charges the next batch's projection against banked actuals, while planning
+        charges it against cumulative reservations that no actual ever reconciles
+        downward. That divergence predates this cap work and is not pinned
+        anywhere — see the submission-gate comment in `score_leads.py`.
+        """
+        serial = self._capped_run(concurrency=1)
+        concurrent = self._capped_run(concurrency=4)
+        self.assertEqual(serial, concurrent)
+        self.assertTrue(serial[4], "the cap must actually bind or this test proves nothing")
+        self.assertEqual(serial[5], "MAX_LLM_CALLS_PER_RUN")
+
+
+class ConcurrentCapEnforcementTest(unittest.TestCase):
+    """Spend caps must still be able to stop a *concurrent* run.
+
+    The serial loop re-checks `_hit_llm_cap(calls, tokens, usd)` against actual
+    banked usage before every batch. The first concurrent implementation replaced
+    that with an up-front reservation and then submitted every planned batch
+    before banking any of them, so after planning there was no point at which a
+    cap could still stop the run:
+
+    - `MAX_LLM_CALLS_PER_RUN` was compared against the *planned-batch index*, but
+      one batch can bill up to three calls (initial, truncation retry, validation
+      repair), so a cap of 60 admitted ~180 billed calls.
+    - The per-batch reservation covers exactly one call, so a batch that retries
+      lands at 2-3x its reservation with nothing left to notice.
+    - Reservations were priced with the *caller's* model. A `subscription:*` entry
+      at the head of the chain is priced (0.0, 0.0), which zeroes every
+      reservation and makes `MAX_LLM_USD_PER_RUN` not bind at all — even though a
+      fall-through to Kimi or the Claude API spends real money.
+
+    Every one of these was invisible to the older tests, which pass
+    `max_calls=0, max_tokens_per_run=0, max_usd_per_run=0.0` — i.e. caps off.
+    """
+
+    def _records(self, count: int) -> list[dict]:
+        return [
+            {
+                "google": _google_fixture(f"Landscaping {index}", f"ChIJ{index}"),
+                "evidence": _evidence_fixture(),
+            }
+            for index in range(count)
+        ]
+
+    def test_two_call_batches_do_not_exceed_max_calls_per_run(self) -> None:
+        """(a) The cap counts billed calls, not planned batches."""
+        from score_leads import score_records_api_run
+
+        provider, attempts = _two_call_provider()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("score_leads.llm_client.score_batch", side_effect=provider):
+                run = score_records_api_run(
+                    self._records(6),
+                    scores_dir=Path(tmp) / "scores",
+                    fallback_vertical="hardscaping",
+                    batch_size=1,
+                    model="claude-sonnet-5",
+                    max_tokens=20,
+                    max_calls=4,
+                    max_tokens_per_run=0,
+                    max_usd_per_run=0.0,
+                    concurrency=4,
+                )
+
+        billed_calls = sum(attempts.values())
+        self.assertTrue(
+            all(count == 2 for count in attempts.values()),
+            f"every batch was supposed to bill two calls, got {attempts}",
+        )
+        self.assertLessEqual(
+            billed_calls, 4, f"MAX_LLM_CALLS_PER_RUN=4 admitted {billed_calls} billed calls"
+        )
+        self.assertEqual(run.calls, billed_calls, "the run must bank the calls it actually made")
+        self.assertTrue(run.stopped_by_cap)
+        self.assertEqual(run.stop_reason, "MAX_LLM_CALLS_PER_RUN")
+
+    def test_subscription_first_chain_still_stops_at_the_usd_cap(self) -> None:
+        """(c) Reservations price the priciest model the chain can reach.
+
+        `subscription:codex` is priced (0.0, 0.0). Pricing the reservation with it
+        zeroes the whole run's projected spend, so `MAX_LLM_USD_PER_RUN` never
+        binds — while the chain quietly falls through to kimi-k3 and bills for it.
+        """
+        from score_leads import score_records_api_run
+
+        served_usage = {"input_tokens": 20_000, "output_tokens": 20_000, "total_tokens": 40_000}
+
+        def fake_score_batch(prompt: str, *, model: str, max_tokens: int) -> dict:
+            batch_number = int(_BATCH_ID_RE.search(prompt).group(1))
+            return _valid_batch_result(batch_number, usage=served_usage, model="kimi-k3")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("score_leads.llm_client.score_batch", side_effect=fake_score_batch):
+                run = score_records_api_run(
+                    self._records(6),
+                    scores_dir=Path(tmp) / "scores",
+                    fallback_vertical="hardscaping",
+                    batch_size=1,
+                    model="subscription:codex",
+                    projection_model="kimi-k3",
+                    max_tokens=40_000,
+                    max_calls=0,
+                    max_tokens_per_run=0,
+                    max_usd_per_run=1.0,
+                    concurrency=4,
+                )
+
+        self.assertTrue(
+            run.stopped_by_cap,
+            f"MAX_LLM_USD_PER_RUN=1.0 never bound; the run spent ${run.usd:.4f}",
+        )
+        self.assertEqual(run.stop_reason, "MAX_LLM_USD_PER_RUN")
+        self.assertLessEqual(run.usd, 1.0)
+
+    def test_actual_usage_over_reservation_still_stops_the_run(self) -> None:
+        """(b) Reservations cover one call; banked actuals are what the cap reads.
+
+        `max_tokens=20` makes each reservation trivially small, and the served
+        batches then bill $0.36 apiece. Nothing in the plan could see that — only
+        reconciling against banked totals inside the collection loop can.
+        """
+        from score_leads import score_records_api_run
+
+        served_usage = {"input_tokens": 20_000, "output_tokens": 20_000, "total_tokens": 40_000}
+
+        def fake_score_batch(prompt: str, *, model: str, max_tokens: int) -> dict:
+            batch_number = int(_BATCH_ID_RE.search(prompt).group(1))
+            return _valid_batch_result(batch_number, usage=served_usage)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("score_leads.llm_client.score_batch", side_effect=fake_score_batch):
+                run = score_records_api_run(
+                    self._records(6),
+                    scores_dir=Path(tmp) / "scores",
+                    fallback_vertical="hardscaping",
+                    batch_size=1,
+                    model="kimi-k3",
+                    max_tokens=20,
+                    max_calls=0,
+                    max_tokens_per_run=0,
+                    max_usd_per_run=0.5,
+                    concurrency=2,
+                )
+
+        self.assertTrue(
+            run.stopped_by_cap,
+            f"MAX_LLM_USD_PER_RUN=0.5 never bound; the run spent ${run.usd:.4f}",
+        )
+        self.assertEqual(run.stop_reason, "MAX_LLM_USD_PER_RUN")
+        self.assertLess(run.calls, 6, "the cap must stop submission, not merely be reported")
+
+    def test_a_full_window_throttles_rather_than_ending_the_run(self) -> None:
+        """A worst-case charge that trips on a *full* window must drain, not stop.
+
+        The submission gate charges every in-flight batch at three times its
+        reservation, because a batch that has banked nothing could still spend
+        that much. With the window full that charge can trip the cap on money no
+        batch will actually cost — here reservations are $0.0612 apiece while the
+        served batches cost $0.00018, a 340x gap. Treating that as a verdict ends
+        the run two batches in and silently under-scores the input; the run must
+        instead drain the window and re-decide on banked actuals.
+
+        This pins the `if in_flight: break` throttle. Without it every assertion
+        below fails: the run stops two batches in with `stopped_by_cap=True`,
+        having spent well under 1% of the cap.
+
+        The cap has to sit between two layers, which is the only window where the
+        throttle is observable at all, so it is derived from the real reservation
+        rather than hard-coded: above the planner's cumulative `5 x R` (so all
+        five batches get planned) and below the submission gate's worst-case
+        charge on a full window, `MAX_LLM_CALLS_PER_BATCH x 2 x R`. Hard-coding it
+        would silently stop testing the throttle the moment prompt size moved and
+        the planner started binding first — which is exactly what happened while
+        this test was being written.
+        """
+        import score_leads
+        from score_leads import MAX_LLM_CALLS_PER_BATCH, score_records_api_run
+
+        tiny_usage = {"input_tokens": 10, "output_tokens": 10, "total_tokens": 20}
+        records = self._records(5)
+
+        def fake_score_batch(prompt: str, *, model: str, max_tokens: int) -> dict:
+            batch_number = int(_BATCH_ID_RE.search(prompt).group(1))
+            return _valid_batch_result(batch_number, usage=tiny_usage)
+
+        planned, _, _ = score_leads._plan_api_llm_batches(
+            [score_leads.ensure_evidence(record) for record in records],
+            fallback_vertical="hardscaping",
+            batch_size=1,
+            projection_model="claude-sonnet-5",
+            max_tokens=4000,
+            max_tokens_per_run=0,
+            max_usd_per_run=0.0,
+        )
+        self.assertEqual(len(planned), 5)
+        reservation = planned[0].reserved_usd
+        planner_ceiling = len(planned) * reservation
+        gate_charge = MAX_LLM_CALLS_PER_BATCH * 2 * reservation
+        self.assertLess(
+            planner_ceiling,
+            gate_charge,
+            "no cap can distinguish the two layers; the scenario is unbuildable",
+        )
+        cap = (planner_ceiling + gate_charge) / 2
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("score_leads.llm_client.score_batch", side_effect=fake_score_batch):
+                run = score_records_api_run(
+                    records,
+                    scores_dir=Path(tmp) / "scores",
+                    fallback_vertical="hardscaping",
+                    batch_size=1,
+                    model="claude-sonnet-5",
+                    max_tokens=4000,
+                    max_calls=0,
+                    max_tokens_per_run=0,
+                    max_usd_per_run=cap,
+                    concurrency=3,
+                )
+
+        self.assertFalse(
+            run.stopped_by_cap,
+            f"the run stopped on reserved money it never spent (${run.usd:.5f} of ${cap:.5f})",
+        )
+        self.assertEqual(run.stop_reason, "")
+        self.assertEqual(run.calls, 5, "every batch should still have been submitted")
+        self.assertEqual(
+            len(run.manual_run.rows), 5, "throttling must not drop leads from the output"
+        )
+        self.assertLess(run.usd, cap)
 
 
 class BatchFailureIsolationTest(unittest.TestCase):
