@@ -35,7 +35,13 @@ from enrich_leads import (
 )
 from places_search import getenv_int, normalize_place, place_details, text_search_paged
 from lead_machine.compliance import ComplianceError, load_configured_suppression_index
-from lead_machine.corpus_index import PlaceRegistry, primary_key, registry_path_for
+from lead_machine.corpus_index import (
+    CROSS_BATCH_DEDUPE_CLASSES,
+    PlaceRegistry,
+    is_toll_free,
+    primary_key,
+    registry_path_for,
+)
 from lead_machine.review_velocity import ReviewSnapshotStore
 from lead_machine.schema import GENERIC_DOMAINS, normalize_domain, normalize_phone, slug
 from lead_machine.verticals import resolve_profile
@@ -517,8 +523,19 @@ def dedupe_search_rows(
     in-batch classes so the reason counts stay honest about which duplicates
     were cross-batch. The early skip in `collect_raw_rows` already catches the
     place_id case before any billing; this pass exists for identity drift —
-    Google re-issuing a place_id for a business we already know by phone,
-    domain or name+city.
+    Google re-issuing a place_id for a business we already know by phone or
+    name+city.
+
+    `domain` is deliberately NOT a cross-batch class. It is safe within one
+    batch, where one metro rarely holds two of a chain, and unsafe across the
+    corpus, where a shared domain is the normal shape of a franchise: measured
+    on data/deduped, 38 domains are shared by differently-named businesses in
+    different batches, covering 88 distinct prospects — five separate Wayne
+    Dalton dealers, five Ace Handyman franchisees, three unrelated businesses
+    behind one template host. Excluding on domain would silently delete the
+    second, third and fourth of each, and because a row dropped here never
+    reaches the registry it would be re-discovered and re-billed on every
+    subsequent run: pay every time, never get the lead.
     """
     prior_keys = set(prior_keys or ())
     kept: List[Dict[str, str]] = []
@@ -550,6 +567,10 @@ def dedupe_search_rows(
 
         reason = ""
         for name_of_class, value, namespaced, _seen in classes:
+            if name_of_class not in CROSS_BATCH_DEDUPE_CLASSES:
+                continue
+            if name_of_class == "phone" and is_toll_free(value):
+                continue
             if value and namespaced in prior_keys:
                 reason = f"duplicate_{name_of_class}_prior_batch"
                 break
@@ -1006,13 +1027,19 @@ def run_search_batch(
     _progress(f"Duplicate reason counts: {_inline_counts(duplicate_reason_counts)}")
     write_csv_rows(deduped_path, deduped_rows)
 
-    # Register here, beside the deduped write, not at the end of the run: these
-    # are exactly the businesses a Place Details call was billed for, and an
-    # interrupt during the long enrichment pass must not lose that fact and let
-    # the next batch pay for them again. The rows are on disk either way, so a
-    # half-enriched batch is re-enrichable from data/deduped/<batch>.csv without
-    # touching the Places API.
-    registered = registry.record(deduped_rows, batch=config.batch)
+    # Register here, beside the deduped write, not at the end of the run: an
+    # interrupt during the long enrichment pass must not lose the record of
+    # calls we already paid for and let the next batch pay again. The rows are
+    # on disk either way, so a half-enriched batch is re-enrichable from
+    # data/deduped/<batch>.csv without touching the Places API.
+    #
+    # `raw_rows`, not `deduped_rows`: the billed set is every row that got a
+    # Place Details call, and `dedupe_search_rows` has just discarded some of
+    # them. A row dropped as a cross-batch duplicate is the dangerous case —
+    # it was billed, and registering only survivors would leave it unknown, so
+    # the next run would discover it, bill it, and discard it again, forever.
+    # `record` folds by key, so in-batch repeats still collapse to one entry.
+    registered = registry.record(raw_rows, batch=config.batch)
     _progress(f"Registered {registered} business(es) in {registry.path}")
 
     corpus_dedupe = CorpusDedupe(

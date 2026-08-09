@@ -47,6 +47,28 @@ KEY_CLASSES: Tuple[str, ...] = ("place_id", "phone", "domain", "name_city")
 # phone number ever colliding with a name_city slug.
 _NAMESPACE = {"place_id": "place", "phone": "phone", "domain": "domain", "name_city": "name_city"}
 
+# Which classes may exclude a business the *corpus* already knows. Narrower
+# than KEY_CLASSES on purpose, because in-batch and cross-batch are different
+# questions. Within one metro a repeated domain is almost always one business
+# listed twice; across the corpus it is the ordinary shape of a franchise, and
+# excluding on it deletes real prospects that were never registered and so are
+# re-billed on every later run. Measured on data/deduped: 38 domains shared by
+# differently-named businesses across batches, covering 88 distinct prospects.
+# `name_city` collides 0 times and `phone` once, so both stay.
+CROSS_BATCH_DEDUPE_CLASSES: Tuple[str, ...] = ("place_id", "phone", "name_city")
+
+# The one measured phone collision is a franchise's shared toll-free number
+# (1-800-BOARDUP of Cleveland vs. of Columbus). A number two businesses can
+# both answer is not an identity, so it never crosses batches.
+TOLL_FREE_PREFIXES = frozenset({"800", "833", "844", "855", "866", "877", "888"})
+
+
+def is_toll_free(phone: str) -> bool:
+    digits = "".join(ch for ch in str(phone or "") if ch.isdigit())
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    return len(digits) == 10 and digits[:3] in TOLL_FREE_PREFIXES
+
 
 def registry_path_for(root: Path | str = Path(".")) -> Path:
     return Path(root) / REGISTRY_RELATIVE_PATH
@@ -127,6 +149,16 @@ def namespaced_keys(row: Mapping[str, Any]) -> Set[str]:
     return {f"{_NAMESPACE[cls]}:{value}" for cls, value in row_keys(row).items()}
 
 
+def _ordered_batches(names: Iterable[str]) -> Tuple[str, ...]:
+    """De-duplicate batch names, keeping first-seen order and dropping blanks."""
+    out: List[str] = []
+    for name in names:
+        name = str(name or "").strip()
+        if name and name not in out:
+            out.append(name)
+    return tuple(out)
+
+
 @dataclass(frozen=True)
 class RegistryEntry:
     """One business the corpus has already paid for."""
@@ -140,8 +172,16 @@ class RegistryEntry:
     first_seen_batch: str = ""
     last_seen: str = ""
     last_seen_batch: str = ""
+    # Every batch that has ever seen this business, not just the first and the
+    # last. Two slots were not enough: `exclude_batch` is what stops a batch
+    # being starved by its own history, and a batch that is neither the first
+    # nor the most recent to find a business was invisible to its own escape
+    # hatch. Measured on the real corpus, 25 batches would have had 40-91% of
+    # their own place_ids excluded on an --overwrite or crash-resume rerun,
+    # then written that near-empty result back over data/deduped/<batch>.csv.
+    batches: Tuple[str, ...] = ()
 
-    def to_json(self) -> Dict[str, str]:
+    def to_json(self) -> Dict[str, Any]:
         return {
             "key": self.key,
             "place_id": self.place_id,
@@ -152,6 +192,7 @@ class RegistryEntry:
             "first_seen_batch": self.first_seen_batch,
             "last_seen": self.last_seen,
             "last_seen_batch": self.last_seen_batch,
+            "batches": list(self.batches),
         }
 
     @classmethod
@@ -159,6 +200,17 @@ class RegistryEntry:
         key = str(data.get("key") or "").strip()
         if not key:
             return None
+        first_seen_batch = str(data.get("first_seen_batch") or "")
+        last_seen_batch = str(data.get("last_seen_batch") or "")
+        raw_batches = data.get("batches")
+        if isinstance(raw_batches, (list, tuple)):
+            batches = tuple(str(item) for item in raw_batches if str(item))
+        else:
+            # Ledgers written before `batches` existed carry only the two
+            # slots. Reading them as the batch set keeps an old file usable
+            # without a rebuild; it is simply less complete, in the direction
+            # of excluding more.
+            batches = tuple(name for name in (first_seen_batch, last_seen_batch) if name)
         return cls(
             key=key,
             place_id=str(data.get("place_id") or ""),
@@ -166,17 +218,27 @@ class RegistryEntry:
             domain=str(data.get("domain") or ""),
             name_city=str(data.get("name_city") or ""),
             first_seen=str(data.get("first_seen") or ""),
-            first_seen_batch=str(data.get("first_seen_batch") or ""),
+            first_seen_batch=first_seen_batch,
             last_seen=str(data.get("last_seen") or ""),
-            last_seen_batch=str(data.get("last_seen_batch") or ""),
+            last_seen_batch=last_seen_batch,
+            batches=_ordered_batches(batches),
         )
 
     def namespaced_keys(self) -> Set[str]:
+        """The keys this entry may be excluded by across batches.
+
+        Restricted to `CROSS_BATCH_DEDUPE_CLASSES` — see that constant for why
+        `domain` is not one of them, and why a toll-free number is not an
+        identity.
+        """
         out: Set[str] = set()
-        for cls in KEY_CLASSES:
+        for cls in CROSS_BATCH_DEDUPE_CLASSES:
             value = getattr(self, cls, "")
-            if value:
-                out.add(f"{_NAMESPACE[cls]}:{value}")
+            if not value:
+                continue
+            if cls == "phone" and is_toll_free(value):
+                continue
+            out.add(f"{_NAMESPACE[cls]}:{value}")
         return out
 
 
@@ -208,6 +270,10 @@ def _merge(older: RegistryEntry, newer: RegistryEntry) -> RegistryEntry:
         first_seen_batch=older.first_seen_batch if keep_older_first else newer.first_seen_batch,
         last_seen=newer.last_seen if keep_newer_last else older.last_seen,
         last_seen_batch=newer.last_seen_batch if keep_newer_last else older.last_seen_batch,
+        # Union, never overwrite: this set is what `exclude_batch` reads, and a
+        # batch dropped from it is a batch that can be starved by its own
+        # history.
+        batches=_ordered_batches(tuple(older.batches) + tuple(newer.batches)),
     )
 
 
@@ -283,7 +349,11 @@ class PlaceRegistry:
         ``exclude_batch`` drops the entries a given batch put here itself. A
         batch must not be blocked by its own history, or the second run of one
         batch name — which is what ``--overwrite`` and any crash-resume are —
-        would silently produce zero leads and read as an exhausted market.
+        would silently produce zero leads and read as an exhausted market. It
+        matches against the entry's full ``batches`` set: checking only the
+        first and last slot missed any batch in the middle, which on the real
+        corpus meant 25 batches would still have had 40-91% of their own
+        place_ids excluded on a rerun.
         """
         cutoff = (
             None
@@ -292,7 +362,7 @@ class PlaceRegistry:
         )
         fresh: List[RegistryEntry] = []
         for entry in self._entries.values():
-            if exclude_batch and exclude_batch in (entry.first_seen_batch, entry.last_seen_batch):
+            if exclude_batch and exclude_batch in entry.batches:
                 continue
             if cutoff is not None:
                 seen = _parse_stamp(entry.last_seen)
@@ -362,6 +432,7 @@ class PlaceRegistry:
                 first_seen_batch=batch,
                 last_seen=stamp,
                 last_seen_batch=batch,
+                batches=_ordered_batches((batch,)),
             )
             existing = pending.get(key) or self._entries.get(key)
             pending[key] = _merge(existing, candidate) if existing else candidate
@@ -476,6 +547,7 @@ def rebuild_from_corpus(
                     first_seen_batch=batch,
                     last_seen=stamp,
                     last_seen_batch=batch,
+                    batches=_ordered_batches((batch,)),
                 )
             )
     registry.rewrite(entries)

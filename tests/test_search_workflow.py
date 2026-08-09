@@ -965,7 +965,15 @@ class CorpusDedupeTest(unittest.TestCase):
         self.assertTrue(entry.first_seen.startswith("2026-01-01"))
         self.assertTrue(entry.last_seen.startswith("2026-03-01"))
 
-    def test_known_keys_carries_all_four_dedupe_classes(self) -> None:
+    def test_known_keys_carries_the_cross_batch_safe_classes_only(self) -> None:
+        """`domain` must never exclude across batches — franchises share one.
+
+        Measured on data/deduped: 38 domains are shared by differently-named
+        businesses in different batches, covering 88 distinct prospects (five
+        Wayne Dalton dealers, five Ace Handyman franchisees, three unrelated
+        businesses behind one template host). Excluding on domain deletes all
+        but the first of each, permanently.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             registry = corpus_index.PlaceRegistry(Path(tmp) / "place_registry.jsonl")
             registry.record(
@@ -977,8 +985,79 @@ class CorpusDedupeTest(unittest.TestCase):
             self.assertEqual(registry.known_place_ids(), {"place-1"})
             self.assertEqual(
                 registry.known_keys(),
-                {"place:place-1", "phone:2165550100", "domain:a.example", "name_city:patio-pros:cleveland"},
+                {"place:place-1", "phone:2165550100", "name_city:patio-pros:cleveland"},
             )
+            self.assertNotIn("domain:a.example", registry.known_keys())
+
+    def test_two_franchisees_sharing_a_domain_both_survive(self) -> None:
+        """The V1 regression, end to end through the real dedupe."""
+        registry_keys = {"place:place-akron", "name_city:wayne-dalton-of-akron:akron"}
+        rows = [
+            _row(business_name="Wayne Dalton of Cincinnati", place_id="place-cincy",
+                 phone="(513) 555-0100", website_url="https://wayne-dalton.com", city="Cincinnati"),
+        ]
+
+        kept, reasons = make_search_batch.dedupe_search_rows(rows, prior_keys=registry_keys)
+
+        self.assertEqual([row["business_name"] for row in kept], ["Wayne Dalton of Cincinnati"])
+        self.assertNotIn("duplicate_domain_prior_batch", reasons)
+
+    def test_a_shared_toll_free_number_is_not_an_identity(self) -> None:
+        """1-800-BOARDUP of Cleveland and of Columbus are two prospects."""
+        rows = [
+            _row(business_name="1-800-BOARDUP of Columbus", place_id="place-columbus",
+                 phone="1-800-262-7387", city="Hilliard"),
+        ]
+
+        kept, reasons = make_search_batch.dedupe_search_rows(
+            rows, prior_keys={"phone:8002627387"}
+        )
+
+        self.assertEqual([row["business_name"] for row in kept], ["1-800-BOARDUP of Columbus"])
+        self.assertNotIn("duplicate_phone_prior_batch", reasons)
+
+    def test_a_cross_batch_duplicate_is_registered_so_it_is_billed_only_once(self) -> None:
+        """A row dropped as a prior-batch duplicate was still billed for.
+
+        Registering only the survivors left it unknown, so every later run
+        would rediscover it, pay Place Details again, and drop it again.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = corpus_index.PlaceRegistry(Path(tmp) / "place_registry.jsonl")
+            # Same business, new place_id: caught post-collection, not by the
+            # free early skip, so the Place Details call was already spent.
+            registry.record([{"place_id": "old-id", "phone": "(216) 555-0100"}], batch="batch_one")
+            billed = [{"place_id": "new-id", "phone": "(216) 555-0100",
+                       "business_name": "Patio Pros", "city": "Cleveland"}]
+
+            registry.record(billed, batch="batch_two")
+
+            self.assertIn("new-id", registry.known_place_ids())
+
+    def test_a_batch_in_the_middle_of_its_history_is_not_starved(self) -> None:
+        """`exclude_batch` must read every batch, not just first and last.
+
+        The entry stored two slots, so a batch that was neither the first nor
+        the most recent to find a business was invisible to its own escape
+        hatch. On the real corpus that meant 25 batches would have had 40-91%
+        of their own place_ids excluded on an --overwrite or crash-resume
+        rerun, then written that near-empty result back over
+        data/deduped/<batch>.csv — destroying the artifact a rebuild reads.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "place_registry.jsonl"
+            registry = corpus_index.PlaceRegistry(path)
+            row = {"place_id": "place-x", "business_name": "Patio Pros", "city": "Cleveland"}
+            for batch in ("batch_earlier", "batch_middle", "batch_later"):
+                registry.record([row], batch=batch)
+
+            for reloaded in (registry, corpus_index.PlaceRegistry(path)):
+                self.assertNotIn(
+                    "place-x", reloaded.known_place_ids(exclude_batch="batch_middle")
+                )
+                self.assertIn(
+                    "place-x", reloaded.known_place_ids(exclude_batch="an_unrelated_batch")
+                )
 
     def test_dedupe_search_rows_excludes_prior_keys_on_non_place_id_classes(self) -> None:
         rows = [

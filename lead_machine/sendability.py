@@ -1156,7 +1156,14 @@ def lacks_parsed_page_body(row: Dict[str, Any]) -> bool:
     if NO_BODY_FORM_METHOD in methods:
         return True
 
-    flags = set(str(flag).lower() for flag in (website.get("site_issue_flags") or evidence.get("raw_flags") or []))
+    # Union both sources, never `or` them: a row whose `site_issue_flags` is
+    # non-empty but stale would short-circuit past a marker present only in
+    # `raw_flags`. Every other lookup in this function unions; this one did not.
+    flags = {
+        str(flag).lower()
+        for source in (website.get("site_issue_flags"), evidence.get("raw_flags"))
+        for flag in (source or [])
+    }
     if EMPTY_BODY_FLAG in flags:
         return True
 

@@ -501,7 +501,16 @@ def derive_visual_audit_scores(site: Dict[str, Any]) -> Dict[str, str]:
     """
     scores = {field: VISUAL_UNKNOWN for field in VISUAL_AUDIT_SCORE_FIELDS}
 
-    if _status_from_site(site) in AUDITABLE_SITE_STATES and has_parsed_page_evidence(site):
+    # `has_parsed_body_evidence`, not `has_parsed_page_evidence`: the weaker
+    # guard reads `combined_text` / `homepage.text`, both produced by
+    # `extract_visible_text`, which keeps `<title>`. A React shell satisfies it
+    # with its 56-character title bar and then gets graded "cta_visibility:
+    # None", "trust_proof_visibility: None" — and per this module's own
+    # contract above, "None" means we read the page and the thing was absent.
+    # Those land in the LLM prompt as evidence refs and in the packet as lines
+    # a rep reads out, so they are the same fabrication as `no_form_detected`,
+    # in a different vocabulary that the form-absence blocker cannot see.
+    if _status_from_site(site) in AUDITABLE_SITE_STATES and has_parsed_body_evidence(site):
         homepage = site.get("homepage", {}) or {}
         pages = site.get("pages", {}) or {}
         structure = site.get("page_structure") or {}
