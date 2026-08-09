@@ -184,6 +184,18 @@ MAX_CANDIDATE_PAGE_FETCHES = 16
 # complete one, the way the timeout path already is.
 CANDIDATE_BUDGET_FLAG = "candidate_page_budget_exhausted"
 
+# Same idea, different cause: the server said 200 and handed us a document with
+# nothing in `<body>`. Like the budget flag this describes our crawl, not the
+# prospect's business, so it is carried in `evidence.STATIC_FETCH_REVIEW_FLAGS`
+# rather than in any list that grades a site down.
+EMPTY_BODY_FLAG = "empty_body_on_200"
+
+# `form_detection_method` is written on every lead and "none" already meant
+# three different things — parsed and genuinely formless, body empty, fetch
+# failed. Only the middle one is recoverable by a rendered pass, and only the
+# middle one makes an absence claim unsupported, so it gets its own name.
+NO_BODY_FORM_METHOD = "no_body"
+
 FORM_PROVIDER_TERMS = [
     "hubspot",
     "jobber",
@@ -463,6 +475,36 @@ def extract_visible_text(html: str) -> str:
         tag.decompose()
 
     return clean_text(soup.get_text(" ", strip=True))
+
+
+def extract_visible_body_text(html: str) -> str:
+    """The visible text of `<body>` alone — nothing from `<head>`.
+
+    `extract_visible_text` above runs `get_text()` over the whole document and
+    decomposes only `script/style/noscript/svg`. `<title>` is neither, and it
+    lives in `<head>`, so a React shell that renders nothing still comes back
+    with its title. That is the one document we must be able to recognise: a
+    page whose body we never read is not a page with no form on it, and a
+    whole-document reading cannot tell the two apart.
+
+    Returns `""` for a document with no `<body>` at all — a 0-byte HTTP 200
+    from a parked domain is `ok` as far as `fetch_url` is concerned, and this
+    is the only place that notices.
+
+    Deliberately structural, with no length threshold: the corpus holds real
+    parsed bodies of 76, 94 and 225 characters, and any cutoff long enough to
+    catch a title also throws those away.
+    """
+    soup = BeautifulSoup(html or "", "lxml")
+
+    for tag in soup(["script", "style", "noscript", "svg"]):
+        tag.decompose()
+
+    body = soup.body
+    if body is None:
+        return ""
+
+    return clean_text(body.get_text(" ", strip=True))
 
 
 def extract_title_meta(html: str) -> Tuple[str, str]:
@@ -1181,6 +1223,15 @@ def scrape_site(
 
     title, meta = extract_title_meta(html)
     text = extract_visible_text(html)
+    # The homepage answered, but did it answer with a page? A 200 whose body is
+    # an empty SPA root — or empty outright — leaves every detector below
+    # reading nothing, and everything they report is then a statement about our
+    # parser rather than about the site. `text` cannot be used for this: it
+    # includes `<title>`, so the blankest SPA in the corpus reads as 56
+    # characters of content.
+    homepage_body_blank = not extract_visible_body_text(html)
+    if homepage_body_blank:
+        flags.append(EMPTY_BODY_FLAG)
     links = extract_links(final_url, html)
 
     emails, phones = extract_emails_phones(text, html)
@@ -1439,11 +1490,15 @@ def scrape_site(
     if timed_out():
         enrichment_timed_out = True
 
+    # `and ctas` was the whole trigger, and it skipped precisely the page that
+    # most needs a browser: an SPA whose static body is empty yields no CTA
+    # terms by construction, so the one check that could have recovered its
+    # form never ran on it.
     if (
         rendered_form_check
         and not enrichment_timed_out
         and form_signals.get("form_strength_rank", 0) <= 1
-        and ctas
+        and (ctas or homepage_body_blank)
     ):
         rendered_signals = detect_rendered_form(final_url)
         form_signals = merge_form_signals(form_signals, rendered_signals)
@@ -1464,8 +1519,23 @@ def scrape_site(
     # charges its +14 on `cta_strength in {none, weak}` *or* the flag, so
     # leaving the graded field at "None" keeps the charge standing no matter
     # what the flags say.
+    #
+    # The budget is one way to end a crawl without an answer; an empty body is
+    # the other, and it was ungated. `fetch_url` sets `ok = status < 400`, so a
+    # 200 carrying an empty `<body>` is not a failure and never reaches
+    # `empty_site_result` — the one path that already writes "Unknown"
+    # correctly. It takes this path instead, `detect_form_signals` early-returns
+    # `_empty_form_signals()`, and the flags below get appended about a page
+    # nobody read. Measured on the Phase 3 corpus: twelve businesses, eight of
+    # them with a title-only body.
     truncated_without_answer = budget_exhausted and not has_terminal_form(form_signals)
-    if truncated_without_answer:
+    absence_unproven = truncated_without_answer or homepage_body_blank
+    # The rewrite is the narrower of the two, and deliberately so. A blank
+    # static body is exactly the case `--rendered-form-check` above now reaches,
+    # and a browser that came back with a Strong estimate form has answered the
+    # question the static parse could not. Blanking that to "Unknown" would
+    # throw away the evidence the rendered pass exists to collect.
+    if absence_unproven and not has_terminal_form(form_signals):
         form_signals = dict(form_signals)
         for field in ("contact_form_detected", "estimate_form_detected", "form_strength"):
             form_signals[field] = "Unknown"
@@ -1479,14 +1549,28 @@ def scrape_site(
     # is entered. A site whose only form sits past the ceiling would grade as
     # a site with no form — our own crawl budget sold as the prospect's
     # weakness. We did not look; we do not get to report.
-    if not forms_found and not truncated_without_answer:
+    #
+    # `no_email_detected` and `no_high_ticket_terms_detected` had no gate at
+    # all, and they are read the same way: the first is +5 in
+    # `score_online_weakness` *and* one of the corroborators that turns the
+    # other two +2s into +8s, and the second decides how the packet describes
+    # what the business sells. Both are read out of page text, so a page with
+    # no text cannot support either.
+    if not forms_found and not absence_unproven:
         flags.append("no_form_detected")
-    if not ctas and not truncated_without_answer:
+    if not ctas and not absence_unproven:
         flags.append("no_clear_cta_detected")
-    if not emails:
+    if not emails and not absence_unproven:
         flags.append("no_email_detected")
-    if not high_ticket:
+    if not high_ticket and not absence_unproven:
         flags.append("no_high_ticket_terms_detected")
+
+    # Only when nothing anywhere found a form: a subpage or the rendered pass
+    # answering the question outranks the homepage's empty body, and the method
+    # that answered it is the one worth recording.
+    form_detection_method = form_signals.get("form_detection_method", "none")
+    if homepage_body_blank and form_detection_method == "none":
+        form_detection_method = NO_BODY_FORM_METHOD
 
     if is_social_url(final_url):
         site_status = "Social Only"
@@ -1514,7 +1598,7 @@ def scrape_site(
         "contact_form_detected": form_signals.get("contact_form_detected", "No"),
         "estimate_form_detected": form_signals.get("estimate_form_detected", "No"),
         "form_strength": form_signals.get("form_strength", "None"),
-        "form_detection_method": form_signals.get("form_detection_method", "none"),
+        "form_detection_method": form_detection_method,
         "form_fields": form_signals.get("form_fields", []),
         "form_provider_terms": form_signals.get("provider_terms", []),
         "has_recaptcha": form_signals.get("has_recaptcha", False),

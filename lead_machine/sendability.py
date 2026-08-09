@@ -13,6 +13,7 @@ from .buyer_signals import (
     review_demand_band,
 )
 from . import queue_state
+from .evidence import EMPTY_BODY_FLAG, NO_BODY_FORM_METHOD
 from .score_schema import (
     ASSET_STATES,
     COMMERCIAL_FIT_STATES,
@@ -43,6 +44,11 @@ VISIBLE_PAIN_BLOCKER = "Visible conversion pain too weak for business maturity"
 STRONG_FORM_NO_PAIN_BLOCKER = "Strong estimate form exists / no concrete visible conversion issue"
 ADVANCED_OPTIMIZATION_BLOCKER = "Advanced Optimization without concrete visible pain"
 FORM_ABSENCE_CLAIM_BLOCKER = "Strong estimate form conflicts with missing-form claim"
+# The blocker above is a *contradiction* detector, and it cannot reach this
+# case: on a lead whose body came back empty `estimate_form_detected` is "No"
+# or "Unknown", so `strong_estimate_form` is False and the claim rides through.
+# This one asks the other question — is there a page behind the claim at all.
+UNSUPPORTED_ABSENCE_CLAIM_BLOCKER = "Form-absence claim with no parsed page body"
 ESTIMATE_FUNNEL_STRONG_FORM_BLOCKER = "Estimate Funnel blocked by strong estimate form without estimate-path weakness"
 ANGLE_BLOCKER = "Missing clear outreach angle"
 OPENER_BLOCKER = "Missing evidence-backed opener"
@@ -69,6 +75,7 @@ EVIDENCE_BLOCKERS = {
     STRONG_FORM_NO_PAIN_BLOCKER,
     ADVANCED_OPTIMIZATION_BLOCKER,
     FORM_ABSENCE_CLAIM_BLOCKER,
+    UNSUPPORTED_ABSENCE_CLAIM_BLOCKER,
     ESTIMATE_FUNNEL_STRONG_FORM_BLOCKER,
     DEMAND_BLOCKER,
     OPENER_BLOCKER,
@@ -524,6 +531,14 @@ def evaluate_sendability(row: Dict[str, Any]) -> Dict[str, Any]:
 
     if strong_estimate_form and has_form_absence_claim(row):
         blockers.append(FORM_ABSENCE_CLAIM_BLOCKER)
+
+    # Defence in depth behind the enricher, which no longer mints these. What
+    # is left to catch is a claim arriving by another route — a row scored
+    # before that change, a manual card, an LLM reason written off a blank
+    # crawl — and told to a business whose form is on a page our static parser
+    # could not read.
+    if has_form_absence_claim(row) and lacks_parsed_page_body(row):
+        blockers.append(UNSUPPORTED_ABSENCE_CLAIM_BLOCKER)
 
     if (
         strong_estimate_form
@@ -1114,6 +1129,46 @@ def has_form_absence_claim(row: Dict[str, Any]) -> bool:
         ]
     )
     return any(is_form_absence_text(text) for text in texts)
+
+
+def lacks_parsed_page_body(row: Dict[str, Any]) -> bool:
+    """True when the record says the crawl never read a page body.
+
+    Two spellings of the same fact, because they travel differently: the
+    `form_detection_method` reaches Airtable as its own column, while the flag
+    survives inside `site_issue_flags` / `raw_flags`. Both are written by
+    `enrich_leads` on a 200 whose `<body>` was empty.
+
+    Absence of the marker is not proof of a body — legacy rows predate it — so
+    this only ever adds a blocker, never clears one.
+    """
+    if _pick(row, "Form Detection Method", "form_detection_method").lower() == NO_BODY_FORM_METHOD:
+        return True
+
+    raw = _raw_evidence(row)
+    website = raw.get("website", {}) if isinstance(raw, dict) else {}
+    evidence = _evidence_profile(row)
+
+    methods = {
+        _clean(website.get("form_detection_method")).lower(),
+        _clean(evidence.get("form_detection_method")).lower(),
+    }
+    if NO_BODY_FORM_METHOD in methods:
+        return True
+
+    flags = set(str(flag).lower() for flag in (website.get("site_issue_flags") or evidence.get("raw_flags") or []))
+    if EMPTY_BODY_FLAG in flags:
+        return True
+
+    for item in evidence_items(row):
+        field = _clean(item.get("field")).lower()
+        value_text = _clean(item.get("value")).lower()
+        if field == "form_detection_method" and value_text == NO_BODY_FORM_METHOD:
+            return True
+        if field == "site_issue_flags" and EMPTY_BODY_FLAG in value_text:
+            return True
+
+    return False
 
 
 def is_form_absence_text(text: Any) -> bool:

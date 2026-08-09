@@ -749,6 +749,197 @@ class TruncatedAbsenceIsNotEvidenceTest(unittest.TestCase):
         )
 
 
+class BlankBodyAbsenceIsNotEvidenceTest(unittest.TestCase):
+    """A page we could not read is not a page with nothing on it.
+
+    Same sentence as `TruncatedAbsenceIsNotEvidenceTest`, other half of the
+    branch. That class covers the fetch-budget case, which is the only one
+    `truncated_without_answer` gates; every fixture in it is a 200 carrying
+    real HTML. The case that shipped the defect is a 200 carrying *no body* —
+    a React shell, a title-only document, a 0-byte response. `fetch_url` sets
+    `ok = status < 400`, so none of them is a failure and none reaches
+    `empty_site_result`; the crawl takes the normal path, `detect_form_signals`
+    early-returns `_empty_form_signals()`, and both absence flags are appended
+    about a page nobody ever read.
+
+    The title-only fixture is the one that matters most, and it is why the
+    predicate is body-only. `extract_visible_text` runs `get_text()` over the
+    whole document and decomposes only `script/style/noscript/svg`, so
+    `<title>` — which lives in `<head>` — survives. A blank SPA therefore has
+    non-empty "visible text" and `render_outcome: "loaded"`, and any predicate
+    written against those reports the page as read. Measured on the corpus:
+    of the twelve businesses claiming absence off an unreadable body, eight
+    are title-only and would slip a whole-document check.
+
+    There is deliberately no character threshold. Three sites in the corpus
+    have genuinely parsed bodies of 76, 94 and 225 characters; any cutoff that
+    catches a title catches those too, and suppressing real absence signal
+    corpus-wide is the more expensive mistake. Structural emptiness only.
+    """
+
+    # The real title of the lead this was written around — Door Works &
+    # Construction, whose homepage and all fourteen crawled subpages returned
+    # these 56 characters and nothing else.
+    DOOR_WORKS_TITLE = "Door Works | Garage Door Repair &amp; Installation | NE Ohio"
+
+    SPA_SHELL = '<html><head></head><body><div id="root"></div></body></html>'
+    TITLE_ONLY = f"<html><head><title>{DOOR_WORKS_TITLE}</title></head><body></body></html>"
+    ZERO_BYTE = ""
+
+    # Genuinely parsed, genuinely no form: the control. No <form>, <input>,
+    # <button> or <iframe> (each of which `detect_form_signals` grades as Weak)
+    # and no CTA_TERMS phrase, so both absence claims are honestly reachable.
+    PARSED_NO_FORM = _homepage("<h2>Our work</h2><p>Serving Northeast Ohio since 1998.</p>")
+
+    def _crawl(self, html: str) -> dict[str, object]:
+        def fake_fetch(url: str, timeout: int = 15) -> dict[str, object]:
+            return {"ok": True, "status_code": 200, "final_url": url, "html": html, "error": ""}
+
+        # A budget of 500 keeps `budget_exhausted` false, so anything these
+        # tests observe comes from the blank body and not from truncation.
+        with patch("enrich_leads.fetch_url", side_effect=fake_fetch), patch(
+            "enrich_leads.resolve_candidate_page_budget", return_value=500
+        ):
+            return scrape_site("https://example.com")
+
+    def _record(self, site: dict[str, object]) -> dict[str, object]:
+        return {
+            "google": {"business_name": "X", "reviews": 30, "rating": 4.5},
+            "website": site,
+            "derived": {},
+        }
+
+    def _assert_absence_withheld(self, site: dict[str, object]) -> None:
+        flags = site["site_issue_flags"]
+
+        # Precondition: the crawl really did complete, and really did find
+        # nothing. Without this the assertions below pass for the wrong reason.
+        self.assertNotIn(enrich_leads.CANDIDATE_BUDGET_FLAG, flags)
+        self.assertFalse(site["forms_found"])
+
+        self.assertNotIn("no_form_detected", flags)
+        self.assertNotIn("no_clear_cta_detected", flags)
+        self.assertNotIn("no_email_detected", flags)
+        self.assertNotIn("no_high_ticket_terms_detected", flags)
+
+        # Dropping the flags must not read as "we looked and it was fine".
+        self.assertEqual(site["contact_form_detected"], "Unknown")
+        self.assertEqual(site["estimate_form_detected"], "Unknown")
+        self.assertEqual(site["form_strength"], "Unknown")
+        self.assertEqual(site["cta_strength"], "Unknown")
+
+        # "none" already means three different things — parsed and formless,
+        # body empty, fetch failed. Only the second is recoverable by a
+        # rendered pass, so it needs its own name.
+        self.assertEqual(site["form_detection_method"], "no_body")
+        self.assertIn("empty_body_on_200", flags)
+
+    def test_body_text_extraction_ignores_the_head(self) -> None:
+        extract = enrich_leads.extract_visible_body_text
+
+        self.assertEqual(extract(self.SPA_SHELL), "")
+        self.assertEqual(extract(self.TITLE_ONLY), "")
+        self.assertEqual(extract(self.ZERO_BYTE), "")
+        self.assertIn("Northeast Ohio", extract(self.PARSED_NO_FORM))
+
+        # The whole-document reading the plan proposed, for contrast: this is
+        # what a title-only document looks like to `extract_visible_text`.
+        self.assertTrue(enrich_leads.extract_visible_text(self.TITLE_ONLY).strip())
+
+    def test_an_spa_shell_asserts_nothing(self) -> None:
+        self._assert_absence_withheld(self._crawl(self.SPA_SHELL))
+
+    def test_a_title_only_body_asserts_nothing(self) -> None:
+        site = self._crawl(self.TITLE_ONLY)
+
+        # The regression itself: `render_outcome` reports this page as loaded
+        # and `visible_text` is 56 non-empty characters, so the absence gate
+        # cannot be keyed on either.
+        self.assertEqual(site["verification_snapshot"]["render_outcome"], "loaded")
+        self.assertTrue(site["verification_snapshot"]["visible_text"].strip())
+
+        self._assert_absence_withheld(site)
+
+    def test_a_zero_byte_two_hundred_asserts_nothing(self) -> None:
+        # `fetch_url` sets `ok = status < 400`, so an empty 200 from a parked
+        # domain is not a failure and never reaches `empty_site_result` — the
+        # one path that already writes "Unknown" correctly.
+        self._assert_absence_withheld(self._crawl(self.ZERO_BYTE))
+
+    def test_a_parsed_body_with_no_form_still_reports_absence(self) -> None:
+        # Guarding against over-broadness is half the fix. This site was read
+        # end to end and genuinely has no form and no CTA; saying so is the
+        # signal the whole pipeline runs on.
+        site = self._crawl(self.PARSED_NO_FORM)
+        flags = site["site_issue_flags"]
+
+        self.assertIn("no_form_detected", flags)
+        self.assertIn("no_clear_cta_detected", flags)
+        self.assertNotIn("empty_body_on_200", flags)
+        self.assertEqual(site["form_detection_method"], "none")
+        self.assertEqual(site["estimate_form_detected"], "No")
+
+    def test_a_blank_body_cannot_score_worse_than_a_parsed_one(self) -> None:
+        # The property, mirroring the truncation test: absence of data must
+        # never outscore presence of data. Pain is what carries a lead past
+        # `sendability.VISIBLE_PAIN_BLOCKER`, so a site we could not read
+        # scoring higher than one we read is a lead manufactured out of our
+        # own parser.
+        from lead_machine.evidence import build_evidence_profile
+        from score_leads import score_online_weakness
+
+        parsed = self._record(self._crawl(self.PARSED_NO_FORM))
+
+        for name, html in (
+            ("spa shell", self.SPA_SHELL),
+            ("title only", self.TITLE_ONLY),
+            ("zero byte", self.ZERO_BYTE),
+        ):
+            with self.subTest(body=name):
+                blank = self._record(self._crawl(html))
+                self.assertLessEqual(
+                    score_online_weakness(blank)[0], score_online_weakness(parsed)[0]
+                )
+                self.assertLessEqual(
+                    build_evidence_profile(blank)["visible_pain_score"],
+                    build_evidence_profile(parsed)["visible_pain_score"],
+                )
+
+    def test_the_rendered_check_reaches_a_page_with_no_ctas(self) -> None:
+        # The trigger required `and ctas`, which is exactly the page an SPA
+        # cannot produce: no body, no CTA terms, no rendered pass, no way back.
+        def fake_fetch(url: str, timeout: int = 15) -> dict[str, object]:
+            return {"ok": True, "status_code": 200, "final_url": url, "html": self.SPA_SHELL, "error": ""}
+
+        with patch("enrich_leads.fetch_url", side_effect=fake_fetch), patch(
+            "enrich_leads.resolve_candidate_page_budget", return_value=500
+        ), patch("enrich_leads.detect_rendered_form") as rendered:
+            rendered.return_value = enrich_leads._empty_form_signals()
+            scrape_site("https://example.com", rendered_form_check=True)
+
+        rendered.assert_called_once()
+
+    def test_a_rendered_form_survives_the_unknown_rewrite(self) -> None:
+        # The other direction, and the reason the rewrite is not keyed on the
+        # blank body alone: §2.3 exists to let the browser answer the question
+        # a blank static body could not, and the rewrite must not then discard
+        # the answer it came back with.
+        def fake_fetch(url: str, timeout: int = 15) -> dict[str, object]:
+            return {"ok": True, "status_code": 200, "final_url": url, "html": self.SPA_SHELL, "error": ""}
+
+        strong = enrich_leads.detect_form_signals(STRONG_FORM, page_url="https://example.com")
+        strong["form_detection_method"] = "rendered_browser"
+
+        with patch("enrich_leads.fetch_url", side_effect=fake_fetch), patch(
+            "enrich_leads.resolve_candidate_page_budget", return_value=500
+        ), patch("enrich_leads.detect_rendered_form", return_value=strong):
+            site = scrape_site("https://example.com", rendered_form_check=True)
+
+        self.assertEqual(site["estimate_form_detected"], "Yes")
+        self.assertEqual(site["form_strength"], "Strong")
+        self.assertEqual(site["form_detection_method"], "rendered_browser")
+
+
 class InterWavePauseTest(unittest.TestCase):
     """The pause belongs in the gaps between waves, not after the last one.
 

@@ -61,12 +61,22 @@ FORM_ABSENCE_FLAGS = {
 # reads any other flag as evidence the site is weak, and "weak" is worth pain
 # points that move a lead toward sendable — so a marker meaning "we stopped
 # looking" must live here, or it grades the business on our own budget.
+# Kept as literals rather than imported from `enrich_leads`: this module is a
+# leaf that `enrich_leads` itself imports, and the strings are a wire format
+# read back off scored artifacts long after the enricher that wrote them.
+EMPTY_BODY_FLAG = "empty_body_on_200"
+NO_BODY_FORM_METHOD = "no_body"
+
 STATIC_FETCH_REVIEW_FLAGS = {
     "static_fetch_failed",
     "homepage_fetch_failed",
     "rendered_check_needed",
     "manual_visual_review_needed",
     "candidate_page_budget_exhausted",
+    # Same class as the budget flag: a statement about what our crawl could
+    # read, not about the prospect's business. Grading a site "weak" for it
+    # would recreate exactly the bug it exists to expose.
+    EMPTY_BODY_FLAG,
 }
 
 HARD_SITE_FAILURE_FLAGS = {
@@ -436,21 +446,17 @@ def _derive_trust_proof_visibility(*, homepage_text: str, deep_text: str) -> str
     return "Basic"
 
 
-def derive_visual_audit_scores(site: Dict[str, Any]) -> Dict[str, str]:
-    """Score the seven visual-audit fields from evidence the crawl already holds.
+def has_parsed_page_evidence(site: Dict[str, Any]) -> bool:
+    """Did the crawl come back with any parsed page content for this site?
 
-    These shipped as a hardcoded "Unknown" on every lead, so the review packet
-    carried seven dead keys straight into the prompt. Nothing here opens a
-    screenshot: the grounding is the markup and copy the enricher already
-    fetched, which the prompt already accepts as DOM evidence for visual
-    claims. Any field without that grounding stays Unknown, because a derived
-    score reads to the model as a fact and an Unknown does not.
+    Lifted out of `derive_visual_audit_scores`, where it has always decided
+    whether the seven visual fields may be derived at all. Nothing else asked
+    the question, which is how the form/CTA half of the profile ended up
+    charging pain against leads that have no website.
     """
-    scores = {field: VISUAL_UNKNOWN for field in VISUAL_AUDIT_SCORE_FIELDS}
-
     homepage_candidate = site.get("homepage", {}) or {}
     pages_candidate = site.get("pages", {}) or {}
-    has_parsed_page_evidence = bool(
+    return bool(
         site.get("page_structure")
         or _clean(site.get("combined_text"))
         or (
@@ -464,7 +470,38 @@ def derive_visual_audit_scores(site: Dict[str, Any]) -> Dict[str, str]:
         )
     )
 
-    if _status_from_site(site) in AUDITABLE_SITE_STATES and has_parsed_page_evidence:
+
+def has_parsed_body_evidence(site: Dict[str, Any]) -> bool:
+    """`has_parsed_page_evidence`, plus: was any of it inside `<body>`?
+
+    The generic guard reads `combined_text` and `homepage.text`, both of which
+    come from `enrich_leads.extract_visible_text` — a whole-document reading
+    that keeps `<title>`. A React shell therefore satisfies it with the 56
+    characters of its title bar. The enricher is the only place that can tell
+    the difference, and it says so with `empty_body_on_200` /
+    `form_detection_method: "no_body"`.
+    """
+    flags = {str(flag).strip().lower() for flag in (site.get("site_issue_flags") or [])}
+    if EMPTY_BODY_FLAG in flags:
+        return False
+    if _clean(site.get("form_detection_method")).lower() == NO_BODY_FORM_METHOD:
+        return False
+    return has_parsed_page_evidence(site)
+
+
+def derive_visual_audit_scores(site: Dict[str, Any]) -> Dict[str, str]:
+    """Score the seven visual-audit fields from evidence the crawl already holds.
+
+    These shipped as a hardcoded "Unknown" on every lead, so the review packet
+    carried seven dead keys straight into the prompt. Nothing here opens a
+    screenshot: the grounding is the markup and copy the enricher already
+    fetched, which the prompt already accepts as DOM evidence for visual
+    claims. Any field without that grounding stays Unknown, because a derived
+    score reads to the model as a fact and an Unknown does not.
+    """
+    scores = {field: VISUAL_UNKNOWN for field in VISUAL_AUDIT_SCORE_FIELDS}
+
+    if _status_from_site(site) in AUDITABLE_SITE_STATES and has_parsed_page_evidence(site):
         homepage = site.get("homepage", {}) or {}
         pages = site.get("pages", {}) or {}
         structure = site.get("page_structure") or {}
@@ -552,6 +589,7 @@ def _derive_visible_pain_profile(
     phone_consistency: str = "unknown",
 ) -> Dict[str, Any]:
     flags = {str(flag).strip().lower() for flag in (site.get("site_issue_flags") or [])}
+    parsed_body = has_parsed_body_evidence(site)
     score = 0
     reasons: List[str] = []
     categories: List[str] = []
@@ -605,14 +643,26 @@ def _derive_visible_pain_profile(
             add(18, "Weak estimate form", ["estimate_path_pain"])
         elif normalized_form_strength == "basic":
             add(12, "Basic estimate form only", ["estimate_path_pain"])
-        if _clean(cta_strength).lower() in {"none", "weak"} or "no_clear_cta_detected" in flags:
+        # `cta_strength` defaults to "None", so this clause fires on its own
+        # for any lead the crawl never read — a no-website lead included, where
+        # there is no CTA to be unclear about. The visual half of this module
+        # has always refused to derive a score without parsed page evidence;
+        # so does this now.
+        if parsed_body and (
+            _clean(cta_strength).lower() in {"none", "weak"} or "no_clear_cta_detected" in flags
+        ):
             add(14, "No clear estimate CTA", ["estimate_path_pain"])
         if "buried_cta" in flags:
             add(12, "Estimate CTA appears buried", ["estimate_path_pain"])
         if "only_phone_email_path" in flags:
             add(14, "Only phone/email estimate path", ["estimate_path_pain"])
 
-    if not phones or "phone_not_visible" in flags or "buried_phone" in flags:
+    # `phones_found` is website-scraped phones only — the Google Business
+    # Profile phone is never consulted — so an empty list on a lead with no
+    # website (or no readable one) says nothing about whether the number is
+    # hard to find. It is usually the first line of their Google listing. The
+    # two explicit flags are somebody's positive finding and still count.
+    if (not phones and parsed_body) or "phone_not_visible" in flags or "buried_phone" in flags:
         add(8, "Phone number hard to find", ["estimate_path_pain"])
 
     for flag, (points, reason, pain_categories) in PAIN_FLAG_RULES.items():
