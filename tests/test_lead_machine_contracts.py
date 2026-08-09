@@ -4625,6 +4625,47 @@ class LeadMachineContractsTest(unittest.TestCase):
             f"truncation retry must be named in debug_notes; got {notes!r}",
         )
 
+    def test_chain_exhaustion_still_charges_the_calls_the_batch_already_made(self) -> None:
+        # `All LLM scoring providers unavailable` arrives as a bare RuntimeError
+        # with no usage and no call_count, so _bank_failed_batch banked zero for
+        # a batch that had already paid for calls. That undercounts
+        # MAX_LLM_CALLS_PER_RUN and MAX_LLM_TOKENS_PER_RUN by exactly this
+        # batch's spend — a cap hole, not just a reporting gap. The retry note
+        # rides the same exception and was dropped with it.
+        import score_leads
+        from lead_machine import llm_client
+
+        compact_records = [{"score_file": "phone-123.json", "lead": {"business_name": "X"},
+                            "evidence_ref_options": [{"id": "google_profile", "label": "Google profile"}]}]
+        truncated = llm_client.InvalidLlmResponse(
+            "Unterminated string starting at line 4", raw_text='{"scores": [', parsed_json=None,
+            usage={"input_tokens": 900, "output_tokens": 4096, "total_tokens": 4996},
+        )
+
+        calls = {"n": 0}
+
+        def fake_score_batch(prompt, *, model, max_tokens, **_):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise truncated
+            raise RuntimeError("All LLM scoring providers unavailable: kimi: down; codex: quota")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(score_leads.llm_client, "score_batch", side_effect=fake_score_batch):
+                with self.assertRaises(RuntimeError) as caught:
+                    score_leads._score_batch_with_debug(
+                        "prompt", batch_id="batch_022", bundle_dir=Path(tmp),
+                        compact_records=compact_records, model="m", max_tokens=4096,
+                    )
+
+        exc = caught.exception
+        self.assertEqual(exc.call_count, 2)
+        self.assertEqual(exc.usage["output_tokens"], 4096)
+        self.assertTrue(
+            any("batch_022" in note for note in getattr(exc, "debug_notes", None) or []),
+            "retry note must survive chain exhaustion",
+        )
+
     def test_score_batch_with_debug_carries_retry_notes_onto_the_failure(self) -> None:
         # A batch that retried and *then* failed is the worst reporting case: the
         # retry was billed and the batch produced nothing. The note has to ride the

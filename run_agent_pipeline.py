@@ -589,6 +589,37 @@ def count_airtable_rows(rows: list[dict[str, str]]) -> int:
     return len(rows)
 
 
+#: Last (identity, rows) pair read by `_read_csv_rows_cached`. One slot is
+#: enough: a run reads exactly one scored CSV, repeatedly.
+_SCORED_ROWS_CACHE: dict[str, Any] = {}
+
+
+def _read_csv_rows_cached(path: Path) -> list[dict[str, str]]:
+    """`read_csv_rows`, memoized on (path, mtime, size).
+
+    The summary is now rebuilt as every stage closes, so a naive re-read parses
+    the scored CSV up to five times per run — and that file is 53 MB across 186
+    columns for 133 leads. Paying that repeatedly inside the feature whose whole
+    purpose is measuring per-stage cost would be self-defeating.
+
+    Keying on mtime and size rather than path alone is what makes it correct:
+    the scoring and packets stages rewrite this file mid-run, and a path-only
+    cache would then report the pre-scoring row counts for the rest of the run.
+    """
+    try:
+        stat = path.stat()
+        identity = f"{path}:{stat.st_mtime_ns}:{stat.st_size}"
+    except OSError:
+        # Missing/unreadable: let read_csv_rows decide, and never cache it.
+        return read_csv_rows(path)
+    if _SCORED_ROWS_CACHE.get("identity") == identity:
+        return _SCORED_ROWS_CACHE["rows"]
+    rows = read_csv_rows(path)
+    _SCORED_ROWS_CACHE["identity"] = identity
+    _SCORED_ROWS_CACHE["rows"] = rows
+    return rows
+
+
 class StageClock:
     """Wall clock per stage, and the record the summary reports it from.
 
@@ -628,7 +659,7 @@ def build_summary(
     airtable_status: str,
     clock: StageClock | None = None,
 ) -> dict[str, Any]:
-    rows = read_csv_rows(scored)
+    rows = _read_csv_rows_cached(scored)
     tier_counts = {
         PACKET_TIER_SENDABLE: 0,
         PACKET_TIER_MANUAL: 0,
@@ -642,7 +673,7 @@ def build_summary(
     packet_index = packets / "packet_index.csv"
     airtable_rows = (
         0
-        if airtable_status == "skipped"
+        if airtable_status in {"skipped", "failed"}
         else count_airtable_rows(rows)
     )
     return {
@@ -908,9 +939,16 @@ def _run_pipeline(args: argparse.Namespace) -> int:
     else:
         with stage("airtable"):
             live = args.airtable == "live"
-            airtable_status = "live" if live else "dry-run"
-            status("AIRTABLE", f"Syncing ({airtable_status}, all scored rows)")
+            intended = "live" if live else "dry-run"
+            status("AIRTABLE", f"Syncing ({intended}, all scored rows)")
+            # Claim the sync only once the child returns. stage()'s finally
+            # flushes a summary even when this raises, and `airtable_synced` is
+            # derived from the status — so setting it up front would report a
+            # full sync for a sync that failed. That is the same class of lie
+            # T4.8 exists to remove, reintroduced one stage later.
+            airtable_status = "failed"
             run(build_airtable_cmd(scored=report_csv, packets=packets, live=live))
+            airtable_status = intended
 
     # ---- Summary --------------------------------------------------------- #
     print_summary(flush_summary())

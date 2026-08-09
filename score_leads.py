@@ -3146,6 +3146,24 @@ def _score_batch_with_debug(
     # stdout and dropped a file in the bundle dir, so its spend showed up in the
     # bill and the call count and nowhere in the run's own reporting.
     retry_notes: List[str] = []
+
+    def _charge_bare_failure(exc: BaseException) -> BaseException:
+        """Attach this batch's spend and notes to an error that carries neither.
+
+        Chain exhaustion surfaces as a bare `RuntimeError("All LLM scoring
+        providers unavailable: ...")` raised by `llm_client.score_batch`. It has
+        no `usage` and no `call_count`, so `_bank_failed_batch` banked zero for a
+        batch that had already made billed calls — `MAX_LLM_CALLS_PER_RUN` and
+        `MAX_LLM_TOKENS_PER_RUN` undercounted by exactly that spend, which is a
+        cap hole, not just a reporting gap. The retry note was dropped with it.
+        """
+        if getattr(exc, "call_count", None) is None:
+            exc.usage = failed_usage
+            exc.model = failed_model
+            exc.call_count = calls_made
+            exc.debug_notes = list(retry_notes)
+        return exc
+
     while True:
         try:
             calls_made += 1
@@ -3173,9 +3191,12 @@ def _score_batch_with_debug(
                 )
                 try:
                     calls_made += 1
-                    repaired = llm_client.score_batch(
-                        repair_prompt, model=model, max_tokens=current_max_tokens, batch_id=batch_id
-                    )
+                    try:
+                        repaired = llm_client.score_batch(
+                            repair_prompt, model=model, max_tokens=current_max_tokens, batch_id=batch_id
+                        )
+                    except RuntimeError as chain_exc:
+                        raise _charge_bare_failure(chain_exc)
                     repaired["usage"] = _accumulate_usage(failed_usage, repaired.get("usage"))
                     repaired["call_count"] = calls_made
                     repaired.setdefault("debug_notes", []).extend(retry_notes)
@@ -3228,6 +3249,10 @@ def _score_batch_with_debug(
             err.call_count = calls_made
             err.debug_notes = list(retry_notes)
             raise err from exc
+        except RuntimeError as exc:
+            # Chain exhaustion, not an invalid response. Charge it before it
+            # escapes, or this batch's billed calls vanish from the cap totals.
+            raise _charge_bare_failure(exc)
         else:
             if failed_usage:
                 result["usage"] = _accumulate_usage(failed_usage, result.get("usage"))
@@ -4120,8 +4145,12 @@ def main() -> int:
         # Project against the priciest tier the chain can fall through to, not
         # the first one — otherwise a $0 subscription runner in front zeroes the
         # projection and disables the LLM_SPEND_CONFIRM_USD refusal below.
-        projection_model = resolve_projection_model()
         try:
+            # Inside the try, not above it: resolve_projection_model() now
+            # raises UnknownLlmModelError for an unpriced reachable model, and
+            # the handler below is exactly the message that error was written
+            # for. Left outside, an operator got a raw traceback instead.
+            projection_model = resolve_projection_model()
             estimate = estimate_api_llm_cost(
                 records,
                 fallback_vertical=args.vertical,

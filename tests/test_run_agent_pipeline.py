@@ -253,6 +253,64 @@ class AgentPipelineTest(unittest.TestCase):
         stages = {entry["stage"]: entry for entry in summary["stages"]}
         self.assertEqual(stages["packets"]["status"], "failed")
 
+    def test_failed_airtable_sync_does_not_report_the_rows_as_synced(self) -> None:
+        # Writing the summary as each stage closes reintroduced the defect it
+        # was meant to remove, one stage later: airtable_status was set to
+        # "live" *before* the sync ran, so a sync that raised still flushed a
+        # summary claiming every row synced. `airtable_synced` is the one field
+        # an operator checks to confirm the upload landed.
+        self._write_config()
+        self._write_scored("detailing_cleveland_medium_001")
+
+        def runner(cmd, *, capture: bool = False, check: bool = True):
+            if any("upload_airtable" in part for part in cmd):
+                raise rap.PipelineRefusal("airtable sync blew up")
+            return types.SimpleNamespace(returncode=0, stdout="")
+
+        with patch.object(rap, "run", side_effect=runner), redirect_stdout(io.StringIO()):
+            code = rap.main(self._argv("packets-only", airtable="dry-run"))
+
+        summary = json.loads(
+            (self.root / "output" / "agent_run_summary_detailing_cleveland_medium_001.json").read_text()
+        )
+        self.assertNotEqual(code, 0)
+        self.assertEqual(summary["counts"]["airtable_synced"], 0)
+        self.assertEqual(summary["airtable"]["status"], "failed")
+
+    def test_summary_rereads_the_scored_csv_only_when_it_changes(self) -> None:
+        # The summary is rebuilt at every stage close, and the scored CSV is
+        # 53 MB across 186 columns for 133 leads. Re-parsing it per stage would
+        # make the per-stage timing feature pay for itself in the thing it
+        # measures. Cached on (path, mtime, size) so a mid-run rewrite is still
+        # picked up rather than serving pre-scoring counts for the rest of the run.
+        scored = self._write_scored("detailing_cleveland_medium_001")
+        rap._SCORED_ROWS_CACHE.clear()
+
+        with patch.object(rap, "read_csv_rows", wraps=rap.read_csv_rows) as reader:
+            first = rap._read_csv_rows_cached(scored)
+            second = rap._read_csv_rows_cached(scored)
+            self.assertEqual(reader.call_count, 1)
+            self.assertEqual(first, second)
+
+            # A rewrite must invalidate: same path, different content.
+            os.utime(scored, (0, 0))
+            scored.write_text(scored.read_text() + "Z,No,,\n", encoding="utf-8")
+            rap._read_csv_rows_cached(scored)
+            self.assertEqual(reader.call_count, 2)
+
+        # ...and build_summary must actually go through it, or the caching is
+        # real but unreached and every stage still re-parses the file.
+        rap._SCORED_ROWS_CACHE.clear()
+        kwargs = dict(
+            batch="detailing_cleveland_medium_001", mode="packets-only",
+            enriched=self.root / "output" / "missing.jsonl", scored=scored,
+            packets=self.root / "packets", airtable_status="skipped",
+        )
+        with patch.object(rap, "read_csv_rows", wraps=rap.read_csv_rows) as reader:
+            rap.build_summary(**kwargs)
+            rap.build_summary(**kwargs)
+            self.assertEqual(reader.call_count, 1)
+
     # ---- the parallel-run guard ----------------------------------------- #
     #
     # `--lock-file` exists so distinct batches can run search/enrich/score in
