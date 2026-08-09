@@ -124,8 +124,11 @@ def check_airtable_lock_compatibility(airtable: str, lock_file: str) -> None:
     correctly lets distinct batches run search, enrich and score in parallel.
     The Airtable base is the one piece of shared state with no batch-keyed
     path, and `upload_airtable`'s fetch_existing_records -> plan_airtable_sync
-    -> send_airtable_plan is an unlocked read-then-write that is the only
-    cross-batch dedupe there is. Two syncs behind two private locks each read a
+    -> send_airtable_plan is an unlocked read-then-write. It is the last
+    cross-batch dedupe, not the only one -- `lead_machine.corpus_index` now
+    excludes known businesses before the search stage bills anything -- but it
+    is the only one covering records already in the base, so this refusal
+    stands. Two syncs behind two private locks each read a
     base without the other's rows and both POST, so one business lands twice,
     both rows `Status: New`, both matching QUEUE_FILTER_FORMULA. `mark_sent`
     flips one and the twin is served to a rep again -- the 2026-07-31
