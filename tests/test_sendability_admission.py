@@ -22,7 +22,9 @@ from typing import Any
 from lead_machine.buyer_signals import REVIEW_DEMAND_THRESHOLDS
 from lead_machine.manual_scores import merge_manual_score
 from lead_machine.sendability import (
+    EVIDENCE_BLOCKERS,
     HARD_ICP_SKIP_BLOCKER,
+    UNSUPPORTED_ABSENCE_CLAIM_BLOCKER,
     Admission,
     admit,
     apply_sendability,
@@ -525,6 +527,74 @@ class AStoredSendableYesCannotOutrankTheIcpGateTest(unittest.TestCase):
     def test_a_hand_edited_no_is_still_honoured(self) -> None:
         # Tightening never goes through the gate; the pre-existing contract.
         self.assertEqual(readiness_flags(self._row(sendable="No", skipped=False))[0], "No")
+
+
+class AnAbsenceClaimNeedsAPageBodyTest(unittest.TestCase):
+    """A "they have no contact form" claim must be traceable to a page we read.
+
+    `FORM_ABSENCE_CLAIM_BLOCKER` cannot do this. It is a *contradiction*
+    detector — `strong_estimate_form AND has_form_absence_claim` — and on a
+    lead whose body came back empty `estimate_form_detected` is "No" (or
+    "Unknown"), so the first conjunct is false and the claim rides through
+    unchallenged. `sendability` never read `form_detection_method` at all.
+
+    This is defence in depth, not the fix. The enricher no longer mints the
+    claim; this stops one that arrives by another route — a stale row scored
+    before that change, a manual card, an LLM reason written off a blank crawl
+    — from being sent to a business whose form is sitting on a page our static
+    parser could not read.
+    """
+
+    def _row(self, website: dict[str, Any], claim: str = "No contact form detected") -> dict[str, Any]:
+        return {
+            "Business Name": "Door Works & Construction",
+            "visible_pain_reasons": claim,
+            "Raw Evidence": json.dumps({"website": website}),
+        }
+
+    _READABLE = {
+        "site_status": "Loaded",
+        "site_issue_flags": ["no_form_detected"],
+        "form_detection_method": "static_html",
+    }
+    _NO_BODY_METHOD = {
+        "site_status": "Loaded",
+        "site_issue_flags": [],
+        "form_detection_method": "no_body",
+    }
+    _EMPTY_BODY_FLAG = {
+        "site_status": "Loaded",
+        "site_issue_flags": ["empty_body_on_200"],
+        "form_detection_method": "none",
+    }
+
+    def _blockers(self, row: dict[str, Any]) -> list[str]:
+        return evaluate_sendability(row)["send_blockers"]
+
+    def test_no_body_blocks_the_claim(self) -> None:
+        self.assertIn(UNSUPPORTED_ABSENCE_CLAIM_BLOCKER, self._blockers(self._row(self._NO_BODY_METHOD)))
+
+    def test_the_empty_body_flag_blocks_the_claim(self) -> None:
+        self.assertIn(UNSUPPORTED_ABSENCE_CLAIM_BLOCKER, self._blockers(self._row(self._EMPTY_BODY_FLAG)))
+
+    def test_a_claim_off_a_page_we_read_is_not_blocked(self) -> None:
+        # The control: the blocker is about provenance, not about disliking
+        # absence claims. A form absence found on a page we parsed is the
+        # signal the pipeline runs on.
+        self.assertNotIn(UNSUPPORTED_ABSENCE_CLAIM_BLOCKER, self._blockers(self._row(self._READABLE)))
+
+    def test_no_body_without_an_absence_claim_is_not_blocked(self) -> None:
+        # The other control: an unreadable body is not itself disqualifying.
+        # Plenty of these leads are sendable on a leak that has nothing to do
+        # with forms.
+        row = self._row(self._NO_BODY_METHOD, claim="Website looks outdated")
+
+        self.assertNotIn(UNSUPPORTED_ABSENCE_CLAIM_BLOCKER, self._blockers(row))
+
+    def test_the_blocker_is_an_evidence_blocker(self) -> None:
+        # Minimum-evidence failures are what keep a lead out of the packet
+        # tier, not just out of the send flag.
+        self.assertIn(UNSUPPORTED_ABSENCE_CLAIM_BLOCKER, EVIDENCE_BLOCKERS)
 
 
 if __name__ == "__main__":
