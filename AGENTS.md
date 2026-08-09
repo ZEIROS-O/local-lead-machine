@@ -129,9 +129,14 @@ Key in-flight facts (2026-07-29):
   name, **street address**, **phone**, URLs, and up to 8 raw 300-char windows of the prospect's own
   page text selected by `LLM_SCORING_SNIPPET_TERMS` — a list that includes `contact`, `review` and
   `testimonial`, so the windows routinely contain an owner's name and email or a customer's name.
-  The default chain is **kimi-first**, so an unmodified run sends all of that to Moonshot. Full
-  breakdown and the open decisions in [`docs/pii-boundary.md`](docs/pii-boundary.md); read it before
-  changing the default chain or adding a snippet term.
+  The default chain is **subscription-only, codex first** (`("codex", "claude")`) so that an
+  unattended run can neither bill anything nor send that payload to a third-party API. It was
+  kimi-first until 2026-08-08, which shipped all of it to Moonshot on any unmodified run. `kimi` and
+  `anthropic` are still valid via `LLM_SCORING_PROVIDER_CHAIN` — **putting either in the chain is a
+  deliberate act**: a paid provider after a `subscription:*` runner is the unbounded-spend hazard
+  (quota exhaustion falls through and bills per batch) and reopens the PII path. Full breakdown in
+  [`docs/pii-boundary.md`](docs/pii-boundary.md); read it before changing the chain or adding a
+  snippet term.
 - **Two Anthropic payload features are deliberately NOT wired, and both are traps.** They read like
   free wins, so the reasoning is recorded here to stop a future pass from "finishing" them.
   *`thinking: {"type": "disabled"}`* — not a universal opt-out. It is a hard 400 on `fable-5` and

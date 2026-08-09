@@ -54,25 +54,39 @@ Set by `LLM_SCORING_PROVIDER_CHAIN`; resolution and fallback live in `lead_machi
 
 | Provider | Processor | Where the data goes |
 |---|---|---|
-| `kimi` | Moonshot AI | Moonshot's API. **This is the repo default and the first entry in `DEFAULT_PROVIDER_CHAIN`** (`llm_client.py:32`) |
+| `kimi` | Moonshot AI | Moonshot's API. **Not in the default chain** — opt-in via `LLM_SCORING_PROVIDER_CHAIN` only |
 | `codex` | OpenAI, via the ChatGPT subscription CLI | OpenAI, under the ChatGPT subscription's terms |
 | `claude` | Anthropic, via the Claude subscription CLI | Anthropic, under the subscription's terms |
 | `anthropic` | Anthropic | Anthropic Messages API, under the API terms |
 
-**The default chain is kimi-first.** Out of the box, an unmodified run sends every scored lead's
+**The default chain is `("codex", "claude")` — subscription-only, codex first.** Decided 2026-08-08.
+Out of the box, no prospect data reaches a third-party API and no run can bill anything.
+
+Until that date the default was `kimi,codex,claude`, so an unmodified run sent every scored lead's
 business name, street address, phone number, and up to eight raw snippets of their site text to
-Moonshot. That is a deliberate-looking choice that was never actually decided — it is the default
-because kimi was the cheapest per-token provider when the chain was written, and the PII question
-was not asked at the time.
+Moonshot. That was never actually decided — it was the default because kimi was the cheapest
+per-token provider when the chain was written, and the PII question was not asked at the time.
+
+### Why subscription-only, not just "codex first"
+
+Reordering alone would not have been enough. `subscription:*` is priced `(0.0, 0.0)`, so a chain
+with a paid member *after* a subscription runner behaves fine until the subscription quota runs out
+— and then silently falls through and bills per batch, on the PII path, unattended. The two
+properties are bought together or not at all: every member must be a $0 subscription runner.
+`tests/test_lead_machine_contracts.py::test_default_provider_chain_is_subscription_only` pins it.
 
 ### Consequence for Phase 3
 
-The Phase 3 decision to score the 1,621-lead backlog through `codex` was taken partly on this basis:
-it keeps identifiable small-business data off Moonshot for the bulk run, and costs $0 against an
-existing subscription. That reasoning is sound and this document is the record of it.
+Phase 3's plan already specified scoring the 1,621-lead backlog through `codex` for exactly this
+reason. That is now the default rather than a per-run override, so the backlog run and every routine
+run agree without anyone remembering to set an env var.
 
-It does **not** change the default for every other run. Anyone running `run-lead-batch` without
-setting `LLM_SCORING_PROVIDER_CHAIN` is still on kimi-first.
+### Getting kimi or the Anthropic API back
+
+Both remain valid provider names; they are out of the default, not out of the tool. Set
+`LLM_SCORING_PROVIDER_CHAIN` explicitly. Understand what you are re-enabling: a paid provider in the
+chain restores both the spend hazard and the PII path, and it should be a considered choice for a
+specific run rather than a durable setting in `.env`.
 
 ## Recommendations, in priority order
 

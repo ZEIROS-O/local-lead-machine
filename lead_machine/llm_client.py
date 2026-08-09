@@ -29,7 +29,21 @@ DEFAULT_KIMI_SCORING_MODEL = "kimi-k3"
 DEFAULT_KIMI_REASONING_EFFORT = "low"
 TRANSIENT_HTTP_STATUSES = {429, 500, 502, 503, 504}
 
-DEFAULT_PROVIDER_CHAIN = ("kimi", "codex", "claude")
+# Subscription runners only, codex first. Two properties are being bought here,
+# and both are lost by putting a paid API provider anywhere in this tuple:
+#   * PII — scoring is the one path that sends prospect data off this machine,
+#     and it carries street address, phone, and raw windows of the prospect's
+#     own page text (see docs/pii-boundary.md). kimi-first meant an unmodified
+#     run shipped all of that to Moonshot; that was never a decision, just the
+#     cheapest-per-token default from when the chain was written.
+#   * Spend — `subscription:*` is priced (0.0, 0.0), so a chain that is *all*
+#     subscription cannot bill anything no matter how the caps are configured.
+#     A paid member after codex reintroduces exactly the hazard the plan warns
+#     about: quota exhaustion falls through and bills per batch.
+# `kimi` and `anthropic` remain valid names via LLM_SCORING_PROVIDER_CHAIN —
+# dropping them from the default removes them from the unattended path, not
+# from the tool. Adding one back is a deliberate act with a cost attached.
+DEFAULT_PROVIDER_CHAIN = ("codex", "claude")
 
 # §4.3 — grades have to be reproducible. Re-scoring 25 overlapping leads with no
 # scoring code changed moved 14 grades (three A→B, nine Skip→C, scores swinging
