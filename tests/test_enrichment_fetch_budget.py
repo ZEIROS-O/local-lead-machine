@@ -939,6 +939,32 @@ class BlankBodyAbsenceIsNotEvidenceTest(unittest.TestCase):
         self.assertEqual(site["form_strength"], "Strong")
         self.assertEqual(site["form_detection_method"], "rendered_browser")
 
+    def test_a_basic_rendered_form_also_survives_the_unknown_rewrite(self) -> None:
+        # Strong is not the bar. Guarding the rewrite on `has_terminal_form`
+        # alone spared only Strong forms, and on the real recovery run twelve
+        # of thirteen SPAs came back `embedded_provider` with a Basic form and
+        # were blanked to Unknown anyway — discarding a true finding and the
+        # legitimate +12 "Basic estimate form only" pain that goes with it.
+        def fake_fetch(url: str, timeout: int = 15) -> dict[str, object]:
+            return {"ok": True, "status_code": 200, "final_url": url, "html": self.SPA_SHELL, "error": ""}
+
+        basic = enrich_leads.detect_form_signals(
+            '<form><input name="email"><button type="submit">Send</button></form>',
+            page_url="https://example.com",
+        )
+        basic["form_detection_method"] = "embedded_provider"
+        self.assertTrue(basic["forms_found"])
+        self.assertNotEqual(basic["form_strength"], "Strong")
+
+        with patch("enrich_leads.fetch_url", side_effect=fake_fetch), patch(
+            "enrich_leads.resolve_candidate_page_budget", return_value=500
+        ), patch("enrich_leads.detect_rendered_form", return_value=basic):
+            site = scrape_site("https://example.com", rendered_form_check=True)
+
+        self.assertNotEqual(site["form_strength"], "Unknown")
+        self.assertEqual(site["form_detection_method"], "embedded_provider")
+        self.assertNotIn("no_form_detected", site["site_issue_flags"])
+
 
 class InterWavePauseTest(unittest.TestCase):
     """The pause belongs in the gaps between waves, not after the last one.

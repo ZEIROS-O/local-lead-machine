@@ -1532,10 +1532,28 @@ def scrape_site(
     absence_unproven = truncated_without_answer or homepage_body_blank
     # The rewrite is the narrower of the two, and deliberately so. A blank
     # static body is exactly the case `--rendered-form-check` above now reaches,
-    # and a browser that came back with a Strong estimate form has answered the
-    # question the static parse could not. Blanking that to "Unknown" would
-    # throw away the evidence the rendered pass exists to collect.
-    if absence_unproven and not has_terminal_form(form_signals):
+    # and a browser that came back with a form has answered the question the
+    # static parse could not. Blanking that to "Unknown" would throw away the
+    # evidence the rendered pass exists to collect — which would leave §2.3 and
+    # §2.1 of this fix working against each other: one sends the browser at the
+    # SPA precisely so it can read the form, the other then discards what it
+    # read. `has_terminal_form` alone is too strict a save, because it only
+    # spares a *Strong* form: measured on the 13 recovered leads, twelve came
+    # back `embedded_provider` with a real Basic form and would still have been
+    # blanked. A Basic form is a true finding and a legitimate +12 pain; the
+    # bar is whether anything actually read the page, not how good the answer
+    # was.
+    #
+    # The escape belongs to the blank-body branch only. Truncation keeps its
+    # original T4.4 semantics: having parsed *some* pages says nothing about
+    # the page we never fetched, and a form found on page 3 does not prove
+    # there is no better one on page 17 — which is why the bar there stays
+    # `has_terminal_form`. A blank homepage is the opposite situation: there
+    # is one page in question, and if anything positively found a form on it
+    # we have read it.
+    blank_body_answered = homepage_body_blank and bool(form_signals.get("forms_found"))
+    rewrite_needed = truncated_without_answer or (homepage_body_blank and not blank_body_answered)
+    if rewrite_needed and not has_terminal_form(form_signals):
         form_signals = dict(form_signals)
         for field in ("contact_form_detected", "estimate_form_detected", "form_strength"):
             form_signals[field] = "Unknown"
