@@ -749,8 +749,14 @@ def build_evidence_profile(enriched: Dict[str, Any]) -> Dict[str, Any]:
     services = sorted(set(site.get("high_ticket_terms") or []))
 
     ctas = site.get("cta_terms") or []
+    # The default matters: the enrichment-exception path (`enrich_leads`
+    # builds a record whose `website` dict has no form keys at all) landed here
+    # as a hard "No", which becomes +14 pain and the *send trigger* — the line
+    # the packet leads with — asserting a missing contact form on a website the
+    # crawl never opened. `estimate_form_detected` below has always defaulted
+    # to "Unknown" for exactly this reason; the two were asymmetric.
     contact_form_detected = _clean(site.get("contact_form_detected")) or (
-        "Yes" if site.get("forms_found") else "No"
+        "Yes" if site.get("forms_found") else ("No" if has_parsed_body_evidence(site) else "Unknown")
     )
     estimate_form_detected = _clean(site.get("estimate_form_detected")) or "Unknown"
     form_strength = _clean(site.get("form_strength")) or "None"
@@ -845,8 +851,20 @@ def build_evidence_profile(enriched: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "site_status": site_status,
         "mobile_status": "unknown",
-        "has_estimate_cta": any("estimate" in str(cta).lower() or "quote" in str(cta).lower() for cta in ctas),
-        "has_contact_form": contact_form_detected == "Yes" or bool(site.get("forms_found")),
+        # The boolean twins of the graded fields above. They must not read
+        # `False` where the graded field reads "Unknown": `sendability`'s
+        # concrete-issue gate keys on `is False`, so a hard False on a page we
+        # never read answers "yes, we found a real leak" off an empty crawl.
+        # `None` is the honest third state and the gate ignores it.
+        "has_estimate_cta": (
+            any("estimate" in str(cta).lower() or "quote" in str(cta).lower() for cta in ctas)
+            or (None if not has_parsed_body_evidence(site) else False)
+        ),
+        "has_contact_form": (
+            contact_form_detected == "Yes"
+            or bool(site.get("forms_found"))
+            or (None if contact_form_detected == "Unknown" else False)
+        ),
         "contact_form_detected": contact_form_detected,
         "estimate_form_detected": estimate_form_detected,
         "form_strength": form_strength,
@@ -864,7 +882,10 @@ def build_evidence_profile(enriched: Dict[str, Any]) -> Dict[str, Any]:
         "visible_pain_categories": visible_pain["visible_pain_categories"],
         "send_trigger": visible_pain["send_trigger"],
         "has_online_booking": any(tool in tools for tool in ["Jobber", "Housecall Pro", "GHL"]),
-        "phone_visible": bool(phones),
+        # `phones` is website-scraped only, so an empty list on a lead whose
+        # body we never read says nothing — the number is usually the first
+        # line of their Google listing. Same three-state rule as above.
+        "phone_visible": bool(phones) or (None if not has_parsed_body_evidence(site) else False),
         "email_visible": bool(emails),
         "services_detected": services,
         "service_area_detected": service_area,
