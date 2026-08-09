@@ -412,8 +412,14 @@ def resolve_pipeline_paths(
 # --------------------------------------------------------------------------- #
 # Command builders (pure)
 # --------------------------------------------------------------------------- #
-def build_search_cmd(config_path: Path, batch: str) -> list[str]:
-    return [
+def build_search_cmd(
+    config_path: Path,
+    batch: str,
+    *,
+    refresh_older_than: Optional[int] = None,
+    ignore_corpus: bool = False,
+) -> list[str]:
+    cmd = [
         sys.executable,
         "make_search_batch.py",
         "--config",
@@ -421,6 +427,14 @@ def build_search_cmd(config_path: Path, batch: str) -> list[str]:
         "--batch",
         batch,
     ]
+    # Omitted by default on purpose: no flag means "skip every business the
+    # corpus already knows", which is the behaviour that stops overlapping metro
+    # configs re-billing Place Details for the same place_id.
+    if refresh_older_than is not None:
+        cmd.extend(["--refresh-older-than", str(refresh_older_than)])
+    if ignore_corpus:
+        cmd.append("--ignore-corpus")
+    return cmd
 
 
 def _score_base_cmd(
@@ -761,6 +775,21 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                         help="Authorize paid scoring above the confirmation threshold")
     parser.add_argument("--overwrite", action="store_true", help="Reuse the existing batch instead of forking")
     parser.add_argument(
+        "--refresh-older-than",
+        type=int,
+        default=None,
+        metavar="DAYS",
+        help="Passed to the search stage: re-admit businesses the cross-batch registry "
+             "(run_state/place_registry.jsonl) last saw more than DAYS ago. Unset skips every "
+             "known business.",
+    )
+    parser.add_argument(
+        "--ignore-corpus",
+        action="store_true",
+        help="Passed to the search stage: ignore the cross-batch registry and re-search, re-bill "
+             "and re-crawl businesses earlier batches already covered.",
+    )
+    parser.add_argument(
         "--lock-file",
         default=str(DEFAULT_LOCK_FILE),
         help=(
@@ -859,7 +888,14 @@ def _run_pipeline(args: argparse.Namespace) -> int:
             if not config_path.exists():
                 raise PipelineRefusal(f"Search config not found: {config_path}")
             status("SEARCH", f"Searching + enriching from {config_path}")
-            run(build_search_cmd(config_path, batch))
+            run(
+                build_search_cmd(
+                    config_path,
+                    batch,
+                    refresh_older_than=args.refresh_older_than,
+                    ignore_corpus=args.ignore_corpus,
+                )
+            )
     else:
         status("SEARCH", "skipped (mode does not search)")
         clock.skipped("search")
