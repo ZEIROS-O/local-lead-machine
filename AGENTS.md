@@ -93,8 +93,14 @@ Key in-flight facts (2026-07-29):
   claude CLI (subscription). Order via `LLM_SCORING_PROVIDER_CHAIN`; `anthropic` (Messages API,
   `ANTHROPIC_API_KEY`) remains an optional provider. Fallback happens only on provider
   unavailability — invalid output stays with the repair flow in `score_leads.py`. Every model the
-  chain can resolve must have a price in `score_leads.LLM_PRICING_USD_PER_MILLION_TOKENS` or the
-  run aborts at cost estimation; `[LLM PROVIDER]` in the run log says who actually served.
+  chain can resolve must have a price in `score_leads.LLM_PRICING_USD_PER_MILLION_TOKENS` or
+  `resolve_projection_model()` aborts at cost estimation, before any call is made. A model the
+  *provider reports having served* is different: the call is already paid for, so an unpriced
+  served id never aborts — `resolve_served_model()` charges it at the priciest tier the chain
+  could have reached and warns. It is charged there rather than at the run-level model because
+  the run-level model is routinely a $0 subscription runner, and charging unknown paid spend at
+  $0.00 is exactly how `MAX_LLM_USD_PER_RUN` stops binding.
+  `[LLM PROVIDER]` in the run log says who actually served.
 - **Determinism is pinned only where the model accepts it, and the default config is not pinned.**
   `llm_client` sends `temperature: 0` on the kimi and anthropic payloads, but omits it for model
   families that fix sampling server-side (`SAMPLING_FIXED_MODEL_PREFIXES`): `kimi-k3` (Moonshot
@@ -110,6 +116,37 @@ Key in-flight facts (2026-07-29):
   from a `subscription:*` provider are **not reproducible run-to-run** and re-scoring the same leads
   can move them across the A/B/C/Skip boundary. Do not treat a subscription-scored grade as stable;
   re-verify with `verify-batch` rather than assuming a re-run reproduces it.
+  Verified rather than assumed, and cheap to re-verify: `codex exec --strict-config -c <key>=…`
+  validates config keys *before* it makes any API call, so probing costs no quota. As of 2026-08-08
+  `model_temperature`, `temperature`, `model_top_p`, `top_p`, `seed` and `model_seed` are each
+  rejected as `unknown configuration field`; the only accepted knob is `model_reasoning_effort`,
+  which the repo already wires through `resolve_runner_effort`. **There is therefore no determinism
+  to reach on this path** — the §4.3 "14 of 25 grades moved with no code change" defect stays open
+  for exactly the runs routed through `codex`, and that includes the Phase 3 backlog. This is a
+  known, accepted limitation to decide at the Phase 3 gate, not a bug to fix in `llm_client`.
+- **Scoring is the only path that sends prospect data off this machine**, and the payload is built
+  in exactly one place — `build_llm_scoring_record` (`score_leads.py:2711`). It carries business
+  name, **street address**, **phone**, URLs, and up to 8 raw 300-char windows of the prospect's own
+  page text selected by `LLM_SCORING_SNIPPET_TERMS` — a list that includes `contact`, `review` and
+  `testimonial`, so the windows routinely contain an owner's name and email or a customer's name.
+  The default chain is **kimi-first**, so an unmodified run sends all of that to Moonshot. Full
+  breakdown and the open decisions in [`docs/pii-boundary.md`](docs/pii-boundary.md); read it before
+  changing the default chain or adding a snippet term.
+- **Two Anthropic payload features are deliberately NOT wired, and both are traps.** They read like
+  free wins, so the reasoning is recorded here to stop a future pass from "finishing" them.
+  *`thinking: {"type": "disabled"}`* — not a universal opt-out. It is a hard 400 on `fable-5` and
+  `mythos-5` at any effort, and a 400 on `opus-5` at effort `xhigh`/`max`; three of those ids are
+  already in `SAMPLING_FIXED_MODEL_PREFIXES`, so an unguarded add would kill batches on the repo's
+  own listed models. Worse for this workload specifically: with thinking disabled, `opus-5` is
+  documented to leak `<thinking>` tags into the visible response — and `_parse_score_bundle` parses
+  that response as strict JSON, so the failure mode is a batch-wide `InvalidLlmResponse`, not a
+  degraded answer. Leave thinking on and use `reasoning_effort` to control spend.
+  *`cache_control` prompt caching* — caching is a **prefix** match, and
+  `build_api_llm_scoring_prompt` opens with `# API LLM Lead Scoring - {batch_id}`. A per-batch id at
+  position 0 invalidates the whole prefix, so a breakpoint would write a fresh entry per batch and
+  never read one. Enabling it means moving the stable rubric ahead of the batch id and records —
+  which rewrites the prompt every lead is scored against, and therefore moves grades and the
+  reproducibility corpus. That is a scoring change to schedule ahead of a backlog run, not a cleanup.
 - **`buyer_intent.money_signal` is tri-state** (`yes`/`no`/`unknown`). "unknown" means there was no
   crawlable site text to read a paid stack from, which is not the same claim as "does not spend".
   Only `yes` may count as truthy in a gate — `sendability.required_visible_pain_score` drops the

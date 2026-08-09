@@ -31,6 +31,8 @@ import os
 import re
 import subprocess
 import sys
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -587,6 +589,66 @@ def count_airtable_rows(rows: list[dict[str, str]]) -> int:
     return len(rows)
 
 
+#: Last (identity, rows) pair read by `_read_csv_rows_cached`. One slot is
+#: enough: a run reads exactly one scored CSV, repeatedly.
+_SCORED_ROWS_CACHE: dict[str, Any] = {}
+
+
+def _read_csv_rows_cached(path: Path) -> list[dict[str, str]]:
+    """`read_csv_rows`, memoized on (path, mtime, size).
+
+    The summary is now rebuilt as every stage closes, so a naive re-read parses
+    the scored CSV up to five times per run — and that file is 53 MB across 186
+    columns for 133 leads. Paying that repeatedly inside the feature whose whole
+    purpose is measuring per-stage cost would be self-defeating.
+
+    Keying on mtime and size rather than path alone is what makes it correct:
+    the scoring and packets stages rewrite this file mid-run, and a path-only
+    cache would then report the pre-scoring row counts for the rest of the run.
+    """
+    try:
+        stat = path.stat()
+        identity = f"{path}:{stat.st_mtime_ns}:{stat.st_size}"
+    except OSError:
+        # Missing/unreadable: let read_csv_rows decide, and never cache it.
+        return read_csv_rows(path)
+    if _SCORED_ROWS_CACHE.get("identity") == identity:
+        return _SCORED_ROWS_CACHE["rows"]
+    rows = read_csv_rows(path)
+    _SCORED_ROWS_CACHE["identity"] = identity
+    _SCORED_ROWS_CACHE["rows"] = rows
+    return rows
+
+
+class StageClock:
+    """Wall clock per stage, and the record the summary reports it from.
+
+    The perf plan's own verification step was "record wall clock per stage so the
+    win is measured, not asserted" — and nothing here timed anything, so every
+    performance number in this project was measured by hand and cannot be
+    reproduced from the artifacts. A stage records even when it is skipped or
+    fails: "packets took 0.0s because the mode does not build packets" and
+    "packets failed after 12s" are both things an operator needs to be able to
+    read off the summary without having the terminal still open.
+    """
+
+    def __init__(self) -> None:
+        self._started = time.perf_counter()
+        self._stages: list[dict[str, Any]] = []
+
+    def record(self, stage: str, *, seconds: float, status_: str) -> None:
+        self._stages.append({"stage": stage, "seconds": round(seconds, 3), "status": status_})
+
+    def skipped(self, stage: str) -> None:
+        self.record(stage, seconds=0.0, status_="skipped")
+
+    def stages(self) -> list[dict[str, Any]]:
+        return list(self._stages)
+
+    def elapsed(self) -> float:
+        return round(time.perf_counter() - self._started, 3)
+
+
 def build_summary(
     *,
     batch: str,
@@ -595,8 +657,9 @@ def build_summary(
     scored: Path,
     packets: Path,
     airtable_status: str,
+    clock: StageClock | None = None,
 ) -> dict[str, Any]:
-    rows = read_csv_rows(scored)
+    rows = _read_csv_rows_cached(scored)
     tier_counts = {
         PACKET_TIER_SENDABLE: 0,
         PACKET_TIER_MANUAL: 0,
@@ -610,7 +673,7 @@ def build_summary(
     packet_index = packets / "packet_index.csv"
     airtable_rows = (
         0
-        if airtable_status == "skipped"
+        if airtable_status in {"skipped", "failed"}
         else count_airtable_rows(rows)
     )
     return {
@@ -626,6 +689,8 @@ def build_summary(
             "airtable_synced": airtable_rows,
         },
         "airtable": {"status": airtable_status, "scope": "all_scored_rows"},
+        "stages": clock.stages() if clock is not None else [],
+        "elapsed_seconds": clock.elapsed() if clock is not None else 0.0,
         "artifacts": {
             "scored_csv": str(scored),
             "packet_index": str(packet_index),
@@ -650,6 +715,10 @@ def print_summary(summary: dict[str, Any]) -> None:
         print(f"  Airtable synced:        {counts['airtable_synced']} ({summary['airtable']['status']})")
     print(f"  Output CSV:             {artifacts['scored_csv']}")
     print(f"  Packet index:           {artifacts['packet_index']}")
+    for entry in summary.get("stages") or []:
+        print(f"  Stage {entry['stage']:<16} {entry['seconds']:>8.1f}s  ({entry['status']})")
+    if summary.get("elapsed_seconds"):
+        print(f"  Total elapsed:          {summary['elapsed_seconds']:.1f}s")
 
 
 # --------------------------------------------------------------------------- #
@@ -744,101 +813,145 @@ def _run_pipeline(args: argparse.Namespace) -> int:
     status("PIPELINE", f"tiered_csv={paths.tiered_csv}")
     status("PIPELINE", f"packets_dir={packets}")
 
+    # State the summary is built from. Hoisted above the stages because the
+    # summary is now rewritten as each stage closes, not once at the end.
+    report_csv = paths.report_csv
+    airtable_status = "skipped"
+    clock = StageClock()
+
+    def flush_summary() -> dict[str, Any]:
+        summary = build_summary(
+            batch=batch,
+            mode=args.mode,
+            enriched=enriched,
+            scored=report_csv,
+            packets=packets,
+            airtable_status=airtable_status,
+            clock=clock,
+        )
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return summary
+
+    @contextmanager
+    def stage(name: str):
+        """Time a stage, and leave a truthful summary behind whatever it does.
+
+        The flush is in `finally` on purpose: a run that refuses at packets used
+        to leave the *previous* run's summary on disk, so the artifact described
+        a run that was days old. A partial summary of this run beats a complete
+        summary of a different one.
+        """
+        started = time.perf_counter()
+        failed = False
+        try:
+            yield
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            clock.record(name, seconds=time.perf_counter() - started, status_="failed" if failed else "ok")
+            flush_summary()
+
     # ---- Search / enrich ------------------------------------------------- #
     if args.mode in SEARCH_MODES:
-        if not config_path.exists():
-            raise PipelineRefusal(f"Search config not found: {config_path}")
-        status("SEARCH", f"Searching + enriching from {config_path}")
-        run(build_search_cmd(config_path, batch))
+        with stage("search"):
+            if not config_path.exists():
+                raise PipelineRefusal(f"Search config not found: {config_path}")
+            status("SEARCH", f"Searching + enriching from {config_path}")
+            run(build_search_cmd(config_path, batch))
     else:
         status("SEARCH", "skipped (mode does not search)")
+        clock.skipped("search")
 
     # ---- Scoring --------------------------------------------------------- #
     if args.mode in SCORE_DRY_MODES:
-        if not enriched.exists():
-            raise PipelineRefusal(f"Enriched file not found, cannot score: {enriched}")
+        with stage("scoring"):
+            if not enriched.exists():
+                raise PipelineRefusal(f"Enriched file not found, cannot score: {enriched}")
 
-        status("COST", "Estimating API-LLM cost (dry-run, no paid call)")
-        projected = estimate_llm_cost(
-            enriched=enriched, scored=paths.scored_output, vertical=args.vertical,
-            scores_dir=scores_dir, limit=args.limit,
-            llm_batch_size=args.llm_batch_size, llm_max_tokens=args.llm_max_tokens,
-        )
-        status("COST", f"projected_usd={projected:.4f} max_llm_usd={args.max_llm_usd:.2f}")
-
-        if args.mode == "score-dry-run":
-            status("COST", "score-dry-run complete; no paid scoring performed.")
-        else:
-            # Hard ceiling — never overridden, even with --yes.
-            if args.max_llm_usd > 0 and projected > args.max_llm_usd:
-                raise PipelineRefusal(
-                    f"Projected LLM cost ${projected:.4f} exceeds --max-llm-usd "
-                    f"${args.max_llm_usd:.2f}. Raise the ceiling or lower --limit."
-                )
-            confirm_threshold = min(DEFAULT_SPEND_CONFIRM_USD, args.max_llm_usd)
-            if projected > confirm_threshold and not args.yes:
-                raise PipelineRefusal(
-                    f"Projected LLM cost ${projected:.4f} exceeds the confirmation "
-                    f"threshold ${confirm_threshold:.2f}. Re-run with --yes / --confirm-spend."
-                )
-
-            status("SCORING", f"Running paid API-LLM scoring (projected ${projected:.4f}) -> {paths.scored_output}")
-            os.environ["MAX_LLM_USD_PER_RUN"] = str(args.max_llm_usd)
-            run(build_paid_score_cmd(
+            status("COST", "Estimating API-LLM cost (dry-run, no paid call)")
+            projected = estimate_llm_cost(
                 enriched=enriched, scored=paths.scored_output, vertical=args.vertical,
-                scores_dir=scores_dir, limit=args.limit, cards=cards, llm_usage=llm_usage,
+                scores_dir=scores_dir, limit=args.limit,
                 llm_batch_size=args.llm_batch_size, llm_max_tokens=args.llm_max_tokens,
-            ))
+            )
+            status("COST", f"projected_usd={projected:.4f} max_llm_usd={args.max_llm_usd:.2f}")
+
+            if args.mode == "score-dry-run":
+                status("COST", "score-dry-run complete; no paid scoring performed.")
+            else:
+                # Hard ceiling — never overridden, even with --yes.
+                if args.max_llm_usd > 0 and projected > args.max_llm_usd:
+                    raise PipelineRefusal(
+                        f"Projected LLM cost ${projected:.4f} exceeds --max-llm-usd "
+                        f"${args.max_llm_usd:.2f}. Raise the ceiling or lower --limit."
+                    )
+                confirm_threshold = min(DEFAULT_SPEND_CONFIRM_USD, args.max_llm_usd)
+                if projected > confirm_threshold and not args.yes:
+                    raise PipelineRefusal(
+                        f"Projected LLM cost ${projected:.4f} exceeds the confirmation "
+                        f"threshold ${confirm_threshold:.2f}. Re-run with --yes / --confirm-spend."
+                    )
+
+                status("SCORING", f"Running paid API-LLM scoring (projected ${projected:.4f}) -> {paths.scored_output}")
+                os.environ["MAX_LLM_USD_PER_RUN"] = str(args.max_llm_usd)
+                run(build_paid_score_cmd(
+                    enriched=enriched, scored=paths.scored_output, vertical=args.vertical,
+                    scores_dir=scores_dir, limit=args.limit, cards=cards, llm_usage=llm_usage,
+                    llm_batch_size=args.llm_batch_size, llm_max_tokens=args.llm_max_tokens,
+                ))
     else:
         status("SCORING", "skipped (mode does not score)")
+        clock.skipped("scoring")
 
     # ---- Packet tiers + packets ------------------------------------------ #
     if args.mode in PACKET_MODES:
-        source = paths.scored_csv
-        if source is None or not source.exists():
-            raise PipelineRefusal(
-                "No scored CSV found to build packets from. Tried (in order) "
-                f"{', '.join('scored_' + batch + s + '.csv' for s in SCORED_SUFFIX_PREFERENCE)}. "
-                "Run scoring first or pass --scored-csv."
-            )
-        existing_rows = read_csv_rows(source)
-        if not existing_rows and not args.allow_empty_scored:
-            raise PipelineRefusal(
-                f"Selected scored CSV has 0 rows: {source}. "
-                "Run scoring first or pass --allow-empty-scored to proceed anyway."
-            )
-        status("PACKETS", f"Refreshing packet tiers from {source} -> {paths.tiered_csv}")
-        run(build_refresh_cmd(source, paths.tiered_csv))
-        status("PACKETS", f"Building packets -> {packets}")
-        run(build_packets_cmd(paths.tiered_csv, packets))
+        with stage("packets"):
+            source = paths.scored_csv
+            if source is None or not source.exists():
+                raise PipelineRefusal(
+                    "No scored CSV found to build packets from. Tried (in order) "
+                    f"{', '.join('scored_' + batch + s + '.csv' for s in SCORED_SUFFIX_PREFERENCE)}. "
+                    "Run scoring first or pass --scored-csv."
+                )
+            existing_rows = read_csv_rows(source)
+            if not existing_rows and not args.allow_empty_scored:
+                raise PipelineRefusal(
+                    f"Selected scored CSV has 0 rows: {source}. "
+                    "Run scoring first or pass --allow-empty-scored to proceed anyway."
+                )
+            status("PACKETS", f"Refreshing packet tiers from {source} -> {paths.tiered_csv}")
+            run(build_refresh_cmd(source, paths.tiered_csv))
+            status("PACKETS", f"Building packets -> {packets}")
+            run(build_packets_cmd(paths.tiered_csv, packets))
     else:
         status("PACKETS", "skipped (mode does not build packets)")
+        clock.skipped("packets")
 
     # ---- Airtable -------------------------------------------------------- #
-    report_csv = paths.report_csv
-    airtable_status = "skipped"
     if args.airtable == "skip":
         status("AIRTABLE", "skipped (not requested)")
+        clock.skipped("airtable")
     elif not report_csv.exists():
         status("AIRTABLE", "skipped (no scored CSV)")
+        clock.skipped("airtable")
     else:
-        live = args.airtable == "live"
-        airtable_status = "live" if live else "dry-run"
-        status("AIRTABLE", f"Syncing ({airtable_status}, all scored rows)")
-        run(build_airtable_cmd(scored=report_csv, packets=packets, live=live))
+        with stage("airtable"):
+            live = args.airtable == "live"
+            intended = "live" if live else "dry-run"
+            status("AIRTABLE", f"Syncing ({intended}, all scored rows)")
+            # Claim the sync only once the child returns. stage()'s finally
+            # flushes a summary even when this raises, and `airtable_synced` is
+            # derived from the status — so setting it up front would report a
+            # full sync for a sync that failed. That is the same class of lie
+            # T4.8 exists to remove, reintroduced one stage later.
+            airtable_status = "failed"
+            run(build_airtable_cmd(scored=report_csv, packets=packets, live=live))
+            airtable_status = intended
 
     # ---- Summary --------------------------------------------------------- #
-    summary = build_summary(
-        batch=batch,
-        mode=args.mode,
-        enriched=enriched,
-        scored=report_csv,
-        packets=packets,
-        airtable_status=airtable_status,
-    )
-    summary_path.parent.mkdir(parents=True, exist_ok=True)
-    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print_summary(summary)
+    print_summary(flush_summary())
     return 0
 
 

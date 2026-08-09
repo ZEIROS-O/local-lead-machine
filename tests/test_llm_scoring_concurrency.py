@@ -123,7 +123,9 @@ def _two_call_provider(usage: dict | None = None):
     attempts: dict[int, int] = {}
     lock = threading.Lock()
 
-    def fake_score_batch(prompt: str, *, model: str = "", max_tokens: int = 0) -> dict:
+    def fake_score_batch(
+        prompt: str, *, model: str = "", max_tokens: int = 0, **_: object
+    ) -> dict:
         from lead_machine import llm_client
 
         batch_number = int(_BATCH_ID_RE.search(prompt).group(1))
@@ -162,7 +164,7 @@ class ConcurrentApiLlmScoringTest(unittest.TestCase):
         barrier = threading.Barrier(2, timeout=10)
         overlapped = threading.Event()
 
-        def fake_score_batch(prompt: str, *, model: str, max_tokens: int) -> dict:
+        def fake_score_batch(prompt: str, *, model: str, max_tokens: int, **_: object) -> dict:
             batch_number = int(_BATCH_ID_RE.search(prompt).group(1))
             barrier.wait()
             overlapped.set()
@@ -202,7 +204,7 @@ class ConcurrentApiLlmScoringTest(unittest.TestCase):
         max_in_flight = 0
         lock = threading.Lock()
 
-        def fake_score_batch(prompt: str, *, model: str, max_tokens: int) -> dict:
+        def fake_score_batch(prompt: str, *, model: str, max_tokens: int, **_: object) -> dict:
             nonlocal in_flight, max_in_flight
             with lock:
                 in_flight += 1
@@ -260,7 +262,7 @@ class DotenvThreadSafetyTest(unittest.TestCase):
                 load_calls += 1
             return True
 
-        def fake_provider(prompt, *, model, max_tokens):
+        def fake_provider(prompt, *, model, max_tokens, **_):
             return {"bundle": {"batch_id": "batch_001", "scores": []}, "usage": {}}
 
         with patch.object(llm_client, "load_dotenv", side_effect=counting_load_dotenv):
@@ -319,7 +321,7 @@ class SerialConcurrentEquivalenceTest(unittest.TestCase):
         ]
 
     @staticmethod
-    def _fake_score_batch(prompt: str, *, model: str, max_tokens: int) -> dict:
+    def _fake_score_batch(prompt: str, *, model: str, max_tokens: int, **_: object) -> dict:
         batch_number = int(_BATCH_ID_RE.search(prompt).group(1))
         return {
             "bundle": {
@@ -488,7 +490,7 @@ class ConcurrentCapEnforcementTest(unittest.TestCase):
 
         served_usage = {"input_tokens": 20_000, "output_tokens": 20_000, "total_tokens": 40_000}
 
-        def fake_score_batch(prompt: str, *, model: str, max_tokens: int) -> dict:
+        def fake_score_batch(prompt: str, *, model: str, max_tokens: int, **_: object) -> dict:
             batch_number = int(_BATCH_ID_RE.search(prompt).group(1))
             return _valid_batch_result(batch_number, usage=served_usage, model="kimi-k3")
 
@@ -526,7 +528,7 @@ class ConcurrentCapEnforcementTest(unittest.TestCase):
 
         served_usage = {"input_tokens": 20_000, "output_tokens": 20_000, "total_tokens": 40_000}
 
-        def fake_score_batch(prompt: str, *, model: str, max_tokens: int) -> dict:
+        def fake_score_batch(prompt: str, *, model: str, max_tokens: int, **_: object) -> dict:
             batch_number = int(_BATCH_ID_RE.search(prompt).group(1))
             return _valid_batch_result(batch_number, usage=served_usage)
 
@@ -582,7 +584,7 @@ class ConcurrentCapEnforcementTest(unittest.TestCase):
         tiny_usage = {"input_tokens": 10, "output_tokens": 10, "total_tokens": 20}
         records = self._records(5)
 
-        def fake_score_batch(prompt: str, *, model: str, max_tokens: int) -> dict:
+        def fake_score_batch(prompt: str, *, model: str, max_tokens: int, **_: object) -> dict:
             batch_number = int(_BATCH_ID_RE.search(prompt).group(1))
             return _valid_batch_result(batch_number, usage=tiny_usage)
 
@@ -658,7 +660,7 @@ class BatchFailureIsolationTest(unittest.TestCase):
         ]
 
     @staticmethod
-    def _fake_score_batch_failing_batch_two(prompt: str, *, model: str, max_tokens: int) -> dict:
+    def _fake_score_batch_failing_batch_two(prompt: str, *, model: str, max_tokens: int, **_: object) -> dict:
         """Batch 2 of 3 comes back malformed; batches 1 and 3 are fine."""
         from lead_machine import llm_client
 
