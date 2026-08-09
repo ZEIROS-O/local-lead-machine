@@ -3000,14 +3000,27 @@ class LeadMachineContractsTest(unittest.TestCase):
 
         self.assertEqual(chain, ["kimi", "claude"])
 
-    def test_llm_client_chain_defaults_to_kimi_codex_claude(self) -> None:
+    def test_llm_client_chain_defaults_to_codex_then_claude(self) -> None:
+        # Was kimi,codex,claude. Reordered to subscription-only, codex first:
+        # kimi-first sent prospect PII to Moonshot on any unmodified run, and a
+        # paid member after a $0 runner is the unbounded-spend hazard.
         from lead_machine import llm_client
 
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("LLM_SCORING_PROVIDER_CHAIN", None)
             chain = llm_client._provider_chain()
 
-        self.assertEqual(chain, ["kimi", "codex", "claude"])
+        self.assertEqual(chain, ["codex", "claude"])
+
+    def test_kimi_and_anthropic_remain_selectable_by_env(self) -> None:
+        # Dropping them from the default removes them from the unattended path,
+        # not from the tool. An explicit chain must still resolve them.
+        from lead_machine import llm_client
+
+        with patch.dict(
+            os.environ, {"LLM_SCORING_PROVIDER_CHAIN": "kimi,anthropic"}, clear=False
+        ):
+            self.assertEqual(llm_client._provider_chain(), ["kimi", "anthropic"])
 
     def test_llm_client_falls_back_to_next_provider_on_unavailable(self) -> None:
         from lead_machine import llm_client
@@ -4504,6 +4517,31 @@ class LeadMachineContractsTest(unittest.TestCase):
             {"input_tokens": 1700, "output_tokens": 300, "total_tokens": 2000},
         )
         self.assertEqual(caught.exception.call_count, 2)
+
+    def test_default_provider_chain_is_subscription_only(self) -> None:
+        """The unattended default must not be able to spend money or leak PII.
+
+        Two properties, one tuple. Every default member must be a $0
+        subscription runner, so (a) an unattended run cannot bill anything
+        regardless of cap configuration, and (b) prospect PII — street address,
+        phone, raw page-text windows — cannot reach a third-party API by
+        default. A paid member anywhere in the chain loses both the moment the
+        subscription quota exhausts and the run falls through to it.
+        """
+        from lead_machine import llm_client
+        from score_leads import llm_pricing
+
+        self.assertEqual(llm_client.DEFAULT_PROVIDER_CHAIN[0], "codex")
+        for provider in llm_client.DEFAULT_PROVIDER_CHAIN:
+            model = llm_client.model_for_provider(provider)
+            self.assertTrue(
+                model.startswith("subscription:"),
+                f"default chain member {provider!r} resolves to {model!r}, not a subscription runner",
+            )
+            self.assertEqual(
+                llm_pricing(model), (0.0, 0.0),
+                f"default chain member {provider!r} is priced and can bill an unattended run",
+            )
 
     def test_llm_client_has_exactly_one_outbound_http_seam(self) -> None:
         """Every provider must POST through `_post`, never `requests.post`.
