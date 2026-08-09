@@ -175,8 +175,8 @@ class TestQueryRespectsSuppression(unittest.TestCase):
     The pipeline's three fail-closed gates (search, enrichment, scoring) stop a
     re-discovered opted-out lead before it reaches the base. What they cannot
     stop is a *duplicate* record already in the base under a different record id
-    when the opt-out is logged — deduping is why `dedupe_places.py` exists, so
-    duplicates are a fact. mark_sent refuses such a record, but only after the
+    when the opt-out is logged — deduping is why `lead_machine/corpus_index.py`
+    exists, so duplicates are a fact. mark_sent refuses such a record, but only after the
     rep has already been handed it and dialled it by hand.
     """
 

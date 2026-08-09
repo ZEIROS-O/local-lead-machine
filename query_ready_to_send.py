@@ -11,8 +11,8 @@ Suppression is applied here as well as at send time. The pipeline's three
 fail-closed gates (search, enrichment, scoring) stop a *re-discovered*
 opted-out lead before it ever reaches the base, but they cannot touch a record
 already in Airtable when the opt-out is logged — a duplicate of the same
-business under a different record id is exactly what `dedupe_places.py` exists
-because of. mark_sent refuses such a record, but only after the rep has been
+business under a different record id is exactly what `lead_machine/corpus_index.py`
+exists because of. mark_sent refuses such a record, but only after the rep has been
 handed it and dialled it by hand, which is the call the ledger was supposed to
 prevent.
 """

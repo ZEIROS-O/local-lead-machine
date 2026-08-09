@@ -5,10 +5,12 @@ import io
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 import make_search_batch
+from lead_machine import corpus_index
 from lead_machine.airtable_sync import build_airtable_payload
 
 
@@ -853,6 +855,324 @@ class SearchWorkflowTest(unittest.TestCase):
         self.assertEqual(fields["Reviews"], 130)
         self.assertEqual(fields["Rating"], 4.9)
         self.assertEqual(fields["Score Total"], 86)
+
+
+class CorpusDedupeTest(unittest.TestCase):
+    """Cross-batch dedupe (D0).
+
+    Every dedupe mechanism that ran before this was scoped to one batch, so the
+    17-config backlog came out 61% duplicate: 1,621 enriched rows for 626 unique
+    businesses, one place_id seen in 14 separate batches. Each of those repeats
+    was a billed Place Details call plus a full crawl plus an LLM scoring call,
+    and the only thing that ever collapsed them was the Airtable upsert -- after
+    all the money was spent.
+
+    These tests pin the money, not the row count: the assertion that matters is
+    that ``DetailsBudget.reserve()`` is never reached for a business the registry
+    already knows.
+    """
+
+    DETAILS = {
+        "id": "place-known",
+        "displayName": {"text": "Patio Pros"},
+        "formattedAddress": "123 Main St, Cleveland, OH 44101, USA",
+        "nationalPhoneNumber": "(216) 555-0100",
+        "websiteUri": "https://patiopros.example",
+        "googleMapsUri": "https://maps.google.com/?cid=1",
+        "rating": 4.8,
+        "userRatingCount": 28,
+        "primaryType": "landscaper",
+    }
+
+    def _details_for(self, place_id: str) -> dict:
+        suffix = sum(ord(char) for char in place_id) % 10000
+        return {
+            **self.DETAILS,
+            "id": place_id,
+            "displayName": {"text": f"Patio Pros {suffix}"},
+            "formattedAddress": f"{suffix} Main St, Cleveland, OH 44101, USA",
+            "nationalPhoneNumber": f"(216) 555-{suffix:04d}",
+            "websiteUri": f"https://patiopros{suffix}.example",
+            "googleMapsUri": f"https://maps.google.com/?cid={suffix}",
+        }
+
+    @staticmethod
+    def _fake_enrich(row, screenshots_dir, take_shots, rendered_site_check=False,
+                     suppression_index=None, review_snapshot_store=None, per_lead_timeout=None):
+        return {"google": row, "website": {"site_status": "No Website"}, "derived": {}, "screenshots": {}}
+
+    def _write_config(self, root: Path) -> Path:
+        config_path = root / "search_configs/test_hardscaping_001.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            json.dumps(_config(queries=["hardscaping Cleveland OH"], geo_slices=["Cleveland OH"]).to_dict()),
+            encoding="utf-8",
+        )
+        return config_path
+
+    def _run(self, root: Path, place_ids: list[str], **kwargs):
+        """Run the batch against fakes, capturing the real DetailsBudget."""
+        config_path = self._write_config(root)
+        budgets: list = []
+
+        class RecordingBudget(make_search_batch.DetailsBudget):
+            def __init__(self, cap):
+                super().__init__(cap)
+                budgets.append(self)
+
+        with patch("make_search_batch.text_search_paged",
+                   return_value=([{"id": pid} for pid in place_ids], 1)), patch(
+            "make_search_batch.place_details", side_effect=lambda api_key, place_id: self._details_for(place_id)
+        ) as details_call, patch(
+            "make_search_batch.DetailsBudget", RecordingBudget
+        ), patch("make_search_batch.enrich_row", side_effect=self._fake_enrich), redirect_stdout(io.StringIO()):
+            result = make_search_batch.run_search_batch(
+                config_path=config_path,
+                batch="test_hardscaping_001",
+                root=root,
+                api_key="test-key",
+                no_screenshots=True,
+                sleep_seconds=0,
+                **kwargs,
+            )
+        return result, details_call, budgets[0]
+
+    # ---- registry unit behaviour ---------------------------------------- #
+    def test_registry_round_trips_first_seen_batch_and_last_seen(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "run_state" / "place_registry.jsonl"
+            registry = corpus_index.PlaceRegistry(path)
+            registry.record(
+                [{"place_id": "place-1", "phone": "(216) 555-0100", "website_url": "https://a.example",
+                  "business_name": "A", "city": "Cleveland"}],
+                batch="batch_one",
+                now=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            )
+            registry.record(
+                [{"place_id": "place-1", "phone": "(216) 555-0100", "website_url": "https://a.example",
+                  "business_name": "A", "city": "Cleveland"}],
+                batch="batch_two",
+                now=datetime(2026, 3, 1, tzinfo=timezone.utc),
+            )
+
+            reloaded = corpus_index.PlaceRegistry(path)
+            entries = reloaded.entries()
+
+        self.assertEqual(list(entries), ["place-1"])
+        entry = entries["place-1"]
+        self.assertEqual(entry.first_seen_batch, "batch_one")
+        self.assertEqual(entry.last_seen_batch, "batch_two")
+        self.assertTrue(entry.first_seen.startswith("2026-01-01"))
+        self.assertTrue(entry.last_seen.startswith("2026-03-01"))
+
+    def test_known_keys_carries_all_four_dedupe_classes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = corpus_index.PlaceRegistry(Path(tmp) / "place_registry.jsonl")
+            registry.record(
+                [{"place_id": "place-1", "phone": "(216) 555-0100", "website_url": "https://a.example/x",
+                  "business_name": "Patio Pros", "city": "Cleveland"}],
+                batch="batch_one",
+            )
+
+            self.assertEqual(registry.known_place_ids(), {"place-1"})
+            self.assertEqual(
+                registry.known_keys(),
+                {"place:place-1", "phone:2165550100", "domain:a.example", "name_city:patio-pros:cleveland"},
+            )
+
+    def test_dedupe_search_rows_excludes_prior_keys_on_non_place_id_classes(self) -> None:
+        rows = [
+            _row(business_name="Known by phone", place_id="new-1", phone="(216) 555-0100"),
+            _row(business_name="Fresh", place_id="new-2", phone="(216) 555-0999",
+                 website_url="https://fresh.example"),
+        ]
+
+        kept, reasons = make_search_batch.dedupe_search_rows(rows, prior_keys={"phone:2165550100"})
+
+        self.assertEqual([row["business_name"] for row in kept], ["Fresh"])
+        self.assertEqual(reasons["duplicate_phone_prior_batch"], 1)
+
+    # ---- the money assertion -------------------------------------------- #
+    def test_registry_place_id_is_skipped_before_details_budget_is_reserved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            registry = corpus_index.PlaceRegistry(corpus_index.registry_path_for(root))
+            registry.record([{"place_id": "place-known"}], batch="prior_batch_001")
+
+            result, details_call, budget = self._run(root, ["place-known", "place-new"])
+
+            # The point of the skip is the saved Place Details spend, so assert
+            # the budget counter itself -- an absent row could also mean the
+            # call happened and the row was dropped later.
+            self.assertEqual(budget.count, 1)
+            self.assertEqual(details_call.call_count, 1)
+            self.assertEqual([call.args[1] for call in details_call.call_args_list], ["place-new"])
+            self.assertEqual(result.duplicate_reason_counts["duplicate_place_id_prior_batch"], 1)
+            self.assertNotIn("duplicate_place_id_early", result.duplicate_reason_counts)
+            self.assertEqual(result.raw_count, 1)
+
+            report = result.report_path.read_text(encoding="utf-8")
+            self.assertIn("duplicate_place_id_prior_batch", report)
+            self.assertIn("Cross-Batch Corpus Dedupe", report)
+
+    def test_surviving_rows_are_appended_to_the_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._run(root, ["place-new"])
+
+            registry = corpus_index.PlaceRegistry(corpus_index.registry_path_for(root))
+            entries = registry.entries()
+
+        self.assertIn("place-new", entries)
+        self.assertEqual(entries["place-new"].first_seen_batch, "test_hardscaping_001")
+
+    def test_rerunning_the_same_batch_is_not_blocked_by_its_own_history(self) -> None:
+        """A batch must never dedupe itself out of existence.
+
+        `run_agent_pipeline --overwrite` and every crash-resume rerun the same
+        batch name. If its own registry rows counted as "prior batch" the second
+        run would skip every place, enrich nothing, and read on the report as an
+        exhausted market rather than as the dedupe working.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._run(root, ["place-a", "place-b"])
+
+            result, details_call, budget = self._run(root, ["place-a", "place-b"])
+
+            self.assertEqual(budget.count, 2)
+            self.assertEqual(details_call.call_count, 2)
+            self.assertNotIn("duplicate_place_id_prior_batch", result.duplicate_reason_counts)
+            self.assertEqual(result.enriched_count, 2)
+
+    def test_refresh_older_than_readmits_entries_past_the_cutoff(self) -> None:
+        stale = datetime.now(timezone.utc) - timedelta(days=40)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            registry = corpus_index.PlaceRegistry(corpus_index.registry_path_for(root))
+            registry.record([{"place_id": "place-known"}], batch="prior_batch_001", now=stale)
+
+            _, details_call, budget = self._run(root, ["place-known"], refresh_older_than_days=30)
+
+            self.assertEqual(budget.count, 1)
+            self.assertEqual(details_call.call_count, 1)
+
+    def test_refresh_older_than_still_skips_entries_inside_the_cutoff(self) -> None:
+        recent = datetime.now(timezone.utc) - timedelta(days=3)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            registry = corpus_index.PlaceRegistry(corpus_index.registry_path_for(root))
+            registry.record([{"place_id": "place-known"}], batch="prior_batch_001", now=recent)
+
+            result, details_call, budget = self._run(root, ["place-known"], refresh_older_than_days=30)
+
+            self.assertEqual(budget.count, 0)
+            self.assertEqual(details_call.call_count, 0)
+            self.assertEqual(result.duplicate_reason_counts["duplicate_place_id_prior_batch"], 1)
+
+    def test_ignore_corpus_bypasses_the_registry_entirely(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            registry = corpus_index.PlaceRegistry(corpus_index.registry_path_for(root))
+            registry.record([{"place_id": "place-known"}], batch="prior_batch_001")
+
+            result, details_call, budget = self._run(root, ["place-known"], ignore_corpus=True)
+
+            self.assertEqual(budget.count, 1)
+            self.assertEqual(details_call.call_count, 1)
+            self.assertNotIn("duplicate_place_id_prior_batch", result.duplicate_reason_counts)
+
+    # ---- self-healing ---------------------------------------------------- #
+    def test_rebuild_from_corpus_reconstructs_the_registry_from_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            deduped = root / "data" / "deduped"
+            deduped.mkdir(parents=True)
+            make_search_batch.write_csv_rows(
+                deduped / "batch_csv_001.csv",
+                [
+                    {"place_id": "from-csv", "business_name": "CSV Co", "city": "Cleveland",
+                     "phone": "(216) 555-0100", "website_url": "https://csv.example",
+                     "source_batch": "batch_csv_001"},
+                ],
+            )
+            enriched = root / "output"
+            enriched.mkdir(parents=True)
+            (enriched / "enriched_batch_jsonl_001.jsonl").write_text(
+                json.dumps(
+                    {
+                        "google": {
+                            "place_id": "from-jsonl",
+                            "business_name": "JSONL Co",
+                            "city": "Lakewood",
+                            "phone": "(216) 555-0200",
+                            "website_url": "https://jsonl.example",
+                            "source_batch": "batch_jsonl_001",
+                        }
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            registry = corpus_index.rebuild_from_corpus(root=root)
+            entries = registry.entries()
+
+            self.assertEqual(set(entries), {"from-csv", "from-jsonl"})
+            self.assertEqual(entries["from-csv"].first_seen_batch, "batch_csv_001")
+            self.assertEqual(entries["from-jsonl"].first_seen_batch, "batch_jsonl_001")
+            self.assertIn("phone:2165550100", registry.known_keys())
+
+            # Self-healing means the rebuilt file is what a later run reads.
+            reloaded = corpus_index.PlaceRegistry(corpus_index.registry_path_for(root))
+            self.assertEqual(reloaded.known_place_ids(), {"from-csv", "from-jsonl"})
+
+    def test_rebuild_is_idempotent_and_does_not_grow_the_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "data" / "deduped").mkdir(parents=True)
+            make_search_batch.write_csv_rows(
+                root / "data" / "deduped" / "batch_csv_001.csv",
+                [{"place_id": "from-csv", "business_name": "CSV Co", "city": "Cleveland",
+                  "source_batch": "batch_csv_001"}],
+            )
+
+            corpus_index.rebuild_from_corpus(root=root)
+            first = corpus_index.registry_path_for(root).read_text(encoding="utf-8")
+            corpus_index.rebuild_from_corpus(root=root)
+            second = corpus_index.registry_path_for(root).read_text(encoding="utf-8")
+
+        self.assertEqual(len(first.splitlines()), 1)
+        self.assertEqual(len(second.splitlines()), 1)
+
+    # ---- CLI threading ---------------------------------------------------- #
+    def test_search_batch_cli_exposes_corpus_flags(self) -> None:
+        parser_help = make_search_batch.main.__doc__  # touch, keeps import honest
+        del parser_help
+        source = Path("make_search_batch.py").read_text(encoding="utf-8")
+        self.assertIn("--refresh-older-than", source)
+        self.assertIn("--ignore-corpus", source)
+
+    def test_agent_pipeline_threads_corpus_flags_into_the_search_stage(self) -> None:
+        import run_agent_pipeline as rap
+
+        plain = rap.build_search_cmd(Path("search_configs/x.json"), "batch_001")
+        self.assertNotIn("--refresh-older-than", plain)
+        self.assertNotIn("--ignore-corpus", plain)
+
+        threaded = rap.build_search_cmd(
+            Path("search_configs/x.json"), "batch_001", refresh_older_than=30, ignore_corpus=True
+        )
+        self.assertIn("--refresh-older-than", threaded)
+        self.assertIn("30", threaded)
+        self.assertIn("--ignore-corpus", threaded)
+
+        args = rap.parse_args(
+            ["--vertical", "detailing", "--market", "cleveland", "--size", "medium",
+             "--mode", "search-only", "--refresh-older-than", "45", "--ignore-corpus"]
+        )
+        self.assertEqual(args.refresh_older_than, 45)
+        self.assertTrue(args.ignore_corpus)
 
 
 if __name__ == "__main__":

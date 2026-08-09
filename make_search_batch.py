@@ -35,6 +35,7 @@ from enrich_leads import (
 )
 from places_search import getenv_int, normalize_place, place_details, text_search_paged
 from lead_machine.compliance import ComplianceError, load_configured_suppression_index
+from lead_machine.corpus_index import PlaceRegistry, primary_key, registry_path_for
 from lead_machine.review_velocity import ReviewSnapshotStore
 from lead_machine.schema import GENERIC_DOMAINS, normalize_domain, normalize_phone, slug
 from lead_machine.verticals import resolve_profile
@@ -267,6 +268,25 @@ class SearchEfficiency:
 
 
 @dataclass(frozen=True)
+class CorpusDedupe:
+    """What the cross-batch registry did to this run.
+
+    Reported because the saving is otherwise invisible: a batch that skips 300
+    already-known businesses looks identical on the counts to a batch whose
+    queries found nothing, and the first is the system working while the second
+    is a config to fix. An operator has to be able to tell them apart.
+    """
+
+    enabled: bool = True
+    registry_path: str = ""
+    known_count: int = 0
+    refresh_older_than_days: Optional[int] = None
+    skipped_before_details: int = 0
+    skipped_after_collection: int = 0
+    registered: int = 0
+
+
+@dataclass(frozen=True)
 class PrefilterResult:
     should_skip: bool
     reason: str = ""
@@ -295,6 +315,7 @@ class SearchRunResult:
     warnings: List[str]
     errors: List[str]
     efficiency: SearchEfficiency = SearchEfficiency()
+    corpus_dedupe: CorpusDedupe = CorpusDedupe()
 
 
 def _string_list(value: Any) -> List[str]:
@@ -404,24 +425,16 @@ def expand_searches(config: SearchConfig) -> List[ExpandedSearch]:
 
 
 def make_place_key(row: Mapping[str, Any]) -> str:
-    place_id = _pick(row, "place_id", "Place ID")
-    if place_id:
-        return place_id
+    """The row's identity key: place_id → phone → domain → name_city.
 
-    phone = normalize_phone(_pick(row, "phone", "Phone"))
-    if phone:
-        return f"phone:{phone}"
-
-    domain = normalize_domain(_pick(row, "website_url", "Website URL", "website"))
-    if domain and domain not in GENERIC_DOMAINS:
-        return f"domain:{domain}"
-
-    name = slug(_pick(row, "business_name", "Business Name", "name"))
-    city = slug(_pick(row, "city", "City"))
-    if name and city:
-        return f"name_city:{name}:{city}"
-
-    return name or "unknown"
+    The implementation moved to `lead_machine.corpus_index.primary_key` when the
+    cross-batch registry landed, and this stayed as the name every caller here
+    already used. One implementation on purpose: a registry that derived keys
+    slightly differently from the in-batch dedupe would be a second opinion
+    about what "the same business" is, and the stricter of the two would quietly
+    stop excluding anything.
+    """
+    return primary_key(row)
 
 
 def normalize_search_row(
@@ -492,7 +505,22 @@ def normalize_search_row(
     return base
 
 
-def dedupe_search_rows(rows: Iterable[Mapping[str, Any]]) -> Tuple[List[Dict[str, str]], Dict[str, int]]:
+def dedupe_search_rows(
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    prior_keys: Optional[AbstractSet[str]] = None,
+) -> Tuple[List[Dict[str, str]], Dict[str, int]]:
+    """Collapse a batch to one row per business, optionally against the corpus.
+
+    `prior_keys` are the namespaced keys of businesses earlier batches already
+    paid for (see `lead_machine.corpus_index`). They are checked *before* the
+    in-batch classes so the reason counts stay honest about which duplicates
+    were cross-batch. The early skip in `collect_raw_rows` already catches the
+    place_id case before any billing; this pass exists for identity drift —
+    Google re-issuing a place_id for a business we already know by phone,
+    domain or name+city.
+    """
+    prior_keys = set(prior_keys or ())
     kept: List[Dict[str, str]] = []
     duplicate_reasons: Counter[str] = Counter()
     seen_place_ids: set[str] = set()
@@ -513,15 +541,23 @@ def dedupe_search_rows(rows: Iterable[Mapping[str, Any]]) -> Tuple[List[Dict[str
         if name and city:
             name_city = f"{name}:{city}"
 
+        classes = (
+            ("place_id", place_id, f"place:{place_id}", seen_place_ids),
+            ("phone", phone, f"phone:{phone}", seen_phones),
+            ("domain", domain, f"domain:{domain}", seen_domains),
+            ("name_city", name_city, f"name_city:{name_city}", seen_name_cities),
+        )
+
         reason = ""
-        if place_id and place_id in seen_place_ids:
-            reason = "duplicate_place_id"
-        elif phone and phone in seen_phones:
-            reason = "duplicate_phone"
-        elif domain and domain in seen_domains:
-            reason = "duplicate_domain"
-        elif name_city and name_city in seen_name_cities:
-            reason = "duplicate_name_city"
+        for name_of_class, value, namespaced, _seen in classes:
+            if value and namespaced in prior_keys:
+                reason = f"duplicate_{name_of_class}_prior_batch"
+                break
+        if not reason:
+            for name_of_class, value, _namespaced, seen in classes:
+                if value and value in seen:
+                    reason = f"duplicate_{name_of_class}"
+                    break
 
         if reason:
             duplicate_reasons[reason] += 1
@@ -713,11 +749,19 @@ def collect_raw_rows(
     errors: List[str],
     max_searches: Optional[int] = None,
     max_details: Optional[int] = None,
+    prior_place_ids: Optional[AbstractSet[str]] = None,
 ) -> Tuple[List[Dict[str, str]], List[str], Dict[str, int], SearchEfficiency]:
     raw_rows: List[Dict[str, str]] = []
     queries_run: List[str] = []
     duplicate_reason_counts: Counter[str] = Counter()
     seen_place_ids: set[str] = set()
+    # Deliberately a second set rather than seeding `seen_place_ids`: that set
+    # feeds `efficiency.unique_raw_count`, which means "distinct places this run
+    # actually pulled", and seeding it would inflate the number by the size of
+    # the whole corpus. Keeping them apart is also what lets the cross-batch
+    # skip carry its own reason key.
+    prior_place_ids = set(prior_place_ids or ())
+    skipped_prior_place_ids: set[str] = set()
     max_details = resolve_max_details(max_details)
     details_budget = DetailsBudget(max_details)
     details_cap_reported = False
@@ -778,8 +822,20 @@ def collect_raw_rows(
                     if not place_id:
                         warnings.append(f"Search result missing place id for {search.search_text!r}")
                         continue
-                    if place_id in seen_place_ids:
+                    if place_id in seen_place_ids or place_id in skipped_prior_place_ids:
                         duplicate_reason_counts["duplicate_place_id_early"] += 1
+                        continue
+                    # The cross-batch skip, and the whole point of the registry:
+                    # it lands *before* details_budget.reserve() below, so a
+                    # business an earlier batch already paid for is never billed
+                    # for Place Details again and never re-crawled. Counted once
+                    # per distinct place_id, so the number is exactly the number
+                    # of billed calls saved; later repeats of the same id inside
+                    # this batch fall through to duplicate_place_id_early above,
+                    # which keeps that key meaning what it always meant.
+                    if place_id in prior_place_ids:
+                        duplicate_reason_counts["duplicate_place_id_prior_batch"] += 1
+                        skipped_prior_place_ids.add(place_id)
                         continue
                     seen_place_ids.add(place_id)
                     # Reserve the billed slot before the call is queued, never
@@ -866,6 +922,9 @@ def run_search_batch(
     max_enrich: Optional[int] = None,
     suppression_index: Optional[AbstractSet[str]] = None,
     review_snapshot_db: Optional[Path | str] = None,
+    refresh_older_than_days: Optional[int] = None,
+    ignore_corpus: bool = False,
+    place_registry_path: Optional[Path | str] = None,
 ) -> SearchRunResult:
     config = load_search_config(config_path)
     if batch and batch != config.batch:
@@ -873,6 +932,7 @@ def run_search_batch(
     _validate_optional_cap("--max-searches", max_searches)
     _validate_optional_cap("--max-details", max_details)
     _validate_optional_cap("--max-enrich", max_enrich)
+    _validate_optional_cap("--refresh-older-than", refresh_older_than_days)
 
     api_key = (api_key or os.getenv("GOOGLE_PLACES_API_KEY", "")).strip()
     if not api_key:
@@ -887,6 +947,37 @@ def run_search_batch(
 
     warnings: List[str] = []
     errors: List[str] = []
+
+    # The corpus ledger is read before the first billed call, because that is
+    # the only moment at which knowing a business is already ours can still save
+    # anything. `--ignore-corpus` skips the read entirely for a deliberate
+    # re-scrape.
+    registry = PlaceRegistry(place_registry_path or registry_path_for(root))
+    prior_place_ids: set[str] = set()
+    prior_keys: set[str] = set()
+    if not ignore_corpus:
+        # exclude_batch: this batch's own history never blocks it, so a rerun
+        # under --overwrite or after a crash still searches instead of silently
+        # returning nothing.
+        prior_place_ids = registry.known_place_ids(refresh_older_than_days, exclude_batch=config.batch)
+        prior_keys = registry.known_keys(refresh_older_than_days, exclude_batch=config.batch)
+        _progress(
+            f"Corpus registry: {len(registry)} known businesses "
+            f"({len(prior_place_ids)} with a place_id) from {registry.path}"
+        )
+        if registry.malformed_lines:
+            warnings.append(
+                f"Place registry has {registry.malformed_lines} unreadable line(s); "
+                "rerun `python -m lead_machine.corpus_index --rebuild` to heal it."
+            )
+        if refresh_older_than_days is not None:
+            _progress(
+                f"Corpus refresh window: re-admitting businesses last seen more than "
+                f"{refresh_older_than_days} day(s) ago"
+            )
+    else:
+        _progress("Corpus registry: ignored (--ignore-corpus)")
+
     raw_rows, queries_run, early_duplicate_reason_counts, efficiency = collect_raw_rows(
         config,
         api_key=api_key,
@@ -895,11 +986,15 @@ def run_search_batch(
         errors=errors,
         max_searches=max_searches,
         max_details=max_details,
+        prior_place_ids=prior_place_ids,
     )
     _progress(f"Raw count: {len(raw_rows)}")
     write_csv_rows(raw_path, raw_rows)
 
-    deduped_rows, duplicate_reason_counts = dedupe_search_rows(raw_rows)
+    deduped_rows, duplicate_reason_counts = dedupe_search_rows(raw_rows, prior_keys=prior_keys)
+    prior_batch_after_collection = sum(
+        count for reason, count in duplicate_reason_counts.items() if reason.endswith("_prior_batch")
+    )
     duplicate_reason_counts = {
         **duplicate_reason_counts,
         **{
@@ -910,6 +1005,25 @@ def run_search_batch(
     _progress(f"Deduped count: {len(deduped_rows)}")
     _progress(f"Duplicate reason counts: {_inline_counts(duplicate_reason_counts)}")
     write_csv_rows(deduped_path, deduped_rows)
+
+    # Register here, beside the deduped write, not at the end of the run: these
+    # are exactly the businesses a Place Details call was billed for, and an
+    # interrupt during the long enrichment pass must not lose that fact and let
+    # the next batch pay for them again. The rows are on disk either way, so a
+    # half-enriched batch is re-enrichable from data/deduped/<batch>.csv without
+    # touching the Places API.
+    registered = registry.record(deduped_rows, batch=config.batch)
+    _progress(f"Registered {registered} business(es) in {registry.path}")
+
+    corpus_dedupe = CorpusDedupe(
+        enabled=not ignore_corpus,
+        registry_path=_relative(registry.path),
+        known_count=len(prior_place_ids),
+        refresh_older_than_days=refresh_older_than_days,
+        skipped_before_details=early_duplicate_reason_counts.get("duplicate_place_id_prior_batch", 0),
+        skipped_after_collection=prior_batch_after_collection,
+        registered=registered,
+    )
 
     passed_rows: List[Dict[str, str]] = []
     skip_reason_counts: Counter[str] = Counter()
@@ -1021,6 +1135,7 @@ def run_search_batch(
         warnings=warnings,
         errors=errors,
         efficiency=efficiency,
+        corpus_dedupe=corpus_dedupe,
     )
     write_search_report(result)
     _progress(f"Report: {result.report_path}")
@@ -1074,6 +1189,32 @@ def write_search_report(result: SearchRunResult) -> None:
     lines.extend(_count_lines(result.skip_reason_counts))
     lines.extend(["", "Duplicate reasons count:"])
     lines.extend(_count_lines(result.duplicate_reason_counts))
+
+    corpus = result.corpus_dedupe
+    if corpus.refresh_older_than_days is None:
+        refresh_line = "skip every business the corpus already knows"
+    else:
+        refresh_line = (
+            f"re-admit businesses last seen more than {corpus.refresh_older_than_days} day(s) ago "
+            "(--refresh-older-than)"
+        )
+    lines.extend(
+        [
+            "",
+            "## Cross-Batch Corpus Dedupe",
+            "",
+            f"- Corpus dedupe: {'enabled' if corpus.enabled else 'disabled (--ignore-corpus)'}",
+            f"- Registry: {corpus.registry_path}",
+            f"- Known place_ids excluded at run start: {corpus.known_count}",
+            f"- Refresh window: {refresh_line}",
+            f"- Place Details calls skipped (duplicate_place_id_prior_batch): {corpus.skipped_before_details}",
+            f"- Rows dropped post-collection (*_prior_batch): {corpus.skipped_after_collection}",
+            f"- Businesses registered by this run: {corpus.registered}",
+            "",
+            "A high skip count is the machine working, not a thin batch: those are",
+            "businesses earlier batches already paid Place Details for and crawled.",
+        ]
+    )
 
     eff = result.efficiency
     leads_per_search = result.enriched_count / eff.searches_run if eff.searches_run else 0.0
@@ -1156,6 +1297,21 @@ def main() -> int:
     )
     parser.add_argument("--max-enrich", type=int, default=None, help="Optional cap on enrichment rows")
     parser.add_argument(
+        "--refresh-older-than",
+        type=int,
+        default=None,
+        metavar="DAYS",
+        help="Re-admit businesses the corpus registry last saw more than DAYS ago. Unset (the "
+             "default) skips every known business, which is what stops the same place_id being "
+             "billed for Place Details once per overlapping metro config.",
+    )
+    parser.add_argument(
+        "--ignore-corpus",
+        action="store_true",
+        help="Ignore run_state/place_registry.jsonl entirely for a deliberate re-scrape. Every "
+             "known business is re-searched, re-billed and re-crawled.",
+    )
+    parser.add_argument(
         "--review-snapshot-db",
         default=os.getenv("REVIEW_SNAPSHOT_DB", DEFAULT_REVIEW_SNAPSHOT_DB),
         help="SQLite path containing longitudinal Google review-count observations",
@@ -1179,6 +1335,8 @@ def main() -> int:
             max_enrich=args.max_enrich,
             suppression_index=suppression_index,
             review_snapshot_db=args.review_snapshot_db,
+            refresh_older_than_days=args.refresh_older_than,
+            ignore_corpus=args.ignore_corpus,
         )
     except (FileNotFoundError, RuntimeError, ValueError, ComplianceError) as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
@@ -1191,6 +1349,10 @@ def main() -> int:
         return 1
 
     print(f"[DONE] Raw results: {result.raw_count} -> {result.raw_path}")
+    print(
+        f"[DONE] Corpus dedupe: skipped {result.corpus_dedupe.skipped_before_details} known "
+        f"business(es) before Place Details; registered {result.corpus_dedupe.registered}"
+    )
     print(f"[DONE] Deduped: {result.deduped_count} -> {result.deduped_path}")
     print(f"[DONE] ICP pass: {result.icp_pass_count}")
     print(f"[DONE] Enriched: {result.enriched_count} -> {result.enriched_path}")
