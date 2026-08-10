@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List
 
+from lead_machine.verticals import matches_term
+
 
 TRACKING_TERMS = {
     "Google Analytics": ["google-analytics", "gtag(", "gtm.js", "googletagmanager"],
@@ -267,10 +269,20 @@ def _evidence_item(
 
 
 def _detect_from_text(text: str, mapping: Dict[str, List[str]]) -> List[str]:
+    """Detect labelled terms in *text*, requiring a left word boundary.
+
+    Bare `term in text` matched a term that is merely the TAIL of a longer
+    word: `urable` is a suffix of `durable`, so "durable, high-performance
+    coatings" read as the Urable booking platform on 42% of a scored corpus and
+    shipped as a claim about the prospect's software stack. Same shape as the
+    `roofing` ⊂ `waterproofing` bug `matches_term` was written for, so reuse it
+    rather than growing a second matcher — including the left-only boundary,
+    which keeps `thryv` matching `thryv's`.
+    """
     lowered = text.lower()
     found = []
     for label, terms in mapping.items():
-        if any(term.lower() in lowered for term in terms):
+        if any(matches_term(lowered, term.lower()) for term in terms):
             found.append(label)
     return sorted(found)
 

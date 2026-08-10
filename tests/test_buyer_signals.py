@@ -45,6 +45,40 @@ class BuyerSignalsTest(unittest.TestCase):
                 self.assertTrue(buyer_intent["crm_booking_stack"]["has_paid_crm"])
                 self.assertTrue(buyer_intent["money_signal"])
 
+    def test_marketing_copy_saying_durable_does_not_detect_urable(self) -> None:
+        """`urable` is a suffix of `durable` — the `roofing` ⊂ `waterproofing`
+        bug, reintroduced in the CRM detector. Bare substring matching read
+        "durable, high-performance coatings" as a paid booking stack on 263 of
+        625 recovery-corpus leads (42%), and seven of them shipped
+        "Urable was detected as a paid CRM/booking tool" as an outreach claim
+        about a business that runs no such thing.
+        """
+        from lead_machine.buyer_signals import build_buyer_intent
+
+        record = self._record(text="Durable, high-performance concrete coatings built to last.")
+
+        buyer_intent = build_buyer_intent(record, ads_check=False)
+
+        self.assertNotIn("Urable", buyer_intent["crm_booking_stack"]["detected_tools"])
+        self.assertFalse(buyer_intent["crm_booking_stack"]["has_paid_crm"])
+
+    def test_third_party_tool_terms_have_no_left_boundary_collisions(self) -> None:
+        """The collision audit, mirroring the vertical-term one. A term that is
+        the tail of another term's word is a false positive waiting to ship."""
+        from lead_machine.evidence import THIRD_PARTY_TOOLS
+        from lead_machine.verticals import matches_term
+
+        collisions = []
+        for label, terms in THIRD_PARTY_TOOLS.items():
+            for term in terms:
+                for other_label, other_terms in THIRD_PARTY_TOOLS.items():
+                    if other_label == label:
+                        continue
+                    for other in other_terms:
+                        if term != other and term in other and not matches_term(other, term):
+                            collisions.append((label, term, other_label, other))
+        self.assertEqual(collisions, [])
+
     def test_ads_check_false_sets_unknown_ads_without_network_calls(self) -> None:
         from lead_machine.buyer_signals import build_buyer_intent
 
