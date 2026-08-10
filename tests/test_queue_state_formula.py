@@ -66,13 +66,17 @@ class TestQueueStateFormula(unittest.TestCase):
         self.assertEqual(clause.expected, verdict.VERDICT_SEND)
         self.assertIn(clause.expected, verdict.VERDICT_CHOICES)
 
-    def test_the_dropped_clauses_are_implied_by_the_verdict(self):
-        # The two clauses this collapse removed are not lost, they are folded in:
-        # `send` is unreachable unless the lead is commercially-sendable and
-        # contact-now, because both are blockers inside the same admission. If
-        # that ever stopped holding, the shorter queue filter would start
-        # selecting leads the longer one excluded.
-        from lead_machine.sendability import apply_sendability
+    def test_a_send_row_is_never_dropped_by_the_queues_defensive_check(self):
+        # This used to assert that `send` implied commercially-sendable and
+        # contact-now. It no longer does — the commercial tribunal was removed
+        # from the gate — but the property those assertions were really
+        # protecting still matters, and matters more now: `query_ready_to_send`
+        # runs `is_contact_ready` over every row the filter returns and silently
+        # discards the failures behind a warning. If the row-level check can
+        # reject what the verdict admitted, the queue empties without the filter
+        # ever looking wrong. Stripping the tribunal broke exactly this, via the
+        # commercial-fit cross-checks, before they were removed too.
+        from lead_machine.sendability import apply_sendability, is_contact_ready
         from lead_machine.verdict import evaluate_verdict
         from tests.test_verdict import rows_across_the_tier_space
 
@@ -81,9 +85,7 @@ class TestQueueStateFormula(unittest.TestCase):
             if not evaluate_verdict(row).is_send:
                 continue
             sends += 1
-            scored = apply_sendability(row)
-            self.assertEqual(scored["Commercial Fit State"], "commercially-sendable")
-            self.assertEqual(scored["Contact Eligibility"], "contact-now")
+            self.assertTrue(is_contact_ready(apply_sendability(row)))
         self.assertGreater(sends, 0)
 
     def test_prospect_status_vocabulary_includes_mvp_terminal_states(self):

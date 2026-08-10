@@ -365,7 +365,12 @@ class DashboardRepositoryTest(unittest.TestCase):
     def test_sendable_tier_without_shared_readiness_is_blocked_and_not_counted(self) -> None:
         write_enriched(self.paths.enriched, 1)
         rows = scored_rows(1)
-        rows[0]["Contact Eligibility"] = "hold-commercial-case"
+        # A sendable tier that still declares Sendable=Yes while failing the
+        # readiness contract. This used to be induced with a hold-commercial-case
+        # contact eligibility; that cross-check went with the commercial tribunal,
+        # so the mismatch is induced through Packet Eligible instead — one of the
+        # two clauses `contact_readiness_failures` actually still enforces.
+        rows[0]["Packet Eligible"] = "No"
         write_csv(self.paths.scored_csv, rows)
         write_csv(self.paths.tiered_csv, rows)
         batch = self.repo.batch(BATCH, force=True)

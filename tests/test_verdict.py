@@ -175,21 +175,20 @@ class VerdictReDecidesNothing(unittest.TestCase):
                 )
 
     def test_send_implies_the_readiness_clauses_the_queue_filter_drops(self) -> None:
-        # The load-bearing test for the base cutover. The Call Queue filter is
-        # about to become `Verdict='send'` alone, dropping the compound
-        # commercially-sendable / contact-now clauses. That is only safe because
-        # `send` already implies both — they are blockers inside the same
-        # admission — so the shorter filter selects the same leads.
+        # The load-bearing test for the base cutover: the Call Queue filter is
+        # `Verdict='send'` alone, so anything the filter cannot express has to be
+        # implied by `send` or the queue and the gate disagree.
+        #
+        # The commercially-sendable / contact-now assertions are gone with the
+        # commercial tribunal. `is_contact_ready` is the one that was always
+        # doing the work — `query_ready_to_send` applies it as a defensive drop
+        # over every row the filter returns — and it is kept, and now unguarded
+        # by the two weaker assertions that used to fail first.
         for index, row in enumerate(rows_across_the_tier_space()):
             with self.subTest(row=index):
                 if not evaluate_verdict(row).is_send:
                     continue
-                scored = apply_sendability(row)
-                self.assertEqual(
-                    scored["Commercial Fit State"], "commercially-sendable"
-                )
-                self.assertEqual(scored["Contact Eligibility"], "contact-now")
-                self.assertTrue(is_contact_ready(scored))
+                self.assertTrue(is_contact_ready(apply_sendability(row)))
 
     def test_the_row_set_reaches_all_four_verdicts(self) -> None:
         # Guards every loop above: a row set that only ever reached `reject`

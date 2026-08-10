@@ -577,12 +577,23 @@ def evaluate_sendability(row: Dict[str, Any]) -> Dict[str, Any]:
     if has_hard_disqualifier(row):
         blockers.append(HARD_DISQUALIFIER_BLOCKER)
 
-    if commercial_fit["commercial_fit_state"] != "commercially-sendable":
-        blockers.append(f"{COMMERCIAL_FIT_BLOCKER}: {commercial_fit['commercial_fit_state']}")
-    if commercial_fit["contact_eligibility"] != "contact-now":
-        blockers.append(CONTACT_ELIGIBILITY_BLOCKER)
-    if commercial_fit["state_errors"]:
-        blockers.extend(f"{COMMERCIAL_FIT_BLOCKER}: {error}" for error in commercial_fit["state_errors"])
+    # The commercial tribunal is computed and reported, but it no longer blocks.
+    #
+    # It asked an LLM whether a verified leak was worth money, and answered no
+    # for 71% of every lead ever scored — 2,525 of 2,995 held at
+    # `hold-commercial-case` alone. The rule driving that is unsatisfiable by
+    # construction: `contact-now` required a verified asset, Loop B is not built,
+    # and `AGENTS.md` Gate 0 forbids building it before a first close. So the
+    # gate was withholding leads pending an artifact that cannot exist yet.
+    #
+    # It is also a verdict on an unvalidated offer, rendered before any human
+    # conversation could settle it. That belongs in the rank, not the gate: the
+    # rep still dials best-first, but the tail is no longer destroyed. What stays
+    # blocking is claim integrity — a claim contradicted by a deterministic
+    # enrichment fact — which is the part that protects conversion rate.
+    #
+    # `evaluate_commercial_fit` still runs so the states remain visible for
+    # diagnosis and so `accept_rate` can be read against them later.
 
     concrete_issue = has_concrete_conversion_issue(row)
     strong_estimate_form = has_strong_estimate_form(row)
@@ -736,12 +747,19 @@ def contact_readiness_failures(row: Dict[str, Any]) -> List[str]:
     Packet eligibility by itself is intentionally insufficient: manual-review
     packets may be uploadable while remaining unsafe to contact.
 
-    The commercially-sendable and contact-now clauses are gone from
-    READINESS_CLAUSES because `Verdict` folds them in — `send` is unreachable
-    unless both hold. What does not go away is re-deriving the stored value:
-    `Verdict` in the base is still a snapshot, and a snapshot is exactly what let
-    a hard-skipped lead ride a stale cell into the send queue. `readiness_flags`
-    re-runs the admission over it, in the tightening direction only.
+    What does not go away is re-deriving the stored value: `Verdict` in the base
+    is still a snapshot, and a snapshot is exactly what let a hard-skipped lead
+    ride a stale cell into the send queue. `readiness_flags` re-runs the
+    admission over it, in the tightening direction only.
+
+    The commercially-sendable / contact-now cross-checks are gone with the
+    commercial tribunal. They asserted that a row's declared commercial fit
+    agreed with its verdict, which was true while `send` implied both. It no
+    longer does, so keeping them would have inverted their purpose: the majority
+    of legitimately sendable rows carry `hold-commercial-case`, and
+    `query_ready_to_send` applies this function as a defensive drop. Every
+    re-gated lead would have passed the gate and then been discarded at the queue
+    behind a warning.
     """
     failures: List[str] = []
     sendable, packet_eligible = readiness_flags(row)
@@ -749,20 +767,6 @@ def contact_readiness_failures(row: Dict[str, Any]) -> List[str]:
         failures.append(queue_state.READINESS_CLAUSES[0].failure)
     if packet_eligible.casefold() != "yes":
         failures.append("Packet Eligible must be Yes")
-    # A row carrying a Verdict is a base row read back after the cutover, where
-    # these two columns no longer exist. Anything else — a scored CSV, a legacy
-    # row — is expected to carry them, and their absence is the scorer never
-    # having established commercial fit. Blank must keep meaning "failed" there,
-    # or a legacy row asserting Sendable=Yes with no evidence at all uploads as
-    # a sendable packet.
-    carries_verdict = bool(_pick(row, "Verdict", "verdict").strip())
-    for clause in queue_state.READINESS_CROSS_CHECKS:
-        snake_case = clause.field.casefold().replace(" ", "_")
-        declared = _pick(row, clause.field, snake_case).strip()
-        if not declared and carries_verdict:
-            continue
-        if declared.casefold() != clause.expected.casefold():
-            failures.append(clause.failure)
     return failures
 
 

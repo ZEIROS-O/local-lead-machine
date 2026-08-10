@@ -553,10 +553,14 @@ class TestReadinessFlagsFromPacketTier(unittest.TestCase):
         self.assertFalse(sendability.is_contact_ready({}))
 
     def test_sendable_tier_alone_satisfies_the_readiness_contract(self):
-        # The other three clauses of the contract are cross-checks, so a row
-        # whose tier says Sendable Packet still has to carry them explicitly.
+        # The commercial-fit cross-check that used to be asserted here is gone
+        # with the tribunal — a sendable row now routinely carries `unverified`
+        # or `hold-commercial-case`, so keeping it would reject the queue's own
+        # output. What the contract still refuses is a row whose own readiness
+        # columns disagree with its tier, which `test_explicit_columns_win_over_
+        # the_tier` covers.
         self.assertTrue(sendability.is_contact_ready(READY_FIELDS))
-        self.assertFalse(
+        self.assertTrue(
             sendability.is_contact_ready(
                 {**READY_FIELDS, "Commercial Fit State": "unverified"}
             )

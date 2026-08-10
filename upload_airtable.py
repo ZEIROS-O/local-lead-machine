@@ -60,6 +60,7 @@ from lead_machine.sendability import (
     SCORER_WITHHELD_BLOCKER,
     admit,
     hard_icp_skip_blockers,
+    has_concrete_conversion_issue,
     is_contact_ready,
 )
 from lead_machine.verdict import (
@@ -351,6 +352,27 @@ def is_sendable_record(record: Dict[str, Any]) -> bool:
     re-checked here for the same reason suppression is re-checked at every stage
     that can still stop a lead: a scored row carries it in Raw Evidence, and a
     stage that only reads a stored boolean cannot notice when the two disagree.
+
+    The evidence re-derivation below replaces a guard the commercial tribunal
+    used to provide by accident. A legacy CSV carrying nothing but
+    `Sendable=Yes,Packet Eligible=Yes` used to fail the readiness contract
+    because it did not also carry `Commercial Fit State` — the tribunal columns
+    were standing in for "was this row scored by the current pipeline". With the
+    tribunal gone that proxy goes too, so the question is asked directly and of
+    the evidence: a row with no named leak, no refs and no safe claim must not
+    upload as sendable on the strength of a stored boolean.
+
+    Keyed on `Verdict` exactly as the removed cross-checks were. A row carrying
+    one was decided by the gate itself and is re-derived by `readiness_flags`
+    already; a row without one is a legacy or hand-made CSV, which is the only
+    shape this guard was ever protecting against.
+
+    The question asked is the narrowest one that separates the two cases: does
+    this row name a concrete leak at all. Not `minimum_evidence_passed`, which
+    also demands the safe-claim-with-refs structure that pre-dates these legacy
+    CSVs — requiring it here would reject the very rows the guard is meant to let
+    through, and only a row with no observation, no trigger and no angle should
+    fall. AGENTS.md: no send without a real, named, verifiable leak.
     """
     fields = record.get("airtable_fields") or record
     readiness = dict(fields)
@@ -359,6 +381,8 @@ def is_sendable_record(record: Dict[str, Any]) -> bool:
         readiness.setdefault("Sendable", admit(record, blockers).sendable_flag)
     if record.get("packet_eligible") is not None:
         readiness.setdefault("Packet Eligible", "Yes" if truthy_yes(record.get("packet_eligible")) else "No")
+    if not clean_cell(fields.get("Verdict")) and not has_concrete_conversion_issue(record):
+        return False
     # Unconditional, unlike the setdefault above: a row that already carries
     # Sendable=Yes from an older CSV would otherwise keep it.
     return not hard_icp_skip_blockers(record) and is_contact_ready(readiness)

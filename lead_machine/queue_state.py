@@ -48,29 +48,14 @@ READINESS_CLAUSES = (
     ReadinessClause("Verdict", "send", "Verdict must be send"),
 )
 
-# Cross-checks, not filter clauses — and the distinction is the whole reason
-# they survive the collapse. As base filter clauses they were redundant, because
-# `send` already implies both. As row-level checks they are not: a scored CSV row
-# carries this evidence beside its declared tier, and a row whose declared
-# verdict disagrees with its own commercial-fit evidence is precisely the drift
-# the dashboard exists to surface. Dropping them entirely would have made
-# `sendable_readiness_mismatch` unreachable.
-#
-# Applied only to fields the row actually carries. A base row after the cutover
-# has neither column, and treating absent as failing would empty the send queue
-# — the exact failure mode the blank-Packet-Tier rows already demonstrated.
-READINESS_CROSS_CHECKS = (
-    ReadinessClause(
-        "Commercial Fit State",
-        "commercially-sendable",
-        "Commercial Fit State must be commercially-sendable",
-    ),
-    ReadinessClause(
-        "Contact Eligibility",
-        "contact-now",
-        "Contact Eligibility must be contact-now",
-    ),
-)
+# READINESS_CROSS_CHECKS held the commercially-sendable / contact-now clauses.
+# They survived the verdict collapse because `send` implied both, which made a
+# row disagreeing with its own commercial-fit evidence real drift worth
+# surfacing. Removing the commercial tribunal from the gate ends that
+# implication, so the check no longer detects drift — it detects the new normal.
+# `sendable_readiness_mismatch` stays reachable through the Sendable and Packet
+# Eligible clauses in `sendability.contact_readiness_failures`, which is where
+# the re-derivation that actually caught stale cells always lived.
 # The whole `Prospects.Status` vocabulary, declared here because this module
 # already owns the only clause that reads Status and is imported by the send
 # path. Everything else that names a Status is a narrower view of this tuple —

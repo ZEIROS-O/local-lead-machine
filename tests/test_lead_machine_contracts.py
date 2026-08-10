@@ -454,9 +454,14 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(fields["Lead Priority"], "A")
         self.assertEqual(fields["Score Total"], 86)
         # No Packet Tier column in this legacy-shaped CSV, so it is derived. The
-        # row carries Sendable=Yes but no commercial fit or contact eligibility,
-        # so it fails the readiness contract and lands as a manual-review packet
+        # row carries Sendable=Yes and nothing to justify it — no named leak, no
+        # evidence refs, no safe claim — so it lands as a manual-review packet
         # rather than inheriting the bare Sendable string it used to sync.
+        #
+        # It used to fail for want of the commercial-fit columns, which were
+        # standing in for "scored by the current pipeline". That proxy went with
+        # the tribunal; `is_sendable_record` now asks the evidence directly, so
+        # this row is still refused, for the reason that was always the real one.
         self.assertEqual(fields["Verdict"], "review")
         self.assertNotIn("Sendable", fields)
         self.assertNotIn("Packet Eligible", fields)
@@ -556,6 +561,10 @@ class LeadMachineContractsTest(unittest.TestCase):
                     "Contact Eligibility": "contact-now",
                     "Asset State": "ready",
                     "Promise State": "kept",
+                    # Carries a leak so the row still earns `send`; the test is
+                    # about which columns are written, not about the verdict.
+                    "Visible Pain Score": "35",
+                    "Visible Pain Reasons": "No estimate form detected; No clear estimate CTA",
                     "Send Blockers": "something",
                     "Skip Reason": "something",
                 },
@@ -691,6 +700,11 @@ class LeadMachineContractsTest(unittest.TestCase):
                     "Packet Eligible": "Yes",
                     "Commercial Fit State": "commercially-sendable",
                     "Contact Eligibility": "contact-now",
+                    # A row with no Verdict of its own must name a leak to upload
+                    # as sendable, so this fixture carries one. The test is about
+                    # clearing Verdict Reasons, not about earning the verdict.
+                    "Visible Pain Score": "35",
+                    "Visible Pain Reasons": "No estimate form detected; No clear estimate CTA",
                     "Verdict Reasons": "",
                     "Send Blockers": "",
                 },
@@ -5510,7 +5524,11 @@ class LeadMachineContractsTest(unittest.TestCase):
         with self.assertRaisesRegex(SchemaMigrationError, "current schema v2 required"):
             refresh_row({"Place Key": "old", "Sendable": "Yes", "Packet Eligible": "Yes"})
 
-    def test_missing_or_misspelled_contact_eligibility_holds_with_state_error(self) -> None:
+    def test_misspelled_contact_eligibility_still_normalizes_but_no_longer_blocks(self) -> None:
+        # The normalization survives — a value the vocabulary does not contain
+        # still reads as hold-commercial-case rather than being trusted — but it
+        # is reporting now, not a gate. A typo in a field with no downstream
+        # consumer must not cost a dialable lead.
         enriched = {
             "google": {**self._google_fixture(), "reviews": "18"},
             "buyer_intent": self._buyer_intent_fixture(),
@@ -5521,8 +5539,9 @@ class LeadMachineContractsTest(unittest.TestCase):
         row["contact_eligibility"] = "contact-no"
         held = apply_sendability(row)
         self.assertEqual(held["Contact Eligibility"], "hold-commercial-case")
-        self.assertEqual(held["Sendable"], "No")
-        self.assertIn("invalid contact_eligibility contact-no; held", held["Send Blockers"])
+        self.assertEqual(held["Sendable"], "Yes")
+        self.assertNotIn("Contact eligibility", held["Send Blockers"])
+        self.assertNotIn("Commercial fit gate failed", held["Send Blockers"])
 
     def test_pass_asset_receipt_propagates_to_both_aliases(self) -> None:
         enriched = {
@@ -6021,7 +6040,11 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(row["Packet Tier"], "No Packet")
         self.assertEqual(row["Packet Eligible"], "")
 
-    def test_isolated_minor_fix_is_nurture_not_sendable(self) -> None:
+    def test_isolated_minor_fix_is_reported_as_nurture_but_still_sendable(self) -> None:
+        # "Too small to be a paid engagement" is a judgement about an offer with
+        # zero closes behind it. It is kept as a reported state and belongs in
+        # the rank, but a lead with a real named leak and a dialable number is
+        # not withheld from a phone call over it.
         enriched = {
             "google": {**self._google_fixture(), "reviews": "18"},
             "buyer_intent": self._buyer_intent_fixture(),
@@ -6035,9 +6058,9 @@ class LeadMachineContractsTest(unittest.TestCase):
             ),
             fallback_vertical="hardscaping",
         )
-        self.assertEqual(row["Sendable"], "No")
         self.assertEqual(row["Commercial Fit State"], "minor-fix/nurture")
-        self.assertIn("Commercial fit gate failed: minor-fix/nurture", row["Send Blockers"])
+        self.assertEqual(row["Sendable"], "Yes")
+        self.assertNotIn("Commercial fit gate failed", row["Send Blockers"])
 
     def test_missing_asset_can_contact_now_with_asset_free_promise(self) -> None:
         enriched = {
@@ -6054,7 +6077,11 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(row["Asset State"], "none")
         self.assertEqual(row["Promise State"], "asset-free")
 
-    def test_asset_specific_promise_waits_for_asset(self) -> None:
+    def test_asset_specific_promise_no_longer_withholds_the_phone_call(self) -> None:
+        # This was the unsatisfiable rule. `contact-after-asset` waited on an
+        # asset, Loop B is not built, and AGENTS.md Gate 0 forbids building it
+        # before a first close — so the wait had no end. The MVP is phone-only;
+        # the asset promise is an outreach-copy concern, not an eligibility one.
         enriched = {
             "google": {**self._google_fixture(), "reviews": "18"},
             "buyer_intent": self._buyer_intent_fixture(),
@@ -6067,8 +6094,9 @@ class LeadMachineContractsTest(unittest.TestCase):
             ),
             fallback_vertical="hardscaping",
         )
-        self.assertEqual(row["Sendable"], "No")
-        self.assertIn("Contact eligibility is not contact-now", row["Send Blockers"])
+        self.assertEqual(row["Sendable"], "Yes")
+        self.assertEqual(row["Asset State"], "planned")
+        self.assertNotIn("Contact eligibility is not contact-now", row["Send Blockers"])
         self.assertEqual(row["Minimum Evidence Passed"], "Yes")
 
     def test_existing_asset_promise_requires_pass_receipt(self) -> None:

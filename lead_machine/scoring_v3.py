@@ -192,9 +192,11 @@ def score_v3(
         blockers.append("missing_verified_named_leak")
     if components["reachability"] <= 0:
         blockers.append("missing_eligible_contact_channel")
-    contact_state = str(row.get("Contact Eligibility") or row.get("contact_eligibility") or "").strip().lower()
-    if contact_state and contact_state != "contact-now":
-        blockers.append("contact_eligibility_not_contact_now")
+    # `contact_eligibility_not_contact_now` used to sit here. It re-read the
+    # commercial tribunal's verdict, so this shadow policy inherited a gate that
+    # `sendability` no longer applies — and v3 exists to *rank*, not to re-run a
+    # judgement the authority has dropped. `independent_sendability_gate_not_passed`
+    # below still defers to the real gate, which is the correct dependency.
     governed_sendable = str(row.get("Sendable") or row.get("sendable") or "").strip().lower()
     if governed_sendable != "yes":
         blockers.append("independent_sendability_gate_not_passed")
