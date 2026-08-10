@@ -69,6 +69,19 @@ FORM_ABSENCE_FLAGS = {
 EMPTY_BODY_FLAG = "empty_body_on_200"
 NO_BODY_FORM_METHOD = "no_body"
 
+# The crawl never reached a body at all. `EMPTY_BODY_FLAG` is only the
+# 200-with-blank-body spelling; these are the ways a fetch dies before there is
+# a body to be blank. Kept apart from `STATIC_FETCH_REVIEW_FLAGS` because that
+# set includes `rendered_check_needed`, which means "look again", not "we never
+# read the page".
+HARD_FETCH_FAILURE_FLAGS = {
+    "static_fetch_failed",
+    "rendered_load_failed",
+    "dns_domain_failure",
+    "ssl_cert_hard_failure",
+    "homepage_http_hard_failure",
+}
+
 STATIC_FETCH_REVIEW_FLAGS = {
     "static_fetch_failed",
     "homepage_fetch_failed",

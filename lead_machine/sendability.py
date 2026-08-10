@@ -13,7 +13,7 @@ from .buyer_signals import (
     review_demand_band,
 )
 from . import queue_state
-from .evidence import EMPTY_BODY_FLAG, NO_BODY_FORM_METHOD
+from .evidence import EMPTY_BODY_FLAG, HARD_FETCH_FAILURE_FLAGS, NO_BODY_FORM_METHOD
 from .score_schema import (
     ASSET_STATES,
     COMMERCIAL_FIT_STATES,
@@ -292,6 +292,24 @@ FORM_ABSENCE_PATTERNS = [
     r"\bneed(s)? an estimate path\b",
 ]
 
+# The same "we never read the page" problem, one family over. These are claims
+# about what a page does NOT show, so they need a page we read — but unlike the
+# form family they are not a contradiction of `strong_estimate_form`, so they
+# belong only to the provenance blocker, never to FORM_ABSENCE_CLAIM_BLOCKER.
+#
+# Deliberately absent: "no owned website was found". That is a statement about
+# the search, not about an unreadable page, and it is the leak the entire
+# no-site lane is sendable on.
+UNREADABLE_PAGE_ABSENCE_PATTERNS = [
+    r"\bno clear (estimate |quote )?cta\b",
+    r"\bno estimate cta\b",
+    r"\bunclear (estimate )?cta\b",
+    r"\bphone number (is )?hard to find\b",
+    r"\bhard[- ]to[- ]find phone\b",
+    r"\bphone (number )?(is )?(not visible|buried)\b",
+    r"\bno visible phone\b",
+]
+
 ESTIMATE_PATH_WEAKNESS_PATTERNS = [
     r"\bweak estimate form\b",
     r"\bbasic estimate form\b",
@@ -537,7 +555,7 @@ def evaluate_sendability(row: Dict[str, Any]) -> Dict[str, Any]:
     # before that change, a manual card, an LLM reason written off a blank
     # crawl — and told to a business whose form is on a page our static parser
     # could not read.
-    if has_form_absence_claim(row) and lacks_parsed_page_body(row):
+    if has_unreadable_page_absence_claim(row) and lacks_parsed_page_body(row):
         blockers.append(UNSUPPORTED_ABSENCE_CLAIM_BLOCKER)
 
     if (
@@ -1118,6 +1136,10 @@ def has_estimate_path_weakness_beyond_form_existence(row: Dict[str, Any]) -> boo
 
 
 def has_form_absence_claim(row: Dict[str, Any]) -> bool:
+    return any(is_form_absence_text(text) for text in _absence_claim_texts(row))
+
+
+def _absence_claim_texts(row: Dict[str, Any]) -> List[str]:
     texts: List[str] = [get_send_trigger(row)]
     texts.extend(get_visible_pain_reasons(row))
     texts.extend(_clean(claim.get("claim")) for claim in normalize_safe_outreach_claims(row))
@@ -1128,7 +1150,29 @@ def has_form_absence_claim(row: Dict[str, Any]) -> bool:
             _pick(row, "Specific Observation", "specific_observation"),
         ]
     )
-    return any(is_form_absence_text(text) for text in texts)
+    return texts
+
+
+def has_unreadable_page_absence_claim(row: Dict[str, Any]) -> bool:
+    """Any claim about what a page does not show — form, CTA or phone.
+
+    Wider than `has_form_absence_claim` on purpose. The form family was gated
+    and the CTA/phone family was not, and the CTA/phone family is the one that
+    reached leads: 46 of 56 sendables in the recovery corpus asserted a
+    hard-to-find phone number while carrying a phone number, 28 of them for a
+    business with no website at all.
+    """
+    return any(
+        is_form_absence_text(text) or is_unreadable_page_absence_text(text)
+        for text in _absence_claim_texts(row)
+    )
+
+
+def is_unreadable_page_absence_text(text: Any) -> bool:
+    cleaned = _clean(text).lower()
+    if not cleaned:
+        return False
+    return any(re.search(pattern, cleaned) for pattern in UNREADABLE_PAGE_ABSENCE_PATTERNS)
 
 
 def lacks_parsed_page_body(row: Dict[str, Any]) -> bool:
@@ -1164,7 +1208,25 @@ def lacks_parsed_page_body(row: Dict[str, Any]) -> bool:
         for source in (website.get("site_issue_flags"), evidence.get("raw_flags"))
         for flag in (source or [])
     }
-    if EMPTY_BODY_FLAG in flags:
+    if EMPTY_BODY_FLAG in flags or flags & HARD_FETCH_FAILURE_FLAGS:
+        return True
+
+    # The no-site lane reaches none of the markers above: nothing was fetched,
+    # so nothing failed. But a crawl that holds no text at all is the plainest
+    # case of "we never read a page", and it is where most of the bad claims
+    # were — a business with no website cannot have a buried phone number.
+    #
+    # Two guards, because this infers from an absence rather than reading a
+    # marker. The website record must exist at all (a row carrying no crawl is
+    # a legacy row, not a proven blank), and nothing may claim a successful
+    # parse — a real `form_detection_method` is positive evidence that a body
+    # was read, and outranks text this artifact merely did not carry forward.
+    parsed_by = methods - {"", "none", NO_BODY_FORM_METHOD}
+    if (
+        website
+        and not parsed_by
+        and not _clean(website.get("combined_text") or (website.get("homepage") or {}).get("text"))
+    ):
         return True
 
     for item in evidence_items(row):

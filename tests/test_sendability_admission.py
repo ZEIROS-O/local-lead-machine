@@ -596,6 +596,68 @@ class AnAbsenceClaimNeedsAPageBodyTest(unittest.TestCase):
         # tier, not just out of the send flag.
         self.assertIn(UNSUPPORTED_ABSENCE_CLAIM_BLOCKER, EVIDENCE_BLOCKERS)
 
+    _HARD_FAILURES = {
+        "dns_domain_failure": {"site_status": "broken", "site_issue_flags": ["dns_domain_failure"]},
+        "static_fetch_failed": {
+            "site_status": "broken",
+            "site_issue_flags": ["static_fetch_failed", "rendered_load_failed"],
+        },
+        "homepage_http_hard_failure": {
+            "site_status": "broken",
+            "site_issue_flags": ["homepage_http_hard_failure"],
+        },
+        "ssl_cert_hard_failure": {"site_status": "broken", "site_issue_flags": ["ssl_cert_hard_failure"]},
+    }
+
+    def test_a_hard_fetch_failure_blocks_the_claim(self) -> None:
+        """`empty_body_on_200` is only the 200-with-blank-body spelling. A DNS
+        failure, a 404 or a dead TLS handshake never reached a body either, and
+        those set none of the three markers this gate used to recognise — so
+        the blocker was unreachable on the entire broken-site lane, which was 8
+        of 56 sends in the recovery corpus.
+        """
+        for name, website in self._HARD_FAILURES.items():
+            with self.subTest(flag=name):
+                self.assertIn(
+                    UNSUPPORTED_ABSENCE_CLAIM_BLOCKER, self._blockers(self._row(website))
+                )
+
+    def test_a_cta_or_phone_absence_claim_needs_a_body_too(self) -> None:
+        """The form family was gated; the CTA/phone family was not, and it is
+        the one that actually shipped. 46 of 56 recovery-corpus sendables
+        asserted "Phone number hard to find" — every one of them had a phone
+        number on the record, and 28 had no website at all, so there was no
+        page on which a number could be buried.
+        """
+        claims = [
+            "No clear estimate CTA",
+            "Phone number hard to find",
+            "The crawl flagged no clear estimate CTA and a hard-to-find phone number.",
+        ]
+        for claim in claims:
+            with self.subTest(claim=claim):
+                self.assertIn(
+                    UNSUPPORTED_ABSENCE_CLAIM_BLOCKER,
+                    self._blockers(self._row(self._EMPTY_BODY_FLAG, claim=claim)),
+                )
+
+    def test_a_cta_claim_off_a_page_we_read_is_still_allowed(self) -> None:
+        # The control for the widened family: a weak CTA found on a page we
+        # actually parsed is a real leak and the pipeline runs on it.
+        self.assertNotIn(
+            UNSUPPORTED_ABSENCE_CLAIM_BLOCKER,
+            self._blockers(self._row(self._READABLE, claim="No clear estimate CTA")),
+        )
+
+    def test_a_missing_website_claim_survives_an_empty_body(self) -> None:
+        # The leak that carries the no-site lane. "No owned website was found"
+        # is a statement about the search, not about a page we failed to read,
+        # and gating it would delete the largest sendable category.
+        self.assertNotIn(
+            UNSUPPORTED_ABSENCE_CLAIM_BLOCKER,
+            self._blockers(self._row(self._EMPTY_BODY_FLAG, claim="No owned website was found")),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
