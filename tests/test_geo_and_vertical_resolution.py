@@ -92,6 +92,45 @@ class CorporateLocationNameTest(unittest.TestCase):
         self.assertFalse(is_corporate_location_name("sons of thunder roofing", record))
 
 
+class BareLaneNameResolvesToItsOwnProfileTest(unittest.TestCase):
+    """`resolve_profile("service", source_query="… detailing")` returned
+    **hardscaping**, silently.
+
+    `DETAILING_TERMS` carried `auto detailing` / `car detailing` /
+    `mobile detailing` but not the bare word, so `_infer_profile_key` returned
+    "" and the default `fallback="hardscaping"` won. Those leads were then
+    gated against hardscaping's roofing-franchise list, so
+    `DETAILING_FRANCHISE_DENYLIST` (mister car wash, take 5, tommy's express,
+    zips, quick quack, delta sonic) never ran — on 62 of 80 rows in one
+    backfill, including 20 of its 22 sendables.
+
+    Note the asymmetry with epoxy: bare `epoxy` is deliberately NOT a term (see
+    the comment above EPOXY_BATCH_TERMS — on its own it belongs to resin
+    hobbyists), so that lane has to be fixed by writing a real Vertical rather
+    than by widening terms.
+    """
+
+    def test_a_bare_lane_name_resolves_to_its_own_profile(self) -> None:
+        self.assertEqual(
+            resolve_profile("service", source_query="airtable backfill detailing").key, "detailing"
+        )
+        self.assertEqual(
+            resolve_profile("", source_query="mobile detailing cleveland oh").key, "detailing"
+        )
+
+    def test_the_bare_token_does_not_capture_another_vertical(self) -> None:
+        # The reason a one-word term is normally refused. `detailing` collides
+        # with nothing in the other six profiles' term lists, which is what
+        # makes it safe here and `epoxy` unsafe.
+        for query, expected in (
+            ("epoxy flooring cleveland oh", "epoxy"),
+            ("garage door repair akron oh", "garage_doors"),
+            ("water damage restoration parma oh", "water_restoration"),
+        ):
+            with self.subTest(query=query):
+                self.assertEqual(resolve_profile("", source_query=query).key, expected)
+
+
 class InferVerticalTest(unittest.TestCase):
     def test_a_declared_vertical_outranks_scraped_copy(self) -> None:
         record = _record(vertical="plumbing", text="we also repair the roof over your water heater")

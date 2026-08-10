@@ -170,6 +170,13 @@ HARDSCAPE_LOW_TICKET_TERMS = (
 )
 
 DETAILING_TERMS = (
+    # The bare lane name, unlike `epoxy` below. Without it
+    # `resolve_profile("service", source_query="… detailing")` matched nothing
+    # and fell through to the default hardscaping fallback, so this vertical's
+    # franchise denylist never ran on its own leads. Safe here and not for
+    # epoxy because `detailing` collides with no other profile's terms — the
+    # collision audit in tests/test_geo_and_vertical_resolution.py pins that.
+    "detailing",
     "ceramic coating",
     "paint correction",
     "ppf",

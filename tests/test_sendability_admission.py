@@ -24,6 +24,7 @@ from lead_machine.manual_scores import merge_manual_score
 from lead_machine.sendability import (
     EVIDENCE_BLOCKERS,
     HARD_ICP_SKIP_BLOCKER,
+    INVALID_REF_BLOCKER,
     OUT_OF_COUNTRY_BLOCKER,
     UNSUPPORTED_ABSENCE_CLAIM_BLOCKER,
     Admission,
@@ -528,6 +529,56 @@ class AStoredSendableYesCannotOutrankTheIcpGateTest(unittest.TestCase):
     def test_a_hand_edited_no_is_still_honoured(self) -> None:
         # Tightening never goes through the gate; the pre-existing contract.
         self.assertEqual(readiness_flags(self._row(sendable="No", skipped=False))[0], "No")
+
+
+class AnEvidenceRefSeparatorTypoIsNotAFabricatedRefTest(unittest.TestCase):
+    """`ev-visible_pain-reasons-15` and `ev-visible_pain_reasons-15` are the
+    same citation written two ways.
+
+    The generator emits `ev-<field>-<n>` with the field's own underscores
+    intact; a model writing the reference back sometimes hyphenates them. The
+    membership test was exact, so the id failed to resolve and
+    `INVALID_REF_BLOCKER` fired — indistinguishable, in the output, from a
+    model that invented a citation.
+
+    Twelve leads in one 194-row corpus were rejected this way, every one of
+    them a separator difference and none a fabrication. Two were A-grade with
+    no other blocker (scores 95 and 93). The blocker exists to catch invented
+    evidence; spending real leads on punctuation is not what it is for.
+    """
+
+    def _row(self, cited: str) -> dict[str, Any]:
+        return {
+            "Business Name": "Dynasty Epoxy Louisville",
+            "Raw Evidence": json.dumps(
+                {
+                    "evidence": {
+                        "evidence_items": [
+                            {"id": "ev-visible_pain_reasons-15", "field": "visible_pain_reasons", "value": "x"},
+                            {"id": "ev-google_rating-1", "field": "google_rating", "value": "5.0"},
+                        ]
+                    }
+                }
+            ),
+            "Evidence Refs": json.dumps(["ev-google_rating-1", cited]),
+            "Safe Outreach Claims": f"The scan recorded the visible pain. [{cited}]",
+        }
+
+    def test_a_hyphenated_field_separator_still_resolves(self) -> None:
+        blockers = evaluate_sendability(self._row("ev-visible_pain-reasons-15"))["send_blockers"]
+        self.assertNotIn(INVALID_REF_BLOCKER, blockers)
+
+    def test_the_exact_spelling_still_resolves(self) -> None:
+        # The control: normalizing must not break the ids that already worked.
+        blockers = evaluate_sendability(self._row("ev-visible_pain_reasons-15"))["send_blockers"]
+        self.assertNotIn(INVALID_REF_BLOCKER, blockers)
+
+    def test_a_genuinely_invented_ref_is_still_blocked(self) -> None:
+        # The blocker's actual job, and the reason this is normalization rather
+        # than a relaxation: a citation to evidence that does not exist in any
+        # spelling must still fail.
+        blockers = evaluate_sendability(self._row("ev-fabricated_metric-99"))["send_blockers"]
+        self.assertIn(INVALID_REF_BLOCKER, blockers)
 
 
 class ALeadOutsideTheCountryIsNotInIcpTest(unittest.TestCase):

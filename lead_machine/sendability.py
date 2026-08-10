@@ -1480,6 +1480,21 @@ def has_evidence_backed_opener(row: Dict[str, Any], *, safe_claims: List[Dict[st
     return any(claim.get("evidence_refs") for claim in claims)
 
 
+def _canonical_ref(ref: Any) -> str:
+    """Fold the separators in an `ev-<field>-<n>` id.
+
+    The generator emits the field's own underscores intact
+    (`ev-visible_pain_reasons-15`); a model citing it back sometimes
+    hyphenates them (`ev-visible_pain-reasons-15`). Those are the same
+    citation, and treating them as different spent twelve leads in one
+    194-row corpus — two of them A-grade with no other blocker — on
+    punctuation. `INVALID_REF_BLOCKER` is for evidence that was invented, and
+    folding the separators leaves that job untouched: a ref naming a field
+    that does not exist still fails in every spelling.
+    """
+    return re.sub(r"[-_]+", "-", str(ref or "").strip().lower())
+
+
 def has_invalid_refs(
     evidence_refs: List[str],
     safe_claims: List[Dict[str, Any]],
@@ -1488,10 +1503,11 @@ def has_invalid_refs(
     if not known_refs:
         return False
 
+    canonical_known = {_canonical_ref(ref) for ref in known_refs}
     refs = list(evidence_refs)
     for claim in safe_claims:
         refs.extend(claim.get("evidence_refs") or [])
-    return any(ref not in known_refs for ref in refs)
+    return any(_canonical_ref(ref) not in canonical_known for ref in refs)
 
 
 def known_evidence_ids(row: Dict[str, Any]) -> Set[str]:
