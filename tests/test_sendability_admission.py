@@ -24,6 +24,7 @@ from lead_machine.manual_scores import merge_manual_score
 from lead_machine.sendability import (
     EVIDENCE_BLOCKERS,
     HARD_ICP_SKIP_BLOCKER,
+    OUT_OF_COUNTRY_BLOCKER,
     UNSUPPORTED_ABSENCE_CLAIM_BLOCKER,
     Admission,
     admit,
@@ -527,6 +528,65 @@ class AStoredSendableYesCannotOutrankTheIcpGateTest(unittest.TestCase):
     def test_a_hand_edited_no_is_still_honoured(self) -> None:
         # Tightening never goes through the gate; the pre-existing contract.
         self.assertEqual(readiness_flags(self._row(sendable="No", skipped=False))[0], "No")
+
+
+class ALeadOutsideTheCountryIsNotInIcpTest(unittest.TestCase):
+    """An Ohio batch admitted a business in Kolkata.
+
+    `Urban Interior - 3D and Metallic Epoxy flooring`, address
+    "…Behala, Kolkata, West Bengal 700041, India", phone "091230 69950", came
+    back from the query "metallic epoxy flooring Toledo OH" tagged
+    `Metro Context: toledo`, scored Grade A, and cleared for contact with
+    `hard_icp_skip: False`. No gate between the search and the rep looked at
+    what country the business was in.
+
+    The check is deliberately narrow — country only, not metro distance. A
+    business two metros over is a judgment call about reach; one on another
+    continent is not one this pipeline ever wants to make.
+    """
+
+    def _row(self, address: str) -> dict[str, Any]:
+        return {
+            "Business Name": "Urban Interior",
+            "Raw Evidence": json.dumps({"google": {"address": address}}),
+        }
+
+    def _blockers(self, row: dict[str, Any]) -> list[str]:
+        return evaluate_sendability(row)["send_blockers"]
+
+    def _has_out_of_country(self, row: dict[str, Any]) -> bool:
+        # The blocker names the country it saw, the way the ICP one names its
+        # reasons, so match the prefix rather than the bare constant.
+        return any(b.startswith(OUT_OF_COUNTRY_BLOCKER) for b in self._blockers(row))
+
+    def test_a_foreign_address_blocks_the_lead(self) -> None:
+        for address in (
+            "173/h, PN Mitra Ln, Tara Park, Behala, Kolkata, West Bengal 700041, India",
+            "2219 Deer Run Rd, Wheatley, ON N0P 2P0, Canada",
+        ):
+            with self.subTest(address=address):
+                self.assertTrue(self._has_out_of_country(self._row(address)))
+
+    def test_a_us_address_is_not_blocked(self) -> None:
+        for address in (
+            "1121 N Meridian Rd, Youngstown, OH 44509, USA",
+            "500 Main St, Akron, OH 44311, United States",
+        ):
+            with self.subTest(address=address):
+                self.assertFalse(self._has_out_of_country(self._row(address)))
+
+    def test_an_address_with_no_country_is_not_blocked(self) -> None:
+        # Fails open. Plenty of records carry a bare street address, and a
+        # missing country is not evidence of a foreign one — inferring a skip
+        # from it would delete real leads to close a four-row hole.
+        for address in ("", "500 Main St, Akron, OH 44311", "Akron, OH"):
+            with self.subTest(address=address):
+                self.assertFalse(self._has_out_of_country(self._row(address)))
+
+    def test_the_blocker_survives_a_caller_supplied_clean_list(self) -> None:
+        # It belongs to the choke point, not the caller — same contract as the
+        # hard ICP verdict.
+        self.assertFalse(admit(self._row("Kolkata, West Bengal 700041, India")).admitted)
 
 
 class AnAbsenceClaimNeedsAPageBodyTest(unittest.TestCase):

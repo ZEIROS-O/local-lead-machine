@@ -66,9 +66,33 @@ SCORER_WITHHELD_BLOCKER = "Scorer did not mark this lead sendable"
 MANUAL_CARD_UNVERIFIED_BLOCKER = "Manual lead card not marked sendable by the operator"
 PACKET_TIER_NOT_SENDABLE_BLOCKER = "Packet Tier is not the sendable tier"
 
+OUT_OF_COUNTRY_BLOCKER = "Business is not in the United States"
+
+# Address tails that mean "in market". Anything else that looks like a country
+# name is out; a tail that is not a country at all (a bare street address, a
+# ZIP) reads as unknown and clears, because inferring a foreign address from a
+# missing one would cost real leads to close a four-row hole.
+IN_MARKET_COUNTRY_TAILS = {"usa", "us", "u.s.", "u.s.a.", "united states", "united states of america"}
+
+# Address tails that are alphabetic but domestic. A two-letter tail is a state
+# code ("Akron, OH"), and a full state name is the other way Places truncates a
+# domestic address — both would otherwise read as a foreign country.
+US_STATE_NAMES = {
+    "alabama", "alaska", "arizona", "arkansas", "california", "colorado", "connecticut",
+    "delaware", "florida", "georgia", "hawaii", "idaho", "illinois", "indiana", "iowa",
+    "kansas", "kentucky", "louisiana", "maine", "maryland", "massachusetts", "michigan",
+    "minnesota", "mississippi", "missouri", "montana", "nebraska", "nevada",
+    "new hampshire", "new jersey", "new mexico", "new york", "north carolina",
+    "north dakota", "ohio", "oklahoma", "oregon", "pennsylvania", "rhode island",
+    "south carolina", "south dakota", "tennessee", "texas", "utah", "vermont",
+    "virginia", "washington", "west virginia", "wisconsin", "wyoming",
+    "district of columbia", "puerto rico",
+}
+
 EVIDENCE_BLOCKERS = {
     HARD_DISQUALIFIER_BLOCKER,
     HARD_ICP_SKIP_BLOCKER,
+    OUT_OF_COUNTRY_BLOCKER,
     CONVERSION_ISSUE_BLOCKER,
     SEND_TRIGGER_BLOCKER,
     VISIBLE_PAIN_BLOCKER,
@@ -473,6 +497,31 @@ def hard_icp_skip_blockers(row: Dict[str, Any]) -> List[str]:
     return [f"{HARD_ICP_SKIP_BLOCKER}: {named}" if named else HARD_ICP_SKIP_BLOCKER]
 
 
+def out_of_country_blockers(row: Dict[str, Any]) -> List[str]:
+    """Block a business whose address names a country that is not the US.
+
+    Only the trailing comma-segment is read, which is where the Places address
+    format puts the country ("…, OH 44509, USA"). A tail that is not a country
+    name — a bare street address, a state and ZIP — is unknown, not foreign,
+    and clears: this closes a correctness hole, it is not a geo filter.
+    """
+    google = _raw_evidence(row).get("google")
+    if not isinstance(google, dict):
+        google = {}
+    address = _clean(google.get("address") or _pick(row, "Address", "address"))
+    if not address or "," not in address:
+        return []
+
+    tail = address.rsplit(",", 1)[-1].strip().lower().rstrip(".")
+    if not tail or tail in {t.rstrip(".") for t in IN_MARKET_COUNTRY_TAILS}:
+        return []
+    # A country name is alphabetic; "OH 44509" is not, and means the address
+    # simply carried no country. A short or state-named tail is domestic.
+    if not tail.replace(" ", "").isalpha() or len(tail) <= 2 or tail in US_STATE_NAMES:
+        return []
+    return [f"{OUT_OF_COUNTRY_BLOCKER}: {address.rsplit(',', 1)[-1].strip()}"]
+
+
 @dataclass(frozen=True)
 class Admission:
     """A lead's permission to be contacted, and the only thing that can grant it.
@@ -504,7 +553,9 @@ def admit(row: Dict[str, Any], blockers: Iterable[str] = ()) -> Admission:
     an admission for a skipped lead, because the check belongs to the choke point
     and not to the caller. Any new sendable path has to come through here.
     """
-    return Admission(tuple(blockers) + tuple(hard_icp_skip_blockers(row)))
+    return Admission(
+        tuple(blockers) + tuple(hard_icp_skip_blockers(row)) + tuple(out_of_country_blockers(row))
+    )
 
 
 def evaluate_sendability(row: Dict[str, Any]) -> Dict[str, Any]:
