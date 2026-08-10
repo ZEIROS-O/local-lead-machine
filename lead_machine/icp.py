@@ -44,6 +44,14 @@ def hard_icp_gate(lead: CanonicalLead) -> GateResult:
     if any(term in text for term in profile.franchise_denylist):
         reasons.append("franchise_or_chain")
 
+    # Matched against the category alone, not the joined `text` above: the
+    # denylist entries are trade names that appear in ordinary copy, and a
+    # garage-door company whose source query mentioned a roof would otherwise
+    # be skipped for a word rather than for what it is.
+    category = str(lead.category or "").strip().lower()
+    if category and category in profile.category_denylist:
+        reasons.append("category_is_a_different_trade")
+
     if any(term in text for term in profile.deny_terms):
         if profile.key == "hardscaping":
             reasons.append("medical_aesthetic_v1_excluded")

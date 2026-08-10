@@ -33,6 +33,12 @@ class VerticalProfile:
     franchise_denylist: tuple[str, ...]
     exclude_terms: tuple[str, ...]
     aliases: tuple[str, ...] = ()
+    # Google Places categories that can never be this vertical, however the
+    # lead was found. Deliberately tiny: the Places taxonomy is noisy enough
+    # that a broad category gate causes false skips — `supplier` is 166 of 239
+    # garage-door leads and `general_contractor` is 286 of 386 epoxy ones — so
+    # only a category naming a different trade outright belongs here.
+    category_denylist: tuple[str, ...] = ()
     # One floor for every vertical, and it must equal the matching
     # `vertical_profiles/<key>.json` min_reviews: that file is the search-time
     # floor, this is the score-time floor, and two numbers means a lead can be
@@ -286,6 +292,23 @@ GARAGE_DOOR_FRANCHISE_DENYLIST = (
     "a1 garage door service",
     "overhead door company",
     "wayne dalton",
+    # National exterior-remodel franchises the "commercial overhead door"
+    # queries pull in. Window World of Akron scored A and cleared for contact
+    # while the structurally identical Pella showroom was correctly rejected —
+    # the gate caught the brands it had been told about and nothing else.
+    "window world",
+    "pella",
+    "renewal by andersen",
+    "champion windows",
+)
+
+# `commercial overhead door <metro>` seeded six non-garage-door leads into the
+# vertical. Only categories that are a different trade outright — a roofer is
+# not a garage-door company under any labelling — and never `supplier` or
+# `general_contractor`, which are how most real garage-door leads are tagged.
+GARAGE_DOOR_CATEGORY_DENYLIST = (
+    "roofing_contractor",
+    "locksmith",
 )
 
 PLUMBING_BATCH_TERMS = (
@@ -597,6 +620,7 @@ VERTICAL_PROFILES: Mapping[str, VerticalProfile] = {
         deny_terms=GARAGE_DOOR_DENY_TERMS,
         low_ticket_terms=GARAGE_DOOR_DENY_TERMS,
         franchise_denylist=GARAGE_DOOR_FRANCHISE_DENYLIST,
+        category_denylist=GARAGE_DOOR_CATEGORY_DENYLIST,
         exclude_terms=(),
         aliases=(
             "garage doors",

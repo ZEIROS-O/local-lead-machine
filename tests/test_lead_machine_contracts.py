@@ -1489,6 +1489,56 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertIn("franchise_or_chain", hard_icp_gate(franchise).reasons)
         self.assertFalse(hard_icp_gate(no_site).should_skip)
 
+    def test_hard_icp_gate_skips_a_category_that_is_a_different_trade(self) -> None:
+        """`commercial overhead door <metro>` seeded six non-garage-door leads.
+
+        DroCo Roofing and Renew Home Exteriors (both `roofing_contractor`) and
+        County Lock LLC (`locksmith`) were admitted to the garage_doors
+        vertical and scored as garage-door prospects.
+        """
+        def lead(name: str, category: str):
+            return normalize_lead(
+                {
+                    "business_name": name,
+                    "city": "Akron",
+                    "rating": "4.8",
+                    "reviews": "60",
+                    "category": category,
+                    "website_url": "https://example.com",
+                },
+                fallback_vertical="garage_doors",
+                source_batch="round1",
+            )
+
+        for name, category in (("DroCo Roofing", "roofing_contractor"), ("County Lock LLC", "locksmith")):
+            with self.subTest(category=category):
+                result = hard_icp_gate(lead(name, category))
+                self.assertTrue(result.should_skip)
+                self.assertIn("category_is_a_different_trade", result.reasons)
+
+    def test_hard_icp_gate_keeps_the_categories_real_garage_door_leads_carry(self) -> None:
+        # The control, and the reason the denylist is tiny: `supplier` is 166
+        # of 239 garage-door leads in the recovery corpus and
+        # `general_contractor` another 25. Gating the noisy Places taxonomy
+        # broadly would skip most of the vertical.
+        for category in ("supplier", "general_contractor", "service", ""):
+            with self.subTest(category=category):
+                result = hard_icp_gate(
+                    normalize_lead(
+                        {
+                            "business_name": "Buckeye Overhead Door",
+                            "city": "Akron",
+                            "rating": "4.8",
+                            "reviews": "60",
+                            "category": category,
+                            "website_url": "https://example.com",
+                        },
+                        fallback_vertical="garage_doors",
+                        source_batch="round1",
+                    )
+                )
+                self.assertNotIn("category_is_a_different_trade", result.reasons)
+
     def test_hard_icp_gate_has_a_floor_and_no_ceiling(self) -> None:
         low_review_with_site = normalize_lead(
             {
