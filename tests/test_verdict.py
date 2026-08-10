@@ -47,6 +47,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SENDABLE_ROW = {
     "Business Name": "Lorain Garage Door Repair Co",
     "Place Key": "place-send-1",
+    # The MVP is phone-only, so a lead with no dialable number is now refused
+    # outright. Every fixture that is meant to reach `send` has to carry one.
+    "Phone": "(440) 555-0142",
     # `Lead Priority`, not `Grade`: `manual_review_reason` reads only
     # ("Lead Priority", "grade"), so a row carrying the grade under `Grade`
     # alone can never reach the manual-review tier.
@@ -105,12 +108,27 @@ SENDABLE_ROW = {
 
 def rows_across_the_tier_space() -> list[dict[str, str]]:
     """A spread of rows, not a curated pass — the projection must hold on all."""
+    # The tiers no longer split on grade, confidence or rating — those are rank
+    # inputs. They split on how a lead fails: a claim a human can fix is
+    # `review`, a good business with no leak found yet is `watch`, and only a
+    # hard eligibility failure is `reject`.
     return [
         {},
         dict(SENDABLE_ROW),  # send
-        {**SENDABLE_ROW, "Lead Priority": "C", "Site Status": "missing"},  # review
-        {**SENDABLE_ROW, "confidence": "low"},  # watch
-        {**SENDABLE_ROW, "Safe Outreach Claims": ""},  # reject
+        # Claim integrity fails, business is fine — a human can fix the copy.
+        {**SENDABLE_ROW, "Lead Priority": "B", "Safe Outreach Claims": ""},  # review
+        # No concrete leak found, but a business worth keeping an eye on.
+        {
+            **SENDABLE_ROW,
+            "Current Website Quality": "Good",
+            "Site Status": "loaded",
+            "best_angle": "Website Rebuild",
+            "visible_pain_score": "0",
+            "Visible Pain Reasons": "",
+            "send_trigger": "",
+        },  # watch
+        # No dialable number: nothing a human can do with it.
+        {**SENDABLE_ROW, "Phone": ""},  # reject
         {**SENDABLE_ROW, "commercial_fit_state": "unverified"},
         {**SENDABLE_ROW, "contact_eligibility": "hold-commercial-case"},
         {**SENDABLE_ROW, "Rating": "3.1", "Reviews": "2"},

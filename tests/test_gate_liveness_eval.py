@@ -39,8 +39,10 @@ class GateLivenessEvalTests(unittest.TestCase):
 
         constants = module.blocker_constants(sendability)
 
-        self.assertIn("SCORE_BLOCKER", constants)
-        self.assertEqual(constants["SCORE_BLOCKER"], sendability.SCORE_BLOCKER)
+        self.assertIn("CONVERSION_ISSUE_BLOCKER", constants)
+        self.assertEqual(
+            constants["CONVERSION_ISSUE_BLOCKER"], sendability.CONVERSION_ISSUE_BLOCKER
+        )
         self.assertTrue(all(name.endswith("_BLOCKER") for name in constants))
         self.assertEqual(
             set(constants),
@@ -57,26 +59,29 @@ class GateLivenessEvalTests(unittest.TestCase):
 
         reachable = module.reachable_blockers(source, "evaluate_sendability")
 
-        self.assertIn("SCORE_BLOCKER", reachable)
+        self.assertIn("CONVERSION_ISSUE_BLOCKER", reachable)
         self.assertIn("HARD_ICP_SKIP_BLOCKER", reachable)
         self.assertNotIn("SCORER_WITHHELD_BLOCKER", reachable)
         self.assertNotIn("PACKET_TIER_NOT_SENDABLE_BLOCKER", reachable)
 
     def test_suffixed_blocker_messages_still_count_as_a_fire(self) -> None:
-        """Commercial-fit blockers ship as `"<blocker>: <state>"`; matching the
-        bare string would undercount them to zero."""
+        """ICP-skip and out-of-country blockers ship as `"<blocker>: <detail>"`;
+        matching the bare string would undercount them to zero."""
         module = self.module()
 
         fires = module.count_fires(
             [
-                {"send_blockers": ["Commercial fit gate failed: unverified"]},
-                {"send_blockers": ["Low confidence"]},
+                {"send_blockers": ["Hard ICP gate skipped this lead: franchise"]},
+                {"send_blockers": ["No dialable phone number"]},
             ],
-            {"COMMERCIAL_FIT_BLOCKER": "Commercial fit gate failed", "CONFIDENCE_BLOCKER": "Low confidence"},
+            {
+                "HARD_ICP_SKIP_BLOCKER": "Hard ICP gate skipped this lead",
+                "MISSING_PHONE_BLOCKER": "No dialable phone number",
+            },
         )
 
-        self.assertEqual(fires["COMMERCIAL_FIT_BLOCKER"], 1)
-        self.assertEqual(fires["CONFIDENCE_BLOCKER"], 1)
+        self.assertEqual(fires["HARD_ICP_SKIP_BLOCKER"], 1)
+        self.assertEqual(fires["MISSING_PHONE_BLOCKER"], 1)
 
     def test_a_blocker_fires_at_most_once_per_row(self) -> None:
         module = self.module()
@@ -85,15 +90,15 @@ class GateLivenessEvalTests(unittest.TestCase):
             [
                 {
                     "send_blockers": [
-                        "Commercial fit gate failed: unverified",
-                        "Commercial fit gate failed: invalid asset_state",
+                        "Hard ICP gate skipped this lead: franchise",
+                        "Hard ICP gate skipped this lead: category denylist",
                     ]
                 }
             ],
-            {"COMMERCIAL_FIT_BLOCKER": "Commercial fit gate failed"},
+            {"HARD_ICP_SKIP_BLOCKER": "Hard ICP gate skipped this lead"},
         )
 
-        self.assertEqual(fires["COMMERCIAL_FIT_BLOCKER"], 1)
+        self.assertEqual(fires["HARD_ICP_SKIP_BLOCKER"], 1)
 
     # --- the categories ------------------------------------------------------
 

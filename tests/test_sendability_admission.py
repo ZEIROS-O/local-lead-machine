@@ -420,26 +420,25 @@ class NoScoringPathEmitsSendableYesOnASkippedLeadTest(unittest.TestCase):
         # ceiling still stood would have made the one profile that has ever
         # converted unsendable — which is why the ceiling came out first.
         #
-        # What still governs a 222-review lead is the demand band, not the ICP
-        # gate: `mature` demands a visible pain score of 40 rather than 16. That
-        # is the separate axis, and it is meant to keep biting.
+        # The demand band used to govern such a lead as a second gate: `mature`
+        # demanded a visible pain score of 40 rather than 16. That threshold is a
+        # rank input now — it says how far down the queue a lead sits, not
+        # whether it is in it — so a 222-review business with a named leak is
+        # sendable at either pain score, and the band still travels with it.
         enriched = self._enriched()
         enriched["google"]["reviews"] = "222"
 
-        under_the_band = self._scored(enriched)
-        self.assertEqual(under_the_band["Sendable"], "No")
-        self.assertEqual(
-            under_the_band["Send Blockers"],
-            "Visible conversion pain too weak for business maturity",
-        )
-        self.assertNotIn(HARD_ICP_SKIP_BLOCKER, under_the_band["Send Blockers"])
+        low_pain = self._scored(enriched)
+        self.assertEqual(low_pain["Sendable"], "Yes")
+        self.assertEqual(low_pain["Send Blockers"], "")
+        self.assertNotIn(HARD_ICP_SKIP_BLOCKER, low_pain["Send Blockers"])
 
         enriched["evidence"]["visible_pain_score"] = 45
-        cleared = self._scored(enriched)
+        higher_pain = self._scored(enriched)
 
-        self.assertEqual(cleared["Review Demand Band"], "mature")
-        self.assertEqual(cleared["Sendable"], "Yes")
-        self.assertEqual(cleared["Send Blockers"], "")
+        self.assertEqual(higher_pain["Review Demand Band"], "mature")
+        self.assertEqual(higher_pain["Sendable"], "Yes")
+        self.assertEqual(higher_pain["Send Blockers"], "")
 
     def test_evaluate_sendability_reports_the_same_verdict_as_the_admission(self) -> None:
         row = self._scored(

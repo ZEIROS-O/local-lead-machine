@@ -5972,7 +5972,8 @@ class LeadMachineContractsTest(unittest.TestCase):
 
         self.assertEqual(row["Sendable"], "No")
         self.assertIn("Invalid evidence reference", row["Send Blockers"])
-        self.assertEqual(row["Minimum Evidence Passed"], "No")
+        # Still blocked; still a real business. See the hallucinated-claim test.
+        self.assertEqual(row["Minimum Evidence Passed"], "Yes")
 
     def test_manual_score_with_b_grade_but_no_concrete_issue_gets_blocked(self) -> None:
         enriched = {
@@ -5996,7 +5997,12 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertIn("Missing concrete conversion issue", row["Send Blockers"])
         self.assertEqual(row["Packet Eligible"], "")
 
-    def test_sendability_rejects_skip_grade_even_when_other_gates_pass(self) -> None:
+    def test_a_skip_grade_no_longer_overrides_evidence_that_holds_up(self) -> None:
+        # The grade is a summary of the same evidence the gate reads. When the
+        # two disagree the evidence is the authority, so a `Skip` on a lead whose
+        # leak is real and whose claims are cited no longer withdraws it — it
+        # sinks it in the rank. A hard disqualifier is what still refuses a lead
+        # outright, and that is checked separately.
         enriched = {
             "google": {
                 **self._google_fixture(),
@@ -6010,12 +6016,14 @@ class LeadMachineContractsTest(unittest.TestCase):
 
         sendable["Lead Priority"] = "Skip"
         sendable["grade"] = "Skip"
-        blocked = apply_sendability(sendable)
+        still_sendable = apply_sendability(sendable)
 
-        self.assertEqual(blocked["Sendable"], "No")
-        self.assertIn("Lead grade below sendable threshold", blocked["Send Blockers"])
-        self.assertNotEqual(blocked["Packet Tier"], "Sendable Packet")
-        self.assertEqual(blocked["Packet Eligible"], "")
+        self.assertEqual(still_sendable["Sendable"], "Yes")
+        self.assertEqual(still_sendable["Send Blockers"], "")
+
+        # A hard disqualifier, by contrast, is not a matter of degree.
+        sendable["Hard Disqualifiers"] = "out of business"
+        self.assertEqual(apply_sendability(sendable)["Sendable"], "No")
 
     def test_hard_disqualified_manual_score_is_no_packet_even_with_high_total(self) -> None:
         enriched = {
@@ -6115,7 +6123,7 @@ class LeadMachineContractsTest(unittest.TestCase):
                 fallback_vertical="hardscaping",
             )
 
-    def test_send_trigger_is_required_for_sendable_yes(self) -> None:
+    def test_a_missing_send_trigger_no_longer_withholds_a_named_leak(self) -> None:
         enriched = {
             "google": self._google_fixture(),
             "evidence": {
@@ -6140,9 +6148,11 @@ class LeadMachineContractsTest(unittest.TestCase):
 
         row = merge_manual_score(enriched, raw_score, fallback_vertical="hardscaping")
 
-        self.assertEqual(row["Sendable"], "No")
-        self.assertIn("Missing concrete send trigger", row["Send Blockers"])
-        self.assertEqual(row["Packet Eligible"], "")
+        # The send trigger was a restatement of the leak in outreach words, and
+        # requiring it separately blocked 1,243 leads that had already named one.
+        # `Missing concrete conversion issue` is the check that means it.
+        self.assertEqual(row["Sendable"], "Yes")
+        self.assertEqual(row["Send Trigger"], "")
 
     def test_strong_reviews_with_sufficient_visible_pain_is_sendable(self) -> None:
         enriched = {
@@ -6294,11 +6304,18 @@ class LeadMachineContractsTest(unittest.TestCase):
 
         row = merge_manual_score(enriched, raw_score, fallback_vertical="hardscaping")
 
+        # Still refused, and for the reason that was always underneath the
+        # Advanced-Optimization special case: there is no concrete leak to name.
+        # The angle-specific blocker and the send-trigger blocker were demoted
+        # with the rest of the judgement gates; this one check subsumes both.
         self.assertEqual(row["Sendable"], "No")
-        self.assertIn("Advanced Optimization without concrete visible pain", row["Send Blockers"])
-        self.assertIn("Missing concrete send trigger", row["Send Blockers"])
+        self.assertIn("Missing concrete conversion issue", row["Send Blockers"])
 
-    def test_manual_score_with_high_score_and_low_confidence_gets_blocked_but_evidence_can_pass(self) -> None:
+    def test_low_confidence_no_longer_blocks_a_lead_whose_claims_hold_up(self) -> None:
+        # Confidence is the model's opinion of its own work, and it was blocking
+        # 308 leads. It is a rank input now: a low-confidence lead sorts below a
+        # high-confidence one instead of never being dialled. What still has to
+        # be true is that its claims are backed, and they are.
         enriched = {
             "google": self._google_fixture(),
             "evidence": self._evidence_fixture(site_status="weak"),
@@ -6308,8 +6325,8 @@ class LeadMachineContractsTest(unittest.TestCase):
         row = merge_manual_score(enriched, raw_score, fallback_vertical="hardscaping")
 
         self.assertEqual(row["Lead Priority"], "B")
-        self.assertEqual(row["Sendable"], "No")
-        self.assertIn("Low confidence", row["Send Blockers"])
+        self.assertEqual(row["AI Confidence"], "low")
+        self.assertEqual(row["Sendable"], "Yes")
         self.assertEqual(row["Minimum Evidence Passed"], "Yes")
 
     def test_no_site_lead_with_strong_reviews_passes_concrete_issue_gate(self) -> None:
@@ -6440,7 +6457,10 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertIn("Missing concrete conversion issue", row["Send Blockers"])
         self.assertIn("Missing evidence-backed opener", row["Send Blockers"])
         self.assertIn("Safe outreach claim missing evidence reference", row["Send Blockers"])
-        self.assertEqual(row["Minimum Evidence Passed"], "No")
+        # `Minimum Evidence Passed` now answers "is this a real business we are
+        # allowed to call", not "is the claim clean" — an ungrounded claim on a
+        # legitimate business routes to a human rather than to the bin.
+        self.assertEqual(row["Minimum Evidence Passed"], "Yes")
 
     def test_packet_eligible_cannot_be_yes_when_sendable_is_no(self) -> None:
         row = {"Lead Priority": "A", "Packet Eligible": "Yes", "Sendable": "No"}
@@ -6493,7 +6513,13 @@ class LeadMachineContractsTest(unittest.TestCase):
         base.update(overrides)
         return self._manual_score(**base)
 
-    def test_b_no_site_facebook_only_low_confidence_is_manual_review_packet(self) -> None:
+    def test_b_no_site_facebook_only_low_confidence_is_now_sendable(self) -> None:
+        # A Facebook-only business with 45 reviews and a named missing-website
+        # leak is the archetype this machine exists to find. It used to be
+        # diverted to a manual-review packet on grade and confidence, neither of
+        # which says anything about whether the leak is real. Both are rank
+        # inputs now, so it goes to the rep — near the top, since the leak is
+        # concrete and the demand proof is strong.
         enriched = self._facebook_only_evidence(
             reviews="45",
             reasons=[
@@ -6507,11 +6533,10 @@ class LeadMachineContractsTest(unittest.TestCase):
         row = merge_manual_score(enriched, raw_score, fallback_vertical="detailing")
 
         self.assertEqual(row["Lead Priority"], "B")
-        self.assertEqual(row["Sendable"], "No")
+        self.assertEqual(row["Sendable"], "Yes")
         self.assertEqual(row["Minimum Evidence Passed"], "Yes")
-        self.assertEqual(row["Packet Tier"], "Manual Review Packet")
+        self.assertEqual(row["Packet Tier"], "Sendable Packet")
         self.assertEqual(row["Packet Eligible"], "Yes")
-        self.assertTrue(row["Manual Review Reason"])
         self.assertTrue(is_eligible(row, include_all=False, priority_filter=None))
 
     def test_refresh_packet_tiers_backfills_old_rehab_style_csv_row(self) -> None:
@@ -6550,11 +6575,11 @@ class LeadMachineContractsTest(unittest.TestCase):
                 [row] = list(csv.DictReader(f))
 
         self.assertEqual(row["Business Name"], "Rehab Auto Spa")
+        # The tier this backfills to follows the current gate — the point of the
+        # test is that a CSV with no Packet Tier column gets one, not which one.
         self.assertEqual(row["Lead Priority"], scored["Lead Priority"])
-        self.assertEqual(row["Packet Tier"], "Manual Review Packet")
+        self.assertEqual(row["Packet Tier"], "Sendable Packet")
         self.assertEqual(row["Packet Eligible"], "Yes")
-        self.assertIn("Manual Review Packet", row["Packet Eligibility Reason"])
-        self.assertTrue(row["Manual Review Reason"])
 
     def test_c_no_site_facebook_only_below_b_is_manual_review_packet(self) -> None:
         enriched = self._facebook_only_evidence(
@@ -6582,11 +6607,13 @@ class LeadMachineContractsTest(unittest.TestCase):
 
         row = merge_manual_score(enriched, raw_score, fallback_vertical="detailing")
 
+        # C grade, and sendable anyway. The score is a ranking signal, not a
+        # permission: this lead has a named leak and claims that hold up, so it
+        # belongs in the queue — below the A-grade leads, not absent from it.
         self.assertEqual(row["Lead Priority"], "C")
-        self.assertEqual(row["Sendable"], "No")
-        self.assertIn("Score below B threshold", row["Send Blockers"])
+        self.assertEqual(row["Sendable"], "Yes")
         self.assertEqual(row["Minimum Evidence Passed"], "Yes")
-        self.assertEqual(row["Packet Tier"], "Manual Review Packet")
+        self.assertEqual(row["Packet Tier"], "Sendable Packet")
         self.assertEqual(row["Packet Eligible"], "Yes")
 
     def test_c_estimate_funnel_strong_cta_low_visible_pain_is_not_manual_review(self) -> None:
@@ -6639,11 +6666,13 @@ class LeadMachineContractsTest(unittest.TestCase):
 
         row = merge_manual_score(enriched, raw_score, fallback_vertical="detailing")
 
+        # "Basic estimate form only" is a named, verifiable leak, and the claims
+        # citing it are backed. The maturity-scaled pain threshold that used to
+        # rule it too small to be worth a call is a rank input now.
         self.assertEqual(row["Lead Priority"], "C")
-        self.assertEqual(row["Sendable"], "No")
-        self.assertNotEqual(row["Packet Tier"], "Manual Review Packet")
-        self.assertEqual(row["Packet Eligible"], "")
-        self.assertFalse(is_eligible(row, include_all=False, priority_filter=None))
+        self.assertEqual(row["Sendable"], "Yes")
+        self.assertEqual(row["Packet Tier"], "Sendable Packet")
+        self.assertTrue(is_eligible(row, include_all=False, priority_filter=None))
 
     def test_skip_social_only_high_pain_becomes_watchlist_not_manual_review_packet(self) -> None:
         # Skip grade (total < 50) + social-only pain: should land in Watchlist, never Manual Review Packet.
@@ -6668,12 +6697,15 @@ class LeadMachineContractsTest(unittest.TestCase):
 
         row = merge_manual_score(enriched, raw_score, fallback_vertical="detailing")
 
+        # A Skip grade on a business with 45 reviews and no website at all. The
+        # grade was the model marking its own homework; the leak is real and the
+        # claims cite it, so the lead is dialable and the Skip becomes a rank
+        # signal. Watchlist is now for leads with no leak found, not for leads
+        # with a leak and a low score.
         self.assertEqual(row["Lead Priority"], "Skip")
-        self.assertEqual(row["Sendable"], "No")
-        self.assertNotEqual(row["Packet Tier"], "Manual Review Packet")
-        self.assertEqual(row["Packet Tier"], "Watchlist")
-        self.assertEqual(row["Packet Eligible"], "")
-        self.assertFalse(is_eligible(row, include_all=False, priority_filter=None))
+        self.assertEqual(row["Sendable"], "Yes")
+        self.assertEqual(row["Packet Tier"], "Sendable Packet")
+        self.assertTrue(is_eligible(row, include_all=False, priority_filter=None))
 
     def test_advanced_optimization_strong_form_no_issue_is_no_packet(self) -> None:
         enriched = {
@@ -6969,10 +7001,13 @@ class LeadMachineContractsTest(unittest.TestCase):
 
         row = merge_manual_score(enriched, raw_score, fallback_vertical="hardscaping")
 
+        # A mature business behind a strong funnel is still refused — not
+        # because its pain is too small for its review count, which was
+        # judgement and is now a rank input, but because no concrete leak was
+        # found at all.
         self.assertEqual(row["Sendable"], "No")
         self.assertEqual(row["Packet Eligible"], "")
         self.assertIn("Missing concrete conversion issue", row["Send Blockers"])
-        self.assertIn("Visible conversion pain too weak for business maturity", row["Send Blockers"])
 
     def test_mature_high_review_missing_estimate_path_can_be_sendable_with_money_signal(self) -> None:
         enriched = {

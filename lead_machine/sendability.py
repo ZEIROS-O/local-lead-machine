@@ -14,6 +14,7 @@ from .buyer_signals import (
 )
 from . import queue_state
 from .evidence import EMPTY_BODY_FLAG, HARD_FETCH_FAILURE_FLAGS, NO_BODY_FORM_METHOD
+from .schema import normalize_phone
 from .score_schema import (
     ASSET_STATES,
     COMMERCIAL_FIT_STATES,
@@ -32,17 +33,13 @@ CONTACT_READINESS_FIELDS = (
     "Contact Eligibility",
 )
 
-SCORE_BLOCKER = "Score below B threshold"
-GRADE_BLOCKER = "Lead grade below sendable threshold"
+# Score, grade, confidence, rating, review count, demand, angle, send trigger and
+# the maturity-scaled pain threshold used to be declared here as blockers. They
+# are gone, not renamed: they are judgement about whether a lead is worth
+# dialling, they are now inputs to the rank the queue sorts on, and a constant
+# left behind would invite a new caller to gate on one again.
 HARD_DISQUALIFIER_BLOCKER = "Hard disqualifier present"
 CONVERSION_ISSUE_BLOCKER = "Missing concrete conversion issue"
-SEND_TRIGGER_BLOCKER = "Missing concrete send trigger"
-DEMAND_BLOCKER = "Missing proof-of-demand signal"
-RATING_BLOCKER = "Rating below 4.0 minimum"
-REVIEW_COUNT_BLOCKER = "Review count below sendable minimum"
-VISIBLE_PAIN_BLOCKER = "Visible conversion pain too weak for business maturity"
-STRONG_FORM_NO_PAIN_BLOCKER = "Strong estimate form exists / no concrete visible conversion issue"
-ADVANCED_OPTIMIZATION_BLOCKER = "Advanced Optimization without concrete visible pain"
 FORM_ABSENCE_CLAIM_BLOCKER = "Strong estimate form conflicts with missing-form claim"
 # The blocker above is a *contradiction* detector, and it cannot reach this
 # case: on a lead whose body came back empty `estimate_form_detected` is "No"
@@ -50,15 +47,11 @@ FORM_ABSENCE_CLAIM_BLOCKER = "Strong estimate form conflicts with missing-form c
 # This one asks the other question — is there a page behind the claim at all.
 UNSUPPORTED_ABSENCE_CLAIM_BLOCKER = "Form-absence claim with no parsed page body"
 ESTIMATE_FUNNEL_STRONG_FORM_BLOCKER = "Estimate Funnel blocked by strong estimate form without estimate-path weakness"
-ANGLE_BLOCKER = "Missing clear outreach angle"
 OPENER_BLOCKER = "Missing evidence-backed opener"
 EVIDENCE_COUNT_BLOCKER = "Not enough evidence references"
-CONFIDENCE_BLOCKER = "Low confidence"
 NO_SAFE_CLAIM_BLOCKER = "No safe outreach claim"
 SAFE_CLAIM_REF_BLOCKER = "Safe outreach claim missing evidence reference"
 INVALID_REF_BLOCKER = "Invalid evidence reference"
-COMMERCIAL_FIT_BLOCKER = "Commercial fit gate failed"
-CONTACT_ELIGIBILITY_BLOCKER = "Contact eligibility is not contact-now"
 HARD_ICP_SKIP_BLOCKER = "Hard ICP gate skipped this lead"
 # The two non-scoring paths that used to mint their own verdict, expressed as
 # blockers so they go through `admit` like everything else.
@@ -67,6 +60,7 @@ MANUAL_CARD_UNVERIFIED_BLOCKER = "Manual lead card not marked sendable by the op
 PACKET_TIER_NOT_SENDABLE_BLOCKER = "Packet Tier is not the sendable tier"
 
 OUT_OF_COUNTRY_BLOCKER = "Business is not in the United States"
+MISSING_PHONE_BLOCKER = "No dialable phone number"
 
 # Address tails that mean "in market". Anything else that looks like a country
 # name is out; a tail that is not a country at all (a bare street address, a
@@ -89,26 +83,39 @@ US_STATE_NAMES = {
     "district of columbia", "puerto rico",
 }
 
-EVIDENCE_BLOCKERS = {
+# A lead we may not or cannot call. Nothing a human can fix on the copy changes
+# any of these, which is what separates them from the claim-integrity set below
+# and what makes them the right split for the packet tiers: these are the only
+# blockers that mean `reject` rather than `review`.
+HARD_ELIGIBILITY_BLOCKERS = {
     HARD_DISQUALIFIER_BLOCKER,
     HARD_ICP_SKIP_BLOCKER,
     OUT_OF_COUNTRY_BLOCKER,
+    MISSING_PHONE_BLOCKER,
+}
+
+# Everything else the gate still raises: the lead is legitimate, but something we
+# would say about it is not backed by its own snapshot. The judgement blockers
+# that used to sit here — score, grade, confidence, rating, review count, demand,
+# angle, send trigger, maturity-scaled pain — were demoted to rank inputs and are
+# no longer raised at all.
+CLAIM_INTEGRITY_BLOCKERS = {
     CONVERSION_ISSUE_BLOCKER,
-    SEND_TRIGGER_BLOCKER,
-    VISIBLE_PAIN_BLOCKER,
-    STRONG_FORM_NO_PAIN_BLOCKER,
-    ADVANCED_OPTIMIZATION_BLOCKER,
     FORM_ABSENCE_CLAIM_BLOCKER,
     UNSUPPORTED_ABSENCE_CLAIM_BLOCKER,
     ESTIMATE_FUNNEL_STRONG_FORM_BLOCKER,
-    DEMAND_BLOCKER,
     OPENER_BLOCKER,
     EVIDENCE_COUNT_BLOCKER,
     NO_SAFE_CLAIM_BLOCKER,
     SAFE_CLAIM_REF_BLOCKER,
     INVALID_REF_BLOCKER,
-    COMMERCIAL_FIT_BLOCKER,
 }
+
+# The whole vocabulary the gate can still produce. Kept as one name because
+# `tests/test_gate_liveness_eval.py` walks it to prove every blocker is
+# reachable, and a blocker that no longer exists must disappear from here rather
+# than linger as a permanently-unreachable entry.
+EVIDENCE_BLOCKERS = HARD_ELIGIBILITY_BLOCKERS | CLAIM_INTEGRITY_BLOCKERS
 
 COMMERCIAL_DIMENSION_FIELDS = {
     "commercial_materiality": ("Commercial Materiality", "commercial_materiality"),
@@ -567,15 +574,28 @@ def evaluate_sendability(row: Dict[str, Any]) -> Dict[str, Any]:
     known_refs = known_evidence_ids(row)
     commercial_fit = evaluate_commercial_fit(row)
 
-    if total_score < MIN_SENDABLE_SCORE:
-        blockers.append(SCORE_BLOCKER)
-
-    grade = _pick(row, "Lead Priority", "grade", "Grade").strip().upper()
-    if grade not in {"A", "B"}:
-        blockers.append(GRADE_BLOCKER)
-
+    # Score, grade, confidence, rating, review count, demand, angle, send trigger
+    # and the maturity-scaled pain threshold used to block here. They are
+    # judgement about whether a lead is *worth* dialling, not about whether what
+    # we would say to it is true — and judgement about an offer with zero closes
+    # behind it is guesswork that only a real call can settle. Blocking on it
+    # destroyed the tail: those nine accounted for the great majority of the
+    # 2,595 rejects left after the commercial tribunal came out.
+    #
+    # They are not discarded, they are demoted. Every one of them is an input to
+    # the deterministic rank the queue sorts on, so the rep still dials
+    # best-first; the difference is that a weak lead now sorts last instead of
+    # not existing. What stays blocking below is claim integrity: the lead is
+    # reachable, it has a real named leak, and everything we would say about it
+    # is backed by a reference that exists in its own snapshot.
     if has_hard_disqualifier(row):
         blockers.append(HARD_DISQUALIFIER_BLOCKER)
+
+    # The MVP is phone-only (AGENTS.md), and reachability was only ever a
+    # subscore — nothing refused a lead we had no way to call. With the score and
+    # grade gates demoted, nothing else would have caught it either.
+    if not has_dialable_phone(row):
+        blockers.append(MISSING_PHONE_BLOCKER)
 
     # The commercial tribunal is computed and reported, but it no longer blocks.
     #
@@ -606,9 +626,6 @@ def evaluate_sendability(row: Dict[str, Any]) -> Dict[str, Any]:
     if not concrete_issue:
         blockers.append(CONVERSION_ISSUE_BLOCKER)
 
-    if not send_trigger:
-        blockers.append(SEND_TRIGGER_BLOCKER)
-
     if strong_estimate_form and has_form_absence_claim(row):
         blockers.append(FORM_ABSENCE_CLAIM_BLOCKER)
 
@@ -627,43 +644,18 @@ def evaluate_sendability(row: Dict[str, Any]) -> Dict[str, Any]:
     ):
         blockers.append(ESTIMATE_FUNNEL_STRONG_FORM_BLOCKER)
 
-    if strong_estimate_form and not concrete_issue:
-        blockers.append(STRONG_FORM_NO_PAIN_BLOCKER)
-
-    if _best_angle(row).lower() == "advanced optimization" and (
-        not concrete_issue or is_generic_optimization_only(row)
-    ):
-        blockers.append(ADVANCED_OPTIMIZATION_BLOCKER)
-
-    if rating and rating < 4.0:
-        blockers.append(RATING_BLOCKER)
-
-    if reviews < 5 and not is_exceptional_low_review_fit(row):
-        blockers.append(REVIEW_COUNT_BLOCKER)
-
-    # Only a confirmed "yes" relaxes the mature-band pain threshold below. An
-    # "unknown" must behave exactly as False did, or the gate loosens on the
-    # leads we have the least evidence about.
-    money_signal = has_money_signal(row)
-    review_band = _review_demand_band(row)
-    required_pain = required_visible_pain_score(reviews, review_band=review_band, money_signal=money_signal)
-    if not is_exceptional_low_review_fit(row) and visible_pain_score < required_pain:
-        blockers.append(VISIBLE_PAIN_BLOCKER)
-
-    if not has_demand_signal(row):
-        blockers.append(DEMAND_BLOCKER)
-
-    if not _pick(row, "best_angle", "Offer Fit", "Best Service Angle"):
-        blockers.append(ANGLE_BLOCKER)
-
     if not has_evidence_backed_opener(row, safe_claims=safe_claims):
         blockers.append(OPENER_BLOCKER)
 
-    if len(evidence_refs) < 2:
+    # One, not two. The floor exists so that nothing is said without a citation
+    # behind it, and one real citation satisfies that; the second was padding
+    # that cost 116 leads without making any claim more true. `INVALID_REF_BLOCKER`
+    # below is what actually enforces that a ref means something.
+    if len(evidence_refs) < 1:
         blockers.append(EVIDENCE_COUNT_BLOCKER)
 
-    if confidence < MIN_SENDABLE_CONFIDENCE:
-        blockers.append(CONFIDENCE_BLOCKER)
+    # Still computed for the rank and for the packet-tier split below.
+    money_signal = has_money_signal(row)
 
     if not safe_claims:
         blockers.append(NO_SAFE_CLAIM_BLOCKER)
@@ -676,10 +668,23 @@ def evaluate_sendability(row: Dict[str, Any]) -> Dict[str, Any]:
 
     admission = admit(row, blockers)
 
+    # "Is this a real business we are allowed to call", not "is the claim clean".
+    #
+    # This used to be defined against EVIDENCE_BLOCKERS, which was then a strict
+    # subset of what the gate raised. It no longer is: thinning the gate left the
+    # two sets equal, which would have made this identical to `sendable` — and
+    # `evaluate_packet_tier` returns early on sendable, so `review` and `watch`
+    # would have become unreachable and every lead would land in send or reject.
+    #
+    # Splitting on hard eligibility instead restores the three-way routing and
+    # gives the middle tiers a clearer meaning than they had before: `reject` is
+    # a lead we may not or cannot call, `review` is a good business whose *claim*
+    # needs a human, and `watch` is a good business with no leak found yet. Only
+    # the first is a dead end.
     minimum_evidence_passed = not any(
-        blocker in EVIDENCE_BLOCKERS
-        or blocker.startswith(f"{COMMERCIAL_FIT_BLOCKER}:")
+        blocker in HARD_ELIGIBILITY_BLOCKERS
         or blocker.startswith(f"{HARD_ICP_SKIP_BLOCKER}:")
+        or blocker.startswith(f"{OUT_OF_COUNTRY_BLOCKER}:")
         for blocker in admission.blockers
     )
 
@@ -1563,6 +1568,27 @@ def _evidence_profile(row: Dict[str, Any]) -> Dict[str, Any]:
 def _raw_evidence(row: Dict[str, Any]) -> Dict[str, Any]:
     raw = _loads_json_if_possible(row.get("Raw Evidence") or row.get("raw_evidence"))
     return raw if isinstance(raw, dict) else {}
+
+
+def has_dialable_phone(row: Dict[str, Any]) -> bool:
+    """Whether *row* carries a number a rep could actually call.
+
+    Ten digits, or eleven behind a US country code — the same normalization the
+    upsert key and the suppression index use, so a lead cannot be dialable here
+    and unidentifiable there. Anything shorter is a fragment scraped off a page,
+    not a phone number.
+
+    Falls back to the crawled numbers because the Places record is not the only
+    place one arrives: a business with no listed number often still prints one in
+    its own site header, and that is a real lead we would otherwise refuse.
+    """
+    candidates = [_pick(row, "Phone", "phone")]
+    raw = _raw_evidence(row)
+    website = raw.get("website") if isinstance(raw.get("website"), dict) else {}
+    google = raw.get("google") if isinstance(raw.get("google"), dict) else {}
+    candidates.extend(str(value) for value in (website.get("phones_found") or []))
+    candidates.append(str(google.get("phone") or ""))
+    return any(len(normalize_phone(candidate)) == 10 for candidate in candidates if candidate)
 
 
 def _split_refs(value: Any) -> List[str]:
