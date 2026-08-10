@@ -28,7 +28,7 @@ import shutil
 import sys
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Tuple
 
@@ -232,9 +232,19 @@ class MissingManualScore:
 
 
 @dataclass(frozen=True)
+class InvalidManualScore:
+    """A lead whose saved score failed validation and was left unscored."""
+
+    lead_name: str
+    score_file: str
+    error: str
+
+
+@dataclass(frozen=True)
 class ManualScoreRun:
     rows: List[Dict[str, Any]]
     missing_scores: List[MissingManualScore]
+    invalid_scores: List["InvalidManualScore"] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -2198,9 +2208,11 @@ def score_records_manual_run(
     only_scored: bool = False,
     api_evidence_ref_ids_by_lead_id: Dict[str, set[str]] | None = None,
     api_merge_debug_dir: Path | None = None,
+    isolate_invalid_scores: bool = False,
 ) -> ManualScoreRun:
     scored: List[Dict[str, Any]] = []
     missing_scores: List[MissingManualScore] = []
+    invalid_scores: List[InvalidManualScore] = []
     has_known_evidence_ids = False
     for record in records:
         record = ensure_evidence(record)
@@ -2233,7 +2245,30 @@ def score_records_manual_run(
                     allowed_refs=allowed_for_api_merge,
                     error=exc,
                 )
-                raise ValueError(f"{exc}; API merge validation debug written to {debug_path}") from exc
+                if not isolate_invalid_scores:
+                    raise ValueError(
+                        f"{exc}; API merge validation debug written to {debug_path}"
+                    ) from exc
+                # Opt-in only, and off by default: raising here is a deliberate
+                # contract (`test_api_llm_resume_does_not_hide_unknown_refs_for_new_records`)
+                # that a refused ref must never pass quietly, and that stands.
+                #
+                # What it did not anticipate is the cost asymmetry on a paid
+                # run: one hallucinated ref in one lead aborts the merge *after*
+                # every call in the chunk is paid for, and nothing about the
+                # merge is resumable, so the only fix is a full re-spend. Two
+                # recovery chunks died that way. With the flag on, the offending
+                # lead is dropped -- fail-closed, so it ends with no score and
+                # cannot be packeted or sent -- and every other score survives.
+                print(
+                    f"[LLM] Score failed validation, lead left unscored: {lead_name} ({exc}); "
+                    f"debug written to {debug_path}",
+                    file=sys.stderr,
+                )
+                invalid_scores.append(
+                    InvalidManualScore(lead_name=lead_name, score_file=str(score_path), error=str(exc))
+                )
+                continue
             raise
         attach_icp_ceiling_shadow(row, record, fallback_vertical=fallback_vertical)
         if "Known Evidence IDs" in row or "known_evidence_ids" in row:
@@ -2245,7 +2280,7 @@ def score_records_manual_run(
             row.setdefault("Known Evidence IDs", "")
             row.setdefault("known_evidence_ids", [])
 
-    return ManualScoreRun(rows=scored, missing_scores=missing_scores)
+    return ManualScoreRun(rows=scored, missing_scores=missing_scores, invalid_scores=invalid_scores)
 
 
 def score_records_manual(
@@ -3479,6 +3514,7 @@ def score_records_api_run(
     resume_scored_keys: set[str] | None = None,
     usage_output_path: Path | None = None,
     concurrency: int = 1,
+    isolate_invalid_scores: bool = False,
 ) -> ApiLlmRun:
     """Score `records` through the API-LLM chain, bounded by the per-run caps.
 
@@ -3891,6 +3927,7 @@ def score_records_api_run(
         only_scored=True,
         api_evidence_ref_ids_by_lead_id=api_evidence_ref_ids_by_lead_id,
         api_merge_debug_dir=bundle_dir,
+        isolate_invalid_scores=isolate_invalid_scores,
     )
     return ApiLlmRun(
         manual_run=manual_run,
@@ -4054,6 +4091,14 @@ def main() -> int:
         "--confirm-llm-spend",
         action="store_true",
         help="API LLM mode: confirm projected spend above the confirmation threshold",
+    )
+    parser.add_argument(
+        "--isolate-invalid-scores",
+        action="store_true",
+        help="API LLM mode: when a returned score cites evidence the lead does not have, leave "
+             "that one lead unscored and merge the rest, instead of aborting the whole run. The "
+             "refused score is never accepted either way -- this only decides whether one bad "
+             "lead discards a chunk that has already been paid for. Off by default.",
     )
     parser.add_argument(
         "--fresh-scores-dir",
@@ -4224,12 +4269,20 @@ def main() -> int:
             max_usd_per_run=max_usd_per_run,
             usage_output_path=Path(args.llm_usage_output) if args.llm_usage_output else None,
             concurrency=resolve_llm_scoring_concurrency(),
+            isolate_invalid_scores=args.isolate_invalid_scores,
         )
         scored = api_run.manual_run.rows
         print(f"[LLM] Calls: {api_run.calls}")
         print(f"[LLM] Tokens: {api_run.tokens}")
         print(f"[LLM] Estimated USD: {api_run.usd:.4f}")
         print(f"[LLM] Missing scores skipped: {len(api_run.manual_run.missing_scores)}")
+        # Loudly, and itemised: these leads were paid for and came back with a
+        # score we refused, so a run that quietly reported N-1 rows would read
+        # as a clean run.
+        invalid = api_run.manual_run.invalid_scores
+        print(f"[LLM] Scores refused by validation (lead left unscored): {len(invalid)}")
+        for bad in invalid:
+            print(f"[LLM] - {bad.lead_name}: {bad.error}")
         cap_skips, batch_failures = partition_api_llm_skips(api_run.skipped_records)
         print(f"[LLM] Records skipped by LLM caps: {len(cap_skips)}")
         for skipped in cap_skips:

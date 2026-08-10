@@ -500,8 +500,9 @@ def build_paid_score_cmd(
     llm_usage: Path,
     llm_batch_size: int,
     llm_max_tokens: int,
+    isolate_invalid_scores: bool = False,
 ) -> list[str]:
-    return _score_base_cmd(
+    cmd = _score_base_cmd(
         enriched=enriched, scored=scored, vertical=vertical, scores_dir=scores_dir,
         limit=limit, llm_batch_size=llm_batch_size, llm_max_tokens=llm_max_tokens,
     ) + [
@@ -513,6 +514,9 @@ def build_paid_score_cmd(
         "--llm-usage-output",
         str(llm_usage),
     ]
+    if isolate_invalid_scores:
+        cmd.append("--isolate-invalid-scores")
+    return cmd
 
 
 def build_refresh_cmd(source: Path, output: Optional[Path] = None) -> list[str]:
@@ -778,6 +782,13 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                         help="Authorize paid scoring above the confirmation threshold")
     parser.add_argument("--overwrite", action="store_true", help="Reuse the existing batch instead of forking")
     parser.add_argument(
+        "--isolate-invalid-scores",
+        action="store_true",
+        help="Passed to paid scoring: if a returned score cites evidence the lead does not have, "
+             "leave that one lead unscored and keep the rest of the run, instead of aborting a "
+             "chunk that has already been paid for. The bad score is refused either way.",
+    )
+    parser.add_argument(
         "--refresh-older-than",
         type=int,
         default=None,
@@ -939,6 +950,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
                     enriched=enriched, scored=paths.scored_output, vertical=args.vertical,
                     scores_dir=scores_dir, limit=args.limit, cards=cards, llm_usage=llm_usage,
                     llm_batch_size=args.llm_batch_size, llm_max_tokens=args.llm_max_tokens,
+                    isolate_invalid_scores=args.isolate_invalid_scores,
                 ))
     else:
         status("SCORING", "skipped (mode does not score)")

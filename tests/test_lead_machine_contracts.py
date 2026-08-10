@@ -4241,6 +4241,70 @@ class LeadMachineContractsTest(unittest.TestCase):
 
         self.assertIn("Unknown evidence_refs: fake_unknown_ref", str(caught.exception))
 
+    def test_isolate_invalid_scores_drops_the_lead_and_keeps_the_rest(self) -> None:
+        """Opt-in: one refused score must not discard a chunk already paid for.
+
+        The refusal itself is unchanged -- the bad score is never accepted, and
+        the lead ends with no row, so it cannot be packeted or sent. What the
+        flag changes is only whether the *other* leads in a paid run survive.
+        Two recovery chunks were lost to this, ~1M tokens, over one bad ref each.
+        """
+        good = self._huge_detailing_record(name="Good Detail", place_id="ChIJ1")
+        bad = self._huge_detailing_record(name="Bad Ref Detail", place_id="ChIJ2")
+        good["google"]["google_maps_url"] = "https://maps.google.com/?cid=1"
+        bad["google"]["google_maps_url"] = "https://maps.google.com/?cid=2"
+
+        def fake_score_batch(prompt, *, model="", max_tokens=0, batch_id="", **kwargs):
+            # The prompt carries the lead's score_file; batch_size=1 so each
+            # call is exactly one lead.
+            score_file = "chij2.json" if "chij2" in str(prompt).lower() else "chij1.json"
+            refs = ["fake_unknown_ref"] if score_file == "chij2.json" else ["google_profile"]
+            return {
+                "bundle": {
+                    "batch_id": "batch_001",
+                    "scores": [
+                        {
+                            "score_file": score_file,
+                            "score": self._manual_score(
+                                total_score=75,
+                                grade="B",
+                                evidence_refs=refs,
+                                safe_outreach_claims=[
+                                    {
+                                        "claim": "Your buyer-intent signals show active demand.",
+                                        "evidence_refs": refs,
+                                    }
+                                ],
+                            ),
+                        }
+                    ],
+                },
+                "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+            }
+
+        from score_leads import score_records_api_run
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("score_leads.llm_client.score_batch", side_effect=fake_score_batch):
+                run = score_records_api_run(
+                    [good, bad],
+                    scores_dir=Path(tmp) / "scores",
+                    fallback_vertical="detailing",
+                    batch_size=1,
+                    model="claude-sonnet-5",
+                    max_tokens=4096,
+                    max_calls=0,
+                    max_tokens_per_run=100_000,
+                    max_usd_per_run=0.0,
+                    isolate_invalid_scores=True,
+                )
+
+        names = [str(row.get("Business Name") or row.get("business_name")) for row in run.manual_run.rows]
+        self.assertIn("Good Detail", names)
+        self.assertNotIn("Bad Ref Detail", names)
+        self.assertEqual(len(run.manual_run.invalid_scores), 1)
+        self.assertIn("fake_unknown_ref", run.manual_run.invalid_scores[0].error)
+
     def _huge_detailing_record(self, *, name: str = "A+ Detailing LLC", place_id: str = "ChIJ123") -> dict:
         giant_text = (
             "Ceramic coating packages include paint correction before installation. "
