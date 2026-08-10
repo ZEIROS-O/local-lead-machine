@@ -63,17 +63,41 @@ def _require_keys(data: Dict[str, Any], keys: Iterable[str]) -> None:
         raise ValueError(f"Manual score missing required keys: {', '.join(missing)}")
 
 
+def _evidence_field_alias(ref: str) -> str:
+    """The bare field name inside an id, so `ev-cta_terms-5` reads `cta-terms`.
+
+    The prompt shows the model two shapes at once: six bare legacy names
+    (`form_detection`, `google_profile`, ...) and the generated `ev-<field>-<n>`
+    ids. It reliably answers in a mixture, and by analogy invents bare names for
+    fields that only exist in the generated form — `cta_terms` for
+    `ev-cta_terms-5` — or welds the two together as `ev-form_detection-4`.
+    Both name a real, unambiguous piece of evidence, and both used to abort the
+    whole merge after every LLM call in the run had already been paid for.
+    """
+    stripped = re.sub(r"^ev[-_]+", "", ref.casefold())
+    stripped = re.sub(r"[-_]+\d+$", "", stripped)
+    return re.sub(r"[-_]+", "-", stripped)
+
+
 def _canonicalize_evidence_refs(refs: List[str], allowed_evidence_ids: Set[str]) -> List[str]:
     aliases: Dict[str, List[str]] = {}
+    field_aliases: Dict[str, List[str]] = {}
     for allowed_id in sorted(allowed_evidence_ids):
         alias = re.sub(r"[-_]+", "-", allowed_id.casefold())
         aliases.setdefault(alias, []).append(allowed_id)
+        field_aliases.setdefault(_evidence_field_alias(allowed_id), []).append(allowed_id)
 
     canonical: List[str] = []
     for ref in refs:
         resolved = ref
         if ref not in allowed_evidence_ids:
             matches = aliases.get(re.sub(r"[-_]+", "-", ref.casefold()), [])
+            if len(matches) != 1:
+                # Fall back to the field name, and only when exactly one piece
+                # of evidence answers to it. Ambiguity stays an error: binding a
+                # claim to the wrong evidence is worse than refusing the score,
+                # which is the same rule the exact-alias pass above follows.
+                matches = field_aliases.get(_evidence_field_alias(ref), [])
             if len(matches) == 1:
                 resolved = matches[0]
         if resolved not in canonical:

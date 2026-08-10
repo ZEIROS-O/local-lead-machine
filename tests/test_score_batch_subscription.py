@@ -151,6 +151,42 @@ class SubscriptionScoringTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unknown evidence_refs: invented-ref"):
             validate_manual_score(score, allowed_evidence_ids={"ev-cta_strength-16"})
 
+    def test_evidence_refs_canonicalize_bare_field_name_model_drift(self) -> None:
+        """The prompt shows bare legacy names and ev-<field>-<n> ids together.
+
+        The model answers in a mixture and, by analogy with the six bare names
+        that are real, invents bare ones for fields that exist only in the
+        generated form. On the recovery run this aborted two whole chunks after
+        every LLM call in them had already been paid for -- one bad ref in one
+        lead discarded ~500k tokens of good scoring.
+        """
+        allowed = {"form_detection", "ev-cta_terms-5", "ev-cta_strength-15"}
+        score = valid_score()
+
+        # A bare name for a field that only exists as an ev- id.
+        score["evidence_refs"] = ["cta_terms"]
+        self.assertEqual(
+            validate_manual_score(score, allowed_evidence_ids=allowed)["evidence_refs"],
+            ["ev-cta_terms-5"],
+        )
+
+        # The two shapes welded together.
+        score["evidence_refs"] = ["ev-form_detection-4"]
+        self.assertEqual(
+            validate_manual_score(score, allowed_evidence_ids=allowed)["evidence_refs"],
+            ["form_detection"],
+        )
+
+    def test_ambiguous_field_name_is_still_refused(self) -> None:
+        """Binding a claim to the wrong evidence is worse than refusing it."""
+        score = valid_score()
+        score["evidence_refs"] = ["cta_terms"]
+
+        with self.assertRaisesRegex(ValueError, "Unknown evidence_refs: cta_terms"):
+            validate_manual_score(
+                score, allowed_evidence_ids={"ev-cta_terms-5", "ev-cta_terms-9"}
+            )
+
     def test_schema_required_keys_match_current_importer_contract(self) -> None:
         schema = json.loads(DEFAULT_SCHEMA.read_text(encoding="utf-8"))
         score_schema = schema["properties"]["scores"]["items"]["properties"]["score"]
