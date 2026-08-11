@@ -285,7 +285,12 @@ CSV_AIRTABLE_FIELDS = [
     "Consent Posture",
 ]
 
-OPERATIONAL_FIELDS = ["Status", "Outreach Channel"]
+OPERATIONAL_FIELDS = [
+    "Status",
+    "Last Contacted",
+    "Next Follow-Up",
+    "Outreach Channel",
+]
 GENERATED_OPERATIONAL_FIELDS = ["Assigned Setter"]
 OPTIONAL_FIELDS = ["Packet Path"]
 DEFAULT_PACKET_DIR = Path("packets_manual_existing_manual")

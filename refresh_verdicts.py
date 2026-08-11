@@ -13,6 +13,7 @@ from tempfile import NamedTemporaryFile
 from typing import Any, Iterable
 
 import refresh_packet_tiers
+from lead_machine.csv_validation import read_validated_dict_rows
 from lead_machine.sendability import (
     VERDICT_PACKET_TIERS,
     apply_sendability,
@@ -79,8 +80,7 @@ def refresh_row(row: dict[str, Any]) -> dict[str, Any]:
 def _read_csv(path: Path) -> tuple[list[str], list[dict[str, str]]]:
     raise_csv_limit()
     with path.open(newline="", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle)
-        return list(reader.fieldnames or []), list(reader)
+        return read_validated_dict_rows(handle, source=str(path))
 
 
 def _write_csv(path: Path, fieldnames: list[str], rows: list[dict[str, Any]]) -> None:
@@ -97,7 +97,7 @@ def _write_csv(path: Path, fieldnames: list[str], rows: list[dict[str, Any]]) ->
             delete=False,
         ) as handle:
             temporary = Path(handle.name)
-            writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+            writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="raise")
             writer.writeheader()
             writer.writerows(rows)
         temporary.replace(path)

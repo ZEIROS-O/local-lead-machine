@@ -89,6 +89,39 @@ class UploadSetterAssignmentTest(unittest.TestCase):
         self.assertEqual(patched["method"], "PATCH")
         self.assertNotIn("Assigned Setter", patched["payload"]["fields"])
 
+    def test_csv_operational_fields_are_seeded_on_create_only(self) -> None:
+        operational = {
+            "Status": "Follow-Up",
+            "Last Contacted": "2026-08-10",
+            "Next Follow-Up": "2026-08-14",
+            "Assigned Setter": "Lou",
+            "Outreach Channel": "Phone",
+        }
+        with patch.dict(os.environ, {"LPM_SETTER_ROSTER": "Lou"}, clear=False):
+            with tempfile.TemporaryDirectory() as tmp:
+                card = upload_airtable.csv_row_to_record(
+                    {
+                        "Business Name": "Human Owned Lead",
+                        "Place Key": "ChIJHumanOwned",
+                        **operational,
+                    },
+                    Path(tmp),
+                )
+
+        posted = plan_airtable_sync([card])[0]
+        patched = plan_airtable_sync(
+            [card], existing_records_by_key={"place:ChIJHumanOwned": "recExisting"}
+        )[0]
+
+        self.assertEqual(posted["method"], "POST")
+        self.assertEqual(
+            {field: posted["payload"]["fields"][field] for field in operational},
+            operational,
+        )
+        self.assertEqual(patched["method"], "PATCH")
+        for field in operational:
+            self.assertNotIn(field, patched["payload"]["fields"])
+
     def test_unconfigured_roster_leaves_assignment_absent(self) -> None:
         with patch.dict(os.environ, {"LPM_SETTER_ROSTER": ""}, clear=False):
             card = self._card()

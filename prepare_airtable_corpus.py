@@ -15,6 +15,7 @@ from typing import Any, Iterable
 
 from lead_machine.schema import normalize_phone
 from lead_machine.airtable_sync import VERTICAL_CHOICES, normalize_airtable_value
+from lead_machine.csv_validation import read_validated_dict_rows
 from lead_machine.verticals import resolve_profile
 from refresh_verdicts import VERDICT_REFRESH_FIELDS, refresh_row, validate_refreshed_row
 
@@ -83,6 +84,20 @@ def _sorted_paths(paths: Iterable[Path | str]) -> list[Path]:
     return sorted(resolved, key=lambda path: (path.stat().st_mtime_ns, str(path)))
 
 
+def _validate_distinct_paths(paths: Iterable[tuple[str, Path | None]]) -> None:
+    seen: dict[Path, str] = {}
+    for label, path in paths:
+        if path is None:
+            continue
+        resolved = path.resolve()
+        prior = seen.get(resolved)
+        if prior is not None:
+            raise ValueError(
+                f"path collision: {label} and {prior} both resolve to {resolved}"
+            )
+        seen[resolved] = label
+
+
 def prepare_corpus(
     paths: Iterable[Path | str],
     overrides: dict[str, str],
@@ -97,11 +112,13 @@ def prepare_corpus(
     sorted_paths = _sorted_paths(paths)
     for source_path in sorted_paths:
         with source_path.open(newline="", encoding="utf-8") as handle:
-            reader = csv.DictReader(handle)
-            for field in reader.fieldnames or []:
+            source_fieldnames, source_records = read_validated_dict_rows(
+                handle, source=str(source_path)
+            )
+            for field in source_fieldnames:
                 if field not in fieldnames:
                     fieldnames.append(field)
-            for line_number, row in enumerate(reader, start=2):
+            for line_number, row in enumerate(source_records, start=2):
                 source_rows += 1
                 key = upsert_key(row)
                 if not key:
@@ -273,8 +290,15 @@ def main(argv: list[str] | None = None) -> int:
     try:
         source_paths = [Path(path) for path in args.source]
         output = Path(args.output)
-        if any(output.resolve() == source.resolve() for source in source_paths):
-            raise ValueError("output must not replace a source CSV")
+        _validate_distinct_paths(
+            [
+                *((f"source[{index}]", source) for index, source in enumerate(source_paths, start=1)),
+                ("output", output),
+                ("report", args.report),
+                ("vertical overrides", args.vertical_overrides),
+                ("excluded upsert keys", args.excluded_upsert_keys),
+            ]
+        )
         fieldnames, rows, report = prepare_corpus(
             source_paths,
             _load_overrides(args.vertical_overrides),

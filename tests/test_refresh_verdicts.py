@@ -21,6 +21,26 @@ OPERATIONAL = {
 
 
 class RefreshVerdictsTests(unittest.TestCase):
+    def _malformed_csv_text(self, kind: str) -> str:
+        row = dict(SENDABLE_ROW)
+        fieldnames = list(row)
+        values = [row[field] for field in fieldnames]
+        if kind == "blank header":
+            fieldnames.append("")
+            values.append("")
+        elif kind == "duplicate header":
+            fieldnames.append("Business Name")
+            values.append(row["Business Name"])
+        elif kind == "unexpected extra cells":
+            values.append("unexpected")
+        else:
+            raise AssertionError(f"unknown malformed CSV kind: {kind}")
+        rendered = io.StringIO(newline="")
+        writer = csv.writer(rendered)
+        writer.writerow(fieldnames)
+        writer.writerow(values)
+        return rendered.getvalue()
+
     def test_refreshes_stale_send_verdict_from_current_authority(self) -> None:
         from refresh_verdicts import refresh_row
 
@@ -97,6 +117,20 @@ class RefreshVerdictsTests(unittest.TestCase):
                 refresh_csv(source)
 
             self.assertEqual(source.read_bytes(), before)
+
+    def test_in_place_refresh_refuses_malformed_csv_without_changing_bytes(self) -> None:
+        from refresh_verdicts import refresh_csv
+
+        for kind in ("blank header", "duplicate header", "unexpected extra cells"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                source = Path(directory) / "input.csv"
+                source.write_text(self._malformed_csv_text(kind), encoding="utf-8")
+                before = source.read_bytes()
+
+                with self.assertRaisesRegex(ValueError, kind):
+                    refresh_csv(source, in_place=True)
+
+                self.assertEqual(source.read_bytes(), before)
 
     def test_cli_requires_an_explicit_write_mode(self) -> None:
         from refresh_verdicts import main

@@ -31,6 +31,25 @@ class PrepareAirtableCorpusTests(unittest.TestCase):
     def _row(self, **changes: str) -> dict[str, str]:
         return {**SENDABLE_ROW, "Vertical": "Hardscaping", **changes}
 
+    def _write_malformed_csv(self, path: Path, kind: str) -> None:
+        row = self._row()
+        fieldnames = list(row)
+        values = [row[field] for field in fieldnames]
+        if kind == "blank header":
+            fieldnames.append("")
+            values.append("")
+        elif kind == "duplicate header":
+            fieldnames.append("Business Name")
+            values.append(row["Business Name"])
+        elif kind == "unexpected extra cells":
+            values.append("unexpected")
+        else:
+            raise AssertionError(f"unknown malformed CSV kind: {kind}")
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(fieldnames)
+            writer.writerow(values)
+
     def test_newer_place_key_row_replaces_older_row(self) -> None:
         from prepare_airtable_corpus import prepare_corpus
 
@@ -249,6 +268,118 @@ class PrepareAirtableCorpusTests(unittest.TestCase):
         self.assertEqual(output_contents, "existing output\n")
         self.assertIn("expect-output-rows", stderr.getvalue())
 
+    def test_malformed_source_refuses_without_replacing_existing_output(self) -> None:
+        from prepare_airtable_corpus import main
+
+        for kind in ("blank header", "duplicate header", "unexpected extra cells"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                source = directory / "source.csv"
+                self._write_malformed_csv(source, kind)
+                output = directory / "corpus.csv"
+                output.write_bytes(b"existing output\n")
+                before = output.read_bytes()
+                stderr = io.StringIO()
+
+                with redirect_stderr(stderr):
+                    exit_code = main(
+                        ["--source", str(source), "--output", str(output)]
+                    )
+
+                self.assertEqual(exit_code, 2)
+                self.assertEqual(output.read_bytes(), before)
+                self.assertIn(kind, stderr.getvalue())
+
+    def test_report_cannot_replace_a_source_or_existing_output(self) -> None:
+        from prepare_airtable_corpus import main
+
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            source = self._write_csv(directory, "source.csv", [self._row()], 1)
+            source_before = source.read_bytes()
+            output = directory / "corpus.csv"
+            output.write_bytes(b"existing output\n")
+            output_before = output.read_bytes()
+            stderr = io.StringIO()
+
+            with redirect_stderr(stderr):
+                exit_code = main(
+                    [
+                        "--source",
+                        str(source),
+                        "--output",
+                        str(output),
+                        "--report",
+                        str(source),
+                    ]
+                )
+
+            source_after = source.read_bytes()
+            output_after = output.read_bytes()
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(source_after, source_before)
+        self.assertEqual(output_after, output_before)
+        self.assertIn("path collision", stderr.getvalue())
+
+    def test_report_cannot_alias_output_and_preserves_existing_bytes(self) -> None:
+        from prepare_airtable_corpus import main
+
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            source = self._write_csv(directory, "source.csv", [self._row()], 1)
+            output = directory / "corpus.csv"
+            output.write_bytes(b"existing output\n")
+            before = output.read_bytes()
+            stderr = io.StringIO()
+
+            with redirect_stderr(stderr):
+                exit_code = main(
+                    [
+                        "--source",
+                        str(source),
+                        "--output",
+                        str(output),
+                        "--report",
+                        str(output),
+                    ]
+                )
+
+            after = output.read_bytes()
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(after, before)
+        self.assertIn("path collision", stderr.getvalue())
+
+    def test_support_file_cannot_alias_output_and_preserves_existing_bytes(self) -> None:
+        from prepare_airtable_corpus import main
+
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            source = self._write_csv(directory, "source.csv", [self._row()], 1)
+            overrides_and_output = directory / "vertical-overrides.json"
+            overrides_and_output.write_text("{}\n", encoding="utf-8")
+            before = overrides_and_output.read_bytes()
+            stderr = io.StringIO()
+
+            with redirect_stderr(stderr):
+                exit_code = main(
+                    [
+                        "--source",
+                        str(source),
+                        "--vertical-overrides",
+                        str(overrides_and_output),
+                        "--output",
+                        str(overrides_and_output),
+                    ]
+                )
+
+            after = overrides_and_output.read_bytes()
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(after, before)
+        self.assertIn("path collision", stderr.getvalue())
+
     def test_cli_report_redacts_sensitive_source_values_and_flattens_sources(self) -> None:
         from prepare_airtable_corpus import main
 
@@ -256,11 +387,12 @@ class PrepareAirtableCorpusTests(unittest.TestCase):
             directory = Path(temporary)
             first = self._write_csv(directory, "first.csv", [self._row()], 1)
             second = self._write_csv(directory, "second.csv", [self._row(**{"Place Key": "other"})], 2)
+            third = self._write_csv(directory, "third.csv", [self._row(**{"Place Key": "third"})], 3)
             output = directory / "corpus.csv"
             stdout = io.StringIO()
             with redirect_stdout(stdout):
                 self.assertEqual(
-                    main(["--source", str(first), str(second), "--source", str(first), "--output", str(output)]),
+                    main(["--source", str(first), str(second), "--source", str(third), "--output", str(output)]),
                     0,
                 )
 
