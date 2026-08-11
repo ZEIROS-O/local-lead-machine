@@ -4,7 +4,7 @@ import csv
 import io
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 from lead_machine.sendability import VERDICT_PACKET_TIERS, evaluate_sendability
@@ -44,6 +44,21 @@ class RefreshVerdictsTests(unittest.TestCase):
         self.assertEqual(updated["Packet Tier"], VERDICT_PACKET_TIERS["reject"])
         self.assertFalse(evaluate_sendability(updated)["sendable"])
 
+    def test_validation_rejects_non_send_verdict_for_sendable_authority(self) -> None:
+        from refresh_verdicts import validate_refreshed_row
+
+        row = {
+            **SENDABLE_ROW,
+            "Sendable": "Yes",
+            "Verdict": "review",
+            "Packet Tier": VERDICT_PACKET_TIERS["review"],
+        }
+
+        self.assertIn(
+            "Verdict must be send exactly when current authority is sendable",
+            validate_refreshed_row(row),
+        )
+
     def test_csv_round_trip_handles_large_raw_evidence_and_is_idempotent(self) -> None:
         from refresh_verdicts import refresh_csv
 
@@ -60,7 +75,7 @@ class RefreshVerdictsTests(unittest.TestCase):
 
             first = refresh_csv(source, output)
             first_bytes = output.read_bytes()
-            second = refresh_csv(output, output)
+            second = refresh_csv(output, in_place=True)
             second_bytes = output.read_bytes()
 
             self.assertEqual(first["verdict_counts"], {"send": 1})
@@ -69,6 +84,34 @@ class RefreshVerdictsTests(unittest.TestCase):
             with output.open(newline="", encoding="utf-8") as handle:
                 result = next(csv.DictReader(handle))
             self.assertEqual(len(result["Raw Evidence"]), 131_073)
+
+    def test_refresh_csv_requires_an_explicit_write_mode(self) -> None:
+        from refresh_verdicts import refresh_csv
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "input.csv"
+            source.write_text("Business Name,Verdict\nExample,reject\n", encoding="utf-8")
+            before = source.read_bytes()
+
+            with self.assertRaises(ValueError):
+                refresh_csv(source)
+
+            self.assertEqual(source.read_bytes(), before)
+
+    def test_cli_requires_an_explicit_write_mode(self) -> None:
+        from refresh_verdicts import main
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "input.csv"
+            source.write_text("Business Name,Verdict\nExample,reject\n", encoding="utf-8")
+            before = source.read_bytes()
+            stderr = io.StringIO()
+
+            with redirect_stderr(stderr):
+                self.assertEqual(main([str(source)]), 2)
+
+            self.assertEqual(source.read_bytes(), before)
+            self.assertIn("--output or --in-place", stderr.getvalue())
 
     def test_check_reports_without_writing(self) -> None:
         from refresh_verdicts import main
