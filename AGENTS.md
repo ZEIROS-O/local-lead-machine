@@ -33,7 +33,10 @@ order; each loop is independently revertible.
 
 ### Non-negotiable invariants (apply to every loop)
 - **Maker ≠ checker.** An independent verifier on an *objective* gate (`lead_machine/sendability.py`)
-  decides what ships. No send without a real, named, verifiable leak. KPI = accept-rate; below ~50% the loop is losing.
+  decides what ships. No send without a real, named, verifiable leak. KPI = pre-dial approval
+  (`evals/pre_dial_approval.py`); below ~50% the loop is losing. Read `evals/accept_rate.py` as an
+  *operational* check only — logging a dial sets `Follow-Up`, which it counts as accepted, so a rep
+  working the queue in order scores 100% whatever the leads are worth. It cannot judge lead quality.
 - **Quality is a gate, not a throughput knob.** Automate the *personalized asset*, keep the *message* human-grade. Never optimize raw message volume.
 - **Hard stops on the outside:** token/$ caps, opt-out suppression, reply-stops-sequence.
 - **Fail-closed compliance**, email-first; never auto-blast cold SMS (TCPA) without consent.

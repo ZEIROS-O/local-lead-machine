@@ -19,6 +19,30 @@
 > may be declared sendable**. Both are detailed under "Landed since" in
 > [phase-a-backlog.md](phase-a-backlog.md). **Gate 0 still governs** — the first booked call landed
 > 2026-07-28, and Gate 0 opens on closes, not calls.
+>
+> **Status note (2026-08-10, commercial-tribunal strip):** the morning layer has a third verb.
+> `mark_declined.py` records the leads the rep reads and refuses to call, into the append-only
+> ledger `lead_machine/dial_decisions.py` (`$LPM_DIAL_DECISIONS_JSONL`), and `mark_sent.py` records
+> the dials into the same file. The morning loop is now
+> `query_ready_to_send → mark_declined | mark_sent → mark_outcome`.
+>
+> This exists because **accept-rate could not measure what it was being asked to measure.**
+> `mark_sent` sets `Follow-Up` and `evals/accept_rate.py` counts `Follow-Up` as accepted, so a rep
+> who dials whatever the queue serves scores 100% regardless of lead quality — the refusals never
+> entered the denominator. That was tolerable while the commercial tribunal refused 71% of the
+> corpus upstream; once those nine judgement gates became a ranking
+> (`lead_machine/dial_rank.py`), accept-rate was the only proposed check on whether the strip cost
+> anything, and it was measuring the wrong event. **The KPI is now
+> `evals/pre_dial_approval.py`**; read accept-rate as an operational check that proposals are being
+> actioned, never as evidence about lead quality.
+>
+> Two things to know before trusting the queue order. The dial-rank weights (35 pain / 25 demand /
+> 15 money / 10 confidence / 10 score / 5 evidence) are **invented and unvalidated** — there has
+> been no close to fit them to — and are deliberately frozen for the first experiment, because
+> retuning an invention before outcomes arrive just substitutes a second invention. And the eval
+> carries their falsifier: it compares the mean rank of approved against refused leads and warns
+> when the gap is under 10 points, since a ranking that does not separate the two is ordering
+> nothing no matter how healthy the approval rate looks.
 
 ## Context
 
