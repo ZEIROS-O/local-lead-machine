@@ -43,6 +43,8 @@ class PrepareAirtableCorpusTests(unittest.TestCase):
             values.append(row["Business Name"])
         elif kind == "unexpected extra cells":
             values.append("unexpected")
+        elif kind == "missing cells":
+            values.pop()
         else:
             raise AssertionError(f"unknown malformed CSV kind: {kind}")
         with path.open("w", newline="", encoding="utf-8") as handle:
@@ -271,7 +273,12 @@ class PrepareAirtableCorpusTests(unittest.TestCase):
     def test_malformed_source_refuses_without_replacing_existing_output(self) -> None:
         from prepare_airtable_corpus import main
 
-        for kind in ("blank header", "duplicate header", "unexpected extra cells"):
+        for kind in (
+            "blank header",
+            "duplicate header",
+            "unexpected extra cells",
+            "missing cells",
+        ):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temporary:
                 directory = Path(temporary)
                 source = directory / "source.csv"

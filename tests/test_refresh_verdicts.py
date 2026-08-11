@@ -33,6 +33,8 @@ class RefreshVerdictsTests(unittest.TestCase):
             values.append(row["Business Name"])
         elif kind == "unexpected extra cells":
             values.append("unexpected")
+        elif kind == "missing cells":
+            values.pop()
         else:
             raise AssertionError(f"unknown malformed CSV kind: {kind}")
         rendered = io.StringIO(newline="")
@@ -121,7 +123,12 @@ class RefreshVerdictsTests(unittest.TestCase):
     def test_in_place_refresh_refuses_malformed_csv_without_changing_bytes(self) -> None:
         from refresh_verdicts import refresh_csv
 
-        for kind in ("blank header", "duplicate header", "unexpected extra cells"):
+        for kind in (
+            "blank header",
+            "duplicate header",
+            "unexpected extra cells",
+            "missing cells",
+        ):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
                 source = Path(directory) / "input.csv"
                 source.write_text(self._malformed_csv_text(kind), encoding="utf-8")
