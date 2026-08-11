@@ -91,10 +91,11 @@ class TheRankFalsifier(unittest.TestCase):
 class TheRankComparisonIsWithheldWhenItWouldMislead(unittest.TestCase):
     """The two sides are written by different commands, so coverage can diverge.
 
-    `hermes_queue` invokes mark_sent without `--rank` while declines are logged
-    by hand, so the dials can be almost entirely unranked while the declines are
-    fully ranked. Averaging across that gap compares two populations and prints
-    one number — the same defect as the accept-rate this eval replaces.
+    Both now go through Hermes carrying the rank the frozen queue served, which
+    closes the structural gap — but a lead decided from a bare record id has no
+    queue entry to take a rank from, and queue files written before the rank was
+    projected carry none. Averaging across that gap compares two populations and
+    prints one number — the same defect as the accept-rate this eval replaces.
     """
 
     def test_a_thin_ranked_side_withholds_the_comparison(self) -> None:

@@ -126,11 +126,13 @@ def evaluate_pre_dial_approval(
     declined_rank = summary["mean_rank_declined"]
 
     # Withheld rather than reported when the two sides are not comparably
-    # ranked. The dials and the declines are recorded by different commands,
-    # and `hermes_queue` runs mark_sent without `--rank`, so one side can be
-    # near-fully ranked while the other is barely covered. A mean-vs-mean across
-    # that gap compares two different populations and prints as one number —
-    # which is the same defect as the accept-rate this eval exists to replace.
+    # ranked. Both are now written through Hermes carrying the rank the frozen
+    # queue served, so the structural gap that made this necessary is closed —
+    # but coverage can still diverge for ordinary reasons: a lead decided from a
+    # bare record id has no queue entry to take a rank from, and queue files
+    # written before the rank was projected carry none at all. A mean-vs-mean
+    # across that gap compares two different populations and prints as one
+    # number, which is the same defect as the accept-rate this eval replaces.
     ranked_dialed = summary["ranked_dialed"]
     ranked_declined = summary["ranked_declined"]
     coverage_dialed = ranked_dialed / summary["dialed"] if summary["dialed"] else 0.0
@@ -168,8 +170,8 @@ def evaluate_pre_dial_approval(
             rank_line = (
                 f"- rank check: withheld — rank coverage is {coverage_dialed:.0%} on dials "
                 f"vs {coverage_declined:.0%} on declines. Comparing these means "
-                "comparing two different populations. Pass --rank on both paths "
-                "(hermes_queue's mark_sent call omits it)."
+                "comparing two different populations. Decide leads by queue item "
+                "number so both paths carry the rank the queue served."
             )
     elif separation < rank_separation_target:
         rank_ok = False

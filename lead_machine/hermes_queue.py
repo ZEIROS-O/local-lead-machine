@@ -60,6 +60,7 @@ from lead_machine.compliance import (
 QUEUE_SCHEMA_VERSION = 2
 QUERY_SCRIPT = "query_ready_to_send.py"
 MARK_SENT_SCRIPT = "mark_sent.py"
+MARK_DECLINED_SCRIPT = "mark_declined.py"
 CONFIG_ENV = "MORNING_QUEUE_CONFIG"
 CONFIG_FILENAME = "morning_queue.json"
 QUERY_TIMEOUT_SECONDS = 120
@@ -603,6 +604,16 @@ def _build_queue_items(
             "n": index,
             "record_id": str(record.get("record_id") or ""),
             "vertical": resolve_vertical_label(str(record.get("Vertical") or "")) or "unknown",
+            # Carried beside record_id rather than through ITEM_FIELD_MAP: the
+            # rank is computed by `query_ready_to_send`, not read from a column,
+            # so there is no Airtable field to map it from. It has to survive
+            # into the frozen queue because this file is what `mark_sent` reads
+            # when the rep types an item number — without it the dial reaches
+            # the ledger unranked while hand-logged declines arrive ranked, and
+            # a mean-vs-mean across that gap is the exact defect
+            # `pre_dial_approval` exists to refuse. `None`, not 0.0: zero is a
+            # rank, and the worst one.
+            "dial_rank": record.get("dial_rank"),
         }
         for key, field in ITEM_FIELD_MAP:
             item[key] = record.get(field, "")
@@ -1168,6 +1179,123 @@ def _append_outcome_row(config: dict[str, Any], row: dict[str, Any]) -> str:
     return f"outcomes row appended to {path.name}"
 
 
+def _resolve_queue_selection(
+    tokens: list[str],
+    *,
+    root_path: Path,
+    queue_run_id: str,
+    queue_sha256: str,
+) -> list[dict[str, Any]]:
+    """Map *tokens* to queue items, binding numbers to an immutable queue run.
+
+    Shared by mark-sent and mark-declined because the rule is the same for both:
+    an item number means nothing without the run that served it, and binding one
+    to the wrong run acts on the wrong business. Retiring the wrong lead is
+    quieter than messaging the wrong one, which is exactly why it needs the same
+    guard rather than a laxer one.
+    """
+    if not tokens:
+        raise CommandError("Pass at least one item number or record id.")
+    if any(token.isdigit() for token in tokens) or queue_run_id or queue_sha256:
+        _, data = _load_queue_for_marking(root_path, queue_run_id, queue_sha256)
+        return _match_items(tokens, data["items"])
+    if not all(RECORD_ID_RE.match(token) for token in tokens):
+        raise CommandError(
+            "Bare item numbers are forbidden; use record IDs or bind numbers to an exact queue run."
+        )
+    return [
+        {"n": None, "record_id": token, "business": token, "vertical": "", "dial_rank": None}
+        for token in dict.fromkeys(tokens)
+    ]
+
+
+def cmd_mark_declined(
+    tokens: list[str],
+    *,
+    reason: str = "",
+    queue_run_id: str = "",
+    queue_sha256: str = "",
+    artifact_sha256: str = "",
+    execute: bool = False,
+    root: Path | str = Path("."),
+    python_path: Path | str | None = None,
+) -> CommandResult:
+    """Record that the rep read a lead and chose not to call it.
+
+    The verb the morning workflow was missing. `mark_sent` was reachable through
+    Hermes and `mark_declined` was not, so the only observation that can push
+    pre-dial approval *down* required remembering an out-of-band command the tool
+    never mentioned — and a KPI whose adverse half depends on the rep's memory
+    measures the rep's memory. Worse for the experiment: dials arrived carrying
+    the rank and hand-logged declines carried whatever the rep typed, so the two
+    sides of the falsifier were never ranked by the same path.
+
+    No approval handshake, unlike mark-sent. That gate exists because a send
+    transmits something to a person and Gate 0 forbids doing that autonomously.
+    A decline transmits nothing; it retires a lead and writes one ledger line.
+    Guarding it like a send would tax the refusal and leave approval measuring
+    how tedious refusing is.
+
+    Re-declining is left to `mark_declined.py`, which only accepts `Status=New`
+    and refuses a second pass on its own — the same reason there is no writeback
+    journal here.
+    """
+    root_path = _absolute(root)
+    why = str(reason or "").strip()
+    if not why:
+        raise CommandError(
+            "Pass --reason. A refusal with no reason records that a lead was refused "
+            "but not which signal was wrong, which is the only thing that can retire "
+            "or restore a demoted blocker."
+        )
+    matched = _resolve_queue_selection(
+        tokens, root_path=root_path, queue_run_id=queue_run_id, queue_sha256=queue_sha256
+    )
+    if any(not str(item.get("record_id") or "") for item in matched):
+        raise CommandError("Every selected item must have an Airtable record ID.")
+
+    labels = [
+        f"{item.get('n') or 'record'}. {item.get('business') or item.get('record_id')}"
+        for item in matched
+    ]
+    if not execute:
+        return CommandResult(
+            f"repo_root: {root_path}\n"
+            f"preview /mark-declined: record a pre-dial refusal for {', '.join(labels)} "
+            f"with reason {why!r}, PATCH Airtable Status=Not Fit via {MARK_DECLINED_SCRIPT}, "
+            "and append one pre-dial decision row. Nothing is transmitted to anyone."
+        )
+
+    lines: list[str] = []
+    for item, label in zip(matched, labels):
+        record_id = str(item.get("record_id") or "")
+        cmd = [
+            str(python_path or sys.executable), MARK_DECLINED_SCRIPT,
+            "--record-id", record_id,
+            "--reason", why,
+        ]
+        served_rank = item.get("dial_rank")
+        if served_rank is not None and str(served_rank).strip() != "":
+            cmd += ["--rank", str(served_rank)]
+        try:
+            result = _run_capture(cmd, cwd=root_path, timeout_seconds=MARK_SENT_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            lines.append(f"[FAIL] {label}: {MARK_DECLINED_SCRIPT} timed out")
+            continue
+        if result.returncode != 0:
+            tail = (result.stderr or result.stdout or "").strip().splitlines()[-3:]
+            lines.append(f"[FAIL] {label}: " + " ".join(tail))
+            continue
+        # Surfaced verbatim: `mark_declined` warns here when the reason reads
+        # like an opt-out, and that warning must not be swallowed by a wrapper.
+        note = ""
+        for line in (result.stderr or "").splitlines():
+            if line.startswith("[NOTE]"):
+                note = f" {line}"
+        lines.append(f"[DECLINED] {label} ({record_id}) -> Airtable Status=Not Fit{note}")
+    return CommandResult("\n".join(lines))
+
+
 def cmd_mark_sent(
     tokens: list[str],
     *,
@@ -1353,6 +1481,20 @@ def cmd_mark_sent(
                     "--date", send_date,
                     "--suppression-source", str(suppression_path),
                 ]
+                # Only when the frozen queue actually carries one. A queue file
+                # written before the rank was projected has none, and passing an
+                # empty or zero value would write a fabricated number into the
+                # ledger — worse than the gap, which `pre_dial_approval` already
+                # reports as missing coverage rather than hiding.
+                #
+                # `--decisions-source` is deliberately not passed. `mark_sent`
+                # falls back to $LPM_DIAL_DECISIONS_JSONL, which every reader and
+                # writer resolves the same way; naming a path here instead would
+                # let the queue record decisions into one file while the eval
+                # computes the rate from another.
+                served_rank = item.get("dial_rank")
+                if served_rank is not None and str(served_rank).strip() != "":
+                    cmd += ["--rank", str(served_rank)]
                 try:
                     result = _run_capture(cmd, cwd=root_path, timeout_seconds=MARK_SENT_TIMEOUT_SECONDS)
                     receipt = _parse_mark_sent_receipt(result, operation_id=operation_id)

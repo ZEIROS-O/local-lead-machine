@@ -1468,7 +1468,9 @@ def cmd_help() -> CommandResult:
             "/queue-topup [--budget USD] [--target N] - top up ONE deficit vertical under budget\n"
             "/morning-queue [--target N] [--date YYYY-MM-DD] - create an immutable queue run\n"
             "/mark-sent <numbers|rec ids> --artifact-sha256 HASH [--queue-run-id ID --queue-sha256 HASH] "
-            "[--channel sms] [--date YYYY-MM-DD] [--dry-run|--approval-id ID] - record Lou's sends"
+            "[--channel sms] [--date YYYY-MM-DD] [--dry-run|--approval-id ID] - record Lou's sends\n"
+            "/mark-declined <numbers|rec ids> --reason TEXT [--queue-run-id ID --queue-sha256 HASH] "
+            "- record a lead read and refused before dialling (transmits nothing)"
         )
     )
 
@@ -1569,6 +1571,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--approval-id", default="")
     p.add_argument("--date", default="")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--execute", action="store_true")
+
+    p = sub.add_parser("mark-declined", parents=[runtime])
+    p.add_argument("items", nargs="+")
+    p.add_argument("--reason", default="")
+    p.add_argument("--queue-run-id", default="")
+    p.add_argument("--queue-sha256", default="")
     p.add_argument("--execute", action="store_true")
 
     p = sub.add_parser("help", parents=[runtime])
@@ -1696,7 +1705,7 @@ def dispatch(args: argparse.Namespace) -> CommandResult:
         return cmd_create_vertical(args.slug, display=args.display, airtable=args.airtable, terms=args.terms, overwrite=args.overwrite, execute=args.execute)
     if args.verb == "create-market":
         return cmd_create_market(args.slug, display=args.display, state=args.state, small=args.small, medium=args.medium, full=args.full, overwrite=args.overwrite, execute=args.execute)
-    if args.verb in {"queue-status", "queue-topup", "morning-queue", "mark-sent"}:
+    if args.verb in {"queue-status", "queue-topup", "morning-queue", "mark-sent", "mark-declined"}:
         # Imported lazily: hermes_queue imports this module for CommandError,
         # CommandResult, and cmd_run, so a top-level import would be circular.
         from lead_machine import hermes_queue
@@ -1720,6 +1729,16 @@ def dispatch(args: argparse.Namespace) -> CommandResult:
                 return hermes_queue.cmd_morning_queue(
                     target=args.target,
                     date=args.date,
+                    execute=args.execute,
+                    root=repo_root,
+                    python_path=python_path,
+                )
+            if args.verb == "mark-declined":
+                return hermes_queue.cmd_mark_declined(
+                    args.items,
+                    reason=args.reason,
+                    queue_run_id=args.queue_run_id,
+                    queue_sha256=args.queue_sha256,
                     execute=args.execute,
                     root=repo_root,
                     python_path=python_path,
@@ -1783,6 +1802,7 @@ TELEGRAM_HERMES_COMMANDS = {
     "queue-topup",
     "morning-queue",
     "mark-sent",
+    "mark-declined",
 }
 TELEGRAM_APPROVAL_REPLIES = {"yes", "no"}
 TELEGRAM_HERMES_WORKTREE = Path("~/local-lead-machine-hermes").expanduser()

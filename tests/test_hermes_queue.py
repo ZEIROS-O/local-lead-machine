@@ -487,16 +487,141 @@ def dry_run_approval(root: Path, path: Path, tokens: list[str], *, channel: str 
     return next(line.split(": ", 1)[1] for line in res.message.splitlines() if line.startswith("approval_id:"))
 
 
-def queue_item(n: int, *, sent_at: str | None = None) -> dict:
+def queue_item(n: int, *, sent_at: str | None = None, dial_rank: float | None = 61.5) -> dict:
     return {
         "n": n,
         "record_id": f"recABCDEFGHIJKLM{n}",
         "business": f"Biz {n}",
         "vertical": "water_restoration",
         "consent_posture": "express written consent",
+        "dial_rank": dial_rank,
         "sent_at": sent_at,
         "sent_channel": "SMS" if sent_at else None,
     }
+
+
+class TheServedRankSurvivesIntoTheLedger(unittest.TestCase):
+    """The rank the rep was shown has to reach the decision that rank produced.
+
+    `query_ready_to_send` computes `dial_rank` and orders the queue by it, and
+    `mark_sent`/`mark_declined` both accept `--rank` so the ledger can later ask
+    whether a high rank predicted approval. Between them sat two gaps: the queue
+    projection dropped the field, and the automated `mark_sent` call never passed
+    it. Dials therefore landed unranked while hand-logged declines landed
+    ranked — and comparing those two populations is the exact defect
+    `pre_dial_approval` withholds its falsifier over. With no rank on either
+    side, the ranking cannot be falsified at all.
+    """
+
+    def test_the_queue_projection_keeps_the_rank(self) -> None:
+        records = [
+            {
+                "record_id": "recABCDEFGHIJKLM1",
+                "Business Name": "Biz 1",
+                "Vertical": "water restoration",
+                "dial_rank": 73.25,
+            }
+        ]
+        items = hq._build_queue_items(records, target=1, overflow_cap=5)
+        self.assertEqual(items[0]["dial_rank"], 73.25)
+
+    def test_a_record_with_no_rank_projects_to_none_rather_than_zero(self) -> None:
+        # Zero is a rank, and the worst one. An absent rank is an unanswered
+        # question, and `approval_rate` must be able to tell them apart or the
+        # coverage check it gates the falsifier on is meaningless.
+        records = [
+            {"record_id": "recABCDEFGHIJKLM1", "Business Name": "Biz 1", "Vertical": "water restoration"}
+        ]
+        items = hq._build_queue_items(records, target=1, overflow_cap=5)
+        self.assertIsNone(items[0]["dial_rank"])
+
+    def test_mark_sent_is_invoked_with_the_served_rank(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp)
+            path = write_queue_file(root, items=[queue_item(1, dial_rank=61.5)])
+            approval_id = dry_run_approval(root, path, ["1"])
+            with patch.object(hq, "_run_capture", return_value=ok_proc()) as run:
+                hq.cmd_mark_sent(
+                    ["1"], approval_id=approval_id, execute=True, root=root, **queue_identity(path)
+                )
+            cmd = run.call_args[0][0]
+            self.assertIn("--rank", cmd)
+            self.assertEqual(cmd[cmd.index("--rank") + 1], "61.5")
+
+    def test_the_morning_workflow_can_refuse_a_lead_at_all(self) -> None:
+        # The refusal is the observation the whole ledger was built to capture,
+        # and until now the only way to record one was an out-of-band script the
+        # morning workflow never mentions. A KPI that depends on the rep
+        # remembering a command the tool does not offer measures the rep's
+        # memory. The rank comes from the frozen queue, so both sides of the
+        # comparison are ranked by the same path.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp)
+            path = write_queue_file(root, items=[queue_item(1, dial_rank=44.0)])
+            declined = subprocess.CompletedProcess(
+                args=[], returncode=0,
+                stdout=json.dumps({"result": "applied", "record_id": "recABCDEFGHIJKLM1"}),
+                stderr="",
+            )
+            with patch.object(hq, "_run_capture", return_value=declined) as run:
+                result = hq.cmd_mark_declined(
+                    ["1"], reason="no owner name", execute=True, root=root, **queue_identity(path)
+                )
+            cmd = run.call_args[0][0]
+            self.assertIn("mark_declined.py", cmd[1])
+            self.assertEqual(cmd[cmd.index("--record-id") + 1], "recABCDEFGHIJKLM1")
+            self.assertEqual(cmd[cmd.index("--reason") + 1], "no owner name")
+            self.assertEqual(cmd[cmd.index("--rank") + 1], "44.0")
+            self.assertIn("[DECLINED]", result.message)
+
+    def test_a_refusal_with_no_reason_is_refused(self) -> None:
+        # Same rule the ledger itself enforces: a decline with no reason records
+        # that a lead was refused but not which signal was wrong, which is the
+        # only thing that can retire or restore a demoted blocker.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp)
+            path = write_queue_file(root, items=[queue_item(1)])
+            with patch.object(hq, "_run_capture") as run, self.assertRaises(hq.CommandError):
+                hq.cmd_mark_declined(
+                    ["1"], reason="   ", execute=True, root=root, **queue_identity(path)
+                )
+            run.assert_not_called()
+
+    def test_a_preview_declines_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp)
+            path = write_queue_file(root, items=[queue_item(1)])
+            with patch.object(hq, "_run_capture") as run:
+                result = hq.cmd_mark_declined(
+                    ["1"], reason="wrong vertical", root=root, **queue_identity(path)
+                )
+            run.assert_not_called()
+            self.assertIn("preview", result.message)
+
+    def test_bare_item_numbers_cannot_be_declined_unbound(self) -> None:
+        # The same rule mark-sent enforces: an item number means nothing without
+        # the queue run it was served by, and binding it to the wrong run
+        # retires the wrong business.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp)
+            write_queue_file(root, items=[queue_item(1)])
+            with patch.object(hq, "_run_capture") as run, self.assertRaises(hq.CommandError):
+                hq.cmd_mark_declined(["recABCDEFGHIJKLM1", "1"], reason="thin", execute=True, root=root)
+            run.assert_not_called()
+
+    def test_an_unranked_queue_item_omits_the_flag_rather_than_inventing_one(self) -> None:
+        # A queue file written before the rank was carried has no rank to pass.
+        # Sending an empty or zero value would put a fabricated number in the
+        # ledger, which is worse than the gap the coverage check already reports.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp)
+            path = write_queue_file(root, items=[queue_item(1, dial_rank=None)])
+            approval_id = dry_run_approval(root, path, ["1"])
+            with patch.object(hq, "_run_capture", return_value=ok_proc()) as run:
+                hq.cmd_mark_sent(
+                    ["1"], approval_id=approval_id, execute=True, root=root, **queue_identity(path)
+                )
+            self.assertNotIn("--rank", run.call_args[0][0])
 
 
 def ok_proc() -> subprocess.CompletedProcess[str]:
