@@ -398,6 +398,7 @@ def plan_airtable_sync(
     existing = existing_records_by_key or {}
     planned: List[Dict[str, Any]] = []
     seen_input_keys: set[str] = set()
+    matched_input_keys_by_record_id: dict[str, str] = {}
     for card in cards:
         place_key = card_place_key(card)
         upsert_key = card_upsert_key(card)
@@ -407,6 +408,14 @@ def plan_airtable_sync(
             raise ValueError(f"Duplicate Airtable upsert key in input: {upsert_key}")
         seen_input_keys.add(upsert_key)
         record_id, match_reason, warning = _resolve_existing_record(card, existing, upsert_key, place_key)
+        if record_id:
+            prior_upsert_key = matched_input_keys_by_record_id.get(record_id)
+            if prior_upsert_key and prior_upsert_key != upsert_key:
+                raise ValueError(
+                    f"Airtable existing record {record_id} matched distinct input upsert keys: "
+                    f"{prior_upsert_key}, {upsert_key}"
+                )
+            matched_input_keys_by_record_id[record_id] = upsert_key
         payload, dropped_fields = build_airtable_payload_with_drops(card)
         if warning:
             planned.append(

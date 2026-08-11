@@ -84,7 +84,9 @@ def _sorted_paths(paths: Iterable[Path | str]) -> list[Path]:
 
 
 def prepare_corpus(
-    paths: Iterable[Path | str], overrides: dict[str, str]
+    paths: Iterable[Path | str],
+    overrides: dict[str, str],
+    excluded_upsert_keys: Iterable[str] = (),
 ) -> tuple[list[str], list[dict[str, str]], dict[str, Any]]:
     raise_csv_limit()
     fieldnames: list[str] = []
@@ -108,11 +110,18 @@ def prepare_corpus(
                 if key in selected:
                     overwritten_rows += 1
                 selected[key] = (source_path, line_number, row)
+    exclusions = set(excluded_upsert_keys)
+    excluded_selected_keys = exclusions & set(selected)
+    unused_exclusions = sorted(exclusions - set(selected))
+    if unused_exclusions:
+        raise ValueError(f"unused excluded upsert keys: {len(unused_exclusions)}")
     rows: list[dict[str, str]] = []
     consumed_overrides: set[str] = set()
     biconditional_violations = 0
     verdict_tier_violations = 0
     for key, (_, _, source_row) in selected.items():
+        if key in excluded_selected_keys:
+            continue
         prepared = dict(source_row)
         prepared["Vertical"], consumed_override = _resolve_upload_vertical(prepared, overrides, key)
         if consumed_override:
@@ -146,6 +155,10 @@ def prepare_corpus(
         "output_row_count": len(rows),
         "overwritten_rows": overwritten_rows,
         "skipped_no_upsert": skipped_no_upsert,
+        "excluded_upsert_count": len(excluded_selected_keys),
+        "excluded_upsert_hashes": sorted(
+            hashlib.sha256(key.encode("utf-8")).hexdigest() for key in excluded_selected_keys
+        ),
         "biconditional_violations": biconditional_violations,
         "verdict_tier_violations": verdict_tier_violations,
         "verdict_counts": dict(sorted(verdict_counts.items())),
@@ -196,6 +209,20 @@ def _load_overrides(path: Path | None) -> dict[str, str]:
     return loaded
 
 
+def _load_excluded_upsert_keys(path: Path | None) -> list[str]:
+    if path is None:
+        return []
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError("excluded upsert keys must be valid JSON") from exc
+    if not isinstance(loaded, list) or not all(isinstance(key, str) and key for key in loaded):
+        raise ValueError("excluded upsert keys must be a JSON list of non-empty strings")
+    if len(set(loaded)) != len(loaded):
+        raise ValueError("excluded upsert keys must not contain duplicates")
+    return loaded
+
+
 def _write_report(path: Path, report: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary: Path | None = None
@@ -218,9 +245,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--source", type=Path, action="append", nargs="+", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--vertical-overrides", type=Path)
+    parser.add_argument("--excluded-upsert-keys", type=Path)
     parser.add_argument("--expect-source-rows", type=int)
     parser.add_argument("--expect-output-rows", type=int)
     parser.add_argument("--expect-skipped-no-key", type=int)
+    parser.add_argument("--expect-excluded-upsert", type=int)
     parser.add_argument("--report", type=Path)
     args = parser.parse_args(argv)
     args.source = [path for group in args.source for path in group]
@@ -232,6 +261,7 @@ def _verify_expected_counts(args: argparse.Namespace, report: dict[str, Any]) ->
         "expect-source-rows": (args.expect_source_rows, "source_row_count"),
         "expect-output-rows": (args.expect_output_rows, "output_row_count"),
         "expect-skipped-no-key": (args.expect_skipped_no_key, "skipped_no_upsert"),
+        "expect-excluded-upsert": (args.expect_excluded_upsert, "excluded_upsert_count"),
     }
     for flag, (wanted, actual_key) in expected.items():
         if wanted is not None and wanted != report[actual_key]:
@@ -245,7 +275,11 @@ def main(argv: list[str] | None = None) -> int:
         output = Path(args.output)
         if any(output.resolve() == source.resolve() for source in source_paths):
             raise ValueError("output must not replace a source CSV")
-        fieldnames, rows, report = prepare_corpus(source_paths, _load_overrides(args.vertical_overrides))
+        fieldnames, rows, report = prepare_corpus(
+            source_paths,
+            _load_overrides(args.vertical_overrides),
+            _load_excluded_upsert_keys(args.excluded_upsert_keys),
+        )
         _verify_expected_counts(args, report)
         _write_csv(output, fieldnames, rows)
         public_report = {**report, "output": str(output)}

@@ -4,6 +4,8 @@ import csv
 import io
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -268,6 +270,91 @@ class PrepareAirtableCorpusTests(unittest.TestCase):
         self.assertNotIn("Lorain Garage Door Repair Co", rendered)
         self.assertNotIn("4405550142", rendered)
         self.assertNotIn("place:place-send-1", rendered)
+
+    def test_cli_excludes_the_newest_selected_key_and_reports_only_its_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            older = self._write_csv(
+                directory,
+                "older.csv",
+                [self._row(**{"Place Key": "excluded", "Business Name": "Older SBR"})],
+                1,
+            )
+            newer = self._write_csv(
+                directory,
+                "newer.csv",
+                [self._row(**{"Place Key": "excluded", "Business Name": "Newest SBR"})],
+                2,
+            )
+            exclusions = directory / "excluded-upsert-keys.json"
+            exclusions.write_text(json.dumps(["place:excluded"]), encoding="utf-8")
+            output = directory / "corpus.csv"
+            report_path = directory / "report.json"
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "prepare_airtable_corpus.py",
+                    "--source",
+                    str(older),
+                    str(newer),
+                    "--excluded-upsert-keys",
+                    str(exclusions),
+                    "--output",
+                    str(output),
+                    "--report",
+                    str(report_path),
+                    "--expect-excluded-upsert",
+                    "1",
+                ],
+                cwd=Path(__file__).resolve().parents[1],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            report = json.loads(report_path.read_text(encoding="utf-8")) if report_path.exists() else {}
+            if output.exists():
+                with output.open(newline="", encoding="utf-8") as handle:
+                    output_rows = list(csv.DictReader(handle))
+            else:
+                output_rows = []
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(output_rows, [])
+        self.assertEqual(report["source_row_count"], 2)
+        self.assertEqual(report["overwritten_rows"], 1)
+        self.assertEqual(report["excluded_upsert_count"], 1)
+        self.assertEqual(
+            report["excluded_upsert_hashes"],
+            ["86a773cfab673d6ad307b8f87c927227a8441fcd2f80ec216d231eb694c52503"],
+        )
+        self.assertNotIn("place:excluded", json.dumps(report))
+
+    def test_cli_refuses_an_exclusion_that_matches_no_selected_upsert_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            source = self._write_csv(directory, "source.csv", [self._row(**{"Place Key": "kept"})], 1)
+            exclusions = directory / "excluded-upsert-keys.json"
+            exclusions.write_text(json.dumps(["place:unused"]), encoding="utf-8")
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "prepare_airtable_corpus.py",
+                    "--source",
+                    str(source),
+                    "--excluded-upsert-keys",
+                    str(exclusions),
+                    "--output",
+                    str(directory / "corpus.csv"),
+                ],
+                cwd=Path(__file__).resolve().parents[1],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("unused excluded upsert keys: 1", completed.stderr)
 
 
 if __name__ == "__main__":
