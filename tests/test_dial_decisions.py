@@ -28,6 +28,7 @@ from lead_machine.dial_decisions import (
     append_decision,
     approval_rate,
     load_decisions,
+    read_ledger,
 )
 
 
@@ -170,6 +171,36 @@ class ReadingTheLedger(unittest.TestCase):
             handle.write("{not json\n")
         append_decision(self.path, decision=DECISION_DECLINE, record_id="rec2", reason="closed")
         self.assertEqual(len(load_decisions(self.path)), 2)
+
+    def test_the_skipped_lines_are_counted_rather_than_vanishing(self) -> None:
+        # Skipping the line keeps the file readable; not counting it is what
+        # makes the KPI a liar. A ledger whose declines are all malformed loads
+        # as pure dials and reports a 100% approval rate — the go/no-go number
+        # silently dropping every adverse observation it holds.
+        append_decision(self.path, decision=DECISION_DIAL, record_id="rec1")
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write("{not json\n")
+            handle.write("[]\n")
+            handle.write(json.dumps({"decision": "shrug", "record_id": "rec9"}) + "\n")
+            handle.write(json.dumps({"decision": DECISION_DIAL}) + "\n")
+        read = read_ledger(self.path)
+        self.assertEqual(len(read.decisions), 1)
+        self.assertEqual(read.unreadable, 4)
+
+    def test_a_clean_ledger_reports_nothing_unreadable(self) -> None:
+        append_decision(self.path, decision=DECISION_DIAL, record_id="rec1")
+        append_decision(self.path, decision=DECISION_DECLINE, record_id="rec2", reason="closed")
+        read = read_ledger(self.path)
+        self.assertEqual(len(read.decisions), 2)
+        self.assertEqual(read.unreadable, 0)
+
+    def test_a_missing_ledger_is_not_an_unreadable_one(self) -> None:
+        # No file means the rep has not started. That is an absence of
+        # evidence, not evidence that was destroyed, and it must not raise the
+        # alarm the corrupt-line count exists to raise.
+        read = read_ledger(self.path)
+        self.assertEqual(read.decisions, [])
+        self.assertEqual(read.unreadable, 0)
 
     def test_the_rate_is_dials_over_decisions(self) -> None:
         append_decision(self.path, decision=DECISION_DIAL, record_id="rec1")

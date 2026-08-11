@@ -34,7 +34,7 @@ import os
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, NamedTuple, Optional
 
 DECISION_DIAL = "dial"
 DECISION_DECLINE = "decline"
@@ -133,18 +133,42 @@ def append_decision(
     return row
 
 
-def load_decisions(ledger: Path | str) -> List[Dict[str, Any]]:
-    """Every decision row in *ledger*, oldest first.
+class LedgerRead(NamedTuple):
+    """What one pass over the ledger recovered, and what it could not.
 
-    A missing file reads as no decisions — the rep has not started, which is
-    different from a rate of zero. A corrupt line is skipped rather than
-    refused: one unreadable row costs one decision, where refusing the file
-    costs every decision ever made.
+    `unreadable` is the whole point of the type. Skipping a corrupt line is
+    right — one bad row must not cost every decision ever made — but skipping it
+    *silently* turns the go/no-go KPI into a number that quietly deletes the
+    observations that would have moved it. A ledger whose declines are all
+    malformed loads as pure dials and reports 100% approval, which is the exact
+    self-grading failure the pre-dial ledger was built to replace.
+
+    So the count travels with the rows and the caller decides. Readers that only
+    want decisions keep using `load_decisions`; anything that renders a verdict
+    has to look at this and refuse to pass on a file it could not fully read.
+    """
+
+    decisions: List[Dict[str, Any]]
+    unreadable: int
+
+
+def read_ledger(ledger: Path | str) -> LedgerRead:
+    """Every decision row in *ledger*, oldest first, with the losses counted.
+
+    A missing file reads as no decisions and *nothing unreadable* — the rep has
+    not started, which is different from a rate of zero and different again from
+    a file whose contents were destroyed. Only a line that is present and
+    unusable counts against `unreadable`.
+
+    Every rejection path below increments it, not just the JSON one: a line that
+    parses but carries an unknown `decision`, or no `record_id`, is just as
+    absent from the rate and just as invisible without the count.
     """
     path = Path(ledger)
     if not path.exists():
-        return []
+        return LedgerRead([], 0)
     rows: List[Dict[str, Any]] = []
+    unreadable = 0
     with path.open(encoding="utf-8") as handle:
         for line in handle:
             line = line.strip()
@@ -153,15 +177,24 @@ def load_decisions(ledger: Path | str) -> List[Dict[str, Any]]:
             try:
                 data = json.loads(line)
             except json.JSONDecodeError:
+                unreadable += 1
                 continue
             if not isinstance(data, dict):
+                unreadable += 1
                 continue
             if _text(data.get("decision")).casefold() not in DECISIONS:
+                unreadable += 1
                 continue
             if not _text(data.get("record_id")):
+                unreadable += 1
                 continue
             rows.append(data)
-    return rows
+    return LedgerRead(rows, unreadable)
+
+
+def load_decisions(ledger: Path | str) -> List[Dict[str, Any]]:
+    """Just the decision rows in *ledger*. See `read_ledger` for the losses."""
+    return read_ledger(ledger).decisions
 
 
 def approval_rate(decisions: Iterable[Dict[str, Any]]) -> Dict[str, Any]:

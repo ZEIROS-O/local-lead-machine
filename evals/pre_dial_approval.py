@@ -42,7 +42,7 @@ from lead_machine.dial_decisions import (  # noqa: E402
     DIAL_DECISIONS_ENV,
     approval_rate,
     configured_decisions_path,
-    load_decisions,
+    read_ledger,
 )
 
 # The same floor AGENTS.md names for accept-rate. Reused rather than reinvented:
@@ -60,6 +60,14 @@ RANK_SEPARATION_TARGET = 10.0
 # artefact rather than on the ranking.
 MINIMUM_RANKED_PER_SIDE = 5
 MAX_COVERAGE_SKEW = 0.34
+# And each side must be ranked at least this densely. The two rules above are
+# both *relative*: 5 ranked dials out of 100 against 5 ranked declines out of
+# 100 clears the per-side minimum and shows zero skew, and the comparison would
+# have reported a confident 80-point separation off 5% of each population. Equal
+# sparsity is not representativeness — those two 5% slices were written by
+# different commands on different days, and whatever selected them is exactly
+# what the separation would be measuring.
+MINIMUM_RANK_COVERAGE = 0.5
 
 
 def evaluate_pre_dial_approval(
@@ -68,12 +76,27 @@ def evaluate_pre_dial_approval(
     floor: float = APPROVAL_FLOOR,
     minimum_decided: int = MINIMUM_DECIDED,
     rank_separation_target: float = RANK_SEPARATION_TARGET,
+    unreadable: int = 0,
 ) -> dict[str, Any]:
     summary = approval_rate(decisions)
     decided = summary["decided"]
     rate = summary["rate"]
 
-    if decided == 0:
+    if unreadable:
+        # Before any rate is read, because a rate computed over the survivors of
+        # a silent filter is the defect this eval replaces, one layer down. The
+        # discarded lines are not a random sample of the ledger: `mark_declined`
+        # is the hand-run command, so a rep fumbling its arguments corrupts
+        # refusals specifically, and refusals are the only observations that can
+        # push this number down. Neither PASS nor FAIL is available off a file
+        # this loader could not fully read.
+        status = "unreadable-ledger"
+        line = (
+            f"- NO VERDICT: pre-dial approval — {unreadable} unreadable ledger line(s) "
+            f"alongside {decided} readable decision(s). The discarded rows may be the "
+            "refusals; repair or remove them before reading a rate."
+        )
+    elif decided == 0:
         status = "no-decisions"
         line = (
             "- NO VERDICT: pre-dial approval — no decisions recorded. Either the "
@@ -115,6 +138,7 @@ def evaluate_pre_dial_approval(
     comparable = (
         ranked_dialed >= MINIMUM_RANKED_PER_SIDE
         and ranked_declined >= MINIMUM_RANKED_PER_SIDE
+        and min(coverage_dialed, coverage_declined) >= MINIMUM_RANK_COVERAGE
         and abs(coverage_dialed - coverage_declined) <= MAX_COVERAGE_SKEW
     )
 
@@ -131,6 +155,14 @@ def evaluate_pre_dial_approval(
             rank_line = (
                 f"- rank check: withheld — only {ranked_dialed} ranked dial(s) and "
                 f"{ranked_declined} ranked decline(s); {MINIMUM_RANKED_PER_SIDE} needed per side"
+            )
+        elif min(coverage_dialed, coverage_declined) < MINIMUM_RANK_COVERAGE:
+            rank_line = (
+                f"- rank check: withheld — rank coverage is {coverage_dialed:.0%} on dials "
+                f"and {coverage_declined:.0%} on declines; "
+                f"{MINIMUM_RANK_COVERAGE:.0%} needed on both. Matching sparsity is not "
+                "representativeness — a separation read off this would be measuring "
+                "whatever selected the ranked rows."
             )
         else:
             rank_line = (
@@ -155,8 +187,11 @@ def evaluate_pre_dial_approval(
 
     return {
         # A thin sample is not a failure, it is an absence of evidence. Only a
-        # measured rate below the floor fails.
+        # measured rate below the floor fails — and `unreadable-ledger` is not
+        # in the tolerated set, because unlike a thin sample it is evidence that
+        # went missing rather than evidence that was never gathered.
         "ok": status in {"pass", "no-decisions", "insufficient-sample"},
+        "unreadable": unreadable,
         "status": status,
         "summary": line,
         "rank_summary": rank_line,
@@ -205,10 +240,12 @@ def main() -> int:
         )
         return 1
 
+    ledger = read_ledger(source)
     result = evaluate_pre_dial_approval(
-        load_decisions(source),
+        ledger.decisions,
         floor=args.floor,
         minimum_decided=args.minimum_decided,
+        unreadable=ledger.unreadable,
     )
 
     if args.json:

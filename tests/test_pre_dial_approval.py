@@ -124,6 +124,47 @@ class TheRankComparisonIsWithheldWhenItWouldMislead(unittest.TestCase):
         self.assertTrue(result["rank_coverage"]["comparable"])
         self.assertAlmostEqual(result["rank_separation"], 40.0)
 
+    def test_equally_sparse_coverage_is_still_withheld(self) -> None:
+        # 5 of 100 ranked on each side. The skew check sees 0% difference and
+        # the per-side minimum is met, so the old rule called this comparable —
+        # but 5% of a population is a sample somebody chose, and the two 5%
+        # slices were chosen by different commands on different days. Matching
+        # sparsity is not representativeness.
+        rows = decisions(dialed=100, declined=100, dial_rank=90.0, decline_rank=10.0)
+        for side in ("dial", "decline"):
+            for row in [r for r in rows if r["decision"] == side][5:]:
+                row["rank"] = None
+        result = evaluate_pre_dial_approval(rows)
+        self.assertIsNone(result["rank_separation"])
+        self.assertFalse(result["rank_coverage"]["comparable"])
+        self.assertIn("withheld", result["rank_summary"])
+
+
+class AnUnreadableLedgerCannotPass(unittest.TestCase):
+    """Rows the loader could not parse are potentially the adverse ones.
+
+    A go/no-go number computed over the survivors of a silent filter is the
+    self-grading defect this eval exists to replace, one layer down.
+    """
+
+    def test_unreadable_lines_block_the_pass(self) -> None:
+        result = evaluate_pre_dial_approval(decisions(dialed=25, declined=5), unreadable=20)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "unreadable-ledger")
+        self.assertIn("20", result["summary"])
+
+    def test_unreadable_lines_block_a_failing_verdict_too(self) -> None:
+        # Not just the pass. A rate read off a partial file is not evidence in
+        # either direction, and reporting FAIL would credit the number with an
+        # authority it does not have.
+        result = evaluate_pre_dial_approval(decisions(dialed=2, declined=28), unreadable=20)
+        self.assertEqual(result["status"], "unreadable-ledger")
+
+    def test_a_fully_readable_ledger_is_unaffected(self) -> None:
+        result = evaluate_pre_dial_approval(decisions(dialed=25, declined=5), unreadable=0)
+        self.assertEqual(result["status"], "pass")
+        self.assertTrue(result["ok"])
+
 
 if __name__ == "__main__":
     unittest.main()
