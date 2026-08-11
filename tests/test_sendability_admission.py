@@ -244,6 +244,9 @@ class AdmissionIsTheOnlyRouteToSendableTest(unittest.TestCase):
                 "score_leads.py:score_record",
                 "lead_machine/manual_scores.py:merge_manual_score",
                 "refresh_packet_tiers.py:refresh_row",
+                # Reprojects stored verdict fields through current authority;
+                # it is a scoring path, not a second sendability decision.
+                "refresh_verdicts.py:refresh_row",
             },
         )
 
