@@ -61,6 +61,7 @@ PACKET_TIER_NOT_SENDABLE_BLOCKER = "Packet Tier is not the sendable tier"
 
 OUT_OF_COUNTRY_BLOCKER = "Business is not in the United States"
 MISSING_PHONE_BLOCKER = "No dialable phone number"
+MISSING_REVIEW_DATA_BLOCKER = "No review data collected for this business"
 
 # Address tails that mean "in market". Anything else that looks like a country
 # name is out; a tail that is not a country at all (a bare street address, a
@@ -101,6 +102,7 @@ HARD_ELIGIBILITY_BLOCKERS = {
 # no longer raised at all.
 CLAIM_INTEGRITY_BLOCKERS = {
     CONVERSION_ISSUE_BLOCKER,
+    MISSING_REVIEW_DATA_BLOCKER,
     FORM_ABSENCE_CLAIM_BLOCKER,
     UNSUPPORTED_ABSENCE_CLAIM_BLOCKER,
     ESTIMATE_FUNNEL_STRONG_FORM_BLOCKER,
@@ -625,6 +627,9 @@ def evaluate_sendability(row: Dict[str, Any]) -> Dict[str, Any]:
 
     if not concrete_issue:
         blockers.append(CONVERSION_ISSUE_BLOCKER)
+
+    if not has_review_data(row):
+        blockers.append(MISSING_REVIEW_DATA_BLOCKER)
 
     if strong_estimate_form and has_form_absence_claim(row):
         blockers.append(FORM_ABSENCE_CLAIM_BLOCKER)
@@ -1443,6 +1448,33 @@ def _review_count(row: Dict[str, Any]) -> int:
     raw = _raw_evidence(row)
     google = raw.get("google", {}) if isinstance(raw, dict) else {}
     return _parse_int(_pick(row, "Reviews", "reviews", "google_review_count") or google.get("reviews"))
+
+
+def has_review_data(row: Dict[str, Any]) -> bool:
+    """Whether anyone ever recorded a review count for this business.
+
+    `_review_count` renders a blank cell as the integer 0, so on its own the gate
+    cannot tell "the collector never got an answer" from "nobody has reviewed
+    them". While `reviews < 5` blocked, that conflation was invisible because
+    both were refused; demoting it left the wrong half showing.
+
+    The direction matters. AGENTS.md already fixed this shape once for
+    `money_signal` — "unknown means there was no crawlable site text to read a
+    paid stack from; it is an unanswered question, not evidence the business does
+    not spend" — and the same reasoning forbids reading it as a pass. Reviews are
+    the demand signal this offer is sold on and the only cheap confirmation that
+    the listing belongs to a live business, so an absent count is a question to
+    answer, not a lead to dial.
+
+    Explicitly reading the string rather than the parsed int, because the parsed
+    int is exactly what destroys the distinction.
+    """
+    raw = _raw_evidence(row)
+    google = raw.get("google", {}) if isinstance(raw, dict) else {}
+    declared = _pick(row, "Reviews", "reviews", "google_review_count")
+    if declared:
+        return True
+    return _clean(google.get("reviews")) != ""
 
 
 def _rating(row: Dict[str, Any]) -> float:

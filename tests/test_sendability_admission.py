@@ -25,6 +25,7 @@ from lead_machine.sendability import (
     EVIDENCE_BLOCKERS,
     HARD_ICP_SKIP_BLOCKER,
     INVALID_REF_BLOCKER,
+    MISSING_REVIEW_DATA_BLOCKER,
     OUT_OF_COUNTRY_BLOCKER,
     UNSUPPORTED_ABSENCE_CLAIM_BLOCKER,
     Admission,
@@ -439,6 +440,43 @@ class NoScoringPathEmitsSendableYesOnASkippedLeadTest(unittest.TestCase):
         self.assertEqual(higher_pain["Review Demand Band"], "mature")
         self.assertEqual(higher_pain["Sendable"], "Yes")
         self.assertEqual(higher_pain["Send Blockers"], "")
+
+    def test_absent_review_data_is_not_read_as_a_business_with_no_reviews(self) -> None:
+        # A blank Reviews cell means the collector never got an answer, and
+        # `_review_count` renders that as the integer 0 — so "we did not look"
+        # and "nobody has reviewed them" arrive at the gate identically.
+        #
+        # The old `reviews < 5` gate hid this by refusing both. Demoting it left
+        # the wrong half showing: 50 of the 1,092 re-gated sendables had no
+        # review data at all, and a lead we cannot confirm is a live business is
+        # not one to hand a rep. This is the `money_signal` rule in the other
+        # direction — unknown is an unanswered question, not a pass.
+        #
+        # Claim integrity rather than hard eligibility, because a re-enrich fixes
+        # it: the lead routes to a human, not to the bin.
+        enriched = self._enriched()
+        enriched["google"]["reviews"] = ""
+        enriched["google"]["rating"] = ""
+
+        row = self._scored(enriched)
+
+        self.assertEqual(row["Sendable"], "No")
+        self.assertIn(MISSING_REVIEW_DATA_BLOCKER, row["Send Blockers"])
+        # Reachable by a human, not written off.
+        self.assertEqual(row["Minimum Evidence Passed"], "Yes")
+
+    def test_a_genuine_zero_review_business_is_told_apart_from_a_blank(self) -> None:
+        # The distinction only means something if a real 0 is allowed through.
+        # A brand-new business with a named leak is a legitimate lead; it simply
+        # ranks low. Reading the explicit 0 as "missing" would re-create the
+        # conflation this blocker exists to end.
+        enriched = self._enriched()
+        enriched["google"]["reviews"] = "0"
+
+        row = self._scored(enriched)
+
+        self.assertEqual(row["Sendable"], "Yes")
+        self.assertNotIn(MISSING_REVIEW_DATA_BLOCKER, row["Send Blockers"])
 
     def test_evaluate_sendability_reports_the_same_verdict_as_the_admission(self) -> None:
         row = self._scored(
