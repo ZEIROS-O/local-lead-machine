@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Produce one reproducible, upload-ready CSV whose 1,089 upsertable leads carry verdicts derived from the current sendability authority, including all 429 currently sendable leads, without overwriting human-owned Airtable state.
+**Goal:** Produce one reproducible, upload-ready CSV whose 1,088 live-unique leads carry verdicts derived from the current sendability authority, including all 429 currently sendable leads, without overwriting human-owned Airtable state.
 
 **Architecture:** Add a single-input `refresh_verdicts.py` projection that reuses `apply_sendability` and `apply_verdict`, then add `prepare_airtable_corpus.py` to select the newest row per uploader upsert key, normalize registered verticals, require explicit overrides for unresolved legacy rows, and invoke the projection. Both tools are local-only, atomic, fail-closed, and emit machine-readable reports. The existing uploader remains unchanged and is exercised first with an empty packet directory and `--dry-run`; `--live` is a separate final gate.
 
@@ -20,7 +20,7 @@
 - Unknown verticals fail closed. The three legacy `manual_existing` lawn-care rows require explicit upsert-key overrides to `hardscaping`; no implicit default is allowed.
 - Write output atomically through a temporary file in the destination directory.
 - Do not mutate `output/` source files. Write operational artifacts and receipts under `/tmp` until the dry-run is accepted.
-- No live Airtable write until the dry-run exits 0, reports 1,089 records and 429 `send` verdicts, and required select choices pass.
+- No live Airtable write until the dry-run exits 0, reports 1,088 records and 429 `send` verdicts, and required select choices pass.
 - Gate 0 remains: this work uploads CRM records only and does not transmit to any prospect.
 
 ---
@@ -184,11 +184,20 @@ git commit -m "feat(airtable): prepare a lossless current-verdict corpus"
 
 **Interfaces:**
 - Consumes: the 51 `output/scored_*.csv` and `output/airtable_*.csv` files in the primary checkout, plus exact override keys for the three `manual_existing` lawn-care rows.
-- Produces: a verified 1,089-record CSV with 429 send verdicts and an Airtable dry-run plan; a live upload is allowed only after every stated gate passes.
+- Produces: a verified 1,088-record CSV with 429 send verdicts and an Airtable dry-run plan; a live upload is allowed only after every stated gate passes.
+
+#### Production-shaped addendum: live fallback-identity collision
+
+The first real dry run found two distinct input upsert keys resolving by phone to the same Airtable record. Both rows are SBR Concrete Polishing INC. in Cleveland at the same phone: the authoritative Google Place row is `epoxy` / `send`, while the stale synthetic backfill row is `hardscaping` / `reject`. Sequential PATCHes would leave the stale reject last and silently reduce the intended 429-send cohort.
+
+- `lead_machine.airtable_sync.plan_airtable_sync` must fail closed if two distinct input upsert keys resolve to the same existing Airtable record id. Add the failing test before the implementation and preserve all existing exact/phone/domain/business-city matching behavior for unique targets.
+- `prepare_airtable_corpus.py` must accept a JSON list of exact excluded upsert keys, reject unused exclusions, hash excluded identities in reports, and expose `--expect-excluded-upsert`. Exclusion happens only after normal newest-by-upsert-key selection, so it cannot disguise source-row count drift.
+- The operational exclusion file contains only `place:backfill:sbr-concrete-polishing-inc:cleveland`. The real Google Place row remains, so the revised artifact has 1,088 rows and still 429 `send` verdicts; `reject` moves from 615 to 614.
+- The revised dry run must have no duplicate PATCH target, no dropped `Vertical`, no operational PATCH fields, and exactly 429 `send` payloads.
 
 - [ ] **Step 1: Generate and inspect exact legacy overrides**
 
-Resolve the three upsert keys read-only from their Place Key or normalized Phone. Write an overrides JSON mapping only those keys to `hardscaping`. Confirm they are the three `service` rows in `scored_manual_existing_manual.csv` and that the other four rows in that same file already carry `hardscaping` for the same lawn/landscaping source family.
+Resolve the three upsert keys read-only from their Place Key or normalized Phone. Write an overrides JSON mapping only those keys to `hardscaping`. Confirm they are the three `service` rows in `scored_manual_existing_manual.csv` and that the other four rows in that same file already carry `hardscaping` for the same lawn/landscaping source family. Write a separate excluded-upsert JSON list containing only the stale synthetic SBR alias named in the addendum.
 
 - [ ] **Step 2: Prepare the corpus with hard expectations**
 
@@ -199,14 +208,16 @@ Run from the isolated worktree, passing the 51 source files explicitly:
   --source /home/lucascoh/local-lead-machine/output/scored_*.csv \
   --source /home/lucascoh/local-lead-machine/output/airtable_*.csv \
   --vertical-overrides /tmp/lpm-reverdict-upload/vertical-overrides.json \
+  --excluded-upsert-keys /tmp/lpm-reverdict-upload/excluded-upsert-keys.json \
   --output /tmp/lpm-reverdict-upload/corpus.csv \
   --report /tmp/lpm-reverdict-upload/prepare-report.json \
   --expect-source-rows 3048 \
-  --expect-output-rows 1089 \
-  --expect-skipped-no-key 1
+  --expect-output-rows 1088 \
+  --expect-skipped-no-key 1 \
+  --expect-excluded-upsert 1
 ```
 
-The CLI must report verdict counts `send=429`, `reject=615`, `review=27`, `watch=18`; zero unsupported verticals; zero lossless-comparison failures; and no unused overrides. These are the four-way projected buckets on the 1,089-key upload corpus; the handoff's `662` figure is the different binary count of refused distinct leads before the no-key row and phone collision are removed.
+The CLI must report verdict counts `send=429`, `reject=614`, `review=27`, `watch=18`; one consumed exact-key exclusion; zero unsupported verticals; zero lossless-comparison failures; and no unused overrides or exclusions. These are the four-way projected buckets after removing the stale synthetic alias; the handoff's `662` figure is the different binary count of refused distinct leads before the no-key row and identity collisions are removed.
 
 - [ ] **Step 3: Prove idempotency and uploader-shaped equivalence**
 
@@ -233,7 +244,7 @@ Run from the primary checkout so its owner-readable `.env` is used:
   --dry-run
 ```
 
-Require exit 0, 1,089 planned records, exactly 429 `Verdict=send`, zero dropped `Vertical` fields, and no operational field in any PATCH payload. Record the actual POST/PATCH split; do not require the older 1,021/68 split because the base can change.
+Require exit 0, 1,088 planned records, exactly 429 `Verdict=send`, zero duplicate PATCH targets, zero dropped `Vertical` fields, and no operational field in any PATCH payload. Record the actual POST/PATCH split; do not require the older split because the base can change.
 
 - [ ] **Step 6: Configure decision-ledger evidence before dialing**
 
