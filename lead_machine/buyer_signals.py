@@ -174,11 +174,28 @@ def money_signal_from_summary(record: Dict[str, Any]) -> str:
     source until someone changes them on purpose.
     """
     text = str(record.get("Buyer Intent Signals") or record.get("buyer_intent_signals") or "")
+    state = MONEY_SIGNAL_UNKNOWN
     for part in text.split(";"):
         key, _, value = part.partition("=")
         if key.strip().lower() == "money_signal":
-            return _normalize_money_signal(value.strip())
-    return MONEY_SIGNAL_UNKNOWN
+            state = _normalize_money_signal(value.strip())
+            break
+
+    # A capsule's *meaning* is version-dependent even though its text is not.
+    # Before 14687fb this summary was written from a boolean —
+    # `money_signal={'yes' if has_money_signal else 'no'}` — so a legacy `no`
+    # covers both "no paid CRM detected" and "there was no crawlable site text
+    # to look at". That is the exact conflation the tri-state was introduced to
+    # end, and reading it as a real `no` would re-import the bug through the
+    # back door: 141 such capsules sit in output/*.csv, 32 of them in rows
+    # already uploaded as sendable.
+    #
+    # `demand_signal=` landed in the same commit as the tri-state, so a capsule
+    # carrying it is post-fix and its `no` is trustworthy. `yes` meant the same
+    # thing in both formats and needs no rescue — only a negative is downgraded.
+    if state == MONEY_SIGNAL_NO and "demand_signal=" not in text:
+        return MONEY_SIGNAL_UNKNOWN
+    return state
 
 
 def money_signal_label(record: Dict[str, Any]) -> str:

@@ -16,7 +16,7 @@ from __future__ import annotations
 import unittest
 
 from lead_machine.dial_rank import RANK_MAX, WEIGHTS, dial_rank, dial_sort_key
-from query_ready_to_send import DISPLAY_FIELDS
+from query_ready_to_send import DISPLAY_FIELDS, RANK_INPUT_FIELDS
 
 
 def row(**overrides) -> dict:
@@ -172,6 +172,19 @@ class EveryWeightIsLiveInTheQueue(unittest.TestCase):
         # Without this, adding a seventh weight with no queue-visible input
         # would pass the loop above by simply not being in it.
         self.assertEqual(set(WEIGHTS), set(_COMPONENT_INPUTS))
+
+    def test_every_column_a_component_reads_is_declared_a_rank_input(self) -> None:
+        # `RANK_INPUT_FIELDS` drives the "ordering is degraded" warning when the
+        # base is missing a column. Nothing tied it to the columns the
+        # components actually read, so a new weight could pass the live-weight
+        # test above and still lose its warning silently.
+        used = {column for inputs, _ in _COMPONENT_INPUTS.values() for column in inputs}
+        used |= {column for _, inputs in _COMPONENT_INPUTS.values() for column in inputs}
+        self.assertLessEqual(used, RANK_INPUT_FIELDS)
+
+    def test_every_declared_rank_input_is_actually_fetched(self) -> None:
+        # A warning about a column the query never requests can never fire.
+        self.assertLessEqual(RANK_INPUT_FIELDS, set(DISPLAY_FIELDS))
 
 
 class TheTwoUnrankedSignalsStayUnranked(unittest.TestCase):

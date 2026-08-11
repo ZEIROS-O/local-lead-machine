@@ -54,6 +54,12 @@ MINIMUM_DECIDED = 20
 # ordering has demonstrated anything. Below this the rank is noise even if the
 # approval rate looks healthy.
 RANK_SEPARATION_TARGET = 10.0
+# Both sides must clear this many ranked decisions, and their rank *coverage*
+# must be within this much of each other, before the comparison is reported at
+# all. Without both, the falsifier can fire or stay silent on a sampling
+# artefact rather than on the ranking.
+MINIMUM_RANKED_PER_SIDE = 5
+MAX_COVERAGE_SKEW = 0.34
 
 
 def evaluate_pre_dial_approval(
@@ -95,16 +101,44 @@ def evaluate_pre_dial_approval(
 
     dialed_rank = summary["mean_rank_dialed"]
     declined_rank = summary["mean_rank_declined"]
+
+    # Withheld rather than reported when the two sides are not comparably
+    # ranked. The dials and the declines are recorded by different commands,
+    # and `hermes_queue` runs mark_sent without `--rank`, so one side can be
+    # near-fully ranked while the other is barely covered. A mean-vs-mean across
+    # that gap compares two different populations and prints as one number —
+    # which is the same defect as the accept-rate this eval exists to replace.
+    ranked_dialed = summary["ranked_dialed"]
+    ranked_declined = summary["ranked_declined"]
+    coverage_dialed = ranked_dialed / summary["dialed"] if summary["dialed"] else 0.0
+    coverage_declined = ranked_declined / summary["declined"] if summary["declined"] else 0.0
+    comparable = (
+        ranked_dialed >= MINIMUM_RANKED_PER_SIDE
+        and ranked_declined >= MINIMUM_RANKED_PER_SIDE
+        and abs(coverage_dialed - coverage_declined) <= MAX_COVERAGE_SKEW
+    )
+
     separation = (
         dialed_rank - declined_rank
-        if dialed_rank is not None and declined_rank is not None
+        if dialed_rank is not None and declined_rank is not None and comparable
         else None
     )
     if separation is None:
-        rank_line = (
-            "- rank check: not enough ranked decisions on both sides to compare"
-        )
         rank_ok = None
+        if dialed_rank is None or declined_rank is None:
+            rank_line = "- rank check: no ranked decisions on one side yet; cannot compare"
+        elif ranked_dialed < MINIMUM_RANKED_PER_SIDE or ranked_declined < MINIMUM_RANKED_PER_SIDE:
+            rank_line = (
+                f"- rank check: withheld — only {ranked_dialed} ranked dial(s) and "
+                f"{ranked_declined} ranked decline(s); {MINIMUM_RANKED_PER_SIDE} needed per side"
+            )
+        else:
+            rank_line = (
+                f"- rank check: withheld — rank coverage is {coverage_dialed:.0%} on dials "
+                f"vs {coverage_declined:.0%} on declines. Comparing these means "
+                "comparing two different populations. Pass --rank on both paths "
+                "(hermes_queue's mark_sent call omits it)."
+            )
     elif separation < rank_separation_target:
         rank_ok = False
         rank_line = (
@@ -132,6 +166,13 @@ def evaluate_pre_dial_approval(
         "rank_separation": separation,
         "rank_separation_target": rank_separation_target,
         "rank_ok": rank_ok,
+        "rank_coverage": {
+            "ranked_dialed": ranked_dialed,
+            "ranked_declined": ranked_declined,
+            "coverage_dialed": coverage_dialed,
+            "coverage_declined": coverage_declined,
+            "comparable": comparable,
+        },
         "counts": {
             "decided": decided,
             "dialed": summary["dialed"],

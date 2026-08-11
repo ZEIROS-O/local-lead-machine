@@ -24,9 +24,16 @@ is an accepted status, so logging a dial creates an acceptance. A rep who works
 the queue in order scores 100% here whatever the leads are worth. This is an
 operational check that proposals are being actioned, not evidence about lead
 quality, and it cannot say whether demoting the commercial tribunal cost us
-anything: a lead the rep silently skipped never reaches the denominator.
+anything: a lead the rep *silently* skipped never reaches the denominator.
 `evals/pre_dial_approval.py` measures the decision made before the dial and is
 the one to read for that question.
+
+Since `mark_declined.py` exists, a *recorded* pre-dial refusal does land here,
+as `Not Fit` — the same value an opt-out writes, and indistinguishable from one
+at this level. So this rate now moves with two different events for two
+different reasons, and crossing the floor no longer implies anything about lead
+quality on its own. Read the pre-dial eval's refusal-reason tally before drawing
+a conclusion from a drop here.
 """
 
 from __future__ import annotations

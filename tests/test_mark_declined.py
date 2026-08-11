@@ -14,7 +14,9 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import mark_declined
+import mark_outcome
 from lead_machine import dial_decisions
+from lead_machine import queue_state
 
 
 def _response(status_code=200, payload=None, text=""):
@@ -128,6 +130,34 @@ class DecliningALead(unittest.TestCase):
         session = _session(patch_response={"id": "rec1", "fields": {"Status": "New"}})
         with self.assertRaises(mark_declined.MarkDeclinedError):
             self._apply(session)
+
+
+class TheStatusItWritesIsPinnedToTheCanonicalVocabulary(unittest.TestCase):
+    """A third `Prospects.Status` writer needs the same pinning as the other two.
+
+    `mark_outcome.REQUIRED_SELECT_CHOICES` is spelled out rather than derived,
+    and a test ties it to `queue_state`. This module writes `Not Fit` too, and
+    was covered only by the accident that `mark_outcome --event opt_out` emits
+    the same value — so a rename that moved opt-out off `Not Fit` would leave
+    this writer emitting a choice no base has, and no test would notice. No
+    Airtable write may set `typecast`, so an unknown choice is a 422.
+    """
+
+    def test_the_declined_status_is_in_the_status_vocabulary(self):
+        self.assertIn(mark_declined.DECLINED_STATUS, queue_state.PROSPECT_STATUS_CHOICES)
+
+    def test_the_declined_status_is_declared_as_a_required_choice(self):
+        self.assertIn(
+            mark_declined.DECLINED_STATUS,
+            mark_outcome.REQUIRED_SELECT_CHOICES["Prospects"]["Status"],
+        )
+
+    def test_the_declined_status_is_terminal_not_a_queued_one(self):
+        # Writing a queued status here would leave the lead in tomorrow's queue
+        # after the rep refused it — the opposite of what the command is for.
+        self.assertNotIn(
+            mark_declined.DECLINED_STATUS, queue_state.QUEUE_STATUS_CLAUSE.allowed
+        )
 
 
 class ADeclineIsNotAnOptOut(unittest.TestCase):

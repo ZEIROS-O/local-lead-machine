@@ -88,5 +88,42 @@ class TheRankFalsifier(unittest.TestCase):
         self.assertIsNone(result["rank_separation"])
 
 
+class TheRankComparisonIsWithheldWhenItWouldMislead(unittest.TestCase):
+    """The two sides are written by different commands, so coverage can diverge.
+
+    `hermes_queue` invokes mark_sent without `--rank` while declines are logged
+    by hand, so the dials can be almost entirely unranked while the declines are
+    fully ranked. Averaging across that gap compares two populations and prints
+    one number — the same defect as the accept-rate this eval replaces.
+    """
+
+    def test_a_thin_ranked_side_withholds_the_comparison(self) -> None:
+        rows = decisions(dialed=15, declined=5, dial_rank=70.0, decline_rank=30.0)
+        # Strip the rank from all but two dials, as the automated path does.
+        for row in [r for r in rows if r["decision"] == "dial"][2:]:
+            row["rank"] = None
+        result = evaluate_pre_dial_approval(rows)
+        self.assertIsNone(result["rank_separation"])
+        self.assertIn("withheld", result["rank_summary"])
+        self.assertFalse(result["rank_coverage"]["comparable"])
+
+    def test_lopsided_coverage_withholds_even_with_enough_ranked_rows(self) -> None:
+        # 8 of 40 dials ranked (20%) against 8 of 8 declines (100%): both sides
+        # clear the minimum, but they are not the same population.
+        rows = decisions(dialed=40, declined=8, dial_rank=70.0, decline_rank=30.0)
+        for row in [r for r in rows if r["decision"] == "dial"][8:]:
+            row["rank"] = None
+        result = evaluate_pre_dial_approval(rows)
+        self.assertIsNone(result["rank_separation"])
+        self.assertIn("coverage", result["rank_summary"])
+
+    def test_even_coverage_reports_the_comparison(self) -> None:
+        result = evaluate_pre_dial_approval(
+            decisions(dialed=15, declined=8, dial_rank=70.0, decline_rank=30.0)
+        )
+        self.assertTrue(result["rank_coverage"]["comparable"])
+        self.assertAlmostEqual(result["rank_separation"], 40.0)
+
+
 if __name__ == "__main__":
     unittest.main()

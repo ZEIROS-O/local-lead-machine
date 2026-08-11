@@ -250,12 +250,19 @@ Key in-flight facts (2026-07-29):
 
 ## The write-back half (post-send CRM)
 
-The pipeline ends at Airtable; three small scripts move a lead through the funnel afterwards, and
+The pipeline ends at Airtable; four small scripts move a lead through the funnel afterwards, and
 every one of them logs something a human already did. **None of them send anything.**
 
-- `query_ready_to_send.py` — read-only queue of `Status=New` leads passing the readiness contract.
+- `query_ready_to_send.py` — read-only queue of `Status=New` leads passing the readiness contract,
+  ordered by `lead_machine/dial_rank.py` and annotated with that rank.
 - `mark_sent.py` — records the completed contact, moves `Status=New` → `Follow-Up`, writes
   `Last Contacted` and `Outreach Channel`, and arms `Next Follow-Up` one cadence step out.
+- `mark_declined.py` — records the opposite decision: a lead the rep read and refused to call,
+  `Status=New` → `Not Fit`. It exists because that refusal reached nothing, which let the
+  accept-rate KPI count only leads someone had already agreed to dial. It writes **no consent
+  state** — a business that asks not to be contacted still needs `mark_outcome.py --event opt_out`,
+  which is the only thing that writes the suppression ledger, and the reason free text is screened
+  for opt-out language before the write.
 - `mark_outcome.py` — everything after that, starting from `Follow-Up`: `replied` /
   `meeting_booked` stay `Follow-Up` (and re-arm the
   cadence), `closed_won` → `Won`, `closed_lost` → `Lost` (both clear it), plus a

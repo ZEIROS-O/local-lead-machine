@@ -190,7 +190,10 @@ def approval_rate(decisions: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
             declined += 1
             reasons[_text(row.get("reason"))] += 1
         rank = row.get("rank")
-        if isinstance(rank, (int, float)) and not isinstance(rank, bool):
+        # `verb not in ranks` is unreachable through `load_decisions`, which
+        # filters — but this function is public and a direct caller passing a
+        # hand-built row should not get a KeyError out of a metrics helper.
+        if verb in ranks and isinstance(rank, (int, float)) and not isinstance(rank, bool):
             ranks[verb].append(float(rank))
 
     decided = dialed + declined
@@ -198,6 +201,13 @@ def approval_rate(decisions: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
         "decided": decided,
         "dialed": dialed,
         "declined": declined,
+        # How many decisions on each side actually carried a rank. The two sides
+        # are recorded by different commands and one automated path
+        # (`hermes_queue`) invokes mark_sent without `--rank`, so these can
+        # diverge badly — and a mean-vs-mean comparison across unequal coverage
+        # compares two different populations while looking like one number.
+        "ranked_dialed": len(ranks[DECISION_DIAL]),
+        "ranked_declined": len(ranks[DECISION_DECLINE]),
         # None, never 0.0: an empty ledger means nobody has judged anything, and
         # reporting that as a failing rate would raise an alarm about the leads
         # when the truth is that the rep has not started.
