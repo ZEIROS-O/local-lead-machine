@@ -1610,16 +1610,20 @@ def has_dialable_phone(row: Dict[str, Any]) -> bool:
     and unidentifiable there. Anything shorter is a fragment scraped off a page,
     not a phone number.
 
-    Falls back to the crawled numbers because the Places record is not the only
-    place one arrives: a business with no listed number often still prints one in
-    its own site header, and that is a real lead we would otherwise refuse.
+    Deliberately narrower than "any number we found anywhere". An earlier version
+    also read `website.phones_found`, on the reasoning that a business with no
+    listed number often prints one in its own site header. That admitted leads on
+    a channel nothing downstream can screen: `query_ready_to_send` and
+    `mark_sent` re-match the opt-out ledger against the Airtable `Phone` column,
+    and only the Google number is ever written there (`score_leads`). A lead
+    admitted on a scraped number would therefore be invisible to both post-upload
+    suppression checks — and blank in the queue the rep reads, so it could not be
+    dialled anyway. Crawled numbers still feed `record_suppression_identifiers`,
+    where matching more numbers can only ever stop a call.
     """
-    candidates = [_pick(row, "Phone", "phone")]
     raw = _raw_evidence(row)
-    website = raw.get("website") if isinstance(raw.get("website"), dict) else {}
     google = raw.get("google") if isinstance(raw.get("google"), dict) else {}
-    candidates.extend(str(value) for value in (website.get("phones_found") or []))
-    candidates.append(str(google.get("phone") or ""))
+    candidates = [_pick(row, "Phone", "phone"), str(google.get("phone") or "")]
     return any(len(normalize_phone(candidate)) == 10 for candidate in candidates if candidate)
 
 

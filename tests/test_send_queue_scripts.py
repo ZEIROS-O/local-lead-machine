@@ -75,24 +75,35 @@ class TestFetchReadyRecords(unittest.TestCase):
         }
         self.assertFalse(removed & set(qrs.DISPLAY_FIELDS))
 
-    def test_paginates_and_sorts_by_priority_then_score(self):
+    def test_paginates_and_sorts_best_lead_first(self):
+        # Grade no longer leads the sort. It was a gate as well as a sort key,
+        # so ordering by it only ever separated leads the gate had already
+        # blessed; now a C lead with a real leak reaches the queue, and putting
+        # the model's holistic guess ahead of the evidence would bury it.
+        # `dial_rank` orders on the signals the demoted gates used to enforce —
+        # here the leak severity and the demand proof behind it.
+        strong = {"Visible Pain Score": 80, "Reviews": 200, "Rating": "4.9", "AI Confidence": "high"}
+        middling = {"Visible Pain Score": 40, "Reviews": 60, "Rating": "4.6", "AI Confidence": "medium"}
+        weak = {"Visible Pain Score": 5, "Reviews": 9, "Rating": "4.1", "AI Confidence": "low"}
         page1 = {
             "records": [
-                {"id": "recB", "fields": {**READY_FIELDS, "Business Name": "B Co", "Lead Priority": "B", "Score Total": 10}},
-                {"id": "recA5", "fields": {**READY_FIELDS, "Business Name": "A5 Co", "Lead Priority": "A", "Score Total": 5}},
+                # A grade with the weakest evidence: it must not lead any more.
+                {"id": "recWeak", "fields": {**READY_FIELDS, "Business Name": "Weak Co", "Lead Priority": "A", "Score Total": 10, **weak}},
+                {"id": "recMid", "fields": {**READY_FIELDS, "Business Name": "Mid Co", "Lead Priority": "A", "Score Total": 5, **middling}},
             ],
             "offset": "next",
         }
         page2 = {
+            # C grade, strongest evidence — the lead the old sort put last.
             "records": [
-                {"id": "recA9", "fields": {**READY_FIELDS, "Business Name": "A9 Co", "Lead Priority": "A", "Score Total": 9}},
+                {"id": "recStrong", "fields": {**READY_FIELDS, "Business Name": "Strong Co", "Lead Priority": "C", "Score Total": 9, **strong}},
             ],
         }
         probe = _response(200, {"records": []})
         with patch("requests.get", side_effect=[probe, _response(200, page1), _response(200, page2)]) as mock_get:
             records = qrs.fetch_ready_records("app123", "Prospects", "tok", suppression=set())
 
-        self.assertEqual([r["record_id"] for r in records], ["recA9", "recA5", "recB"])
+        self.assertEqual([r["record_id"] for r in records], ["recStrong", "recMid", "recWeak"])
         # Missing display fields degrade to empty strings, not KeyErrors.
         self.assertEqual(records[0]["Opener"], "")
         self.assertEqual(mock_get.call_count, 3)

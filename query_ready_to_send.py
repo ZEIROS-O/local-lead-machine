@@ -42,6 +42,7 @@ from lead_machine.compliance import (
     load_configured_suppression_index,
 )
 from lead_machine import queue_state
+from lead_machine.dial_rank import dial_sort_key
 from lead_machine.sendability import is_contact_ready
 
 
@@ -83,7 +84,6 @@ DISPLAY_FIELDS = [
     "Next Follow-Up",
 ]
 
-_PRIORITY_RANK = {"A": 0, "B": 1, "C": 2}
 # The fields the read-back guard must actually receive to mean anything: a guard
 # whose evidence never arrives is one that cannot fail. `Verdict` and `Status`
 # answer the send question after the cutover collapsed it into one column.
@@ -212,12 +212,16 @@ def fetch_ready_records(
         if not offset:
             break
 
-    records.sort(
-        key=lambda r: (
-            _PRIORITY_RANK.get(str(r.get("Lead Priority", "")).strip().upper(), 9),
-            -(r.get("Score Total") or 0),
-        )
-    )
+    # Grade first, score second was the old order, and while grade was also a
+    # gate that was defensible: everything in the queue had already cleared A/B,
+    # so the sort only separated leads the gate had blessed. Grade is no longer a
+    # gate — a C lead with a real leak and a dialable number now reaches the
+    # queue — so sorting on it first would put the model's holistic guess ahead
+    # of the evidence the rep actually pitches on.
+    #
+    # `dial_rank` reads the signals the demoted gates used to enforce by
+    # exclusion, so the ordering they were protecting survives them.
+    records.sort(key=dial_sort_key)
     return records
 
 

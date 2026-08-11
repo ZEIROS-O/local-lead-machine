@@ -443,8 +443,15 @@ def merge_suppression_disqualifiers(row: dict[str, Any], enriched: Mapping[str, 
     Both scoring paths call this before `apply_sendability`, which is what makes
     the verdict binding: `sendability.has_hard_disqualifier` reads these keys, so
     a suppressed lead picks up HARD_DISQUALIFIER_BLOCKER, which is in
-    EVIDENCE_BLOCKERS, which forces minimum_evidence_passed False and therefore
-    Packet Tier = No Packet. No separate gate to keep in sync.
+    HARD_ELIGIBILITY_BLOCKERS, which forces minimum_evidence_passed False and
+    therefore Packet Tier = No Packet. No separate gate to keep in sync.
+
+    HARD_ELIGIBILITY_BLOCKERS, not EVIDENCE_BLOCKERS — membership in the latter
+    stopped implying anything when the gate was thinned and the two sets became
+    equal. The distinction is load-bearing here: the hard set is what routes a
+    lead to No Packet, while the claim-integrity set routes to Manual Review,
+    which would draft a packet and an opener for a business that opted out.
+    `tests/test_sendability_admission.py` pins both the membership and the tier.
 
     `Skip Reason` is set as well as the canonical list because it is already a
     synced Airtable column, so the operator sees why the lead was dropped

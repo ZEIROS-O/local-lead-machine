@@ -22,7 +22,10 @@ from typing import Any
 from lead_machine.buyer_signals import REVIEW_DEMAND_THRESHOLDS
 from lead_machine.manual_scores import merge_manual_score
 from lead_machine.sendability import (
+    CLAIM_INTEGRITY_BLOCKERS,
     EVIDENCE_BLOCKERS,
+    HARD_DISQUALIFIER_BLOCKER,
+    HARD_ELIGIBILITY_BLOCKERS,
     HARD_ICP_SKIP_BLOCKER,
     INVALID_REF_BLOCKER,
     MISSING_REVIEW_DATA_BLOCKER,
@@ -477,6 +480,32 @@ class NoScoringPathEmitsSendableYesOnASkippedLeadTest(unittest.TestCase):
 
         self.assertEqual(row["Sendable"], "Yes")
         self.assertNotIn(MISSING_REVIEW_DATA_BLOCKER, row["Send Blockers"])
+
+    def test_a_suppressed_lead_gets_no_packet_not_a_manual_review_one(self) -> None:
+        # The DNC chain documented in `compliance.py` runs: suppression writes
+        # `dnc_suppressed` into hard_disqualifiers, `has_hard_disqualifier` reads
+        # it, and the resulting blocker must force `minimum_evidence_passed`
+        # False so the lead lands on `No Packet` rather than `Manual Review`.
+        #
+        # Nothing pinned the last step. It holds only because
+        # HARD_DISQUALIFIER_BLOCKER sits in HARD_ELIGIBILITY_BLOCKERS, and that
+        # bucket is heterogeneous — it also carries "out of business" and "weak
+        # reputation", which look like claim-integrity concerns. Moving it would
+        # write a drafted packet, with an opener, for a business that said no.
+        row = self._scored(self._enriched())
+        row["Hard Disqualifiers"] = "dnc_suppressed"
+        result = evaluate_sendability(row)
+
+        self.assertFalse(result["sendable"])
+        self.assertFalse(result["minimum_evidence_passed"])
+        tier, _reason = evaluate_packet_tier(row, result)
+        self.assertEqual(tier, "No Packet")
+
+    def test_hard_disqualifiers_stay_on_the_hard_eligibility_side(self) -> None:
+        # The membership the test above depends on, asserted directly so a move
+        # fails here with the reason rather than only there with a symptom.
+        self.assertIn(HARD_DISQUALIFIER_BLOCKER, HARD_ELIGIBILITY_BLOCKERS)
+        self.assertNotIn(HARD_DISQUALIFIER_BLOCKER, CLAIM_INTEGRITY_BLOCKERS)
 
     def test_evaluate_sendability_reports_the_same_verdict_as_the_admission(self) -> None:
         row = self._scored(

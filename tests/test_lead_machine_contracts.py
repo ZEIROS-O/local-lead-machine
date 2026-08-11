@@ -120,9 +120,16 @@ class LeadMachineContractsTest(unittest.TestCase):
             "Send Trigger": "No estimate form detected",
             "AI Confidence": "medium",
             "Recommended Action": "Build mockup then SMS owner",
-            "Opener": "Want me to send a cleaner estimate-page mockup?",
             "Evidence Refs": "ev-google-rating, ev-site",
-            "Safe Outreach Claims": "Strong Google review proof.",
+            # Claims carry their citations. A row with no `Verdict` is now judged
+            # by `evaluate_sendability` at upload, so a fixture meant to be
+            # sendable has to actually satisfy it — an uncited claim is exactly
+            # what that guard exists to refuse.
+            "Safe Outreach Claims": (
+                "Strong Google review proof. [ev-google-rating]; "
+                "No estimate form was detected on the site. [ev-site]"
+            ),
+            "Opener": "I noticed no estimate form on the site — want a cleaner estimate-page mockup?",
             "Unsafe Claims": "Do not claim they are losing jobs.",
             "Packet Eligible": "Yes",
             "Packet Eligibility Reason": "A lead with Website Rebuild angle.",
@@ -561,10 +568,16 @@ class LeadMachineContractsTest(unittest.TestCase):
                     "Contact Eligibility": "contact-now",
                     "Asset State": "ready",
                     "Promise State": "kept",
-                    # Carries a leak so the row still earns `send`; the test is
-                    # about which columns are written, not about the verdict.
+                    # Carries real evidence so the row still earns `send`; the
+                    # test is about which columns are written, not the verdict.
+                    "Phone": "(440) 555-0144",
+                    "Reviews": "64",
+                    "Rating": "4.8",
                     "Visible Pain Score": "35",
                     "Visible Pain Reasons": "No estimate form detected; No clear estimate CTA",
+                    "Evidence Refs": "ev-site, ev-google",
+                    "Safe Outreach Claims": "No estimate form was detected on the site. [ev-site]",
+                    "Opener": "I noticed no estimate form on the site — worth a look?",
                     "Send Blockers": "something",
                     "Skip Reason": "something",
                 },
@@ -575,7 +588,13 @@ class LeadMachineContractsTest(unittest.TestCase):
         for field in superseded:
             self.assertNotIn(field, posted, field)
         # The tier still drives the verdict internally; only the column is gone.
-        self.assertEqual(posted["Verdict"], "send")
+        #
+        # `reject`, not `send`: this row carries `Skip Reason: something` because
+        # the point is that the superseded column is not written, and the gate
+        # reads a skip reason as a hard disqualifier. That the verdict follows
+        # the gate rather than the row's own `Sendable: Yes` is the derivation
+        # this test is asserting.
+        self.assertEqual(posted["Verdict"], "reject")
 
     def test_airtable_derived_verdict_travels_with_the_derived_tier(self) -> None:
         """A Verdict minted from a defaulted tier is just as much a guess.
@@ -700,11 +719,18 @@ class LeadMachineContractsTest(unittest.TestCase):
                     "Packet Eligible": "Yes",
                     "Commercial Fit State": "commercially-sendable",
                     "Contact Eligibility": "contact-now",
-                    # A row with no Verdict of its own must name a leak to upload
-                    # as sendable, so this fixture carries one. The test is about
-                    # clearing Verdict Reasons, not about earning the verdict.
+                    # A row with no Verdict of its own is judged by
+                    # `evaluate_sendability` at upload, so this fixture has to
+                    # actually earn `send`. The test is about clearing Verdict
+                    # Reasons, not about the verdict.
+                    "Phone": "(440) 555-0143",
+                    "Reviews": "64",
+                    "Rating": "4.8",
                     "Visible Pain Score": "35",
                     "Visible Pain Reasons": "No estimate form detected; No clear estimate CTA",
+                    "Evidence Refs": "ev-site, ev-google",
+                    "Safe Outreach Claims": "No estimate form was detected on the site. [ev-site]",
+                    "Opener": "I noticed no estimate form on the site — worth a look?",
                     "Verdict Reasons": "",
                     "Send Blockers": "",
                 },

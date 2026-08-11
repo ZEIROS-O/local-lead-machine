@@ -59,8 +59,9 @@ from lead_machine.sendability import (
     PACKET_TIER_CHOICES,
     SCORER_WITHHELD_BLOCKER,
     admit,
+    evaluate_sendability,
     hard_icp_skip_blockers,
-    has_concrete_conversion_issue,
+    has_hard_disqualifier,
     is_contact_ready,
 )
 from lead_machine.verdict import (
@@ -353,26 +354,30 @@ def is_sendable_record(record: Dict[str, Any]) -> bool:
     that can still stop a lead: a scored row carries it in Raw Evidence, and a
     stage that only reads a stored boolean cannot notice when the two disagree.
 
-    The evidence re-derivation below replaces a guard the commercial tribunal
-    used to provide by accident. A legacy CSV carrying nothing but
-    `Sendable=Yes,Packet Eligible=Yes` used to fail the readiness contract
-    because it did not also carry `Commercial Fit State` — the tribunal columns
-    were standing in for "was this row scored by the current pipeline". With the
-    tribunal gone that proxy goes too, so the question is asked directly and of
-    the evidence: a row with no named leak, no refs and no safe claim must not
-    upload as sendable on the strength of a stored boolean.
+    The commercial tribunal used to supply a guard here by accident: a legacy CSV
+    carrying nothing but `Sendable=Yes,Packet Eligible=Yes` failed the readiness
+    contract because it did not also carry `Commercial Fit State`. Those columns
+    were standing in for "was this row decided by the current pipeline". With the
+    tribunal gone that proxy goes too, and a row with no `Verdict` is exactly a
+    row nothing in this codebase has judged.
 
-    Keyed on `Verdict` exactly as the removed cross-checks were. A row carrying
-    one was decided by the gate itself and is re-derived by `readiness_flags`
-    already; a row without one is a legacy or hand-made CSV, which is the only
-    shape this guard was ever protecting against.
+    So such a row is judged here, by the authority itself. An earlier version of
+    this guard asked a narrower question — does the row name a concrete leak —
+    and that was wrong twice over. It let a `dnc_suppressed` business upload as
+    `Verdict=send, Status=New`, which is the rep's dial queue, and it let 19
+    named businesses through carrying claims `evaluate_sendability` refuses:
+    openers asserting a missing estimate form on a page that was never parsed,
+    and claims citing evidence ids absent from their own snapshot. Those are the
+    two blockers that exist to stop a misrepresentation to a business owner.
 
-    The question asked is the narrowest one that separates the two cases: does
-    this row name a concrete leak at all. Not `minimum_evidence_passed`, which
-    also demands the safe-claim-with-refs structure that pre-dates these legacy
-    CSVs — requiring it here would reject the very rows the guard is meant to let
-    through, and only a row with no observation, no trigger and no angle should
-    fall. AGENTS.md: no send without a real, named, verifiable leak.
+    A predicate weaker than the authority is a second sendable path, and
+    AGENTS.md allows exactly one: "`sendability.admit()` is the only place a lead
+    may be declared sendable. Any new sendable path goes through `admit`." This
+    goes through it.
+
+    Rows that do carry a `Verdict` are left to `readiness_flags`, which already
+    re-runs the admission over the stored value in the tightening direction.
+    Re-deciding them here would second-guess the gate with a copy of itself.
     """
     fields = record.get("airtable_fields") or record
     readiness = dict(fields)
@@ -381,7 +386,11 @@ def is_sendable_record(record: Dict[str, Any]) -> bool:
         readiness.setdefault("Sendable", admit(record, blockers).sendable_flag)
     if record.get("packet_eligible") is not None:
         readiness.setdefault("Packet Eligible", "Yes" if truthy_yes(record.get("packet_eligible")) else "No")
-    if not clean_cell(fields.get("Verdict")) and not has_concrete_conversion_issue(record):
+    # Merged, not `record` alone: `csv_row_to_record` nests every column under
+    # `airtable_fields`, so judging the bare record would hand the authority an
+    # almost-empty dict and refuse everything. JSONL cards carry their evidence
+    # at the top level instead, and the merge lets one call read both shapes.
+    if not clean_cell(fields.get("Verdict")) and not evaluate_sendability({**record, **fields})["sendable"]:
         return False
     # Unconditional, unlike the setdefault above: a row that already carries
     # Sendable=Yes from an older CSV would otherwise keep it.
@@ -561,6 +570,13 @@ def csv_row_to_record(row: Dict[str, str], packet_dir: Path) -> Dict[str, Any]:
     # CSV. This also keeps scored CSVs written before Packet Tier existed working.
     source = {**row, **fields}
     row_is_sendable = is_sendable_record(source)
+    # A hard disqualifier is not a matter of degree, and `dnc_suppressed` is one
+    # of them. Both tier derivations below fall back to Manual Review whenever
+    # `Packet Eligible` is Yes, which for a suppressed business means drafting a
+    # packet — with an opener — for someone who asked not to be contacted. The
+    # canonical gate already routes these to No Packet via
+    # `minimum_evidence_passed`; this is the CSV path saying the same thing.
+    row_is_disqualified = has_hard_disqualifier(source)
     if clean_cell(fields.get("Packet Tier")) == _TIER_SENDABLE and not row_is_sendable:
         # An explicit tier is still only a snapshot. Total mirroring means a
         # stale Sendable Packet would otherwise survive after the canonical
@@ -569,7 +585,9 @@ def csv_row_to_record(row: Dict[str, str], packet_dir: Path) -> Dict[str, Any]:
         # default: an existing Airtable row must be PATCHed away from the stale
         # sendable tier.
         fields["Packet Tier"] = (
-            _TIER_MANUAL if truthy_yes(source.get("Packet Eligible")) else _TIER_NONE
+            _TIER_MANUAL
+            if truthy_yes(source.get("Packet Eligible")) and not row_is_disqualified
+            else _TIER_NONE
         )
 
     # Packet Tier is the only readiness column Airtable keeps, so a CSV without
@@ -585,7 +603,7 @@ def csv_row_to_record(row: Dict[str, str], packet_dir: Path) -> Dict[str, Any]:
     if not clean_cell(fields.get("Packet Tier")):
         if row_is_sendable:
             derived_tier = _TIER_SENDABLE
-        elif truthy_yes(source.get("Packet Eligible")):
+        elif truthy_yes(source.get("Packet Eligible")) and not row_is_disqualified:
             derived_tier = _TIER_MANUAL
         else:
             derived_tier = _TIER_NONE
