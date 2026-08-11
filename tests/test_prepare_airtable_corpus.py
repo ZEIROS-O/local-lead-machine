@@ -170,6 +170,14 @@ class PrepareAirtableCorpusTests(unittest.TestCase):
                 "place:unknown",
             )
 
+    def test_override_on_resolved_selected_row_is_unused(self) -> None:
+        from prepare_airtable_corpus import prepare_corpus
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self._write_csv(Path(temporary), "source.csv", [self._row()], 1)
+            with self.assertRaisesRegex(ValueError, "unused vertical overrides"):
+                prepare_corpus([path], {"place:place-send-1": "Roofing"})
+
     def test_preparation_only_changes_vertical_and_machine_owned_verdict_fields(self) -> None:
         from prepare_airtable_corpus import prepare_corpus
 

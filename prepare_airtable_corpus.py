@@ -34,9 +34,9 @@ def upsert_key(row: dict[str, Any]) -> str:
     return f"phone:{phone}" if phone else ""
 
 
-def resolve_upload_vertical(
+def _resolve_upload_vertical(
     row: dict[str, Any], overrides: dict[str, str], key: str
-) -> str:
+) -> tuple[str, bool]:
     """Return a supported Airtable vertical without guessing unknown services."""
     stored = str(row.get("Vertical") or "").strip()
     stored_profile = resolve_profile(stored, fallback="").key
@@ -63,12 +63,19 @@ def resolve_upload_vertical(
     if not vertical:
         if stored.casefold() == "service":
             if override:
-                return override
+                return override, True
             raise ValueError(f"cannot resolve service Vertical for {key}")
         raise ValueError(f"unsupported Vertical {stored!r} for {key}")
     if vertical not in VERTICAL_CHOICES:
         raise ValueError(f"unsupported Vertical {vertical!r} for {key}")
-    return vertical
+    return vertical, False
+
+
+def resolve_upload_vertical(
+    row: dict[str, Any], overrides: dict[str, str], key: str
+) -> str:
+    """Return a supported Airtable vertical without guessing unknown services."""
+    return _resolve_upload_vertical(row, overrides, key)[0]
 
 
 def _sorted_paths(paths: Iterable[Path | str]) -> list[Path]:
@@ -101,16 +108,15 @@ def prepare_corpus(
                 if key in selected:
                     overwritten_rows += 1
                 selected[key] = (source_path, line_number, row)
-    unused_overrides = sorted(set(overrides) - set(selected))
-    if unused_overrides:
-        raise ValueError(f"unused vertical overrides: {len(unused_overrides)}")
-
     rows: list[dict[str, str]] = []
+    consumed_overrides: set[str] = set()
     biconditional_violations = 0
     verdict_tier_violations = 0
     for key, (_, _, source_row) in selected.items():
         prepared = dict(source_row)
-        prepared["Vertical"] = resolve_upload_vertical(prepared, overrides, key)
+        prepared["Vertical"], consumed_override = _resolve_upload_vertical(prepared, overrides, key)
+        if consumed_override:
+            consumed_overrides.add(key)
         prepared = refresh_row(prepared)
         changed = {
             field
@@ -127,6 +133,9 @@ def prepare_corpus(
             else:
                 verdict_tier_violations += 1
         rows.append(prepared)
+    unused_overrides = sorted(set(overrides) - consumed_overrides)
+    if unused_overrides:
+        raise ValueError(f"unused vertical overrides: {len(unused_overrides)}")
     for field in ["Vertical", *VERDICT_REFRESH_FIELDS]:
         if field not in fieldnames:
             fieldnames.append(field)
