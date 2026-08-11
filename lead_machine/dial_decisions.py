@@ -6,7 +6,7 @@ Why this exists. `evals/accept_rate.py` reads `Prospects.Status`, and
 the workflow manufactures its own approval: a rep who dials whatever the queue
 serves produces a 100% accept rate, and the KPI reads green whether the leads
 were good or worthless. That was tolerable while the commercial tribunal was
-refusing 71% of the corpus upstream. With the tribunal demoted to a ranking,
+refusing 83% of the corpus upstream. With the tribunal demoted to a ranking,
 accept-rate became the only proposed check on whether the strip cost us
 anything, and it cannot answer that question as built.
 

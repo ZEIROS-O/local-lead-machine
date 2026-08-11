@@ -196,7 +196,7 @@ class TheTwoUnrankedSignalsStayUnranked(unittest.TestCase):
     """
 
     def test_offer_fit_does_not_move_the_rank(self) -> None:
-        # Present on 1,042 of 1,042 sendable leads and categorical, so there is
+        # Present on 429 of 429 sendable leads and categorical, so there is
         # no direction to sort it in.
         self.assertEqual(
             dial_rank(queue_row(**{"Offer Fit": "estimate funnel", "Score Total": "70"})),
@@ -204,7 +204,7 @@ class TheTwoUnrankedSignalsStayUnranked(unittest.TestCase):
         )
 
     def test_send_trigger_does_not_move_the_rank(self) -> None:
-        # Absent on 124 of 1,042, so this one *would* discriminate. Left out
+        # Absent on 55 of 429, so this one *would* discriminate. Left out
         # until an outcome justifies inventing a seventh weight.
         self.assertEqual(
             dial_rank(queue_row(**{"Send Trigger": "new location opened", "Score Total": "70"})),

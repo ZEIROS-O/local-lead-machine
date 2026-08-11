@@ -581,8 +581,10 @@ def evaluate_sendability(row: Dict[str, Any]) -> Dict[str, Any]:
     # judgement about whether a lead is *worth* dialling, not about whether what
     # we would say to it is true — and judgement about an offer with zero closes
     # behind it is guesswork that only a real call can settle. Blocking on it
-    # destroyed the tail: those nine accounted for the great majority of the
-    # 2,595 rejects left after the commercial tribunal came out.
+    # destroyed the tail: 1,009 of 1,091 distinct leads were refused before the
+    # strip and 662 after it. See `dial_rank` for the measurement, including why
+    # the share attributable to these nine specifically is not separable from
+    # the tribunal's and is not claimed.
     #
     # They are not discarded, they are demoted. Every one of them is an input to
     # the deterministic rank the queue sorts on, so the rep still dials
@@ -602,7 +604,7 @@ def evaluate_sendability(row: Dict[str, Any]) -> Dict[str, Any]:
     # The commercial tribunal is computed and reported, but it no longer blocks.
     #
     # It asked an LLM whether a verified leak was worth money, and answered no
-    # for 71% of every lead ever scored — 2,525 of 2,995 held at
+    # for 83% of every lead ever scored — 908 of 1,091 distinct leads held at
     # `hold-commercial-case` alone. The rule driving that is unsatisfiable by
     # construction: `contact-now` required a verified asset, Loop B is not built,
     # and `AGENTS.md` Gate 0 forbids building it before a first close. So the

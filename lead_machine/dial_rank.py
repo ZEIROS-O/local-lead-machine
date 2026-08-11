@@ -4,8 +4,26 @@ Nine checks came out of `sendability` because they answered the wrong question.
 Score, grade, confidence, rating, review count, demand, angle, send trigger and
 the maturity-scaled pain threshold do not say whether what we would tell a
 business is true — they say whether the lead looks worth the call. As gates they
-destroyed the tail: 2,595 of 2,995 scored leads were refused, most of them by
-those nine, on an offer with zero closes behind it.
+destroyed the tail, on an offer with zero closes behind it.
+
+Every count in this docstring is by *distinct lead*, and the distinction is not
+pedantry. The corpus is 3,048 scored CSV rows but only 1,091 distinct leads: a
+lead reappears in every rescore batch it survives, roughly 2.8 times on average.
+An earlier version of this docstring counted rows, which inflated every
+population it argued from by about that factor and put the sendable pool at
+1,042 when the real figure is 429. Identity here is `Place Key`, falling back to
+`Place ID` and then to name+phone+city, because 132 rows carry no `Place Key`
+and dropping them would be its own silent undercount.
+
+Measured by re-running the pre-strip gate at 1e46d02 over that corpus and the
+current gate beside it: the old gate refused 1,009 of 1,091 distinct leads and
+the current one refuses 662, so the strip returned 347 leads — 82 sendable
+before, 429 after, a 5.2× pool. The commercial tribunal is the larger share of
+that: `hold-commercial-case` alone appears on 956 of the 1,009 refusals. The
+nine are heavily overlapping with it and with each other (grade on 782, score on
+767, the pain threshold on 718), so "most of them by those nine" is not
+separable from these numbers and is not claimed here — what is measured is the
+347 the two changes freed together.
 
 Ranking preserves what they were protecting — the rep's time — without the
 destruction. A weak lead sorts last instead of not existing, and the judgement
@@ -15,12 +33,12 @@ that never happened.
 Seven of the nine rank. Two do not, and saying "all nine became weights" would
 be false:
 
-  * `Offer Fit` (the old "Missing clear outreach angle") is present on all
-    1,042 currently sendable leads. It was a presence check over a categorical
+  * `Offer Fit` (the old "Missing clear outreach angle") is present on all 429
+    currently sendable leads. It was a presence check over a categorical
     label, not a quality, so there is no direction to sort it in and nothing to
     separate — weighting it would move no lead past any other.
-  * `Send Trigger` (the old "Missing concrete send trigger") is absent on 124
-    of those 1,042, so unlike Offer Fit it would discriminate. It is left out
+  * `Send Trigger` (the old "Missing concrete send trigger") is absent on 55
+    of those 429, so unlike Offer Fit it would discriminate. It is left out
     anyway, deliberately: adding it means inventing a seventh weight, and the
     six below have never been checked against a close. Substituting a second
     invention for the first buys no accuracy and costs the ability to read the
@@ -34,8 +52,8 @@ Why this and not `scoring_v3`. That module already computes a 0-100 rank and was
 the obvious candidate, but it resolves a per-vertical profile and returns *no
 rank at all* when there is no exact match. `scoring_profiles/` covers detailing,
 plumbing and water restoration; the live verticals are epoxy and garage doors. It
-scores 59 of the 1,042 currently sendable leads. Sorting the queue on a column
-blank for 94% of it would be worse than the grade sort it replaced. This reads
+scores 41 of the 429 currently sendable leads. Sorting the queue on a column
+blank for 90% of it would be worse than the grade sort it replaced. This reads
 only fields every scored row carries, so it works the day a vertical is added
 rather than after someone authors a profile for it.
 

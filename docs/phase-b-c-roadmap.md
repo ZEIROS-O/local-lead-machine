@@ -29,7 +29,7 @@
 > This exists because **accept-rate could not measure what it was being asked to measure.**
 > `mark_sent` sets `Follow-Up` and `evals/accept_rate.py` counts `Follow-Up` as accepted, so a rep
 > who dials whatever the queue serves scores 100% regardless of lead quality — the refusals never
-> entered the denominator. That was tolerable while the commercial tribunal refused 71% of the
+> entered the denominator. That was tolerable while the commercial tribunal refused 83% of the
 > corpus upstream; once those nine judgement gates became a ranking
 > (`lead_machine/dial_rank.py`), accept-rate was the only proposed check on whether the strip cost
 > anything, and it was measuring the wrong event. **The KPI is now

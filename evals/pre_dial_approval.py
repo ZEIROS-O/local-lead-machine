@@ -5,7 +5,7 @@
 accepted, while `mark_sent.py` sets `Follow-Up` as the act of logging a
 completed contact. The workflow therefore manufactures its own approval: a rep
 who dials whatever the queue serves scores 100% regardless of lead quality.
-That was survivable while the commercial tribunal refused 71% of the corpus
+That was survivable while the commercial tribunal refused 83% of the corpus
 before a human ever saw it. Once the tribunal became a ranking, accept-rate was
 the only proposed check on whether the strip cost anything — and it was
 measuring the wrong event.
