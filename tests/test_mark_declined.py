@@ -130,5 +130,75 @@ class DecliningALead(unittest.TestCase):
             self._apply(session)
 
 
+class ADeclineIsNotAnOptOut(unittest.TestCase):
+    """The one place these two verbs can be confused is the rep's hands.
+
+    `mark_declined` writes the same terminal `Not Fit` that an opt-out writes,
+    and the only status it accepts is `New` — which is exactly when a business
+    says "take me off your list", on the first dial. A refusal recorded here
+    writes no suppression row, so if the rep reaches for the wrong verb the
+    business can be re-discovered under a new record id and called again.
+
+    Nothing in the code reads `Status` as consent, so this is a human-factors
+    gap rather than a broken invariant. It is still the one that ends in a call
+    to someone who said no.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.ledger = Path(self.tmp.name) / "decisions.jsonl"
+
+    def _apply(self, session, **overrides):
+        kwargs = dict(
+            record_id="rec1",
+            reason="no owner name to ask for",
+            decisions_source=str(self.ledger),
+            base_id="base",
+            table="Prospects",
+            token="tok",
+            session=session,
+        )
+        kwargs.update(overrides)
+        return mark_declined.apply_mark_declined(**kwargs)
+
+    def test_a_consent_flavoured_reason_is_refused_before_any_write(self):
+        for reason in [
+            "owner asked not to be contacted",
+            "said take me off your list",
+            "TOLD ME TO STOP CALLING",
+            "wants to unsubscribe",
+            "do not contact again",
+        ]:
+            with self.subTest(reason=reason):
+                session = _session()
+                with self.assertRaises(mark_declined.MarkDeclinedError) as caught:
+                    self._apply(session, reason=reason)
+                # The error has to name the right verb, or it is a dead end that
+                # leaves the rep with no way to record what they heard.
+                self.assertIn("mark_outcome", str(caught.exception))
+                session.patch.assert_not_called()
+        self.assertEqual(dial_decisions.load_decisions(self.ledger), [])
+
+    def test_an_ordinary_refusal_is_unaffected(self):
+        # The screen must not swallow normal reasons; a false positive here
+        # blocks the rep from clearing a lead at all.
+        for reason in [
+            "no owner name to ask for",
+            "wrong vertical, they do commercial only",
+            "site is fine, nothing to pitch",
+            "already a customer",
+        ]:
+            with self.subTest(reason=reason):
+                self._apply(_session(), reason=reason)
+
+    def test_the_receipt_says_no_suppression_was_recorded(self):
+        # A green receipt that looks identical to an opt-out receipt is how the
+        # two get conflated in the first place.
+        receipt = self._apply(_session())
+        self.assertFalse(receipt["suppression_recorded"])
+        self.assertIn("mark_outcome", receipt["suppression_note"])
+
+
 if __name__ == "__main__":
     unittest.main()

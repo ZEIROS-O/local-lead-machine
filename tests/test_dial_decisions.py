@@ -16,6 +16,7 @@ a lead already dialled can no longer be decided.
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -97,6 +98,61 @@ class LedgerWriting(unittest.TestCase):
         )
         self.assertEqual(row["rank"], 61.5)
         self.assertEqual(load_decisions(self.path)[0]["business_name"], "Acme Epoxy")
+
+
+class AnUnwritableLedgerFailsAsOneKind(unittest.TestCase):
+    """Every write failure must arrive as `DialDecisionError`, never a bare OSError.
+
+    `mark_sent` records the dial *after* the Airtable mutation is confirmed, and
+    catches this type in order to warn instead of failing. An OSError escaping
+    that catch tracebacks the script after a real state change, which reads as
+    "that did not work" and invites the rep to run it again.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_an_uncreatable_parent_directory_raises_the_ledger_error(self) -> None:
+        # The parent must be *missing* to reach the mkdir — an existing-but-bad
+        # parent is caught by the open() below it and proves nothing about the
+        # mkdir. Here a plain file stands where a parent directory would go, so
+        # `mkdir(parents=True)` raises NotADirectoryError.
+        blocker = Path(self.tmp.name) / "not-a-dir"
+        blocker.write_text("", encoding="utf-8")
+        with self.assertRaises(DialDecisionError):
+            append_decision(
+                blocker / "nested" / "decisions.jsonl",
+                decision=DECISION_DIAL,
+                record_id="rec1",
+            )
+
+    def test_an_unwritable_parent_directory_raises_the_ledger_error(self) -> None:
+        locked = Path(self.tmp.name) / "locked"
+        locked.mkdir()
+        locked.chmod(0o500)
+        self.addCleanup(locked.chmod, 0o700)
+        if os.access(locked, os.W_OK):  # root ignores the mode; skip rather than lie
+            self.skipTest("cannot make a directory unwritable as this user")
+        with self.assertRaises(DialDecisionError):
+            append_decision(
+                locked / "nested" / "decisions.jsonl",
+                decision=DECISION_DIAL,
+                record_id="rec1",
+            )
+
+    def test_an_unwritable_ledger_file_raises_the_ledger_error(self) -> None:
+        # The already-covered case, kept explicit: parent exists, open() fails.
+        locked = Path(self.tmp.name) / "locked-file"
+        locked.mkdir()
+        locked.chmod(0o500)
+        self.addCleanup(locked.chmod, 0o700)
+        if os.access(locked, os.W_OK):
+            self.skipTest("cannot make a directory unwritable as this user")
+        with self.assertRaises(DialDecisionError):
+            append_decision(
+                locked / "decisions.jsonl", decision=DECISION_DIAL, record_id="rec1"
+            )
 
 
 class ReadingTheLedger(unittest.TestCase):

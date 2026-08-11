@@ -113,11 +113,17 @@ def append_decision(
     }
 
     path = Path(ledger)
-    parent = path.parent
-    if str(parent) and not parent.exists():
-        parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(row, ensure_ascii=False)
+    # The mkdir belongs inside the guard, not above it. `mark_sent` records the
+    # dial after the Airtable mutation is confirmed and catches DialDecisionError
+    # in order to warn rather than fail; a bare OSError from mkdir escapes that
+    # catch and tracebacks the script after a real state change, which reads as
+    # "that did not work" and invites the rep to run it again. Every way this
+    # write can fail has to arrive as one type.
     try:
+        parent = path.parent
+        if str(parent) and not parent.exists():
+            parent.mkdir(parents=True, exist_ok=True)
         # One `write` of one short line under O_APPEND, so two reps working the
         # queue at once cannot interleave inside a record.
         with path.open("a", encoding="utf-8") as handle:

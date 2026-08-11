@@ -46,9 +46,25 @@ except ModuleNotFoundError:
         return False
 
 from lead_machine import dial_decisions
-from lead_machine.compliance import is_mark_sent_source_status
+from lead_machine.compliance import (
+    ComplianceError,
+    is_mark_sent_source_status,
+    is_suppressed,
+    load_configured_suppression_index,
+    opt_out_language_in,
+)
 
 DECLINED_STATUS = "Not Fit"
+
+# Said on every decline, because the receipt is the only thing the rep reads.
+# A green `{"status": "Not Fit"}` here is visually identical to the visible half
+# of an opt-out, and that resemblance is the whole risk.
+NO_SUPPRESSION_NOTE = (
+    "No suppression was recorded — this is a 'we chose not to call', not consent "
+    "state. If the business asked not to be contacted, run "
+    "mark_outcome.py --event opt_out instead; only that writes the ledger row "
+    "that stops re-discovery under a new record id."
+)
 
 
 class MarkDeclinedError(RuntimeError):
@@ -92,6 +108,21 @@ def apply_mark_declined(
             "was rejected but not which signal was wrong, and the reason is the "
             "only thing that can retire or restore a demoted blocker"
         )
+
+    # Screened before any call, so a misfiled opt-out costs a retyped reason
+    # rather than a missing suppression row. Refusing is the safe direction: the
+    # rep is told which command to use, and the lead stays in the queue until
+    # one of them is run.
+    phrase = opt_out_language_in(reason)
+    if phrase:
+        raise MarkDeclinedError(
+            f"--reason contains opt-out language ({phrase!r}), and this command "
+            "records no consent state: it writes Status='Not Fit' and nothing "
+            "else, so the business would be re-discovered under a new record id "
+            "and contacted again. If they asked not to be contacted, run "
+            "mark_outcome.py --event opt_out, which writes the suppression "
+            "ledger row. If they did not, reword the reason."
+        )
     if not str(decisions_source or "").strip():
         raise MarkDeclinedError(
             "no decision ledger configured "
@@ -110,9 +141,30 @@ def apply_mark_declined(
         raise MarkDeclinedError("Airtable GET response has no fields object")
     fields = dict(raw_fields)
 
+    # Read, never gated. A suppressed lead being retired is the outcome we want,
+    # so refusing would block the rep for no safety gain — but `already_applied`
+    # on a record retired by an opt-out looks exactly like one retired by an
+    # earlier decline, and the rep should know which they are holding.
+    suppression_note = ""
+    try:
+        suppression = load_configured_suppression_index()
+    except ComplianceError:
+        suppression = frozenset()
+    if suppression and is_suppressed({"id": record_id, "fields": fields}, suppression):
+        suppression_note = (
+            "This record is already suppressed (opt-out). It is retired for "
+            "compliance, not judgement; the decline is recorded for the KPI only."
+        )
+
     status = str(fields.get("Status") or "").strip()
     if status == DECLINED_STATUS:
-        return {"result": "already_applied", "record_id": record_id, "status": DECLINED_STATUS}
+        return {
+            "result": "already_applied",
+            "record_id": record_id,
+            "status": DECLINED_STATUS,
+            "suppression_recorded": False,
+            "suppression_note": suppression_note or NO_SUPPRESSION_NOTE,
+        }
     # `is_mark_sent_source_status` is the shared reading of "still in the
     # queue", so the decline gate and the dial gate cannot drift apart.
     if not is_mark_sent_source_status(status):
@@ -150,6 +202,10 @@ def apply_mark_declined(
         "record_id": record_id,
         "status": DECLINED_STATUS,
         "reason": reason,
+        # Stated on every receipt, never inferred from its absence: this command
+        # writes no consent state, and the rep must not read `Not Fit` as one.
+        "suppression_recorded": False,
+        "suppression_note": suppression_note or NO_SUPPRESSION_NOTE,
     }
 
 
@@ -200,6 +256,12 @@ def main() -> int:
         return 1
 
     print(json.dumps(receipt, sort_keys=True))
+    # Also on stderr in prose. The JSON is piped and parsed by the queue tooling;
+    # the human reading the terminal is the one who might mistake this for an
+    # opt-out, and they are the audience for the warning.
+    note = receipt.get("suppression_note")
+    if note:
+        print(f"[NOTE] {note}", file=sys.stderr)
     return 0
 
 

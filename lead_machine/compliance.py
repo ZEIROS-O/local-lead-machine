@@ -209,6 +209,66 @@ def load_suppression_index(value: Path | str) -> set[str]:
 
 DEFAULT_SUPPRESSION_EVENT = "opt_out"
 
+# Free-text that means a business withdrew consent, for screening any note a rep
+# types about a lead they are retiring for a *non*-compliance reason.
+#
+# Needed because `mark_declined.py` writes `Status="Not Fit"` — the same
+# terminal value `mark_outcome.py` writes for an opt-out — and the only status
+# it accepts is `New`, which is exactly when "take me off your list" is heard:
+# on the first dial. Nothing in the repo reads `Status` as consent state, so a
+# misfiled refusal breaks no invariant; it just leaves no suppression row, and
+# the business is re-discovered under a new record id and called again. That is
+# the case the ledger exists to prevent, arriving through the one door that
+# does not write to it.
+#
+# Substrings, matched case-folded, and deliberately over-broad. A false positive
+# costs a rep one retyped reason and a pointer to the right command; a false
+# negative costs a call to someone who said no. Tune only in that direction.
+OPT_OUT_LANGUAGE = (
+    "take me off",
+    "take us off",
+    "off your list",
+    "off the list",
+    "stop calling",
+    "stop contacting",
+    "don't call",
+    "dont call",
+    "do not call",
+    "don't contact",
+    "dont contact",
+    "do not contact",
+    # Bare "be contacted" rather than "not to be contacted": the negation moves
+    # around ("does not want to be contacted", "prefers not to be contacted",
+    # "asked not to be contacted") and a list that chases each phrasing will
+    # miss one. This also trips "asked to be contacted in the fall", which is a
+    # legitimate refusal — that rep retypes one reason, which is the trade this
+    # list is explicitly tuned to make.
+    "be contacted",
+    "no contact",
+    "unsubscribe",
+    "opt out",
+    "opted out",
+    "opt-out",
+    "remove me",
+    "remove us",
+    "lose my number",
+    "harass",
+    "dnc",
+)
+
+
+def opt_out_language_in(text: Any) -> str:
+    """The first opt-out phrase found in *text*, or "" if there is none.
+
+    Returns the phrase rather than a bool so the caller can quote it back: a
+    refusal that says which words tripped it is one the rep can act on.
+    """
+    haystack = str(text or "").casefold()
+    for phrase in OPT_OUT_LANGUAGE:
+        if phrase in haystack:
+            return phrase
+    return ""
+
 
 def normalize_suppression_event(value: Any) -> str:
     """Fold an event name the way `load_suppression_index` folds it on read."""
