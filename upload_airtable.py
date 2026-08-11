@@ -695,17 +695,22 @@ def csv_row_to_record(row: Dict[str, str], packet_dir: Path) -> Dict[str, Any]:
     }
 
 
-def validate_write_path_select_values(records: Iterable[Dict[str, Any]]) -> None:
-    """Refuse any select value the live schema gate cannot authorize."""
+def validate_planned_select_values(
+    planned: Iterable[Dict[str, Any]], *, applied_keys: AbstractSet[str] | None = None
+) -> None:
+    """Refuse a select value in any payload that would actually be sent."""
     choices = configured_write_path_select_choices()
-    for record in records:
-        fields = build_airtable_payload(record)["fields"]
+    already_applied = set(applied_keys or ())
+    for item in planned:
+        key = str(item.get("upsert_key") or item.get("place_key") or "")
+        if item.get("method") == "SKIP" or (key and key in already_applied):
+            continue
+        fields = (item.get("payload") or {}).get("fields") or {}
         for field, allowed in choices.items():
             value = fields.get(field)
             if value in ("", None):
                 continue
             if value not in allowed:
-                key = str(record.get("upsert_key") or record.get("place_id_or_unique_key") or "")
                 raise ValueError(f"unsupported {field} value {value!r} for {key or '<unknown>'}")
 
 
@@ -1058,6 +1063,7 @@ def send_airtable_plan(
     is now appended to a receipts file before the next one is attempted, so a
     re-run can skip what already landed.
     """
+    validate_planned_select_values(planned, applied_keys=applied_keys)
     base_url = airtable_base_url(base_id, table)
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     already_applied = set(applied_keys or ())
@@ -1241,13 +1247,13 @@ def main() -> int:
             input_path,
             packet_dir=packet_dir,
         )
-        validate_write_path_select_values(records)
 
         if not args.live:
             existing = {}
             if args.dry_run and args.base_id and args.table and args.token:
                 existing = fetch_existing_records(args.base_id, args.table, args.token)
             planned = plan_airtable_sync(records, existing_records_by_key=existing)
+            validate_planned_select_values(planned)
             print_plan_diagnostics(planned)
             print(f"[DRY-RUN] Records: {len(records)}")
             print(json.dumps(planned, ensure_ascii=False, indent=2))

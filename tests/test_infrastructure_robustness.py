@@ -90,6 +90,20 @@ class AirtableRetryTest(unittest.TestCase):
 
 
 class AirtableReceiptsTest(unittest.TestCase):
+    def test_writer_refuses_unsupported_select_before_receipts_or_session(self) -> None:
+        plan = _plan(1)
+        plan[0]["payload"]["fields"]["Outreach Channel"] = "Carrier Pigeon"
+        with tempfile.TemporaryDirectory() as tmp:
+            receipts = Path(tmp) / "writes.jsonl"
+            with patch("upload_airtable.requests.Session") as session_cls:
+                with self.assertRaisesRegex(ValueError, "unsupported Outreach Channel"):
+                    upload_airtable.send_airtable_plan(
+                        "base1", "Prospects", "token", plan, receipts_path=receipts
+                    )
+
+            self.assertFalse(receipts.exists())
+            session_cls.assert_not_called()
+
     def test_writes_that_applied_before_a_failure_are_recorded(self) -> None:
         """The property that makes a half-synced base recoverable.
 
@@ -142,12 +156,14 @@ class AirtableReceiptsTest(unittest.TestCase):
             ):
                 request = session_cls.return_value.__enter__.return_value.request
                 request.return_value = _response(200)
+                plan = _plan(3)
+                plan[0]["payload"]["fields"]["Outreach Channel"] = "Legacy Value Never Sent"
                 with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                     applied = upload_airtable.send_airtable_plan(
                         "base1",
                         "Prospects",
                         "token",
-                        _plan(3),
+                        plan,
                         receipts_path=receipts,
                         applied_keys=applied_keys,
                     )
