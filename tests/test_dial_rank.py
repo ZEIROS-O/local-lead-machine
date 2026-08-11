@@ -15,7 +15,8 @@ from __future__ import annotations
 
 import unittest
 
-from lead_machine.dial_rank import RANK_MAX, dial_rank, dial_sort_key
+from lead_machine.dial_rank import RANK_MAX, WEIGHTS, dial_rank, dial_sort_key
+from query_ready_to_send import DISPLAY_FIELDS
 
 
 def row(**overrides) -> dict:
@@ -118,6 +119,58 @@ class EachDemotedGateStillMovesTheOrder(unittest.TestCase):
         a = dial_sort_key(row(**{"Lead Priority": "A"}))
         c = dial_sort_key(row(**{"Lead Priority": "C"}))
         self.assertLess(a, c)
+
+
+def queue_row(**overrides) -> dict:
+    """A row shaped the way `query_ready_to_send` builds one.
+
+    That query projects each Airtable record onto DISPLAY_FIELDS, so a column
+    absent from that list does not reach the ranker no matter what the base
+    holds. `row()` above hands dial_rank a full scored CSV row instead, which is
+    how a dead component passed every test in this file: `Visible Pain Score`
+    was missing from DISPLAY_FIELDS, so the largest weight contributed zero to
+    every live lead while the unit tests exercised it happily.
+    """
+    return {field: str(overrides.get(field, "") or "") for field in DISPLAY_FIELDS}
+
+
+# Each rank component and the DISPLAY_FIELDS columns it can be moved by. Money
+# is read from the `Buyer Intent Signals` capsule because the base has no
+# `Money Signal` column for it to read directly.
+_COMPONENT_INPUTS = {
+    "pain": ({"Visible Pain Score": "80"}, {"Visible Pain Score": "5"}),
+    "demand": ({"Reviews": "200", "Rating": "5.0"}, {"Reviews": "3", "Rating": "4.0"}),
+    "money": (
+        {"Buyer Intent Signals": "money_signal=yes; demand_signal=yes"},
+        {"Buyer Intent Signals": "money_signal=no; demand_signal=no"},
+    ),
+    "confidence": ({"AI Confidence": "high"}, {"AI Confidence": "low"}),
+    "evidence": ({"Evidence Refs": "ev-1, ev-2, ev-3"}, {"Evidence Refs": ""}),
+    "score": ({"Score Total": "95"}, {"Score Total": "10"}),
+}
+
+
+class EveryWeightIsLiveInTheQueue(unittest.TestCase):
+    """The fetch and the ranker are one contract; this is what joins them.
+
+    A weight that no DISPLAY_FIELDS column can move is not a ranking signal, it
+    is a constant — it shifts every lead by the same amount and orders nothing.
+    """
+
+    def test_every_weighted_component_responds_to_a_queue_row(self) -> None:
+        for name, (better, worse) in _COMPONENT_INPUTS.items():
+            with self.subTest(component=name):
+                self.assertGreater(
+                    dial_rank(queue_row(**better)),
+                    dial_rank(queue_row(**worse)),
+                    f"the {name!r} weight is dead in the live queue: no column in "
+                    "DISPLAY_FIELDS moves it",
+                )
+
+    def test_the_coverage_check_names_every_weight(self) -> None:
+        # Without this, adding a seventh weight with no queue-visible input
+        # would pass the loop above by simply not being in it.
+        self.assertEqual(set(WEIGHTS), set(_COMPONENT_INPUTS))
 
 
 class TheSortKeyPutsTheBestLeadFirst(unittest.TestCase):

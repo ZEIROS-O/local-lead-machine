@@ -158,6 +158,29 @@ def money_signal_state(record: Dict[str, Any]) -> str:
     return _normalize_money_signal(buyer_intent.get("money_signal"))
 
 
+def money_signal_from_summary(record: Dict[str, Any]) -> str:
+    """Recover the tri-state from the `Buyer Intent Signals` capsule.
+
+    `Money Signal` is written to the scored CSV but is not a column in the
+    Airtable base, so a row read back from the base carries neither it nor the
+    `buyer_intent` dict — `money_signal_state` can only answer "unknown" there.
+    The capsule `buyer_intent_summary` writes *is* a base column, and it leads
+    with `money_signal=<state>`, so the answer survives the round trip in text.
+
+    Deliberately separate from `money_signal_state` rather than folded in as
+    another fallback: `has_money_signal` feeds the maturity-scaled pain
+    threshold, and widening what that reads would move a gate as a side effect
+    of repairing an ordering. Ranking may read this; gates keep their narrower
+    source until someone changes them on purpose.
+    """
+    text = str(record.get("Buyer Intent Signals") or record.get("buyer_intent_signals") or "")
+    for part in text.split(";"):
+        key, _, value = part.partition("=")
+        if key.strip().lower() == "money_signal":
+            return _normalize_money_signal(value.strip())
+    return MONEY_SIGNAL_UNKNOWN
+
+
 def money_signal_label(record: Dict[str, Any]) -> str:
     """Title-cased tri-state for row columns and the LLM capsule."""
     return money_signal_state(record).capitalize()

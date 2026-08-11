@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Mapping
 
-from .buyer_signals import money_signal_state
+from .buyer_signals import money_signal_from_summary, money_signal_state
 
 RANK_MAX = 100.0
 
@@ -127,7 +127,19 @@ def _confidence_fraction(row: Mapping[str, Any]) -> float:
 
 
 def _money_fraction(row: Mapping[str, Any]) -> float:
-    return MONEY_POINTS.get(money_signal_state(dict(row)), 0.5)
+    """Money credit, reading the capsule when the direct column is absent.
+
+    A queue row read back from Airtable has no `Money Signal` column — the base
+    does not have one — so the direct read answers `unknown` for every lead and
+    this component becomes a constant that orders nothing. The capsule in
+    `Buyer Intent Signals` carries the same state and *is* a base column, so it
+    is consulted whenever the direct read comes back unanswered.
+    """
+    record = dict(row)
+    state = money_signal_state(record)
+    if state == "unknown":
+        state = money_signal_from_summary(record)
+    return MONEY_POINTS.get(state, 0.5)
 
 
 def _evidence_fraction(row: Mapping[str, Any]) -> float:

@@ -65,6 +65,7 @@ DISPLAY_FIELDS = [
     "Rating",
     "AI Confidence",
     "Buyer Intent Signals",
+    "Visible Pain Score",
     "Send Trigger",
     "Offer Fit",
     "Specific Observation",
@@ -100,6 +101,29 @@ REQUIRED_READINESS_FIELDS = {
     "Status",
     "Phone",
     "Email",
+}
+
+# The columns `dial_rank` actually reads. Declared here because the fetch and
+# the ranker are the two halves of one contract and nothing else joined them:
+# `Visible Pain Score` — the single largest weight — was absent from
+# DISPLAY_FIELDS while dial_rank asked for it, so every lead scored zero pain
+# and the queue served an order nobody chose. The unit tests could not see it,
+# because they hand dial_rank a full scored row rather than the projection onto
+# DISPLAY_FIELDS that is the only thing this query can ever produce.
+#
+# Not added to REQUIRED_READINESS_FIELDS: a missing rank input degrades the
+# order, it does not make the queue unsafe to serve, and a hard failure here
+# would take the morning queue down over a sort. It warns in its own right
+# instead, because the generic schema warning reads as cosmetic.
+RANK_INPUT_FIELDS = {
+    "Visible Pain Score",
+    "Buyer Intent Signals",
+    "Reviews",
+    "Rating",
+    "AI Confidence",
+    "Evidence Refs",
+    "Score Total",
+    "Lead Priority",
 }
 
 
@@ -169,6 +193,15 @@ def fetch_ready_records(
             "update the Airtable schema or DISPLAY_FIELDS.",
             file=sys.stderr,
         )
+        degraded = sorted(set(missing_display_fields) & RANK_INPUT_FIELDS)
+        if degraded:
+            print(
+                "[WARN] dial-queue ordering is degraded: rank input(s) "
+                f"{', '.join(repr(field) for field in degraded)} are missing from the "
+                "base, so their weight is dead and the queue order is not the one "
+                "dial_rank describes.",
+                file=sys.stderr,
+            )
 
     params = [("filterByFormula", build_formula(vertical))]
     for field in requested:
