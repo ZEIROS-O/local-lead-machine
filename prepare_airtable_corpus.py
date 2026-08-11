@@ -38,11 +38,6 @@ def resolve_upload_vertical(
     row: dict[str, Any], overrides: dict[str, str], key: str
 ) -> str:
     """Return a supported Airtable vertical without guessing unknown services."""
-    if key in overrides:
-        vertical = str(normalize_airtable_value("Vertical", overrides[key]) or "")
-        if not vertical or vertical not in VERTICAL_CHOICES:
-            raise ValueError(f"override for {key} is not a supported Vertical")
-        return vertical
     stored = str(row.get("Vertical") or "").strip()
     stored_profile = resolve_profile(stored, fallback="").key
     if stored.casefold() == "service":
@@ -60,11 +55,17 @@ def resolve_upload_vertical(
     else:
         vertical = str(normalize_airtable_value("Vertical", stored_profile) or "")
 
+    override = ""
+    if key in overrides:
+        override = str(normalize_airtable_value("Vertical", overrides[key]) or "")
+        if not override or override not in VERTICAL_CHOICES:
+            raise ValueError(f"override for {key} is not a supported Vertical")
     if not vertical:
         if stored.casefold() == "service":
+            if override:
+                return override
             raise ValueError(f"cannot resolve service Vertical for {key}")
-        else:
-            raise ValueError(f"unsupported Vertical {stored!r} for {key}")
+        raise ValueError(f"unsupported Vertical {stored!r} for {key}")
     if vertical not in VERTICAL_CHOICES:
         raise ValueError(f"unsupported Vertical {vertical!r} for {key}")
     return vertical

@@ -150,6 +150,26 @@ class PrepareAirtableCorpusTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsupported"):
             resolve_upload_vertical(self._row(Vertical="Novel service"), {}, "place:unknown")
 
+    def test_override_does_not_rescue_unsupported_stored_vertical(self) -> None:
+        from prepare_airtable_corpus import resolve_upload_vertical
+
+        with self.assertRaisesRegex(ValueError, "unsupported"):
+            resolve_upload_vertical(
+                self._row(Vertical="Novel service"),
+                {"place:unknown": "Hardscaping"},
+                "place:unknown",
+            )
+
+    def test_override_does_not_bypass_malformed_service_evidence(self) -> None:
+        from prepare_airtable_corpus import resolve_upload_vertical
+
+        with self.assertRaisesRegex(ValueError, "malformed Raw Evidence"):
+            resolve_upload_vertical(
+                self._row(Vertical="service", **{"Raw Evidence": "not json"}),
+                {"place:unknown": "Hardscaping"},
+                "place:unknown",
+            )
+
     def test_preparation_only_changes_vertical_and_machine_owned_verdict_fields(self) -> None:
         from prepare_airtable_corpus import prepare_corpus
 
