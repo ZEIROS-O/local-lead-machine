@@ -149,6 +149,16 @@ First resolve the stored value through `resolve_profile(value, fallback="")`. Fo
 
 After preparation, compare each output row with its selected source row. Permit changes only in `Vertical` and `refresh_verdicts.VERDICT_REFRESH_FIELDS`. Assert all other keys and values match, explicitly including all five operational fields. Assert the final report has zero biconditional violations, zero verdict/tier violations, and verdict counts matching the rows.
 
+> **Correction (post-implementation).** The "assert zero" half of that sentence
+> was unsatisfiable as a check and is superseded. As built, the counters were
+> computed on the row `refresh_row` returned — a row that function has already
+> validated and raised on — so both were structurally always zero and asserting
+> zero proved nothing. They now measure the **stored input** and are named
+> `source_biconditional_violations` / `source_verdict_tier_violations`; a corpus
+> with stale verdicts is *expected* to report non-zero, since that disagreement
+> is the reason to re-verdict at all. Only `verdict_counts` matching the rows
+> survives as a zero-tolerance assertion.
+
 - [ ] **Step 7: Implement refresh, atomic output, and report checks**
 
 Normalize `Vertical`, call `refresh_row`, validate allowed-field-only differences, then atomically write the output. Expected-count flags must refuse with exit 2 on mismatch. Write the JSON report to stdout and optionally to `--report PATH`; never include business names, phones, or raw evidence in the report.

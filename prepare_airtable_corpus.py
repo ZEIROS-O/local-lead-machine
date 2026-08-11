@@ -134,8 +134,8 @@ def prepare_corpus(
         raise ValueError(f"unused excluded upsert keys: {len(unused_exclusions)}")
     rows: list[dict[str, str]] = []
     consumed_overrides: set[str] = set()
-    biconditional_violations = 0
-    verdict_tier_violations = 0
+    source_biconditional_violations = 0
+    source_verdict_tier_violations = 0
     for key, (_, _, source_row) in selected.items():
         if key in excluded_selected_keys:
             continue
@@ -143,6 +143,19 @@ def prepare_corpus(
         prepared["Vertical"], consumed_override = _resolve_upload_vertical(prepared, overrides, key)
         if consumed_override:
             consumed_overrides.add(key)
+        # Count staleness on the *stored* row, before the refresh overwrites it.
+        # Measuring after `refresh_row` counted nothing at all: that function
+        # already raises on any error in the row it returns, so re-validating
+        # its output was tautologically clean and both counters were always
+        # zero — a report field that read as verification but asserted nothing.
+        # What the report is meant to carry is how many stored verdicts the
+        # current gate disagreed with, which is only observable before the
+        # rewrite.
+        for error in validate_refreshed_row(prepared):
+            if error.startswith(("Sendable must", "Verdict must")):
+                source_biconditional_violations += 1
+            else:
+                source_verdict_tier_violations += 1
         prepared = refresh_row(prepared)
         changed = {
             field
@@ -153,11 +166,6 @@ def prepare_corpus(
         unauthorized = changed - allowed_changes
         if unauthorized:
             raise ValueError("preparation changed fields outside its machine-owned contract")
-        for error in validate_refreshed_row(prepared):
-            if error.startswith(("Sendable must", "Verdict must")):
-                biconditional_violations += 1
-            else:
-                verdict_tier_violations += 1
         rows.append(prepared)
     unused_overrides = sorted(set(overrides) - consumed_overrides)
     if unused_overrides:
@@ -176,8 +184,13 @@ def prepare_corpus(
         "excluded_upsert_hashes": sorted(
             hashlib.sha256(key.encode("utf-8")).hexdigest() for key in excluded_selected_keys
         ),
-        "biconditional_violations": biconditional_violations,
-        "verdict_tier_violations": verdict_tier_violations,
+        # Renamed from `biconditional_violations`/`verdict_tier_violations`,
+        # which were measured after the refresh and so were always zero. The
+        # `source_` prefix says what they now count — disagreements in the
+        # stored input — so a report diff cannot read the change from a
+        # tautological zero to a real figure as a regression.
+        "source_biconditional_violations": source_biconditional_violations,
+        "source_verdict_tier_violations": source_verdict_tier_violations,
         "verdict_counts": dict(sorted(verdict_counts.items())),
         "selected_source_provenance": {
             hashlib.sha256(key.encode("utf-8")).hexdigest(): {

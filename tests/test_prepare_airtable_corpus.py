@@ -229,10 +229,49 @@ class PrepareAirtableCorpusTests(unittest.TestCase):
         self.assertEqual(output["Verdict"], "send")
         for field, value in operational.items():
             self.assertEqual(output[field], value)
-        self.assertEqual(report["biconditional_violations"], 0)
-        self.assertEqual(report["verdict_tier_violations"], 0)
         self.assertEqual(report["verdict_counts"], {"send": 1})
         self.assertTrue(all(field in allowed_changes or source_row.get(field, "") == output.get(field, "") for field in set(source_row) | set(output)))
+
+    def test_source_violation_counts_measure_the_input_not_the_refreshed_output(
+        self,
+    ) -> None:
+        """The counters have to be able to reach a non-zero value.
+
+        They were previously computed on the row `refresh_row` returned, which
+        that function has already validated and raised on — so both were
+        structurally always zero and the report field asserted nothing. Pinning
+        a stale row against an already-refreshed one is what keeps the signal
+        honest: the stale corpus must count, the clean corpus must not.
+        """
+        from prepare_airtable_corpus import prepare_corpus
+        from refresh_verdicts import refresh_row
+
+        stale = self._row(Verdict="reject")
+        refreshed = {
+            key: str(value)
+            for key, value in refresh_row(self._row(Vertical="hardscaping")).items()
+        }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            stale_report = prepare_corpus(
+                [self._write_csv(directory, "stale.csv", [stale], 1)], {}
+            )[2]
+            refreshed_report = prepare_corpus(
+                [self._write_csv(directory, "fresh.csv", [refreshed], 2)], {}
+            )[2]
+
+        # A stored `reject` on a row the current gate sends breaks the send
+        # biconditional on both `Sendable` and `Verdict`, and strands the tier.
+        self.assertEqual(stale_report["source_biconditional_violations"], 2)
+        self.assertEqual(stale_report["source_verdict_tier_violations"], 1)
+
+        self.assertEqual(refreshed_report["source_biconditional_violations"], 0)
+        self.assertEqual(refreshed_report["source_verdict_tier_violations"], 0)
+
+        # Either way the corpus itself lands on the current authority.
+        self.assertEqual(stale_report["verdict_counts"], {"send": 1})
+        self.assertEqual(refreshed_report["verdict_counts"], {"send": 1})
 
     def test_preparation_rejects_unused_or_invalid_vertical_overrides(self) -> None:
         from prepare_airtable_corpus import prepare_corpus
