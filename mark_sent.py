@@ -31,6 +31,7 @@ from lead_machine.compliance import (
     load_suppression_index,
     record_suppression_identifiers,
 )
+from lead_machine import dial_decisions
 from lead_machine.follow_up import next_follow_up_date
 from lead_machine.sendability import contact_readiness_failures
 
@@ -194,6 +195,16 @@ def main() -> int:
     parser.add_argument("--base-id", default=os.getenv("AIRTABLE_BASE_ID", ""))
     parser.add_argument("--table", default=os.getenv("AIRTABLE_PROSPECTS_TABLE", ""))
     parser.add_argument("--token", default=os.getenv("AIRTABLE_PAT", ""))
+    parser.add_argument(
+        "--decisions-source",
+        default="",
+        help=f"Pre-dial decision ledger JSONL; defaults to ${dial_decisions.DIAL_DECISIONS_ENV}",
+    )
+    parser.add_argument(
+        "--rank",
+        default="",
+        help="dial_rank the lead was served at, from query_ready_to_send.py --json",
+    )
     args = parser.parse_args()
 
     if not args.base_id or not args.table or not args.token:
@@ -221,6 +232,36 @@ def main() -> int:
     except MarkSentError as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         return 1
+
+    # Recorded here rather than inside `apply_mark_sent`: that function is the
+    # send path, and a metrics ledger must not be able to add a failure mode to
+    # it. By this point the Airtable mutation is applied and confirmed.
+    #
+    # A missing or unwritable ledger warns and never fails. The dial already
+    # happened; exiting non-zero after a confirmed mutation would read as "that
+    # did not work" and invite a re-run. The cost is a gap in the KPI, and
+    # `evals/pre_dial_approval.py` reports its own coverage so the gap shows up
+    # as missing data instead of a green rate.
+    decisions_source = args.decisions_source.strip() or dial_decisions.configured_decisions_path()
+    if not decisions_source:
+        print(
+            "[WARN] no pre-dial decision ledger configured "
+            f"(${dial_decisions.DIAL_DECISIONS_ENV} or --decisions-source), so this dial is "
+            "not counted in pre-dial approval. The accept-rate KPI cannot answer "
+            "whether a lead was judged worth calling without it.",
+            file=sys.stderr,
+        )
+    else:
+        try:
+            dial_decisions.append_decision(
+                decisions_source,
+                decision=dial_decisions.DECISION_DIAL,
+                record_id=args.record_id,
+                rank=float(args.rank) if str(args.rank).strip() else None,
+                decided_by=os.getenv("LPM_SETTER", ""),
+            )
+        except (dial_decisions.DialDecisionError, ValueError) as exc:
+            print(f"[WARN] pre-dial decision not recorded: {exc}", file=sys.stderr)
 
     print(json.dumps(receipt, sort_keys=True))
     return 0

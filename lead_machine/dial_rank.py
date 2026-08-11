@@ -12,6 +12,24 @@ destruction. A weak lead sorts last instead of not existing, and the judgement
 stays revisable, because a weight is a number to tune where a gate is a lead
 that never happened.
 
+Seven of the nine rank. Two do not, and saying "all nine became weights" would
+be false:
+
+  * `Offer Fit` (the old "Missing clear outreach angle") is present on all
+    1,042 currently sendable leads. It was a presence check over a categorical
+    label, not a quality, so there is no direction to sort it in and nothing to
+    separate — weighting it would move no lead past any other.
+  * `Send Trigger` (the old "Missing concrete send trigger") is absent on 124
+    of those 1,042, so unlike Offer Fit it would discriminate. It is left out
+    anyway, deliberately: adding it means inventing a seventh weight, and the
+    six below have never been checked against a close. Substituting a second
+    invention for the first buys no accuracy and costs the ability to read the
+    experiment. Revisit it when accept-rate data exists — that is a decision
+    for outcomes to make, not this module.
+
+`tests/test_dial_rank.py` pins both, so restoring either is a deliberate edit
+rather than a silent one.
+
 Why this and not `scoring_v3`. That module already computes a 0-100 rank and was
 the obvious candidate, but it resolves a per-vertical profile and returns *no
 rank at all* when there is no exact match. `scoring_profiles/` covers detailing,

@@ -18,6 +18,15 @@ report the machine's own proposals back as approvals.
 Below the floor fails. Too few decisions to judge reports `insufficient-sample`
 and says so — it never prints PASS, because a KPI with no data behind it reading
 green is the same defect as a gate that cannot fail.
+
+What this does *not* measure. `mark_sent.py` sets `Follow-Up`, and `Follow-Up`
+is an accepted status, so logging a dial creates an acceptance. A rep who works
+the queue in order scores 100% here whatever the leads are worth. This is an
+operational check that proposals are being actioned, not evidence about lead
+quality, and it cannot say whether demoting the commercial tribunal cost us
+anything: a lead the rep silently skipped never reaches the denominator.
+`evals/pre_dial_approval.py` measures the decision made before the dial and is
+the one to read for that question.
 """
 
 from __future__ import annotations

@@ -70,11 +70,12 @@ class TheRankIsBounded(unittest.TestCase):
 
 
 class EachDemotedGateStillMovesTheOrder(unittest.TestCase):
-    """One test per signal removed from the gate.
+    """One test per signal removed from the gate *that ranks* — seven of nine.
 
     If a signal stops affecting the order, it has not been demoted — it has been
     discarded, and the rep loses the ordering the gate used to enforce by
-    exclusion.
+    exclusion. `Offer Fit` and `Send Trigger` are discarded, knowingly; see
+    `TheTwoUnrankedSignalsStayUnranked` below and the module docstring for why.
     """
 
     def assert_orders(self, better: dict, worse: dict, label: str) -> None:
@@ -171,6 +172,31 @@ class EveryWeightIsLiveInTheQueue(unittest.TestCase):
         # Without this, adding a seventh weight with no queue-visible input
         # would pass the loop above by simply not being in it.
         self.assertEqual(set(WEIGHTS), set(_COMPONENT_INPUTS))
+
+
+class TheTwoUnrankedSignalsStayUnranked(unittest.TestCase):
+    """Two of the nine demoted gates do not rank, and that is on the record.
+
+    Pinned rather than left implicit so the omission cannot be mistaken for the
+    oversight that killed the pain weight. If someone gives either of these a
+    weight, this fails and they have to say so in the commit.
+    """
+
+    def test_offer_fit_does_not_move_the_rank(self) -> None:
+        # Present on 1,042 of 1,042 sendable leads and categorical, so there is
+        # no direction to sort it in.
+        self.assertEqual(
+            dial_rank(queue_row(**{"Offer Fit": "estimate funnel", "Score Total": "70"})),
+            dial_rank(queue_row(**{"Offer Fit": "", "Score Total": "70"})),
+        )
+
+    def test_send_trigger_does_not_move_the_rank(self) -> None:
+        # Absent on 124 of 1,042, so this one *would* discriminate. Left out
+        # until an outcome justifies inventing a seventh weight.
+        self.assertEqual(
+            dial_rank(queue_row(**{"Send Trigger": "new location opened", "Score Total": "70"})),
+            dial_rank(queue_row(**{"Send Trigger": "", "Score Total": "70"})),
+        )
 
 
 class TheSortKeyPutsTheBestLeadFirst(unittest.TestCase):

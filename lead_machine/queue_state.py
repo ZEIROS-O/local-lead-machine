@@ -90,6 +90,17 @@ PROSPECT_STATUS_CHOICE_SET = frozenset(PROSPECT_STATUS_CHOICES)
 # directly from New to Follow-Up, so Follow-Up is the first durable acceptance
 # signal. A lead that later loses was still accepted; conversion remains a
 # separate metric.
+#
+# Read the consequence of that plainly, because it has been misread once:
+# `mark_sent.py` sets Follow-Up as the act of logging a completed contact, so a
+# rep who dials whatever the queue serves scores 100% here. This measures that
+# the workflow ran, not that a human judged the lead worth calling.
+#
+# It therefore cannot answer whether demoting the commercial tribunal cost us
+# anything — the leads the rep would have refused never enter the denominator.
+# That question belongs to `evals/pre_dial_approval.py`, which reads the
+# decision made before the dial from a ledger this vocabulary does not touch.
+# Do not repurpose accept-rate as evidence about lead quality.
 ACCEPTED_STATUSES = frozenset({"Follow-Up", "Won", "Lost", "Booked"})
 REJECTED_STATUSES = frozenset({"Not Fit"})
 UNDECIDED_STATUSES = frozenset({"New", "Manual Review"})

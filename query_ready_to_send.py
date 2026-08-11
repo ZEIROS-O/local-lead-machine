@@ -42,7 +42,7 @@ from lead_machine.compliance import (
     load_configured_suppression_index,
 )
 from lead_machine import queue_state
-from lead_machine.dial_rank import dial_sort_key
+from lead_machine.dial_rank import dial_rank, dial_sort_key, rank_components
 from lead_machine.sendability import is_contact_ready
 
 
@@ -255,6 +255,16 @@ def fetch_ready_records(
     # `dial_rank` reads the signals the demoted gates used to enforce by
     # exclusion, so the ordering they were protecting survives them.
     records.sort(key=dial_sort_key)
+
+    # Emitted alongside the Airtable columns, lower-cased like `record_id` to
+    # mark it as computed here rather than read from the base. Two reasons it
+    # ships rather than staying implicit in the sort: an order nobody can
+    # interrogate is one nobody trusts, and `mark_sent`/`mark_declined` record
+    # it with the rep's decision, which is the only way to find out whether a
+    # high rank actually predicts a lead worth calling.
+    for row in records:
+        row["dial_rank"] = dial_rank(row)
+        row["dial_rank_components"] = rank_components(row)
     return records
 
 
