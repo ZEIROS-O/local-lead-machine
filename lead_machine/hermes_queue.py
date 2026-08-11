@@ -1188,11 +1188,25 @@ def _resolve_queue_selection(
 ) -> list[dict[str, Any]]:
     """Map *tokens* to queue items, binding numbers to an immutable queue run.
 
-    Shared by mark-sent and mark-declined because the rule is the same for both:
-    an item number means nothing without the run that served it, and binding one
+    An item number means nothing without the run that served it, and binding one
     to the wrong run acts on the wrong business. Retiring the wrong lead is
     quieter than messaging the wrong one, which is exactly why it needs the same
     guard rather than a laxer one.
+
+    Used by `cmd_mark_declined` only. `cmd_mark_sent` enforces the identical
+    rule from its own inline copy, because it also needs the resolved run id,
+    content hash and queue date that this returns nothing of. The two are
+    behaviourally identical today and must stay so — a tightening applied to one
+    does not reach the other. Said plainly because an earlier version of this
+    docstring claimed they were already shared, which was the intent and not the
+    code.
+
+    This binding is load-bearing beyond wrong-lead protection. `cmd_mark_declined`
+    has no preview-then-confirm step, and the Telegram route auto-appends
+    `--execute`, so from a phone the PATCH is immediate and unreviewed. What
+    makes that safe is that the selection cannot mis-resolve — not that a decline
+    transmits nothing. Relax the bare-number refusal below and the missing
+    preview becomes the only thing between a typo and a retired lead.
     """
     if not tokens:
         raise CommandError("Pass at least one item number or record id.")
@@ -1215,7 +1229,6 @@ def cmd_mark_declined(
     reason: str = "",
     queue_run_id: str = "",
     queue_sha256: str = "",
-    artifact_sha256: str = "",
     execute: bool = False,
     root: Path | str = Path("."),
     python_path: Path | str | None = None,
@@ -1230,11 +1243,15 @@ def cmd_mark_declined(
     the rank and hand-logged declines carried whatever the rep typed, so the two
     sides of the falsifier were never ranked by the same path.
 
-    No approval handshake, unlike mark-sent. That gate exists because a send
-    transmits something to a person and Gate 0 forbids doing that autonomously.
-    A decline transmits nothing; it retires a lead and writes one ledger line.
-    Guarding it like a send would tax the refusal and leave approval measuring
-    how tedious refusing is.
+    No approval handshake, unlike mark-sent. That gate does two jobs, and only
+    one of them is about sending: Gate 0's human-in-the-loop before a
+    transmission, which a decline does not need, and a preview of what the
+    tokens resolved to, which it would. The second is genuinely absent here —
+    the Telegram route auto-appends `--execute`, so from a phone this PATCHes
+    immediately. It is safe because `_resolve_queue_selection` makes the
+    selection unable to mis-resolve, not because nothing is transmitted; see its
+    docstring. Guarding it like a send anyway would tax the refusal and leave
+    approval measuring how tedious refusing is.
 
     Re-declining is left to `mark_declined.py`, which only accepts `Status=New`
     and refuses a second pass on its own — the same reason there is no writeback
@@ -1286,8 +1303,17 @@ def cmd_mark_declined(
             tail = (result.stderr or result.stdout or "").strip().splitlines()[-3:]
             lines.append(f"[FAIL] {label}: " + " ".join(tail))
             continue
-        # Surfaced verbatim: `mark_declined` warns here when the reason reads
-        # like an opt-out, and that warning must not be swallowed by a wrapper.
+        # `mark_declined` prints `[NOTE]` on every *successful* decline, saying
+        # that no suppression was recorded and naming `mark_outcome --event
+        # opt_out` as the command that does. It must reach the rep verbatim: the
+        # opt-out screen it backs up is literal-substring matching, so a refusal
+        # worded "they said never again" is not caught and this note is the only
+        # thing standing between that and a business believing it opted out.
+        # Never make it conditional.
+        #
+        # A reason that *does* trip the screen never gets here — `mark_declined`
+        # raises before any network call and exits non-zero, so it lands in the
+        # `[FAIL]` branch above.
         note = ""
         for line in (result.stderr or "").splitlines():
             if line.startswith("[NOTE]"):

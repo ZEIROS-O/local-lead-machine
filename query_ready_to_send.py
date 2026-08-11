@@ -96,11 +96,23 @@ DISPLAY_FIELDS = [
 # record — the case the ledger exists for. That must not happen behind a warning
 # that reads as cosmetic; if they are absent the query fails rather than serving
 # a queue it cannot screen.
+#
+# `Reviews` joined them when `contact_readiness_failures` started re-deriving
+# reachability from the projection instead of trusting a stored verdict. The
+# failure mode is worse here than for the others, because a dropped column is
+# not absent — the row rebuild below reads `DISPLAY_FIELDS`, not `requested`, so
+# every record comes back carrying `Reviews: ""`. An absent review count now
+# fails the gate, so one 422 on this column refuses *every* lead at once and
+# serves an empty queue behind a schema warning. While it only fed the rank it
+# degraded the sort; now it can decide the answer, so it has to fail loudly.
+# `tests/test_verdict.py` derives this set from the gate rather than trusting
+# this list, so a future gate input cannot be added without protecting it.
 REQUIRED_READINESS_FIELDS = {
     "Verdict",
     "Status",
     "Phone",
     "Email",
+    "Reviews",
 }
 
 # The columns `dial_rank` actually reads. Declared here because the fetch and

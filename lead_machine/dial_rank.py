@@ -19,7 +19,11 @@ Measured by re-running the pre-strip gate at 1e46d02 over that corpus and the
 current gate beside it: the old gate refused 1,009 of 1,091 distinct leads and
 the current one refuses 662, so the strip returned 347 leads — 82 sendable
 before, 429 after, a 5.2× pool. The commercial tribunal is the larger share of
-that: `hold-commercial-case` alone appears on 956 of the 1,009 refusals. The
+that: 956 of the 1,009 refusals carry `Contact eligibility is not contact-now`,
+which is 908 leads held at `hold-commercial-case` plus 48 at
+`contact-after-asset`. Quote the 908 when the claim is about that state — it is
+the figure `sendability` and `dial_decisions` both use — and 956 only for the
+blocker. The
 nine are heavily overlapping with it and with each other (grade on 782, score on
 767, the pain threshold on 718), so "most of them by those nine" is not
 separable from these numbers and is not claimed here — what is measured is the
@@ -51,9 +55,14 @@ rather than a silent one.
 Why this and not `scoring_v3`. That module already computes a 0-100 rank and was
 the obvious candidate, but it resolves a per-vertical profile and returns *no
 rank at all* when there is no exact match. `scoring_profiles/` covers detailing,
-plumbing and water restoration; the live verticals are epoxy and garage doors. It
-scores 41 of the 429 currently sendable leads. Sorting the queue on a column
-blank for 90% of it would be worse than the grade sort it replaced. This reads
+plumbing and water restoration; the live verticals are epoxy and garage doors.
+Calling `score_v3` over the corpus, it resolves a profile for 71 of the 429
+currently sendable leads and none for the other 358, which carry no score at
+all. Sorting the queue on a column blank for 83% of it would be worse than the
+grade sort it replaced. (Counted by calling `score_v3` itself. Deriving it from
+`supported_scoring_cells` instead gives 41, because the profile resolver falls
+back more widely than that exact-cell list implies — a reminder that the
+question is what the function returns, not what its inputs suggest.) This reads
 only fields every scored row carries, so it works the day a vertical is added
 rather than after someone authors a profile for it.
 

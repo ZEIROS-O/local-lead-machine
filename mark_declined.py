@@ -148,8 +148,19 @@ def apply_mark_declined(
     suppression_note = ""
     try:
         suppression = load_configured_suppression_index()
-    except ComplianceError:
+    except ComplianceError as exc:
+        # Fails open deliberately — this load gates nothing, it only decides
+        # which note the receipt carries, and an empty index falls through to
+        # the *more* cautionary text. But it must not fail open in silence: this
+        # is the same index `mark_sent` hard-refuses on, so a dead
+        # $LPM_OUTCOMES_JSONL would otherwise stay invisible for a whole decline
+        # session and surface only at the first send attempt.
         suppression = frozenset()
+        print(
+            f"[WARN] suppression index unreadable ({exc}); this decline is unaffected, "
+            "but the same index gates mark_sent — fix it before dialling.",
+            file=sys.stderr,
+        )
     if suppression and is_suppressed({"id": record_id, "fields": fields}, suppression):
         suppression_note = (
             "This record is already suppressed (opt-out). It is retired for "

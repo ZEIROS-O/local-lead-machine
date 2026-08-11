@@ -482,6 +482,17 @@ def queue_identity(path: Path) -> dict:
     }
 
 
+def queue_binding(path: Path) -> dict:
+    """Just the run id and content hash.
+
+    `queue_identity` also carries `artifact_sha256`, which belongs to the send
+    approval handshake. `cmd_mark_declined` has no handshake and no artifact, so
+    passing it there would be testing a parameter the command does not take.
+    """
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return {"queue_run_id": data["queue_run_id"], "queue_sha256": data["queue_sha256"]}
+
+
 def dry_run_approval(root: Path, path: Path, tokens: list[str], *, channel: str = "sms") -> str:
     res = hq.cmd_mark_sent(tokens, channel=channel, dry_run=True, execute=True, root=root, **queue_identity(path))
     return next(line.split(": ", 1)[1] for line in res.message.splitlines() if line.startswith("approval_id:"))
@@ -565,7 +576,7 @@ class TheServedRankSurvivesIntoTheLedger(unittest.TestCase):
             )
             with patch.object(hq, "_run_capture", return_value=declined) as run:
                 result = hq.cmd_mark_declined(
-                    ["1"], reason="no owner name", execute=True, root=root, **queue_identity(path)
+                    ["1"], reason="no owner name", execute=True, root=root, **queue_binding(path)
                 )
             cmd = run.call_args[0][0]
             self.assertIn("mark_declined.py", cmd[1])
@@ -573,6 +584,51 @@ class TheServedRankSurvivesIntoTheLedger(unittest.TestCase):
             self.assertEqual(cmd[cmd.index("--reason") + 1], "no owner name")
             self.assertEqual(cmd[cmd.index("--rank") + 1], "44.0")
             self.assertIn("[DECLINED]", result.message)
+
+    def test_the_no_suppression_note_reaches_the_rep_verbatim(self) -> None:
+        # `mark_declined` prints this on every successful decline. It is the
+        # backstop for a screen that only does literal-substring matching, so a
+        # refusal worded "they said never again" gets a clean receipt — and this
+        # note is the only thing telling the rep that no suppression was
+        # recorded. A wrapper that swallowed it would leave a business believing
+        # it opted out. Pinned because nothing else asserts it survives.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp)
+            path = write_queue_file(root, items=[queue_item(1)])
+            noted = subprocess.CompletedProcess(
+                args=[], returncode=0,
+                stdout=json.dumps({"result": "applied"}),
+                stderr="[NOTE] No suppression was recorded — run mark_outcome.py --event opt_out",
+            )
+            with patch.object(hq, "_run_capture", return_value=noted):
+                result = hq.cmd_mark_declined(
+                    ["1"], reason="thin reviews", execute=True, root=root, **queue_binding(path)
+                )
+            self.assertIn("No suppression was recorded", result.message)
+            self.assertIn("mark_outcome.py --event opt_out", result.message)
+
+    def test_an_opt_out_worded_reason_surfaces_the_refusal_not_a_receipt(self) -> None:
+        # `mark_declined` screens the reason before any network call and exits
+        # non-zero, so the wrapper must report a failure. A rep who types "take
+        # me off your list" here has recorded a suppression request, and a green
+        # [DECLINED] would tell them it was handled when no suppression row
+        # exists and the business can be re-discovered and called again.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp)
+            path = write_queue_file(root, items=[queue_item(1)])
+            refused = subprocess.CompletedProcess(
+                args=[], returncode=1, stdout="",
+                stderr="[ERROR] --reason contains opt-out language ('take me off'); "
+                       "run mark_outcome.py --event opt_out instead",
+            )
+            with patch.object(hq, "_run_capture", return_value=refused):
+                result = hq.cmd_mark_declined(
+                    ["1"], reason="take me off your list", execute=True, root=root,
+                    **queue_binding(path),
+                )
+            self.assertIn("[FAIL]", result.message)
+            self.assertNotIn("[DECLINED]", result.message)
+            self.assertIn("opt-out language", result.message)
 
     def test_a_refusal_with_no_reason_is_refused(self) -> None:
         # Same rule the ledger itself enforces: a decline with no reason records
@@ -583,7 +639,7 @@ class TheServedRankSurvivesIntoTheLedger(unittest.TestCase):
             path = write_queue_file(root, items=[queue_item(1)])
             with patch.object(hq, "_run_capture") as run, self.assertRaises(hq.CommandError):
                 hq.cmd_mark_declined(
-                    ["1"], reason="   ", execute=True, root=root, **queue_identity(path)
+                    ["1"], reason="   ", execute=True, root=root, **queue_binding(path)
                 )
             run.assert_not_called()
 
@@ -593,7 +649,7 @@ class TheServedRankSurvivesIntoTheLedger(unittest.TestCase):
             path = write_queue_file(root, items=[queue_item(1)])
             with patch.object(hq, "_run_capture") as run:
                 result = hq.cmd_mark_declined(
-                    ["1"], reason="wrong vertical", root=root, **queue_identity(path)
+                    ["1"], reason="wrong vertical", root=root, **queue_binding(path)
                 )
             run.assert_not_called()
             self.assertIn("preview", result.message)

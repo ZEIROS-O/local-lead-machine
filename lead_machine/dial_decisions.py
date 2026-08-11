@@ -234,11 +234,13 @@ def approval_rate(decisions: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
         "decided": decided,
         "dialed": dialed,
         "declined": declined,
-        # How many decisions on each side actually carried a rank. The two sides
-        # are recorded by different commands and one automated path
-        # (`hermes_queue`) invokes mark_sent without `--rank`, so these can
-        # diverge badly — and a mean-vs-mean comparison across unequal coverage
-        # compares two different populations while looking like one number.
+        # How many decisions on each side actually carried a rank. Both sides
+        # now go through Hermes carrying the rank the frozen queue served, but
+        # they can still diverge: a lead decided from a bare record id has no
+        # queue entry to take a rank from, and queue files written before the
+        # rank was projected carry none. A mean-vs-mean comparison across
+        # unequal coverage compares two different populations while looking like
+        # one number, so the eval gates on these rather than assuming parity.
         "ranked_dialed": len(ranks[DECISION_DIAL]),
         "ranked_declined": len(ranks[DECISION_DECLINE]),
         # None, never 0.0: an empty ledger means nobody has judged anything, and

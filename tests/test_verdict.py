@@ -441,6 +441,78 @@ class AStoredVerdictIsNotAClearanceCertificate(unittest.TestCase):
         # does not need the gate's permission.
         self.assertFalse(is_contact_ready(dict(self.BASE_ROW, Sendable="No")))
 
+    def test_every_send_row_survives_its_own_projection(self) -> None:
+        """The property the Airtable formula cannot express.
+
+        The queue filter selects on `Verdict` and `Status`; the local gate now
+        additionally demands the projection carry a phone and a review count.
+        Correspondence between them is therefore data-dependent, and the failure
+        mode is silent and total: a lead the gate passed at score time gets
+        dropped at the queue behind one `[WARN]` per record.
+
+        The tests above prove the gate *can* refuse a projection. This proves it
+        does not refuse the ones it just admitted, which is the direction that
+        empties the morning queue.
+        """
+        from query_ready_to_send import DISPLAY_FIELDS
+
+        checked = 0
+        for index, row in enumerate(rows_across_the_tier_space()):
+            scored = apply_sendability(dict(row))
+            if not evaluate_verdict(scored).is_send:
+                continue
+            checked += 1
+            projection = {field: scored.get(field, "") for field in DISPLAY_FIELDS}
+            with self.subTest(row=index):
+                self.assertTrue(
+                    is_contact_ready(projection),
+                    f"a send row failed its own readback projection: "
+                    f"{contact_readiness_failures(projection)}",
+                )
+        self.assertGreater(checked, 0, "no send rows reached the projection check")
+
+
+class TheQueueProjectionCannotSilentlyLoseAGateInput(unittest.TestCase):
+    """A column the gate reads must be one the query refuses to run without.
+
+    `REQUIRED_READINESS_FIELDS` exists because the schema probe drops any
+    display field Airtable 422s on, and then rebuilds every row from
+    `DISPLAY_FIELDS` — so a dropped column comes back as `""` for every record
+    rather than being absent. While the dropped column only fed the rank that
+    degraded the sort. Now it can decide the gate, and `""` fails it for every
+    record at once: an empty queue behind a warning the code itself describes as
+    reading "as cosmetic".
+
+    Derived rather than listed, so a future gate input cannot be added without
+    either protecting it or failing here.
+    """
+
+    def test_any_field_that_can_flip_the_gate_is_required(self) -> None:
+        from query_ready_to_send import DISPLAY_FIELDS, REQUIRED_READINESS_FIELDS
+
+        healthy = {
+            "Verdict": "send",
+            "Status": "New",
+            "Business Name": "Projection Co",
+            "Phone": "(216) 555-0123",
+            "Reviews": "42",
+            "Rating": "4.6",
+        }
+        self.assertTrue(is_contact_ready(healthy), "control row must pass")
+
+        decisive = {
+            field
+            for field in DISPLAY_FIELDS
+            if field in healthy and not is_contact_ready({**healthy, field: ""})
+        }
+        self.assertTrue(decisive, "no field was decisive; the control row proves nothing")
+        self.assertLessEqual(
+            decisive,
+            set(REQUIRED_READINESS_FIELDS),
+            "these columns decide the gate but the schema probe may drop them, "
+            "which blanks them for every record and empties the queue",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
