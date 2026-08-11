@@ -292,6 +292,7 @@ OPERATIONAL_FIELDS = [
     "Outreach Channel",
 ]
 GENERATED_OPERATIONAL_FIELDS = ["Assigned Setter"]
+LEGACY_OUTREACH_CHANNEL_PLACEHOLDERS = frozenset({"Google Maps"})
 OPTIONAL_FIELDS = ["Packet Path"]
 DEFAULT_PACKET_DIR = Path("packets_manual_existing_manual")
 
@@ -650,6 +651,9 @@ def csv_row_to_record(row: Dict[str, str], packet_dir: Path) -> Dict[str, Any]:
         else:
             del fields["Email"]
 
+    if clean_cell(fields.get("Outreach Channel")) in LEGACY_OUTREACH_CHANNEL_PLACEHOLDERS:
+        fields.pop("Outreach Channel", None)
+
     if not clean_cell(fields.get("Outreach Channel")):
         channel = "Phone" if clean_cell(fields.get("Phone")) else "Email" if clean_cell(fields.get("Email")) else ""
         if channel:
@@ -689,6 +693,20 @@ def csv_row_to_record(row: Dict[str, str], packet_dir: Path) -> Dict[str, Any]:
         "airtable_fields": fields,
         "defaulted_airtable_fields": defaulted_fields,
     }
+
+
+def validate_write_path_select_values(records: Iterable[Dict[str, Any]]) -> None:
+    """Refuse any select value the live schema gate cannot authorize."""
+    choices = configured_write_path_select_choices()
+    for record in records:
+        fields = build_airtable_payload(record)["fields"]
+        for field, allowed in choices.items():
+            value = fields.get(field)
+            if value in ("", None):
+                continue
+            if value not in allowed:
+                key = str(record.get("upsert_key") or record.get("place_id_or_unique_key") or "")
+                raise ValueError(f"unsupported {field} value {value!r} for {key or '<unknown>'}")
 
 
 def raise_csv_field_limit() -> None:
@@ -1223,6 +1241,7 @@ def main() -> int:
             input_path,
             packet_dir=packet_dir,
         )
+        validate_write_path_select_values(records)
 
         if not args.live:
             existing = {}

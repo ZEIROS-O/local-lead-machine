@@ -227,6 +227,36 @@ class LeadMachineContractsTest(unittest.TestCase):
         self.assertEqual(fields["Visible Pain Reasons"], "No estimate form detected; No clear estimate CTA")
         self.assertEqual(fields["Send Trigger"], "No estimate form detected")
 
+    def test_legacy_google_maps_outreach_placeholder_defaults_to_phone(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            card = upload_airtable.csv_row_to_record(
+                self._airtable_csv_row(**{"Outreach Channel": "Google Maps"}),
+                Path(tmp),
+            )
+
+        planned = plan_airtable_sync([card])[0]
+        self.assertEqual(planned["method"], "POST")
+        self.assertEqual(planned["payload"]["fields"]["Outreach Channel"], "Phone")
+        self.assertIn("Outreach Channel", card["defaulted_airtable_fields"])
+
+    def test_upload_refuses_unsupported_select_values_before_network(self) -> None:
+        for field, value in (
+            ("Outreach Channel", "Carrier Pigeon"),
+            ("Lead Priority", "Urgent-ish"),
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
+                csv_path = Path(tmp) / "scored.csv"
+                self._write_airtable_csv(csv_path, [self._airtable_csv_row(**{field: value})])
+
+                with patch("upload_airtable.requests.get") as get:
+                    code, _stdout, stderr = self._run_upload(
+                        ["upload_airtable.py", "--input", str(csv_path)]
+                    )
+
+                self.assertEqual(code, 1)
+                self.assertIn(f"unsupported {field}", stderr)
+                get.assert_not_called()
+
     def test_scored_csv_suppresses_placeholder_emails_and_prefers_business_domain(self) -> None:
         record = {
             "google": {
@@ -753,7 +783,7 @@ class LeadMachineContractsTest(unittest.TestCase):
                 [
                     self._airtable_csv_row(
                         **{
-                            "Status": "Contacted",
+                            "Status": "Follow-Up",
                             "Outreach Channel": "Email",
                         }
                     )
@@ -766,7 +796,7 @@ class LeadMachineContractsTest(unittest.TestCase):
         planned = self._dry_run_plan(stdout)
         self.assertEqual(len(planned), 1)
         fields = planned[0]["payload"]["fields"]  # type: ignore[index]
-        self.assertEqual(fields["Status"], "Contacted")
+        self.assertEqual(fields["Status"], "Follow-Up")
         self.assertEqual(fields["Outreach Channel"], "Email")
 
     def test_airtable_patch_does_not_send_defaulted_operational_values(self) -> None:
