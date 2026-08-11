@@ -21,6 +21,7 @@ from lead_machine.sendability import (
     PACKET_TIER_SENDABLE,
     PACKET_TIER_WATCHLIST,
     apply_sendability,
+    contact_readiness_failures,
     evaluate_packet_tier,
     evaluate_sendability,
     is_contact_ready,
@@ -384,6 +385,61 @@ class OnlyVerdictModuleMintsAVerdict(unittest.TestCase):
             self.assertEqual(
                 sendability_module.VERDICT_PACKET_TIERS[verdict_value], tier
             )
+
+
+class AStoredVerdictIsNotAClearanceCertificate(unittest.TestCase):
+    """`Verdict=send` in the base is a snapshot, and snapshots go stale.
+
+    `readiness_flags` re-runs the admission over a stored value, but `admit`
+    only re-reads the ICP skip and the out-of-country check. The gates this
+    branch newly made blocking — chiefly a number the rep can actually dial —
+    live in `evaluate_sendability` and are not re-read from there. So a row that
+    was legitimately `send` when it was written, and has since lost its phone,
+    reconstructs to `Sendable=Yes` and reaches the dial queue.
+
+    These rows are shaped like what the base actually returns: the projection
+    onto `query_ready_to_send.DISPLAY_FIELDS`, which is the only shape a
+    readback can ever produce. A row carrying `Raw Evidence` would not prove
+    anything, because the queue never sees one.
+    """
+
+    BASE_ROW = {
+        "Verdict": "send",
+        "Status": "New",
+        "Business Name": "Stale Co",
+        "Phone": "(216) 555-0123",
+        "Reviews": "42",
+        "Rating": "4.6",
+    }
+
+    def test_the_healthy_readback_row_is_still_contact_ready(self) -> None:
+        # Guards every test below: if the projection failed the contract on its
+        # own, the withdrawals asserted below would prove nothing.
+        self.assertTrue(is_contact_ready(dict(self.BASE_ROW)))
+
+    def test_a_stored_send_that_lost_its_phone_is_withdrawn(self) -> None:
+        row = dict(self.BASE_ROW, Phone="")
+        self.assertFalse(is_contact_ready(row))
+        self.assertTrue(
+            any("phone" in failure.casefold() for failure in contact_readiness_failures(row)),
+            contact_readiness_failures(row),
+        )
+
+    def test_a_stored_send_with_an_undialable_number_is_withdrawn(self) -> None:
+        # The shape that is already sitting in the corpus: a non-US listing
+        # number that normalizes to fewer than ten digits. Nothing downstream
+        # can call it, and the opt-out ledger cannot match on it either.
+        self.assertFalse(is_contact_ready(dict(self.BASE_ROW, Phone="091230 69950")))
+
+    def test_a_stored_send_with_no_review_count_is_withdrawn(self) -> None:
+        # An absent count is an unanswered question, not a business nobody has
+        # reviewed — the same direction `has_review_data` fixed at score time.
+        self.assertFalse(is_contact_ready(dict(self.BASE_ROW, Reviews="")))
+
+    def test_a_hand_edited_no_is_still_honoured_over_a_stored_send(self) -> None:
+        # The tightening direction never inverted: a human withdrawing a lead
+        # does not need the gate's permission.
+        self.assertFalse(is_contact_ready(dict(self.BASE_ROW, Sendable="No")))
 
 
 if __name__ == "__main__":

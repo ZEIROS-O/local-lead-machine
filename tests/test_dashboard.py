@@ -55,7 +55,7 @@ def enriched_rows(count: int) -> list[dict]:
                 "city": "Cleveland",
                 "website_url": f"https://lead-{index}.example",
                 "place_key": f"place-{index}",
-                "phone": "555-secret",
+                "phone": "(216) 555-0137",
                 "email": "secret@example.com",
             }
         }
@@ -76,11 +76,15 @@ def scored_rows(count: int) -> list[dict[str, str]]:
                 "Place Key": f"place-{index}",
                 "Business Name": f"Lead {index}",
                 "City": "Cleveland",
-                "Phone": "555-secret",
+                "Phone": "(216) 555-0137",
                 "Email": "secret@example.com",
                 "Website URL": f"https://lead-{index}.example",
                 "Google Maps URL": f"https://maps.example/{index}",
                 "Score Total": str(90 - index),
+                # Reachability, which `contact_readiness_failures` now re-derives
+                # rather than trusting the stored tier. A fixture without it is a
+                # lead nobody could call.
+                "Reviews": str(40 + index),
                 "Lead Priority": "A" if sendable else "B",
                 "Packet Tier": PACKET_TIER_SENDABLE if sendable else PACKET_TIER_MANUAL,
                 "Sendable": "Yes" if sendable else "No",
@@ -507,7 +511,7 @@ class DashboardRepositoryTest(unittest.TestCase):
         self.assertEqual(result["total"], 2)
         self.assertEqual({item["scoring_state"] for item in result["items"]}, {"scored", "unscored"})
         serialized = json.dumps(result)
-        self.assertNotIn("555-secret", serialized)
+        self.assertNotIn("(216) 555-0137", serialized)
         self.assertNotIn("secret@example.com", serialized)
         self.assertNotIn("Sensitive opener", serialized)
 

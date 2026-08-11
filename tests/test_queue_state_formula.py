@@ -190,11 +190,18 @@ class TestQueueStateFormula(unittest.TestCase):
         # A base row after the collapse: one verdict column, plus the
         # human-owned Status. The commercial-fit and contact-eligibility columns
         # are gone, and the verdict already carries what they asserted.
+        # `Phone` and `Reviews` are part of the base row, not decoration:
+        # `contact_readiness_failures` re-derives reachability from them because
+        # the stored verdict is a snapshot that can go stale. Without them every
+        # case below would carry two extra failures that have nothing to do with
+        # the clause logic under test.
         ready = {
             "Verdict": "send",
             "Commercial Fit State": "commercially-sendable",
             "Contact Eligibility": "contact-now",
             "Status": "New",
+            "Phone": "(216) 555-0123",
+            "Reviews": "42",
         }
         cases = (
             (
@@ -230,7 +237,12 @@ class TestQueueStateFormula(unittest.TestCase):
         # string, not a duplicate literal that could drift from the formula the
         # base evaluates.
         clauses = (replace(queue_state.READINESS_CLAUSES[0], failure="Shared readiness failure"),)
-        row = {"Verdict": "reject", "Packet Eligible": "Yes"}
+        row = {
+            "Verdict": "reject",
+            "Packet Eligible": "Yes",
+            "Phone": "(216) 555-0123",
+            "Reviews": "42",
+        }
 
         with patch.object(queue_state, "READINESS_CLAUSES", clauses):
             self.assertEqual(contact_readiness_failures(row), ["Shared readiness failure"])

@@ -21,10 +21,18 @@ from lead_machine import sendability
 
 # A base row as it reads back after the collapse: one verdict column plus the
 # human-owned Status. The three readiness columns it replaces are gone.
+#
+# `Phone` and `Reviews` are here because a real readback always carries them —
+# `Phone` is in `REQUIRED_READINESS_FIELDS`, so the query refuses to serve a
+# queue without it — and `contact_readiness_failures` now re-derives
+# reachability from them rather than trusting the stored verdict. A fixture
+# without them is not a base row, it is a shape the base cannot produce.
 READY_FIELDS = {
     "Verdict": "send",
     "Status": "New",
     "Consent Posture": "express written consent",
+    "Phone": "(216) 555-0123",
+    "Reviews": "42",
 }
 
 

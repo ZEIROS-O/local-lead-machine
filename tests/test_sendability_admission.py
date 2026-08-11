@@ -571,6 +571,10 @@ class AStoredSendableYesCannotOutrankTheIcpGateTest(unittest.TestCase):
             "Packet Tier": "Sendable Packet",
             "Commercial Fit State": "commercially-sendable",
             "Contact Eligibility": "contact-now",
+            # Reachability, so the ICP-skip assertions below are testing the ICP
+            # gate rather than riding a fixture that has no number to call.
+            "Phone": "(440) 555-0188",
+            "Reviews": "37",
             "Raw Evidence": json.dumps(raw),
         }
 

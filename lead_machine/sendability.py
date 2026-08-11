@@ -770,6 +770,27 @@ def contact_readiness_failures(row: Dict[str, Any]) -> List[str]:
     `query_ready_to_send` applies this function as a defensive drop. Every
     re-gated lead would have passed the gate and then been discarded at the queue
     behind a warning.
+
+    What `readiness_flags` re-runs is not enough on its own. `admit` re-reads the
+    ICP skip and the out-of-country check and nothing else, so the gates this
+    branch newly made blocking are absent from the reconstruction: a row written
+    when it had a phone, and since blanked or corrected to a number nobody can
+    dial, rebuilds to `Sendable=Yes` and arrives in the rep's queue. The stored
+    verdict is a snapshot, and the whole reason this function re-derives is that
+    snapshots go stale.
+
+    Only two of those gates are re-checked here, and the boundary is not
+    fastidiousness — it is what the evidence allows. This function runs against
+    the readback, whose only possible shape is the projection onto
+    `query_ready_to_send.DISPLAY_FIELDS`. `Phone` and `Reviews` are in it, so
+    these two questions can actually be asked. The claim-integrity gates cannot:
+    `has_strong_estimate_form` needs `Estimate Form Detected` and `Form Strength`,
+    and `lacks_parsed_page_body` needs the crawl — none of which the base returns.
+    Re-running them here would add a guard whose evidence never arrives, which is
+    a guard that cannot fail, and DISPLAY_FIELDS already carries that warning
+    about itself. Claim integrity is enforced where the evidence still exists, at
+    score time and at upload; reachability is enforced here, where it is the only
+    thing still checkable and the only thing a stale cell can silently invert.
     """
     failures: List[str] = []
     sendable, packet_eligible = readiness_flags(row)
@@ -777,6 +798,10 @@ def contact_readiness_failures(row: Dict[str, Any]) -> List[str]:
         failures.append(queue_state.READINESS_CLAUSES[0].failure)
     if packet_eligible.casefold() != "yes":
         failures.append("Packet Eligible must be Yes")
+    if not has_dialable_phone(row):
+        failures.append(MISSING_PHONE_BLOCKER)
+    if not has_review_data(row):
+        failures.append(MISSING_REVIEW_DATA_BLOCKER)
     return failures
 
 
