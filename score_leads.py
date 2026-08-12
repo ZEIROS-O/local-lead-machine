@@ -684,7 +684,12 @@ def fit_ceiling(
 
     flags: List[str] = []
 
-    if any(f in name for f in profile.franchise_denylist):
+    # Left-boundary matching, the same rule `icp.hard_icp_gate` uses. This was
+    # the second surface of the bare-`in` defect: fixing only the ICP gate let
+    # *Capella Overhead Doors* clear the gate and then be graded Skip here, so
+    # the lead was still discarded. Matched against the name alone rather than
+    # the blob, which is why an address on *Capella Dr* never reached it.
+    if matches_any_term(name, profile.franchise_denylist):
         flags.append("franchise/brand denylist")
         return "Skip", flags
 

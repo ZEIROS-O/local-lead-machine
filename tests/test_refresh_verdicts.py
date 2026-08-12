@@ -238,6 +238,44 @@ class RefreshVerdictsSuppressionTests(unittest.TestCase):
         self.assertEqual(refreshed["Sendable"], "No")
         self.assertIn(DNC_SUPPRESSED_REASON, refreshed["Skip Reason"])
 
+    def test_the_stamp_survives_a_csv_round_trip_without_the_ledger(self) -> None:
+        """`refresh_row` trims `hard_disqualifiers`/`Hard Disqualifiers` back out
+        when the input lacked them, leaving `Skip Reason` as the only carrier.
+
+        That is only safe because `sendability.has_hard_disqualifier` reads
+        `Skip Reason` alongside the two trimmed keys — a cross-file dependency
+        with nothing linking the two. If someone narrows that key tuple, a
+        suppressed lead written to CSV comes back sendable on the next pass, and
+        this is the test that says so.
+        """
+        from refresh_verdicts import refresh_csv
+
+        row = {**SENDABLE_ROW, "Verdict": "send"}
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "scored.csv"
+            with source.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(row))
+                writer.writeheader()
+                writer.writerow(row)
+            self.assertNotIn("Skip Reason", row, "fixture must not pre-carry the column")
+
+            suppressed = Path(directory) / "suppressed.csv"
+            refresh_csv(
+                source,
+                suppressed,
+                suppression_index={suppression_identifier("phone", row["Phone"])},
+            )
+
+            # Re-refresh the written file against an EMPTY ledger.
+            final = Path(directory) / "final.csv"
+            refresh_csv(suppressed, final, suppression_index=frozenset())
+            with final.open(newline="", encoding="utf-8") as handle:
+                refreshed = next(iter(csv.DictReader(handle)))
+
+        self.assertNotEqual(refreshed["Verdict"], "send")
+        self.assertEqual(refreshed["Sendable"], "No")
+        self.assertIn(DNC_SUPPRESSED_REASON, refreshed["Skip Reason"])
+
     def test_the_suppression_stamp_does_not_leak_into_the_control_row(self) -> None:
         """refresh_row copies the row before stamping it; an in-place mutation
         would suppress the caller's row for every later pass over it."""

@@ -35,7 +35,14 @@ from make_llm_batch import build_batch_prompt, write_llm_batches
 from import_llm_score_bundle import import_score_bundle
 from refresh_packet_tiers import SchemaMigrationError, refresh_row
 from score_leads import main as score_leads_main
-from score_leads import governed_opener, read_csv_rows, score_record, score_records_manual, write_csv
+from score_leads import (
+    fit_ceiling,
+    governed_opener,
+    read_csv_rows,
+    score_record,
+    score_records_manual,
+    write_csv,
+)
 
 
 AIRTABLE_ENV_VARS = (
@@ -1656,6 +1663,40 @@ class LeadMachineContractsTest(unittest.TestCase):
                 result = hard_icp_gate(lead(name))
                 self.assertTrue(result.should_skip, f"{name} was admitted")
                 self.assertIn(expected_reason, result.reasons)
+
+    def test_fit_ceiling_denylist_does_not_fire_on_a_word_it_is_only_the_tail_of(self) -> None:
+        """The franchise denylist is read on *two* surfaces, and fixing one is
+        not fixing the defect.
+
+        `hard_icp_gate` was switched to left-boundary matching first; this one
+        (`score_leads.fit_ceiling`) kept bare `in`, so *Capella Overhead Doors*
+        cleared the gate and was then graded `Skip` here — discarded either way.
+        Matched against the business name alone rather than the joined blob,
+        which is why an address on *Capella Dr* never reached this surface.
+        """
+        def record(name: str) -> dict:
+            return {
+                "google": {
+                    "business_name": name,
+                    "rating": 4.8,
+                    "reviews": 120,
+                    "vertical": "garage_doors",
+                    "source_query": "garage door repair akron",
+                },
+                "website": {},
+            }
+
+        for name in ("Capella Overhead Doors", "Polished Garage Floors", "Finished Garage Doors"):
+            with self.subTest(business=name):
+                grade, flags = fit_ceiling(record(name), "garage_doors")
+                self.assertNotIn("franchise/brand denylist", flags)
+                self.assertNotEqual(grade, "Skip")
+
+        for name in ("Pella Windows of Akron", "Precision Garage Door of Akron"):
+            with self.subTest(business=name):
+                grade, flags = fit_ceiling(record(name), "garage_doors")
+                self.assertIn("franchise/brand denylist", flags)
+                self.assertEqual(grade, "Skip")
 
     def test_hard_icp_gate_has_a_floor_and_no_ceiling(self) -> None:
         low_review_with_site = normalize_lead(

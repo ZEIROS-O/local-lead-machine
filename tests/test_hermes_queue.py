@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 import time
@@ -11,6 +12,33 @@ from unittest.mock import patch
 
 from lead_machine import hermes_queue as hq
 from lead_machine.hermes_commands import CommandError, CommandResult
+
+
+# These cases exercise the `config["outcomes_jsonl"]` fallback with a temp ledger
+# per test. Since hermes_queue started resolving through
+# `compliance.configured_suppression_source()`, an ambient SUPPRESSION_SOURCE
+# wins over that config — and `load_dotenv()` in any earlier-imported module
+# pulls the operator's real value out of `.env`. That is correct in production
+# and wrong here: it made these tests read, and *append `sent` rows to*, the live
+# `run_state/suppression_events.jsonl`. The precedence itself is pinned in
+# tests/test_suppression_writer.py, which sets the variables explicitly.
+_ENV_ISOLATION = None
+_LEDGER_VARS = ("SUPPRESSION_SOURCE", "LPM_OUTCOMES_JSONL")
+
+
+def setUpModule() -> None:
+    global _ENV_ISOLATION
+    _ENV_ISOLATION = patch.dict(
+        os.environ, {name: "" for name in _LEDGER_VARS}, clear=False
+    )
+    _ENV_ISOLATION.start()
+    for name in _LEDGER_VARS:
+        os.environ.pop(name, None)
+
+
+def tearDownModule() -> None:
+    if _ENV_ISOLATION is not None:
+        _ENV_ISOLATION.stop()
 
 
 def make_root(tmp: str, *, config: dict | None = None) -> Path:

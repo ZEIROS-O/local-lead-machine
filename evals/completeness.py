@@ -44,9 +44,15 @@ from evals.corpus import (  # noqa: E402
 
 # Two sides, two vocabularies. The base stores `Verdict` after the verdict
 # cutover and step 4 deletes `Packet Tier` outright, so a base read still naming
-# the tier 422s. The scored CSVs on disk are unchanged and still carry the tier
-# column, so the corpus-conflict check keeps reading that one — pointing it at
-# `Verdict` would silently find nothing, because no CSV has such a column.
+# the tier 422s. Every scored CSV carries the tier column, so the corpus-conflict
+# check keeps reading that one — it is the only column present across the whole
+# corpus.
+#
+# `Verdict` is *not* absent from the CSVs, as this comment used to claim: 5 of
+# the 14 active corpora carry it, the ones written since the cutover. The
+# reject-pruning below reads it deliberately, and treats a blank as "not provably
+# a pruned reject" — so the 9 older corpora keep their missing leads in
+# `scored_orphans` rather than having them silently excused.
 DEFAULT_VERDICT_FIELD = verdict_module.VERDICT_FIELD
 SCORED_VERDICT_FIELD = "Packet Tier"
 FINDING_CATEGORIES = (
