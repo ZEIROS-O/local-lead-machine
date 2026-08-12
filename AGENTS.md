@@ -87,8 +87,10 @@ Key in-flight facts (2026-07-29):
   exit 2 names the missing choice and prints the UI steps. On 2026-08-03 Lou manually consolidated
   `Do Not Contact` → `Not Fit`, `Sent` → `Follow-Up`, and `Mockup Needed` → `New` in the live base;
   code's canonical vocabulary is now `New`, `Manual Review`, `Not Fit`, `Follow-Up`, `Won`, `Lost`,
-  `Booked`. The remaining MVP additions (`Booked`, `Held`, and the setter roster) are code-declared
-  but not verified live, so do not claim the checker currently exits 0. Background in
+  `Booked`. The MVP additions (`Booked`, `Held`, `Opted Out`, and the setter roster) **were verified
+  live on 2026-08-12: `airtable_required_choices.py check` exits 0** across all 13 checked fields.
+  That covers select choices only — `Deals.Cash Collected` is a non-select field and is still an
+  open manual check. Background in
   [`docs/airtable_schema_required.md`](docs/airtable_schema_required.md); full record in
   [`docs/airtable_cutover_runbook_2026-07-30.md`](docs/airtable_cutover_runbook_2026-07-30.md).
 - **Scoring runs through a provider chain** in `lead_machine/llm_client.py`: kimi (Moonshot API,

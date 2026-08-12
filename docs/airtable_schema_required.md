@@ -84,9 +84,10 @@ the automated pipeline creates rows here.
 > **Previously unblocked 2026-07-30; MVP schema work is now pending.** `mark_outcome.py` was unable to write a single row from `91c7131`
 > (typecast removal) until the eight missing select choices were created by hand — six in
 > `Sales Activities`, plus `Won` and `Lost` on `Prospects.Status`. All eight now exist and the
-> module became operational. The MVP now additionally requires `Sales Activities.Outcome = Held`,
-> `Prospects.Status = Booked`, the `Assigned Setter` field and choices, and
-> `Deals.Cash Collected`. These additions are code-declared/documented but not verified live.
+> module became operational. The MVP additionally requires `Sales Activities.Outcome = Held` and
+> `= Opted Out`, `Prospects.Status = Booked`, the `Assigned Setter` field and choices, and
+> `Deals.Cash Collected`. **Every select among those was verified live on 2026-08-12** — the checker
+> exits 0. `Deals.Cash Collected` is a non-select field and is outside what the checker can see.
 >
 > **If a write starts 422-ing, run this first:**
 > `.venv/bin/python airtable_required_choices.py check` — it derives the requirement from
@@ -108,11 +109,11 @@ in-CRM record of what happened after contact moves a lead to `Status=Follow-Up`.
 | Activity Name | Single line text | Primary field; `"<Activity Type> — <Business Name>"` |
 | Activity Type | Single select | `mark_outcome` writes **Reply, Call, Close** |
 | Activity Date | Date/time | When the event happened (12:00 UTC on the reported date) |
-| Outcome | Single select | `mark_outcome` writes **Replied, Meeting Booked, Won, Lost**; the closer marks **Held** manually |
+| Outcome | Single select | `mark_outcome` writes **Replied, Meeting Booked, Won, Lost, Opted Out**; the closer marks **Held** manually |
 | Details | Long text | `--notes` |
 | Linked Prospect | Link → Prospects | Join back to the lead |
 
-#### Every choice here must be PRE-CREATED by hand. The original eight exist; `Held` is pending live verification.
+#### Every choice here must be PRE-CREATED by hand. Verified complete live 2026-08-12 — the checker exits 0.
 
 The field's stock choices describe meeting logistics and cannot express a funnel outcome. They used
 to be minted on first write by Airtable's `typecast` flag; **`typecast` was removed from every write
@@ -128,8 +129,15 @@ until the eight were added by hand on 2026-07-30:
 | Field | Added by hand 2026-07-30 | Live vocabulary now |
 |-------|--------------------------|---------------------|
 | `Sales Activities.Activity Type` | **Reply**, **Close** | Call, Email, Meeting, Follow Up, Demo, Note, Other, Reply, Close |
-| `Sales Activities.Outcome` | **Replied**, **Meeting Booked**, **Won**, **Lost** | Completed, Scheduled, Rescheduled, Cancelled, No Show, Outcome Pending, Replied, Meeting Booked, Won, Lost. Add **Held** for the MVP closer workflow |
-| `Prospects.Status` | **Won**, **Lost** (and `Closed` removed) | Current canonical vocabulary after the 2026-08-03 consolidation: New, Manual Review, Not Fit, Follow-Up, Won, Lost, Booked |
+| `Sales Activities.Outcome` | **Replied**, **Meeting Booked**, **Won**, **Lost** | Read live 2026-08-12 (12): Replied, Meeting Booked, Scheduled, Rescheduled, Cancelled, No Show, **Held**, Outcome Pending, Won, Lost, Completed, **Opted Out** |
+| `Prospects.Status` | **Won**, **Lost** (and `Closed` removed) | Read live 2026-08-12 (7), matching the canonical vocabulary after the 2026-08-03 consolidation: New, Manual Review, Not Fit, Follow-Up, **Booked**, Won, Lost |
+
+`Opted Out` is the choice `mark_outcome.py --event opt_out` writes (`mark_outcome.py:143`), and it is
+the one whose absence would have been *silent in the direction that matters*: the suppression ledger
+row is written and fsynced first, deliberately, so an opt-out with no live choice still suppresses
+the business — the rep just gets a 422 and no activity row. The compliance record survives; the CRM
+record of it does not. It was declared in `REQUIRED_SELECT_CHOICES` before it was documented here;
+confirmed present in the base on 2026-08-12.
 
 The same obligation applies to any value added later: it is a hard prerequisite, not cleanup, and
 restoring `typecast` is not the fix — it is the drift channel the removal closed.
@@ -228,13 +236,19 @@ base by hand before that code path can run.
 `airtable_required_choices.py check` is what catches it — exit 2 names the missing choice and prints
 the UI steps. Field creation and non-select types (`Deals.Cash Collected`) remain manual checks.
 
-## MVP setter-assignment cutover (manual, not yet verified live)
+## MVP setter-assignment cutover — select vocabulary verified live 2026-08-12
 
-1. Create `Prospects.Assigned Setter` as single select and add every exact name from
-   `LPM_SETTER_ROSTER`.
-2. Confirm `Booked` exists in `Prospects.Status`.
-3. Add `Held` to `Sales Activities.Outcome`.
-4. Create `Deals.Cash Collected` as currency.
-5. Run `.venv/bin/python airtable_required_choices.py check`; it must exit 0.
+Steps 1–3 and 5 are done: `airtable_required_choices.py check` exited 0 on 2026-08-12, and it
+derives its requirement from the code declarations rather than from this page, so that exit is
+evidence about the base and not about the doc.
+
+1. ~~Create `Prospects.Assigned Setter` as single select and add every exact name from
+   `LPM_SETTER_ROSTER`.~~ **Done** — present, 1 choice live.
+2. ~~Confirm `Booked` exists in `Prospects.Status`.~~ **Done** — live.
+3. ~~Add `Held` to `Sales Activities.Outcome`.~~ **Done** — live, alongside `Opted Out`.
+4. **Create `Deals.Cash Collected` as currency** — still open. The checker covers select choices
+   only, so a missing non-select field does not show up in its exit code.
+5. ~~Run `.venv/bin/python airtable_required_choices.py check`; it must exit 0.~~ **Done
+   2026-08-12: exit 0**, all 13 checked fields present with no missing choices.
 6. Follow [`setter-assignment-sop.md`](setter-assignment-sop.md) for the blank-only dry-run and
    backfill. Per-rep views and permissions are manual and are not verified by repository tests.
