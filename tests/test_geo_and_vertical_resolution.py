@@ -447,6 +447,42 @@ class TermBoundaryMatchingTest(unittest.TestCase):
                             collisions.append((key, term, other_key, other_term))
         self.assertEqual(collisions, [])
 
+    def test_no_term_in_any_gated_list_matches_a_word_it_is_only_the_tail_of(self) -> None:
+        """The collision audit, widened past `batch_terms` to the three lists
+        `icp.hard_icp_gate` gates on.
+
+        Those three were compared with bare `in` until 2026-08-12, which is the
+        same defect as `roofing` inside `waterproofing` with the boundary check
+        absent entirely. A lexical audit cannot catch that class here — the
+        offending longer word is ordinary English (`capella`, `polished`), not
+        another registered term — so this pins the *property* instead: for every
+        term in every gated list, a word that merely ends with that term must
+        not match. It fails the moment any of these lists is read with bare `in`
+        again.
+        """
+        misses = []
+        for key, profile in VERTICAL_PROFILES.items():
+            for list_name in ("batch_terms", "franchise_denylist", "deny_terms", "low_ticket_terms"):
+                for term in getattr(profile, list_name, ()) or ():
+                    if not term:
+                        continue
+                    # A word that ends with the term but starts before it.
+                    haystack = f"the zq{term} company"
+                    if matches_term(haystack, term):
+                        misses.append((key, list_name, term, haystack))
+        self.assertEqual(misses, [])
+
+    def test_gated_lists_still_match_their_own_terms_and_suffix_growth(self) -> None:
+        """The other direction: narrowing the match must not disarm the lists."""
+        for key, profile in VERTICAL_PROFILES.items():
+            for list_name in ("franchise_denylist", "deny_terms", "low_ticket_terms"):
+                for term in getattr(profile, list_name, ()) or ():
+                    if not term:
+                        continue
+                    with self.subTest(vertical=key, list=list_name, term=term):
+                        self.assertTrue(matches_term(f"acme {term} of akron", term))
+                        self.assertTrue(matches_term(f"acme {term}s of akron", term))
+
     def test_known_adjacent_trades_do_not_capture_a_registered_vertical(self) -> None:
         """Trades we do not prospect but which share word tails with ones we do.
         Each must resolve to something other than the vertical it shadows."""

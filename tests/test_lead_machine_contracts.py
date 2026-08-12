@@ -1609,6 +1609,54 @@ class LeadMachineContractsTest(unittest.TestCase):
                 )
                 self.assertNotIn("category_is_a_different_trade", result.reasons)
 
+    def test_hard_icp_gate_denylists_do_not_fire_on_a_word_they_are_only_the_tail_of(self) -> None:
+        """The three gated denylists were matched with bare `in` until 2026-08-12.
+
+        `"pella"` (a real franchise entry) skipped *Capella Overhead Doors* and
+        any garage-door business on *Capella Dr*; `"shed"` in the garage_doors
+        deny/low-ticket lists skipped *Polished*, *Finished* and *Washed* Garage
+        Doors as low-ticket economics. Garage-floor coating businesses are
+        routinely pulled by garage-door queries, so this was a live discard.
+        """
+        def lead(name: str, *, address: str = "123 Main St", vertical: str = "garage_doors"):
+            return normalize_lead(
+                {
+                    "business_name": name,
+                    "address": address,
+                    "city": "Akron",
+                    "rating": "4.8",
+                    "reviews": "60",
+                    "category": "garage door supplier",
+                    "source_query": "garage door repair akron",
+                    "website_url": "https://example.com",
+                },
+                fallback_vertical=vertical,
+                source_batch="round1",
+            )
+
+        for name, row in (
+            ("Capella Overhead Doors", lead("Capella Overhead Doors")),
+            ("Ace Garage Doors on Capella Dr", lead("Ace Garage Doors", address="4400 Capella Dr")),
+            ("Polished Garage Floors", lead("Polished Garage Floors")),
+            ("Finished Garage Doors", lead("Finished Garage Doors")),
+        ):
+            with self.subTest(business=name):
+                result = hard_icp_gate(row)
+                self.assertFalse(result.should_skip, f"{name} was discarded: {result.reasons}")
+
+        # The control: the entries these lists actually exist for still fire,
+        # and suffix growth ("shed" -> "sheds") still matches.
+        for name, expected_reason in (
+            ("Pella Windows of Akron", "franchise_or_chain"),
+            ("Precision Garage Door of Akron", "franchise_or_chain"),
+            ("Akron Shed Company", "low_ticket_economics"),
+            ("Northeast Ohio Sheds", "low_ticket_economics"),
+        ):
+            with self.subTest(business=name):
+                result = hard_icp_gate(lead(name))
+                self.assertTrue(result.should_skip, f"{name} was admitted")
+                self.assertIn(expected_reason, result.reasons)
+
     def test_hard_icp_gate_has_a_floor_and_no_ceiling(self) -> None:
         low_review_with_site = normalize_lead(
             {

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import List
 
 from .schema import CanonicalLead
-from .verticals import resolve_profile
+from .verticals import matches_any_term, resolve_profile
 
 # The HARDSCAPE_*/CLEVELAND_METRO re-export aliases that used to sit here had no
 # callers. They dated from when hardscaping was the only vertical and named it
@@ -41,7 +41,13 @@ def hard_icp_gate(lead: CanonicalLead) -> GateResult:
     ).lower()
     reasons: List[str] = []
 
-    if any(term in text for term in profile.franchise_denylist):
+    # Left-boundary matching, not bare `in`, for the same reason the batch terms
+    # use it: a term that is only the *tail* of a longer word is a different
+    # business. Bare `in` made "pella" skip *Capella Overhead Doors* and any
+    # address on *Capella Dr*, and "shed" skip *Polished*/*Finished*/*Washed*
+    # Garage Doors as low-ticket. The boundary stays left-only so these lists
+    # keep their suffix growth — "shed" still matches "sheds".
+    if matches_any_term(text, profile.franchise_denylist):
         reasons.append("franchise_or_chain")
 
     # Matched against the category alone, not the joined `text` above: the
@@ -52,13 +58,13 @@ def hard_icp_gate(lead: CanonicalLead) -> GateResult:
     if category and category in profile.category_denylist:
         reasons.append("category_is_a_different_trade")
 
-    if any(term in text for term in profile.deny_terms):
+    if matches_any_term(text, profile.deny_terms):
         if profile.key == "hardscaping":
             reasons.append("medical_aesthetic_v1_excluded")
         else:
             reasons.append("low_ticket_economics")
 
-    if any(term in text for term in profile.low_ticket_terms) and "low_ticket_economics" not in reasons:
+    if matches_any_term(text, profile.low_ticket_terms) and "low_ticket_economics" not in reasons:
         reasons.append("low_ticket_economics")
 
     if lead.google_rating is not None and lead.google_rating < 4.3:
