@@ -22,6 +22,7 @@ from lead_machine.compliance import (
     load_suppression_index,
     suppression_identifier,
 )
+from lead_machine.hermes_queue import _configured_outcomes_source
 
 
 class SuppressionWriterTests(unittest.TestCase):
@@ -175,6 +176,32 @@ class ConfiguredSuppressionSourceTests(unittest.TestCase):
             self.assertEqual(configured_suppression_source(), "/b")
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(configured_suppression_source(), "")
+
+    def test_hermes_resolves_the_same_ledger_as_every_other_write_path(self) -> None:
+        """Hermes used to read LPM_OUTCOMES_JSONL and never consult SUPPRESSION_SOURCE.
+
+        With only SUPPRESSION_SOURCE set — the documented variable, and the one
+        `mark_outcome.py` appends opt-outs through — the morning queue screened
+        against `config["outcomes_jsonl"]` instead. Neither side errored, because
+        both files parse. The two resolvers must not be able to disagree.
+        """
+        config = {"outcomes_jsonl": "/tracked/default.jsonl"}
+
+        with patch.dict(os.environ, {"SUPPRESSION_SOURCE": "/a"}, clear=True):
+            self.assertEqual(_configured_outcomes_source(config), configured_suppression_source())
+            self.assertEqual(_configured_outcomes_source(config), "/a")
+
+        # LPM_OUTCOMES_JSONL keeps working, and SUPPRESSION_SOURCE still wins.
+        with patch.dict(os.environ, {"LPM_OUTCOMES_JSONL": "/b"}, clear=True):
+            self.assertEqual(_configured_outcomes_source(config), configured_suppression_source())
+            self.assertEqual(_configured_outcomes_source(config), "/b")
+        with patch.dict(os.environ, {"SUPPRESSION_SOURCE": "/a", "LPM_OUTCOMES_JSONL": "/b"}, clear=True):
+            self.assertEqual(_configured_outcomes_source(config), configured_suppression_source())
+            self.assertEqual(_configured_outcomes_source(config), "/a")
+
+        # Naming neither variable still falls back to the tracked config default.
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(_configured_outcomes_source(config), "/tracked/default.jsonl")
 
 
 if __name__ == "__main__":

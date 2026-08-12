@@ -48,6 +48,7 @@ from lead_machine.hermes_executor import render_command
 from lead_machine.sendability import is_contact_ready
 from lead_machine.compliance import (
     ComplianceError,
+    configured_suppression_source,
     has_acceptable_sms_consent,
     is_mark_sent_source_status,
     is_suppressed,
@@ -529,8 +530,23 @@ def cmd_queue_topup(
 # ---------------------------------------------------------------- morning-queue
 
 
+def _configured_outcomes_source(config: dict[str, Any]) -> str:
+    """The ledger path this module reads and appends to.
+
+    Deferred to `compliance.configured_suppression_source()` rather than reading
+    LPM_OUTCOMES_JSONL directly, because that resolver prefers SUPPRESSION_SOURCE
+    and every other write path already goes through it. Reading only
+    LPM_OUTCOMES_JSONL meant an environment that set just SUPPRESSION_SOURCE had
+    `mark_outcome.py` appending opt-outs to one file while the morning queue
+    screened against another — no error on either side, because both parse fine.
+    The tracked `config["outcomes_jsonl"]` default stays as the final fallback so
+    an environment that names neither variable behaves exactly as before.
+    """
+    return configured_suppression_source() or str(config.get("outcomes_jsonl") or "").strip()
+
+
 def _load_suppression_index(config: dict[str, Any]) -> tuple[set[str], str]:
-    raw_path = os.environ.get("LPM_OUTCOMES_JSONL", "").strip() or str(config.get("outcomes_jsonl") or "").strip()
+    raw_path = _configured_outcomes_source(config)
     try:
         return load_suppression_index(raw_path), ""
     except ComplianceError as exc:
@@ -934,7 +950,7 @@ def _parse_mark_sent_receipt(result: subprocess.CompletedProcess[str], *, operat
 
 
 def _resolved_suppression_path(config: dict[str, Any]) -> Path:
-    raw = os.environ.get("LPM_OUTCOMES_JSONL", "").strip() or str(config.get("outcomes_jsonl") or "").strip()
+    raw = _configured_outcomes_source(config)
     try:
         return suppression_source_path(raw)
     except ComplianceError as exc:
@@ -1102,7 +1118,7 @@ def _require_queue_status_eligible(matched: list[dict[str, Any]]) -> None:
 
 
 def _read_outcome_rows(config: dict[str, Any]) -> tuple[Path, list[dict[str, Any]]]:
-    raw_path = os.environ.get("LPM_OUTCOMES_JSONL", "").strip() or str(config.get("outcomes_jsonl") or "").strip()
+    raw_path = _configured_outcomes_source(config)
     try:
         path = suppression_source_path(raw_path)
     except ComplianceError as exc:
@@ -1147,8 +1163,9 @@ def _matching_sent_outcome(config: dict[str, Any], event_id: str) -> dict[str, A
 
 
 def _append_outcome_row(config: dict[str, Any], row: dict[str, Any]) -> str:
-    # morning_queue.json carries a machine-absolute default; LPM_OUTCOMES_JSONL
-    # overrides it so other machines can redirect without editing tracked config.
+    # morning_queue.json carries a machine-absolute default; SUPPRESSION_SOURCE
+    # (or LPM_OUTCOMES_JSONL) overrides it so other machines can redirect without
+    # editing tracked config. See _configured_outcomes_source.
     path, existing_rows = _read_outcome_rows(config)
     operation_id = str(row.get("operation_id") or "").strip()
     event_id = str(row.get("event_id") or "").strip() or _mark_sent_event_id(
