@@ -244,17 +244,45 @@ OPT_OUT_LANGUAGE = (
     # legitimate refusal — that rep retypes one reason, which is the trade this
     # list is explicitly tuned to make.
     "be contacted",
+    # The twin the comment above argues for and then omits, for the verb the MVP
+    # actually uses: the rep is dialling, so the refusal a rep types is far more
+    # often "asked not to be called" than "...contacted".
+    "be called",
     "no contact",
+    "no calls",
     "unsubscribe",
     "opt out",
     "opted out",
     "opt-out",
     "remove me",
     "remove us",
+    # `mark_declined` reasons are written in the third person about the lead
+    # ("remove them from your list"), not the first person the two above assume.
+    "remove them",
+    "never call",
+    "never contact",
+    "quit calling",
+    "leave me alone",
+    "leave us alone",
+    "cease and desist",
     "lose my number",
     "harass",
     "dnc",
 )
+
+# Every apostrophe a phone keyboard, Word, or a Telegram client can produce where
+# the list above writes U+0027. `/mark-declined` is reachable from Telegram with
+# auto---execute (`hermes_commands.py`), and every one of those surfaces
+# substitutes a curly apostrophe by default — so "don't call me again" typed on a
+# phone missed the screen entirely while the straight-quote twin caught it. The
+# screen was weakest on exactly the surface that produces the most refusals.
+_APOSTROPHES = "‘’ʹʼˈ`´′‵＇"
+_APOSTROPHE_FOLD = {ord(char): "'" for char in _APOSTROPHES}
+
+
+def fold_apostrophes(text: Any) -> str:
+    """Normalise the Unicode apostrophe family to U+0027."""
+    return str(text or "").translate(_APOSTROPHE_FOLD)
 
 
 def opt_out_language_in(text: Any) -> str:
@@ -263,7 +291,7 @@ def opt_out_language_in(text: Any) -> str:
     Returns the phrase rather than a bool so the caller can quote it back: a
     refusal that says which words tripped it is one the rep can act on.
     """
-    haystack = str(text or "").casefold()
+    haystack = fold_apostrophes(text).casefold()
     for phrase in OPT_OUT_LANGUAGE:
         if phrase in haystack:
             return phrase

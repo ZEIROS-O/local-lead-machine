@@ -222,6 +222,43 @@ class ADeclineIsNotAnOptOut(unittest.TestCase):
             with self.subTest(reason=reason):
                 self._apply(_session(), reason=reason)
 
+    def test_a_curly_apostrophe_is_screened_exactly_like_a_straight_one(self):
+        """`/mark-declined` is reachable from Telegram with auto---execute, and
+        every phone keyboard substitutes U+2019 by default. The screen used to
+        casefold without folding punctuation, so it was weakest on precisely the
+        surface that produces the most refusals."""
+        for straight, curly in [
+            ("don't call me again", "don’t call me again"),
+            ("they dont contact vendors", "they don’t contact vendors"),
+        ]:
+            with self.subTest(reason=curly):
+                for reason in (straight, curly):
+                    session = _session()
+                    with self.assertRaises(mark_declined.MarkDeclinedError) as caught:
+                        self._apply(session, reason=reason)
+                    self.assertIn("mark_outcome", str(caught.exception))
+                    session.patch.assert_not_called()
+
+    def test_the_phrasings_a_rep_types_on_a_phone_are_screened(self):
+        for reason in [
+            "asked not to be called",
+            "remove them from your list",
+            "said never call again",
+            "never contact this business",
+            "told me to quit calling",
+            "just said leave me alone",
+            "leave us alone, they said",
+            "threatened a cease and desist",
+            "wants no calls from vendors",
+        ]:
+            with self.subTest(reason=reason):
+                session = _session()
+                with self.assertRaises(mark_declined.MarkDeclinedError) as caught:
+                    self._apply(session, reason=reason)
+                self.assertIn("mark_outcome", str(caught.exception))
+                session.patch.assert_not_called()
+        self.assertEqual(dial_decisions.load_decisions(self.ledger), [])
+
     def test_the_receipt_says_no_suppression_was_recorded(self):
         # A green receipt that looks identical to an opt-out receipt is how the
         # two get conflated in the first place.
