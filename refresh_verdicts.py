@@ -10,9 +10,14 @@ import sys
 from collections import Counter
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Any, Iterable
+from typing import AbstractSet, Any, Iterable
 
 import refresh_packet_tiers
+from lead_machine.compliance import (
+    ComplianceError,
+    load_configured_suppression_index,
+    merge_live_suppression,
+)
 from lead_machine.csv_validation import read_validated_dict_rows
 from lead_machine.sendability import (
     VERDICT_PACKET_TIERS,
@@ -40,11 +45,19 @@ def raise_csv_limit() -> None:
         csv.field_size_limit(2_147_483_647)
 
 
-def output_fieldnames(existing: Iterable[str]) -> list[str]:
+def output_fieldnames(
+    existing: Iterable[str], rows: Iterable[dict[str, Any]] = ()
+) -> list[str]:
     fieldnames = list(existing)
     for field in VERDICT_REFRESH_FIELDS:
         if field not in fieldnames:
             fieldnames.append(field)
+    # A suppression stamp writes `Skip Reason`, which the live corpus already
+    # carries but a narrower CSV need not. Adding it only when a row actually
+    # has one keeps the output schema the input's everywhere else, and stops
+    # the write refusing with "fields not in fieldnames" on a suppressed lead.
+    if "Skip Reason" not in fieldnames and any("Skip Reason" in row for row in rows):
+        fieldnames.append("Skip Reason")
     return fieldnames
 
 
@@ -66,14 +79,45 @@ def validate_refreshed_row(row: dict[str, Any]) -> list[str]:
     return errors
 
 
-def refresh_row(row: dict[str, Any]) -> dict[str, Any]:
-    projected = apply_verdict(apply_sendability(row))
-    updated = dict(row)
+def refresh_row(
+    row: dict[str, Any], *, suppression_index: AbstractSet[str] = frozenset()
+) -> dict[str, Any]:
+    """Re-derive the machine-owned verdict fields for one stored row.
+
+    The suppression index is applied *before* projection, for the reason
+    `score_leads` re-checks it: this pass never re-enriches, so the stored
+    suppression flag is a snapshot from whenever the lead was last enriched, and
+    an opt-out that arrived since would otherwise be invisible. Without it a
+    re-verdict pass can rebuild an opted-out lead to `send` and push it back to
+    the base — the 2026-08-11 condition, where 429 send verdicts were written
+    having never been checked against suppression at any stage.
+
+    Defaulting to an empty index keeps direct library callers working, but every
+    CLI entry point loads the configured index and fails closed first, the same
+    contract as the other five entry points.
+
+    The stamp is carried through validation and then trimmed back to the input's
+    own columns. `validate_refreshed_row` re-reads the authority off the row it
+    is handed, so validating an unstamped copy would compare a suppressed
+    projection against a sendable authority and raise on every suppressed lead.
+    Persisting the stamp is a different question: `Skip Reason` is a real synced
+    column and is kept, so the operator sees why the lead was dropped, while
+    `hard_disqualifiers`/`Hard Disqualifiers` are added back only if the input
+    already carried them — the output CSV's schema is the input's, and a
+    re-verdict pass has no business inventing columns. Nothing is lost by the
+    trim: every entry point re-derives the stamp from the live ledger.
+    """
+    stamped = merge_live_suppression(dict(row), suppression_index)
+    projected = apply_verdict(apply_sendability(stamped))
+    updated = dict(stamped)
     for field in VERDICT_REFRESH_FIELDS:
         updated[field] = projected.get(field, "")
     errors = validate_refreshed_row(updated)
     if errors:
         raise VerdictRefreshError("; ".join(errors))
+    for field in ("hard_disqualifiers", "Hard Disqualifiers"):
+        if field not in row:
+            updated.pop(field, None)
     return updated
 
 
@@ -107,9 +151,11 @@ def _write_csv(path: Path, fieldnames: list[str], rows: list[dict[str, Any]]) ->
         raise
 
 
-def _project(path: Path) -> tuple[list[str], list[dict[str, Any]], dict[str, Any]]:
+def _project(
+    path: Path, *, suppression_index: AbstractSet[str] = frozenset()
+) -> tuple[list[str], list[dict[str, Any]], dict[str, Any]]:
     fieldnames, rows = _read_csv(path)
-    refreshed_rows = [refresh_row(row) for row in rows]
+    refreshed_rows = [refresh_row(row, suppression_index=suppression_index) for row in rows]
     verdict_counts = Counter(str(row["Verdict"]) for row in refreshed_rows)
     report = {"rows": len(refreshed_rows), "verdict_counts": dict(sorted(verdict_counts.items()))}
     return fieldnames, refreshed_rows, report
@@ -120,6 +166,7 @@ def refresh_csv(
     output_path: Path | str | None = None,
     *,
     in_place: bool = False,
+    suppression_index: AbstractSet[str] = frozenset(),
 ) -> dict[str, Any]:
     source = Path(input_path)
     if output_path is None and not in_place:
@@ -130,8 +177,8 @@ def refresh_csv(
     destination = source if in_place else Path(output_path)
     if not in_place and destination.resolve() == source.resolve():
         raise ValueError("same-path writes require in_place=True")
-    fieldnames, rows, report = _project(source)
-    _write_csv(destination, output_fieldnames(fieldnames), rows)
+    fieldnames, rows, report = _project(source, suppression_index=suppression_index)
+    _write_csv(destination, output_fieldnames(fieldnames, rows), rows)
     return report
 
 
@@ -147,14 +194,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    # Fail closed before reading a row. This pass re-derives `Verdict` and can
+    # write `send`; running it with no ledger configured is how a lead that
+    # opted out gets rebuilt as sendable and pushed back to the base. `--check`
+    # loads it too, so the projection report states the same verdicts the write
+    # would produce rather than an optimistic set.
+    try:
+        suppression_index = load_configured_suppression_index()
+    except ComplianceError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
     try:
         if args.check:
-            _, _, report = _project(args.input)
+            _, _, report = _project(args.input, suppression_index=suppression_index)
             print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
         else:
             if args.output is None and not args.in_place:
                 raise ValueError("normal use requires --output or --in-place")
-            report = refresh_csv(args.input, args.output, in_place=args.in_place)
+            report = refresh_csv(
+                args.input,
+                args.output,
+                in_place=args.in_place,
+                suppression_index=suppression_index,
+            )
             destination = args.input if args.in_place else args.output
             print(json.dumps({**report, "output": str(destination)}, ensure_ascii=False, sort_keys=True))
         return 0

@@ -11,10 +11,15 @@ import sys
 from collections import Counter
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Any, Iterable
+from typing import AbstractSet, Any, Iterable
 
 from lead_machine.schema import normalize_phone
 from lead_machine.airtable_sync import VERTICAL_CHOICES, normalize_airtable_value
+from lead_machine.compliance import (
+    ComplianceError,
+    load_configured_suppression_index,
+    record_matches_suppression,
+)
 from lead_machine.csv_validation import read_validated_dict_rows
 from lead_machine.verticals import resolve_profile
 from refresh_verdicts import VERDICT_REFRESH_FIELDS, refresh_row, validate_refreshed_row
@@ -102,8 +107,11 @@ def prepare_corpus(
     paths: Iterable[Path | str],
     overrides: dict[str, str],
     excluded_upsert_keys: Iterable[str] = (),
+    *,
+    suppression_index: AbstractSet[str] = frozenset(),
 ) -> tuple[list[str], list[dict[str, str]], dict[str, Any]]:
     raise_csv_limit()
+    suppressed_rows = 0
     fieldnames: list[str] = []
     selected: dict[str, tuple[Path, int, dict[str, str]]] = {}
     skipped_no_upsert = 0
@@ -156,13 +164,25 @@ def prepare_corpus(
                 source_biconditional_violations += 1
             else:
                 source_verdict_tier_violations += 1
-        prepared = refresh_row(prepared)
+        # Checked before the refresh, because the refresh is what stamps it.
+        suppressed = bool(suppression_index) and record_matches_suppression(
+            prepared, suppression_index
+        )
+        if suppressed:
+            suppressed_rows += 1
+        prepared = refresh_row(prepared, suppression_index=suppression_index)
         changed = {
             field
             for field in set(source_row) | set(prepared)
             if str(source_row.get(field, "")) != str(prepared.get(field, ""))
         }
         allowed_changes = {"Vertical", *VERDICT_REFRESH_FIELDS}
+        if suppressed:
+            # A suppression stamp is machine-owned and compliance-critical, but
+            # `Skip Reason` sits outside the ordinary refresh contract. Widened
+            # only for the rows that actually matched the ledger, so the guard
+            # stays exactly as tight as before for every other row.
+            allowed_changes |= {"Skip Reason", "Hard Disqualifiers", "hard_disqualifiers"}
         unauthorized = changed - allowed_changes
         if unauthorized:
             raise ValueError("preparation changed fields outside its machine-owned contract")
@@ -173,6 +193,9 @@ def prepare_corpus(
     for field in ["Vertical", *VERDICT_REFRESH_FIELDS]:
         if field not in fieldnames:
             fieldnames.append(field)
+    # Only when a lead was actually suppressed — see refresh_verdicts.
+    if suppressed_rows and "Skip Reason" not in fieldnames:
+        fieldnames.append("Skip Reason")
     verdict_counts = Counter(str(row.get("Verdict") or "") for row in rows)
     report = {
         "source_file_count": len(sorted_paths),
@@ -191,6 +214,11 @@ def prepare_corpus(
         # tautological zero to a real figure as a regression.
         "source_biconditional_violations": source_biconditional_violations,
         "source_verdict_tier_violations": source_verdict_tier_violations,
+        # How many rows the live ledger stopped. Reported rather than silent:
+        # a corpus that suppressed nothing and a corpus built with no ledger
+        # configured produce the same verdict counts, and only one of them is
+        # safe to upload.
+        "suppressed_rows": suppressed_rows,
         "verdict_counts": dict(sorted(verdict_counts.items())),
         "selected_source_provenance": {
             hashlib.sha256(key.encode("utf-8")).hexdigest(): {
@@ -300,6 +328,15 @@ def _verify_expected_counts(args: argparse.Namespace, report: dict[str, Any]) ->
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    # Fail closed before reading a row, like the other entry points. This
+    # rebuilds `Verdict` from stored CSV rows and produces the file
+    # `upload_airtable.py` writes from, so an unconfigured ledger here is how an
+    # opted-out lead is rebuilt to `send` and pushed back into the base.
+    try:
+        suppression_index = load_configured_suppression_index()
+    except ComplianceError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
     try:
         source_paths = [Path(path) for path in args.source]
         output = Path(args.output)
@@ -316,6 +353,7 @@ def main(argv: list[str] | None = None) -> int:
             source_paths,
             _load_overrides(args.vertical_overrides),
             _load_excluded_upsert_keys(args.excluded_upsert_keys),
+            suppression_index=suppression_index,
         )
         _verify_expected_counts(args, report)
         _write_csv(output, fieldnames, rows)

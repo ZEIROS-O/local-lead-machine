@@ -10,12 +10,29 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
+from lead_machine.compliance import DNC_SUPPRESSED_REASON, suppression_identifier
 from refresh_verdicts import VERDICT_REFRESH_FIELDS
 from tests.test_verdict import SENDABLE_ROW
 
 
 class PrepareAirtableCorpusTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # This CLI now fails closed on an unconfigured suppression ledger — it
+        # rebuilds `Verdict` and feeds upload_airtable, so running it with no
+        # ledger is how an opted-out lead is pushed back to the base as `send`.
+        # These cases are about paths, counts and reports, so give them a real
+        # but empty ledger and let the compliance behaviour be tested directly
+        # in PrepareAirtableCorpusSuppressionTests.
+        ledger_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(ledger_dir.cleanup)
+        self.ledger = Path(ledger_dir.name) / "suppression.jsonl"
+        self.ledger.write_text("", encoding="utf-8")
+        patcher = patch.dict(os.environ, {"SUPPRESSION_SOURCE": str(self.ledger)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _write_csv(
         self, directory: Path, name: str, rows: list[dict[str, str]], mtime_ns: int
     ) -> Path:
@@ -533,6 +550,86 @@ class PrepareAirtableCorpusTests(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 2)
         self.assertIn("unused excluded upsert keys: 1", completed.stderr)
+
+
+class PrepareAirtableCorpusSuppressionTests(unittest.TestCase):
+    """The corpus builder is the last stage before `upload_airtable.py`.
+
+    It re-derives `Verdict` from stored CSV rows and never re-enriches, so
+    without the live ledger a lead that opted out after it was enriched is
+    rebuilt as `send` and pushed back into the base. That is the 2026-08-11
+    condition, and this is the gate that closes it.
+    """
+
+    def _row(self, **changes: str) -> dict[str, str]:
+        return {**SENDABLE_ROW, "Vertical": "Hardscaping", **changes}
+
+    def _write_source(self, directory: Path, rows: list[dict[str, str]]) -> Path:
+        path = directory / "scored.csv"
+        fieldnames = list(dict.fromkeys(key for row in rows for key in row))
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+        return path
+
+    def test_it_refuses_to_build_with_no_ledger_configured(self) -> None:
+        from prepare_airtable_corpus import main
+
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            source = self._write_source(directory, [self._row()])
+            output = directory / "corpus.csv"
+            stderr = io.StringIO()
+            with patch.dict(os.environ, {}, clear=True), redirect_stderr(stderr):
+                self.assertEqual(main(["--source", str(source), "--output", str(output)]), 1)
+            self.assertFalse(output.exists())
+            self.assertIn("[ERROR]", stderr.getvalue())
+            self.assertIn("suppression source", stderr.getvalue())
+
+    def test_an_opted_out_lead_is_not_rebuilt_to_send(self) -> None:
+        from prepare_airtable_corpus import main
+
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            row = self._row()
+            source = self._write_source(directory, [row])
+            output = directory / "corpus.csv"
+            ledger = directory / "suppression.jsonl"
+            ledger.write_text(
+                json.dumps({"event": "opt_out", "phone": row["Phone"]}) + "\n", encoding="utf-8"
+            )
+            stdout = io.StringIO()
+            with patch.dict(os.environ, {"SUPPRESSION_SOURCE": str(ledger)}), redirect_stdout(stdout):
+                self.assertEqual(main(["--source", str(source), "--output", str(output)]), 0)
+
+            report = json.loads(stdout.getvalue())
+            self.assertEqual(report["suppressed_rows"], 1)
+            self.assertEqual(report["verdict_counts"].get("send", 0), 0)
+
+            with output.open(newline="", encoding="utf-8") as handle:
+                written = list(csv.DictReader(handle))
+            self.assertEqual(len(written), 1)
+            self.assertNotEqual(written[0]["Verdict"], "send")
+            self.assertIn(DNC_SUPPRESSED_REASON, written[0]["Skip Reason"])
+
+    def test_the_same_lead_is_sendable_when_the_ledger_is_empty(self) -> None:
+        """The control. Without it the test above passes for any reason at all."""
+        from prepare_airtable_corpus import main
+
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            source = self._write_source(directory, [self._row()])
+            output = directory / "corpus.csv"
+            ledger = directory / "suppression.jsonl"
+            ledger.write_text("", encoding="utf-8")
+            stdout = io.StringIO()
+            with patch.dict(os.environ, {"SUPPRESSION_SOURCE": str(ledger)}), redirect_stdout(stdout):
+                self.assertEqual(main(["--source", str(source), "--output", str(output)]), 0)
+
+            report = json.loads(stdout.getvalue())
+            self.assertEqual(report["suppressed_rows"], 0)
+            self.assertEqual(report["verdict_counts"].get("send", 0), 1)
 
 
 if __name__ == "__main__":

@@ -545,7 +545,34 @@ def merge_suppression_disqualifiers(row: dict[str, Any], enriched: Mapping[str, 
     synced Airtable column, so the operator sees why the lead was dropped
     instead of finding an unexplained No Packet.
     """
-    reasons = suppression_disqualifiers(enriched)
+    return _merge_disqualifier_reasons(row, suppression_disqualifiers(enriched))
+
+
+def merge_live_suppression(
+    row: dict[str, Any], suppression_index: AbstractSet[str]
+) -> dict[str, Any]:
+    """The same merge, driven by the *live* ledger instead of a stored verdict.
+
+    `merge_suppression_disqualifiers` reads the flag the enricher wrote, which
+    is a snapshot — an opt-out that arrived after enrichment leaves a stale
+    clean behind, which is why `score_leads` re-checks the live index as well.
+    Re-verdict passes rebuild `Verdict` from stored CSV rows without ever
+    re-enriching, so the stored flag is the *only* thing they would see. This is
+    what stops one rebuilding an opted-out lead back to `send`.
+
+    Takes the row itself rather than an enriched record because that is the
+    shape these passes hold; `record_suppression_identifiers` reads `Phone` and
+    `Email` off a flat row, so the identifier set is the same one every other
+    stage matches on.
+    """
+    if not suppression_index:
+        return row
+    if not record_matches_suppression(row, suppression_index):
+        return row
+    return _merge_disqualifier_reasons(row, [DNC_SUPPRESSED_REASON])
+
+
+def _merge_disqualifier_reasons(row: dict[str, Any], reasons: list[str]) -> dict[str, Any]:
     if not reasons:
         return row
 
