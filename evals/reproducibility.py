@@ -40,7 +40,13 @@ from lead_machine.score_schema import (  # noqa: E402
 )
 
 
-DEFAULT_PATTERN = "scored_*.csv"
+from evals.corpus import (  # noqa: E402
+    DEFAULT_PATTERN,
+    CorpusManifestError,
+    describe,
+    resolve_scored_paths,
+)
+
 # The base column this eval reads, and the vocabulary `recompute_verdict`
 # answers in, have to be the same one or every row compares unequal. `Packet
 # Tier` is deleted by step 4 of the verdict cutover; `Verdict` is the
@@ -356,7 +362,7 @@ def _load_baseline(path: Path) -> dict[str, Any]:
 def run_eval(
     *,
     output_dir: Path = Path("output"),
-    pattern: str = DEFAULT_PATTERN,
+    pattern: str | None = None,
     scored_files: Sequence[Path] | None = None,
     base_records: Iterable[dict[str, Any]] | None = None,
     base_id: str = "",
@@ -365,10 +371,8 @@ def run_eval(
     verdict_field: str = DEFAULT_VERDICT_FIELD,
     baseline: dict[str, Any] | None = None,
 ) -> tuple[int, dict[str, Any]]:
-    paths = (
-        [Path(path) for path in scored_files]
-        if scored_files is not None
-        else sorted(Path(output_dir).glob(pattern))
+    paths, corpus_source = resolve_scored_paths(
+        output_dir=output_dir, pattern=pattern, scored_files=scored_files
     )
     if base_records is None:
         resolved_base, resolved_table, resolved_token = _credentials(
@@ -386,6 +390,7 @@ def run_eval(
         verdict_field=verdict_field,
         baseline=baseline,
     )
+    report["corpora"] = describe(paths, corpus_source)
     return (0 if report["ok"] else 2), report
 
 
@@ -394,7 +399,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Re-derive every verdict from stored evidence (read-only)."
     )
     parser.add_argument("--output-dir", type=Path, default=Path("output"))
-    parser.add_argument("--glob", default=DEFAULT_PATTERN)
+    parser.add_argument(
+        "--glob",
+        default=None,
+        help=(
+            "Select corpora by glob instead of evals/active_corpora.json. "
+            f"Unset means the manifest; pass {DEFAULT_PATTERN!r} to replay everything."
+        ),
+    )
     parser.add_argument("--scored-file", type=Path, action="append")
     parser.add_argument("--base-records-json", type=Path)
     parser.add_argument("--base-id", default="")

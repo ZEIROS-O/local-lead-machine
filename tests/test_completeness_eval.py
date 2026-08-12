@@ -17,6 +17,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 def write_scored(path: Path, rows: list[dict[str, str]]) -> None:
     fieldnames = ["Place Key", "Business Name", "City", "Packet Tier"]
+    if any("Verdict" in row for row in rows):
+        fieldnames.append("Verdict")
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
@@ -127,6 +129,8 @@ class CompletenessEvalTests(unittest.TestCase):
                     "duplicate_base_keys": 0,
                     "scored_orphans": 0,
                 },
+                # Counted apart from `findings` because it never fails the run.
+                "reported": {"pruned_rejects": 0},
             },
         )
 
@@ -155,6 +159,11 @@ class CompletenessEvalTests(unittest.TestCase):
                     "place_key": "scored-only",
                     "business_name": "Scored Only LLC",
                     "sources": ["scored_a.csv:2"],
+                    # Blank because this fixture carries no `Verdict` column. A
+                    # lead with no recorded verdict is not provably a pruned
+                    # reject, so it stays an orphan — the check fails toward
+                    # reporting.
+                    "verdicts": [],
                 }
             ],
         )
@@ -422,6 +431,11 @@ class CompletenessEvalTests(unittest.TestCase):
                     [
                         "--output-dir",
                         str(root),
+                        # An explicit glob overrides evals/active_corpora.json,
+                        # which names the repo's real corpora and would not
+                        # resolve against a fixture directory.
+                        "--glob",
+                        "scored_*.csv",
                         "--base-records-json",
                         str(records_path),
                     ]
@@ -454,6 +468,89 @@ class CompletenessEvalTests(unittest.TestCase):
         )
         self.assertNotIn("appSecret", output.call_args.args[0])
         self.assertNotIn("patSecret", output.call_args.args[0])
+
+
+class PrunedRejectTests(unittest.TestCase):
+    """Reject-verdict leads are pruned from the CRM on purpose.
+
+    `scored_orphans = scored_keys - base_keys` therefore counted every pruned
+    reject as a finding — 351 of the 462 it reported on 2026-08-12 — so the check
+    could only go green by uploading leads the operator deliberately removes.
+    """
+
+    def module(self):
+        return importlib.import_module("evals.completeness")
+
+    def evaluate(self, tmp: str, rows: list[dict[str, str]]) -> dict:
+        path = Path(tmp) / "scored_a.csv"
+        write_scored(path, rows)
+        return self.module().evaluate_completeness([path], [])
+
+    def test_a_pruned_reject_is_reported_not_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self.evaluate(
+                tmp,
+                [
+                    {
+                        "Place Key": "pruned",
+                        "Business Name": "Pruned Reject LLC",
+                        "City": "Akron",
+                        "Packet Tier": "No Packet",
+                        "Verdict": "reject",
+                    }
+                ],
+            )
+
+        self.assertEqual(report["findings"]["scored_orphans"], [])
+        self.assertEqual(report["counts"]["reported"]["pruned_rejects"], 1)
+        self.assertEqual(report["counts"]["findings"]["scored_orphans"], 0)
+        self.assertTrue(report["ok"])
+
+    def test_an_actionable_lead_missing_from_the_base_still_fails(self) -> None:
+        """The invariant the narrowing is meant to preserve."""
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self.evaluate(
+                tmp,
+                [
+                    {
+                        "Place Key": "actionable",
+                        "Business Name": "Sendable LLC",
+                        "City": "Akron",
+                        "Packet Tier": "Sendable Packet",
+                        "Verdict": "send",
+                    }
+                ],
+            )
+
+        self.assertEqual(report["counts"]["findings"]["scored_orphans"], 1)
+        self.assertEqual(report["counts"]["reported"]["pruned_rejects"], 0)
+        self.assertFalse(report["ok"])
+
+    def test_a_lead_rejected_in_one_pass_and_sendable_in_another_is_an_orphan(self) -> None:
+        """Fails toward reporting: any non-reject scoring keeps it a finding."""
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self.evaluate(
+                tmp,
+                [
+                    {
+                        "Place Key": "mixed",
+                        "Business Name": "Mixed LLC",
+                        "City": "Akron",
+                        "Packet Tier": "No Packet",
+                        "Verdict": "reject",
+                    },
+                    {
+                        "Place Key": "mixed",
+                        "Business Name": "Mixed LLC",
+                        "City": "Akron",
+                        "Packet Tier": "Sendable Packet",
+                        "Verdict": "send",
+                    },
+                ],
+            )
+
+        self.assertEqual(report["counts"]["findings"]["scored_orphans"], 1)
+        self.assertEqual(report["counts"]["reported"]["pruned_rejects"], 0)
 
 
 if __name__ == "__main__":

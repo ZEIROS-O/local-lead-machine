@@ -1,22 +1,93 @@
 name: Airtable gates
 
 on:
+  push:
   schedule:
     - cron: "37 11 * * *"
   workflow_dispatch:
 
-# One-time repository setup:
+# Two jobs, because they need different things and only one of them can run in
+# hosted CI.
+#
+# `hosted-gates` needs nothing but the checkout, so it runs on every push and is
+# the only part of this workflow that has actually been executing.
+#
+# `airtable-gates` needs BOTH the live base and the scored corpus in `output/`,
+# which is gitignored and exists only on the machine that scored it. It is
+# therefore self-hosted, and **its schedule is deliberately removed**: between
+# ~2026-08-01 and 2026-08-12 no `lpm` runner was registered
+# (`gh api repos/{owner}/{repo}/actions/runners` returned `total_count: 0`), so
+# every scheduled run queued for 24h and silently cancelled. A workflow that
+# cancels daily is worse than no workflow — it reads as coverage that does not
+# exist. It stays available via workflow_dispatch until a runner exists.
+#
+# One-time repository setup for the self-hosted job:
 # 1. Install a self-hosted Linux runner on the machine that owns the scored
 #    corpus, and give it the `lpm` label (in addition to self-hosted + linux).
 # 2. Add LPM_SCORED_OUTPUT_DIR as an Actions repository variable containing the
 #    absolute path to that machine's scored-output directory.
 # 3. Add AIRTABLE_PAT and AIRTABLE_BASE_ID as Actions repository secrets.
+# 4. Add SUPPRESSION_SOURCE + LPM_DIAL_DECISIONS_JSONL as repository variables
+#    pointing at that machine's durable ledgers.
+# 5. Re-add the schedule to `airtable-gates` below.
 permissions:
   contents: read
 
 jobs:
+  # No Airtable, no scored corpus: pure static analysis over the checkout.
+  hosted-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install gate dependencies
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -e ".[runtime]"
+
+      # `never_fires` cannot be judged here — with no corpus every gate reads as
+      # dead — so this runs only the reference half: a declared blocker that no
+      # shipped module mentions is a dead gate, and that is visible from the
+      # checkout alone.
+      - name: Check gate references
+        run: |
+          set -euo pipefail
+          report_failure() {
+            status=$?
+            printf '%s\n' '- FAIL: gate references (a declared blocker is referenced nowhere)' >> "$GITHUB_STEP_SUMMARY"
+            exit "$status"
+          }
+          trap report_failure ERR
+          .venv/bin/python evals/gate_liveness.py --references-only
+          trap - ERR
+          printf '%s\n' '- PASS: gate references' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check the corpus manifest resolves
+        run: |
+          set -euo pipefail
+          report_failure() {
+            status=$?
+            printf '%s\n' '- FAIL: corpus manifest is malformed' >> "$GITHUB_STEP_SUMMARY"
+            exit "$status"
+          }
+          trap report_failure ERR
+          .venv/bin/python -c "from evals.corpus import load_manifest; names = load_manifest(); print(f'active corpora: {len(names)}')"
+          trap - ERR
+          printf '%s\n' '- PASS: corpus manifest parses' >> "$GITHUB_STEP_SUMMARY"
+
   airtable-gates:
     runs-on: [self-hosted, linux, lpm]
+    # Manual only. `on.schedule` is workflow-level, so without this guard the
+    # daily cron would still queue this job against a runner label nothing
+    # answers to — which is the exact silent-cancellation loop being closed.
+    # Delete this line in the same change that registers the `lpm` runner.
+    if: github.event_name == 'workflow_dispatch'
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -112,7 +183,7 @@ jobs:
           printf '%s\n' '- PASS: verdict reproducibility' >> "$GITHUB_STEP_SUMMARY"
 
       # No Airtable secrets: this one replays the corpus through the gates and
-      # never reads the base.
+      # never reads the base. The corpus is why it cannot move to hosted CI.
       - name: Check gate liveness
         env:
           LPM_SCORED_OUTPUT_DIR: ${{ vars.LPM_SCORED_OUTPUT_DIR }}
@@ -128,10 +199,31 @@ jobs:
           trap - ERR
           printf '%s\n' '- PASS: gate liveness' >> "$GITHUB_STEP_SUMMARY"
 
-      # This one writes its own summary line: "too few decisions to judge" is a
-      # third outcome, and a step that printed PASS for it would report a KPI
-      # with no data behind it as green.
-      - name: Report the accept-rate KPI
+      # THE KPI. AGENTS.md is explicit that accept-rate cannot judge lead
+      # quality — logging a dial sets Follow-Up, which it counts as accepted, so
+      # a rep working the queue in order scores 100% whatever the leads are
+      # worth. This workflow ran only accept_rate until 2026-08-12, so even with
+      # a live runner CI was not reporting the KPI at all.
+      #
+      # It writes its own summary line: "too few decisions to judge" is a third
+      # outcome, and a step that printed PASS for it would report a KPI with no
+      # data behind it as green.
+      - name: Report the pre-dial approval KPI
+        env:
+          LPM_DIAL_DECISIONS_JSONL: ${{ vars.LPM_DIAL_DECISIONS_JSONL }}
+        run: |
+          set -euo pipefail
+          report_failure() {
+            status=$?
+            exit "$status"
+          }
+          trap report_failure ERR
+          .venv/bin/python evals/pre_dial_approval.py --summary-file "$GITHUB_STEP_SUMMARY"
+          trap - ERR
+
+      # Kept, clearly labelled as what it is: an operational line about whether
+      # the rep is working the queue, not a quality signal.
+      - name: Report accept-rate (operational only, not the KPI)
         env:
           AIRTABLE_PAT: ${{ secrets.AIRTABLE_PAT }}
           AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}

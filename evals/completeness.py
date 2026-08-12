@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
-"""Read-only completeness check between scored CSVs and Airtable Prospects."""
+"""Read-only completeness check between scored CSVs and Airtable Prospects.
+
+**Reject-verdict leads are deliberately pruned from the CRM.** Confirmed by the
+operator; it is why the 2026-08-11 upload receipt records 1,084 records written
+against a base holding 462 with zero rejects. Every pruned reject is therefore a
+permanent orphan, and `scored_orphans = scored_keys - base_keys` counted all of
+them — most of the 503 it reported. A check that can only go green by uploading
+leads the operator prunes on purpose is measuring the wrong invariant.
+
+The invariant that matters is narrower: **every lead the current gate calls
+actionable must exist in the base.** So a scored lead missing from the base is an
+orphan only when its verdict is something other than `reject`; pruned rejects are
+counted separately as `pruned_rejects` and never fail the run. Do not "fix" this
+back to the set difference.
+"""
 
 from __future__ import annotations
 
@@ -21,7 +35,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from lead_machine import verdict as verdict_module  # noqa: E402
 
 
-DEFAULT_PATTERN = "scored_*.csv"
+from evals.corpus import (  # noqa: E402
+    DEFAULT_PATTERN,
+    CorpusManifestError,
+    describe,
+    resolve_scored_paths,
+)
+
 # Two sides, two vocabularies. The base stores `Verdict` after the verdict
 # cutover and step 4 deletes `Packet Tier` outright, so a base read still naming
 # the tier 422s. The scored CSVs on disk are unchanged and still carry the tier
@@ -38,6 +58,10 @@ FINDING_CATEGORIES = (
     "duplicate_base_keys",
     "scored_orphans",
 )
+# Counted and listed, never failed — see the module docstring. Kept out of
+# FINDING_CATEGORIES because that tuple is what `ok` is computed from.
+REPORTED_CATEGORIES = ("pruned_rejects",)
+PRUNED_VERDICT = "reject"
 
 
 def _set_csv_field_limit() -> None:
@@ -122,7 +146,7 @@ def evaluate_completeness(
     records = list(base_records)
 
     findings: dict[str, list[dict[str, Any]]] = {
-        category: [] for category in FINDING_CATEGORIES
+        category: [] for category in (*FINDING_CATEGORIES, *REPORTED_CATEGORIES)
     }
     scored_by_key: dict[str, list[dict[str, str]]] = defaultdict(list)
     for row in scored_rows:
@@ -184,13 +208,21 @@ def evaluate_completeness(
     base_keys = set(base_by_key)
     for place_key in sorted(scored_keys - base_keys):
         rows = scored_by_key[place_key]
-        findings["scored_orphans"].append(
-            {
-                "place_key": place_key,
-                "business_name": _text(rows[0].get("Business Name")),
-                "sources": sorted(row["_source"] for row in rows),
-            }
-        )
+        verdicts = {_text(row.get(verdict_module.VERDICT_FIELD)).casefold() for row in rows}
+        verdicts.discard("")
+        finding = {
+            "place_key": place_key,
+            "business_name": _text(rows[0].get("Business Name")),
+            "sources": sorted(row["_source"] for row in rows),
+            "verdicts": sorted(verdicts),
+        }
+        # Only when *every* scoring of this lead says reject. A key with any
+        # non-reject scoring is still an orphan: it fails toward reporting,
+        # which is the direction a completeness check should fail.
+        if verdicts == {PRUNED_VERDICT}:
+            findings["pruned_rejects"].append(finding)
+        else:
+            findings["scored_orphans"].append(finding)
     for place_key in sorted(base_keys - scored_keys):
         for record in sorted(base_by_key[place_key], key=_record_id):
             fields = _fields(record)
@@ -205,7 +237,7 @@ def evaluate_completeness(
     findings["corpus_conflicts"] = _corpus_conflicts(
         scored_by_key, SCORED_VERDICT_FIELD
     )
-    for category in ("blank_base_keys", "blank_base_verdicts", "blank_scored_keys"):
+    for category in ("blank_base_keys", "blank_base_verdicts", "blank_scored_keys", "pruned_rejects"):
         findings[category].sort(
             key=lambda item: tuple(_text(item.get(key)) for key in sorted(item))
         )
@@ -222,6 +254,9 @@ def evaluate_completeness(
             "distinct_scored_leads": len(scored_by_key),
             "base_rows": len(records),
             "findings": finding_counts,
+            "reported": {
+                category: len(findings[category]) for category in REPORTED_CATEGORIES
+            },
         },
         "findings": findings,
     }
@@ -310,7 +345,7 @@ def _load_fixture_records(path: Path) -> list[dict[str, Any]]:
 def run_eval(
     *,
     output_dir: Path = Path("output"),
-    pattern: str = DEFAULT_PATTERN,
+    pattern: str | None = None,
     scored_files: Sequence[Path] | None = None,
     base_records: Iterable[dict[str, Any]] | None = None,
     base_id: str = "",
@@ -318,10 +353,8 @@ def run_eval(
     token: str = "",
     verdict_field: str = DEFAULT_VERDICT_FIELD,
 ) -> tuple[int, dict[str, Any]]:
-    paths = (
-        [Path(path) for path in scored_files]
-        if scored_files is not None
-        else sorted(Path(output_dir).glob(pattern))
+    paths, corpus_source = resolve_scored_paths(
+        output_dir=output_dir, pattern=pattern, scored_files=scored_files
     )
     if base_records is None:
         resolved_base, resolved_table, resolved_token = _credentials(
@@ -336,6 +369,7 @@ def run_eval(
     report = evaluate_completeness(
         paths, base_records, verdict_field=verdict_field
     )
+    report["corpora"] = describe(paths, corpus_source)
     return (0 if report["ok"] else 2), report
 
 
@@ -344,7 +378,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Check scored CSV coverage against Airtable Prospects (read-only)."
     )
     parser.add_argument("--output-dir", type=Path, default=Path("output"))
-    parser.add_argument("--glob", default=DEFAULT_PATTERN)
+    parser.add_argument(
+        "--glob",
+        default=None,
+        help=(
+            "Select corpora by glob instead of evals/active_corpora.json. "
+            f"Unset means the manifest; pass {DEFAULT_PATTERN!r} to replay everything."
+        ),
+    )
     parser.add_argument("--scored-file", type=Path, action="append")
     parser.add_argument("--base-records-json", type=Path)
     parser.add_argument("--base-id", default="")

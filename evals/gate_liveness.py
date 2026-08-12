@@ -39,8 +39,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from lead_machine import sendability  # noqa: E402
+from evals.corpus import (  # noqa: E402
+    DEFAULT_PATTERN,
+    CorpusManifestError,
+    describe,
+    resolve_scored_paths,
+)
 
-DEFAULT_PATTERN = "scored_*.csv"
 REPLAY_ENTRY_POINT = "evaluate_sendability"
 SENDABILITY_SOURCE = REPO_ROOT / "lead_machine" / "sendability.py"
 FINDING_CATEGORIES = ("unreferenced", "never_fires")
@@ -283,18 +288,84 @@ def evaluate_gate_liveness(
     }
 
 
+def evaluate_blocker_references(
+    *,
+    constants: dict[str, str] | None = None,
+    in_scope: set[str] | None = None,
+    references: dict[str, list[str]] | None = None,
+) -> dict[str, Any]:
+    """The half of this eval that needs no scored corpus.
+
+    `unreferenced` — a blocker constant no shipped module mentions — is pure
+    static analysis over the checkout, so it is the only part that can run in
+    hosted CI. The corpus lives in `output/`, which is gitignored and exists
+    only on the machine that scored it, so `never_fires` cannot be judged there:
+    with no rows every gate reads as dead, and `evaluate_gate_liveness` raises
+    rather than report that as N code failures.
+
+    Separated so a hosted job can catch a dead gate on every push instead of
+    waiting for a self-hosted runner that may not exist.
+    """
+    resolved_constants = (
+        constants if constants is not None else blocker_constants(sendability)
+    )
+    resolved_scope = (
+        in_scope
+        if in_scope is not None
+        else reachable_blockers(
+            SENDABILITY_SOURCE.read_text(encoding="utf-8"), REPLAY_ENTRY_POINT
+        )
+    )
+    resolved_references = (
+        references if references is not None else repo_references(resolved_constants)
+    )
+
+    findings: dict[str, list[dict[str, Any]]] = {"unreferenced": [], "outside_replay": []}
+    for name in sorted(resolved_constants):
+        message = resolved_constants[name]
+        referenced_by = resolved_references.get(name) or []
+        if not referenced_by:
+            findings["unreferenced"].append({"blocker": name, "message": message})
+        elif name not in resolved_scope:
+            findings["outside_replay"].append(
+                {"blocker": name, "message": message, "referenced_by": referenced_by}
+            )
+
+    failed = bool(findings["unreferenced"])
+    return {
+        "ok": not failed,
+        "mode": "references-only",
+        "entry_point": REPLAY_ENTRY_POINT,
+        "counts": {
+            "gates": len(resolved_constants),
+            "in_replay_scope": len(resolved_scope & set(resolved_constants)),
+            "findings": {
+                "unreferenced": len(findings["unreferenced"]),
+                "outside_replay": len(findings["outside_replay"]),
+            },
+        },
+        "remedies": {"unreferenced": REMEDIES["unreferenced"]} if failed else {},
+        "findings": findings,
+    }
+
+
 def run_eval(
     *,
     output_dir: Path = Path("output"),
-    pattern: str = DEFAULT_PATTERN,
+    pattern: str | None = None,
     scored_files: Sequence[Path] | None = None,
+    references_only: bool = False,
 ) -> tuple[int, dict[str, Any]]:
-    paths = (
-        [Path(path) for path in scored_files]
-        if scored_files is not None
-        else sorted(Path(output_dir).glob(pattern))
+    if references_only:
+        report = evaluate_blocker_references()
+        return (0 if report["ok"] else 2), report
+    paths, source = resolve_scored_paths(
+        output_dir=output_dir, pattern=pattern, scored_files=scored_files
     )
     report = evaluate_gate_liveness(paths)
+    # A green run that does not say what it replayed reads as full coverage
+    # whether or not it was.
+    report["corpora"] = describe(paths, source)
     return (0 if report["ok"] else 2), report
 
 
@@ -303,8 +374,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Replay every sendability gate over the scored corpus (read-only)."
     )
     parser.add_argument("--output-dir", type=Path, default=Path("output"))
-    parser.add_argument("--glob", default=DEFAULT_PATTERN)
+    parser.add_argument(
+        "--glob",
+        default=None,
+        help=(
+            "Select corpora by glob instead of evals/active_corpora.json. "
+            f"Unset means the manifest; pass {DEFAULT_PATTERN!r} to replay everything."
+        ),
+    )
     parser.add_argument("--scored-file", type=Path, action="append")
+    parser.add_argument(
+        "--references-only",
+        action="store_true",
+        help=(
+            "Run only the checks that need no scored corpus, so hosted CI can "
+            "catch a dead gate without the operator machine's output/ directory."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -315,6 +401,7 @@ def main(argv: list[str] | None = None) -> int:
             output_dir=args.output_dir,
             pattern=args.glob,
             scored_files=args.scored_file,
+            references_only=args.references_only,
         )
     except (OSError, ValueError, csv.Error) as exc:
         code = 2

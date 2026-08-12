@@ -231,6 +231,11 @@ def main() -> int:
     parser.add_argument("--floor", type=float, default=APPROVAL_FLOOR)
     parser.add_argument("--minimum-decided", type=int, default=MINIMUM_DECIDED)
     parser.add_argument("--json", action="store_true", help="Emit the full result as JSON")
+    parser.add_argument(
+        "--summary-file",
+        type=Path,
+        help="Append the one-line verdict here (the CI job summary).",
+    )
     args = parser.parse_args()
 
     source = args.decisions_source.strip() or configured_decisions_path()
@@ -249,6 +254,14 @@ def main() -> int:
         minimum_decided=args.minimum_decided,
         unreadable=ledger.unreadable,
     )
+
+    # Written before the stdout branch so the CI summary carries the same verdict
+    # whichever output format the step asked for. "NO VERDICT" is a real third
+    # outcome here — never a PASS — which is why the step must not stamp its own.
+    if args.summary_file:
+        with args.summary_file.open("a", encoding="utf-8") as handle:
+            handle.write(result["summary"] + "\n")
+            handle.write(result["rank_summary"] + "\n")
 
     if args.json:
         print(json.dumps(result, indent=2, sort_keys=True))

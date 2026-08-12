@@ -1,0 +1,36 @@
+{
+  "_comment": [
+    "The scored corpora the evals replay. Read by evals/corpus.py; see that",
+    "module for why a manifest exists at all (the glob replayed 49 files back to",
+    "2026-05-31, so completeness and reproducibility could never go green).",
+    "",
+    "Derived on 2026-08-12, not chosen: for every Place Key currently in the",
+    "live base, the newest scored file by mtime that contains it. That is 14 of",
+    "the 49 files and covers 476 of the base's 493 keyed records. A file that is",
+    "nobody's newest source only contributes superseded rows.",
+    "",
+    "Adding a batch is a one-line edit here. Removing one is a claim that no",
+    "lead in the base still comes from it — re-derive rather than assume.",
+    "",
+    "scored_rescore_claimfix.csv is deliberately absent: it was superseded by",
+    "the _reverdict_2026-08-12 refresh, which is what was uploaded. Keeping both",
+    "would replay every claimfix lead twice, once under a withdrawn verdict."
+  ],
+  "derived_on": "2026-08-12",
+  "active": [
+    "scored_airtable_backfill_001.csv",
+    "scored_cleveland_hardscaping_vpain_medium_001_manual.csv",
+    "scored_cleveland_hardscaping_vpain_medium_001_next_estimate_funnel_manual.csv",
+    "scored_cleveland_hardscaping_vpain_medium_001_next_social_escape_manual.csv",
+    "scored_cleveland_hardscaping_vpain_medium_001_owned_weak_sites_manual.csv",
+    "scored_debug_25_review_split.csv",
+    "scored_debug_next25_review_split_fresh.csv",
+    "scored_garage_doors_cincinnati_full_001_manual.csv",
+    "scored_garage_doors_cleveland_medium_002_manual.csv",
+    "scored_garage_doors_hamilton_medium_001_api.csv",
+    "scored_manual_existing_manual.csv",
+    "scored_plumbing_cleveland_medium_001_manual.csv",
+    "scored_recovery_consolidated.csv",
+    "scored_rescore_claimfix_reverdict_2026-08-12.csv"
+  ]
+}

@@ -15,6 +15,10 @@ SECRET_ENV = {
     "AIRTABLE_BASE_ID": "${{ secrets.AIRTABLE_BASE_ID }}",
 }
 CORPUS_ENV = {"LPM_SCORED_OUTPUT_DIR": "${{ vars.LPM_SCORED_OUTPUT_DIR }}"}
+DECISIONS_ENV = {"LPM_DIAL_DECISIONS_JSONL": "${{ vars.LPM_DIAL_DECISIONS_JSONL }}"}
+
+GATES_HOSTED_JOB = "hosted-gates"
+GATES_SELF_HOSTED_JOB = "airtable-gates"
 
 # The gates that must run daily, in order, each with the env it is allowed to
 # see. Pinned as one list so adding a gate to the workflow without declaring it
@@ -42,10 +46,28 @@ EXPECTED_GATES = (
         CORPUS_ENV,
         False,
     ),
+    # The KPI. accept-rate is kept below it as an operational line only —
+    # AGENTS.md is explicit that it cannot judge lead quality, and this workflow
+    # ran only accept-rate until 2026-08-12.
+    (
+        '.venv/bin/python evals/pre_dial_approval.py --summary-file "$GITHUB_STEP_SUMMARY"',
+        DECISIONS_ENV,
+        True,
+    ),
     (
         '.venv/bin/python evals/accept_rate.py --summary-file "$GITHUB_STEP_SUMMARY"',
         SECRET_ENV,
         True,
+    ),
+)
+
+# The hosted half: everything that needs neither the live base nor the scored
+# corpus, which is why it is the only part that runs on a push.
+EXPECTED_HOSTED_GATES = (
+    ".venv/bin/python evals/gate_liveness.py --references-only",
+    (
+        ".venv/bin/python -c \"from evals.corpus import load_manifest; "
+        "names = load_manifest(); print(f'active corpora: {len(names)}')\""
     ),
 )
 
@@ -65,6 +87,13 @@ class WorkflowContractTests(unittest.TestCase):
         if len(jobs) != 1:
             raise AssertionError(f"expected one job, found {list(jobs)}")
         return next(iter(jobs.values()))
+
+    @staticmethod
+    def job(workflow: dict[str, Any], name: str) -> dict[str, Any]:
+        jobs = workflow.get("jobs", {})
+        if name not in jobs:
+            raise AssertionError(f"missing job {name!r}, found {list(jobs)}")
+        return jobs[name]
 
     def assert_daily_schedule(self, workflow: dict[str, Any]) -> None:
         schedules = workflow["on"]["schedule"]
@@ -124,7 +153,7 @@ class WorkflowContractTests(unittest.TestCase):
 
     def test_gates_workflow_is_daily_and_manually_dispatchable(self) -> None:
         workflow, _ = self.load_workflow("gates.yml")
-        job = self.only_job(workflow)
+        job = self.job(workflow, GATES_SELF_HOSTED_JOB)
         steps = job["steps"]
 
         self.assertIn("schedule", workflow["on"])
@@ -146,9 +175,39 @@ class WorkflowContractTests(unittest.TestCase):
             ['.venv/bin/pip install -e ".[runtime]"'],
         )
 
+    def test_the_self_hosted_job_cannot_be_triggered_by_the_schedule(self) -> None:
+        """No `lpm` runner was registered between ~2026-08-01 and 2026-08-12, so
+        every scheduled run queued for 24h and silently cancelled — coverage that
+        reads as green and does not exist. `on.schedule` is workflow-level, so the
+        job needs its own guard; delete it when the runner is registered."""
+        workflow, _ = self.load_workflow("gates.yml")
+        job = self.job(workflow, GATES_SELF_HOSTED_JOB)
+
+        self.assertEqual(job.get("if"), "github.event_name == 'workflow_dispatch'")
+
+    def test_the_hosted_job_runs_on_push_and_needs_no_secrets_or_corpus(self) -> None:
+        """The half that actually executes. It must stay free of the base and the
+        gitignored corpus, or it silently stops running like the other job did."""
+        workflow, _ = self.load_workflow("gates.yml")
+        job = self.job(workflow, GATES_HOSTED_JOB)
+        steps = job["steps"]
+
+        self.assertIn("push", workflow["on"])
+        self.assertEqual(job["runs-on"], "ubuntu-latest")
+        self.assertNotIn("if", job)
+        for step in steps:
+            self.assertNotIn("env", step, f"{step.get('name')} must need no env")
+        commands = [
+            line.strip()
+            for step in steps
+            for line in step.get("run", "").splitlines()
+            if line.strip().startswith(".venv/bin/python ")
+        ]
+        self.assertEqual(commands, list(EXPECTED_HOSTED_GATES))
+
     def test_gates_workflow_preflights_self_hosted_corpus_before_eval(self) -> None:
         workflow, _ = self.load_workflow("gates.yml")
-        steps = self.only_job(workflow)["steps"]
+        steps = self.job(workflow, GATES_SELF_HOSTED_JOB)["steps"]
         corpus_env = {
             "LPM_SCORED_OUTPUT_DIR": "${{ vars.LPM_SCORED_OUTPUT_DIR }}",
         }
@@ -174,7 +233,7 @@ class WorkflowContractTests(unittest.TestCase):
 
     def test_gates_workflow_wires_secrets_and_runs_gates_in_order(self) -> None:
         workflow, source = self.load_workflow("gates.yml")
-        job = self.only_job(workflow)
+        job = self.job(workflow, GATES_SELF_HOSTED_JOB)
 
         self.assertNotIn("env", job)
         gate_steps = [
@@ -205,7 +264,7 @@ class WorkflowContractTests(unittest.TestCase):
         workflow, _ = self.load_workflow("gates.yml")
         gate_steps = [
             step
-            for step in self.only_job(workflow)["steps"]
+            for step in self.job(workflow, GATES_SELF_HOSTED_JOB)["steps"]
             if ".venv/bin/python " in step.get("run", "")
         ]
 
